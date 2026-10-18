@@ -40,13 +40,30 @@ test('a page that reloads itself but is no bot check is not reported', async () 
     if (!r.isError) ok++;
   }
   assert.ok(ok > 0);
+  // Not even when page tools then fail with "Execution context was destroyed".
+  const page = svc.manager.sessions.get(s).page;
+  const real = page.frames.bind(page);
+  page.frames = () => [{ evaluate: async () => { throw new Error('Execution context was destroyed, most likely because of a navigation'); }, isDetached: () => false }];
+  for (let i = 0; i < 4; i++) assert.doesNotMatch((await c.call('read', { session: s })).text, LOOP);
+  page.frames = real;
   await c.close();
 });
 
-test('page tools failing again and again with "Execution context was destroyed" report the loop', async () => {
+test('a tool that fails for another reason on a reloading bot check reports the loop too', async () => {
   const c = await connect(svc);
   const s = await c.open();
-  await c.call('navigate', { session: s, url: `${pages.base}/` });
+  await c.call('navigate', { session: s, url: `${pages.base}/loop` });
+  await sleep(2000);
+  const r = await c.call('wait_for', { session: s, selector: '#product', timeoutMs: 500 });
+  assert.equal(r.isError, true);
+  assert.match(r.text, LOOP);
+  await c.close();
+});
+
+test('page tools on a bot check failing again and again with "Execution context was destroyed" report the loop', async () => {
+  const c = await connect(svc);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${pages.base}/challenge` });
   const page = svc.manager.sessions.get(s).page;
   const real = page.frames.bind(page);
   page.frames = () => [{ evaluate: async () => { throw new Error('Execution context was destroyed, most likely because of a navigation'); }, isDetached: () => false }];

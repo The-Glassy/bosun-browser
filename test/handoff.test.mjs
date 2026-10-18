@@ -76,16 +76,19 @@ test('the live-view link reopens while the handoff runs, one viewer at a time, a
   // GETs (e.g. link previews) don't consume it.
   for (let i = 0; i < 2; i++) assert.equal((await fetch(link)).status, 200);
   const v1 = await viewer(link);
-  await until(() => v1.key && v1.frames > 0);
-  // A second viewer while the first is connected is turned away (it may retry), whatever key it guesses.
-  for (const key of [undefined, 'f'.repeat(32)]) {
-    const busy = await viewer(link, { key });
+  await until(() => v1.frames > 0);
+  assert.ok(!v1.messages.some((m) => m.viewer)); // no per-tab credential (a duplicated tab would copy it)
+  // A second viewer while the first is connected and responsive is turned away (its page retries).
+  for (const query of ['', '?v=' + 'f'.repeat(32)]) {
+    const busy = await viewer(link, { query });
     await until(() => busy.closed);
     assert.equal(busy.closeCode, 4409);
   }
-  await assert.rejects(viewer(link, { key: v1.key, origin: 'https://evil.example' }), /HTTP 403/);
-  const v2 = await viewer(link, { key: v1.key }); // the same tab reconnecting replaces its old socket at once
+  await assert.rejects(viewer(link, { origin: 'https://evil.example' }), /HTTP 403/);
+  assert.equal(v1.closed, false);
+  v1.ws.close(); // network change: the tab reconnects
   await until(() => v1.closed);
+  const v2 = await viewer(link);
   await until(() => v2.frames > 0);
   // The phone closes the in-app browser; opening the same link again works, and shows the page at once.
   v2.ws.close();
@@ -98,10 +101,9 @@ test('the live-view link reopens while the handoff runs, one viewer at a time, a
   v3.ws.send(JSON.stringify({ type: 'giveup' }));
   assert.equal((await c.call('handoff_wait', { session: s, timeoutSec: 5 })).json().status, 'human-gave-up');
   await until(() => v3.closed);
-  // Finished: no replay, with or without a key.
+  // Finished: no replay.
   assert.equal((await fetch(link)).status, 404);
   await assert.rejects(viewer(link), /HTTP 404/);
-  await assert.rejects(viewer(link, { key: v3.key }), /HTTP 404/);
   await c.close();
 });
 

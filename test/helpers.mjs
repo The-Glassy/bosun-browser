@@ -33,6 +33,7 @@ const PAGES = {
   '/toggle-later': `<title>Toggle later</title><input id="t" type="password" value="pre-scan-toggled"><script>setTimeout(() => { document.getElementById('t').type = 'text'; }, 400)</script>`,
   '/dshadow': `<title>Declarative shadow</title><div id="host"><template shadowrootmode="open"><input id="dp" type="password" value="decl-shadow-secret"></template></div><script>setTimeout(() => { document.getElementById('host').shadowRoot.getElementById('dp').type = 'text'; }, 400)</script>`,
   '/loop': `<title>Just a moment...</title><p>Checking your browser before accessing the site.</p><script>setTimeout(() => location.reload(), 250)</script>`,
+  '/challenge': `<title>Just a moment...</title><p>Checking your browser before accessing the site.</p>`,
   '/reloader': `<title>Dashboard</title><p>live numbers</p><script>setTimeout(() => location.reload(), 250)</script>`,
   // Pointer events, logged into #log (readable from Bosun's isolated world too); a 'reset-log' DOM event clears it.
   '/pointer': `<title>Pointer</title><style>body{margin:0}#pw{position:absolute;left:300px;top:300px}</style>
@@ -142,16 +143,15 @@ export async function until(fn, ms = 5000, step = 25) {
 }
 
 // Live-view viewer: attach to a link over WebSocket. Resolves once open (a busy link closes again with 4409).
-// key: the viewer key of an earlier socket (its own tab reconnecting). autoPong: false = a frozen phone (no pongs).
-export function viewer(link, { key, origin, autoPong = true } = {}) {
-  const u = link.replace(/^http/, 'ws').replace('/v/', '/ws/') + (key ? `?v=${key}` : '');
+// query: extra query string (ignored by the service). autoPong: false = a frozen phone (no pongs).
+export function viewer(link, { query = '', origin, autoPong = true } = {}) {
+  const u = link.replace(/^http/, 'ws').replace('/v/', '/ws/') + query;
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(u, { autoPong, ...(origin ? { origin } : {}) });
-    const v = { ws, frames: 0, ends: [], key: null, closed: false, closeCode: null, cursor: null, messages: [] };
+    const v = { ws, frames: 0, ends: [], closed: false, closeCode: null, cursor: null, messages: [] };
     ws.on('message', (d) => {
       const m = JSON.parse(d);
       v.messages.push(m);
-      if (m.viewer) v.key = m.viewer;
       if (m.cursor) v.cursor = m.cursor;
       if (m.frame) v.frames++;
       if (m.end) v.ends.push(m.end);

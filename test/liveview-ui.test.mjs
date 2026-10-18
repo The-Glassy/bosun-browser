@@ -212,30 +212,32 @@ test('closing and reopening the viewer page: the link works again with a frame a
   }
 });
 
-test('phone layout: bars do not cover the page, every control sits in the bottom thumb zone, portrait fits', async () => {
+for (const [W, H] of [[390, 844], [320, 568]]) {
+test(`phone layout ${W}x${H}: bars do not cover the page, every control sits in the bottom thumb zone, portrait fits`, async () => {
   const c = await connect(svc);
   const { link } = await handoff(c, '/second');
-  const { ctx, vp } = await openViewer(link);
+  const { ctx, vp } = await openViewer(link, { ...PHONE, viewport: { width: W, height: H } });
   try {
     const box = async (sel) => vp.locator(sel).boundingBox();
     const [header, wrap, stage, footer] = [await box('header'), await box('#wrap'), await box('#stage'), await box('footer')];
     assert.ok(header.y + header.height <= wrap.y + 0.5, 'header overlaps the page');
     assert.ok(wrap.y + wrap.height <= footer.y + 0.5, 'footer overlaps the page');
-    assert.ok(stage.y >= wrap.y - 0.5 && stage.y + stage.height <= wrap.y + wrap.height + 0.5 && stage.width <= 390.5);
-    assert.ok(footer.y + footer.height <= 844.5, 'footer below the screen');
+    assert.ok(stage.y >= wrap.y - 0.5 && stage.y + stage.height <= wrap.y + wrap.height + 0.5 && stage.width <= W + 0.5);
+    assert.ok(footer.y + footer.height <= H + 0.5, 'footer below the screen');
     for (const sel of ['#done', '#give', '#kb', '#ins', '#p', '#eye', '#mode [data-m=tap]', '#mode [data-m=pad]']) {
       const b = await box(sel);
-      assert.ok(b && b.y > 844 * 0.7 && b.y + b.height <= 844.5 && b.x >= 0 && b.x + b.width <= 390.5, `${sel} ${JSON.stringify(b)}`);
+      assert.ok(b && b.y > H * 0.7 && b.y + b.height <= H + 0.5 && b.x >= 0 && b.x + b.width <= W + 0.5, `${sel} ${JSON.stringify(b)}`);
       assert.ok(b.height >= 40, `${sel} too small to hit`);
     }
-    assert.equal(await vp.evaluate(() => document.documentElement.scrollWidth), 390); // no sideways scrolling
+    assert.equal(await vp.evaluate(() => document.documentElement.scrollWidth), W); // no sideways scrolling
     assert.match(await vp.getAttribute('meta[name=viewport]', 'content'), /viewport-fit=cover/);
     // Keys opens a key strip, still above the bottom edge.
     await vp.click('#kb');
     const k = await box('#keys');
-    assert.ok(k && k.y + k.height <= 844.5);
+    assert.ok(k && k.y + k.height <= H + 0.5);
   } finally {
     await ctx.close();
     await c.close();
   }
 });
+}
