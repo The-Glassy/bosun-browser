@@ -90,8 +90,9 @@ Flow
 3. The agent tells its human (e.g. Telegram) and waits (no polling — a later event wakes it).
 4. Live view: CDP `Page.startScreencast` frames → browser page (canvas); taps/clicks/keys → `Input.dispatchMouseEvent`
    / `dispatchKeyEvent` / `insertText`. Works on phones. Buttons: Done, Give up.
-5. While a handoff is active the agent is **blinded**: read/screenshot/evaluate return "handoff active" (so typed
-   passwords/OTPs never reach the model). Password inputs are masked in a11y/markdown output at all times.
+5. While a handoff is active the agent is **blinded**: every page tool returns "handoff active" and no URL/title is
+   reported. Password/PIN/OTP inputs are masked in a11y/markdown output and screenshots at all times. Text typed into
+   ordinary fields is not masked after Done (see README › Handoff for the exact guarantees).
 6. Done → `browser:human-done`; timeout → `browser:handoff-timeout`. The pending call resolves and the agent continues
    on the post-login page. Cookies persist if the session uses a persistent profile.
 
