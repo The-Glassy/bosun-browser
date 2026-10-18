@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
-import { startBosun, startPageServer, connect, rawRequest, until, TOKEN, TOKEN_B } from './helpers.mjs';
+import { startBosun, startPageServer, connect, rawRequest, until, TOKEN, TOKEN_B, ENGINE } from './helpers.mjs';
 import { WsTransport } from '../src/wsserver.mjs';
 
 let pages, svc;
@@ -108,7 +108,7 @@ test('session cap holds under concurrent opens and the browser launches once', a
     const res = await Promise.all(Array.from({ length: 6 }, () => c.call('session_open', {})));
     assert.equal(res.filter((r) => !r.isError).length, 2);
     assert.equal(res.filter((r) => r.isError && /session limit 2/.test(r.text)).length, 4);
-    assert.equal(s2.manager.launches, 1);
+    if (ENGINE === 'chromium') assert.equal(s2.manager.launches, 1); // one shared browser; other engines: one per session
     assert.equal(s2.manager.used, 2);
     await c.close();
     await until(() => s2.manager.used === 0);
@@ -145,13 +145,14 @@ test('browser crash: sessions are dropped and the next open relaunches', async (
   try {
     const c = await connect(s2);
     const id = await c.open();
-    const browser = await s2.manager.browserP;
+    const sess = s2.manager.sessions.get(id);
+    const browser = sess.browser || sess.own || sess.ctx.browser();
     await browser.close(); // same 'disconnected' path as a crash
     await until(() => s2.manager.sessions.size === 0);
     await until(() => s2.manager.used === 0);
     assert.match((await c.call('read', { session: id })).text, /no session/);
     const id2 = await c.open();
-    assert.equal(s2.manager.launches, 2);
+    if (ENGINE === 'chromium') assert.equal(s2.manager.launches, 2);
     assert.equal((await c.call('navigate', { session: id2, url: `${pages.base}/` })).isError, false);
     // A closed main page ends its session too.
     await s2.manager.sessions.get(id2).page.close();
@@ -272,8 +273,8 @@ test('a disconnect while session_open is still launching does not leak the sessi
     c.callTool({ name: 'session_open', arguments: {} }).catch(() => {});
     await until(() => s2.manager.used === 1, 2000, 1);
     await c.close();
-    await until(() => s2.manager.pendingOpens.size === 0);
-    await until(() => s2.manager.used === 0);
+    await until(() => s2.manager.pendingOpens.size === 0, 30_000); // camoufox needs ~5 s per open
+    await until(() => s2.manager.used === 0, 15_000);
     assert.equal(s2.manager.sessions.size, 0);
     assert.equal(s2.manager.goneOwners.size, 0);
   } finally {
