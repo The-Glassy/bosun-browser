@@ -41,8 +41,10 @@ export async function evaluateCheck(page, check) {
 }
 
 const sleep = (ms, signal) => new Promise((r) => {
-  const t = setTimeout(r, ms);
-  signal?.addEventListener('abort', () => { clearTimeout(t); r(); }, { once: true });
+  if (signal?.aborted) return r();
+  const onAbort = () => { clearTimeout(t); r(); };
+  const t = setTimeout(() => { signal?.removeEventListener('abort', onAbort); r(); }, ms);
+  signal?.addEventListener('abort', onAbort, { once: true });
 });
 
 // About `ms` of reading-like activity: 3–6 pointer glides along the live view's human path, 1–3 scrolls (mostly
@@ -86,7 +88,7 @@ export async function humanActivity(page, ms, { rnd = Math.random, signal } = {}
     await sleep(Math.max(0, left / steps * between(rnd, [0.6, 1.4])), signal);
   }
   const rest = end - Date.now();
-  if (rest > 0) await sleep(rest, signal);
+  if (rest > 0 && !signal?.aborted) await sleep(rest, signal);
   return done;
 }
 
@@ -102,10 +104,18 @@ class Store {
       if (e.code !== 'ENOENT') throw new Error(`keepalive: cannot read ${file}: ${e.message}`);
     }
   }
+  // Throws on failure; dirty stays set so the next tick retries.
   save() {
+    this.dirty = true;
     const tmp = `${this.file}.${crypto.randomBytes(4).toString('hex')}`;
-    fs.writeFileSync(tmp, JSON.stringify({ version: 1, entries: [...this.entries.values()] }, null, 1), { mode: 0o600 });
-    fs.renameSync(tmp, this.file);
+    try {
+      fs.writeFileSync(tmp, JSON.stringify({ version: 1, entries: [...this.entries.values()] }, null, 1), { mode: 0o600 });
+      fs.renameSync(tmp, this.file);
+    } catch (e) {
+      fs.rmSync(tmp, { force: true });
+      throw e;
+    }
+    this.dirty = false;
   }
 }
 
@@ -126,10 +136,21 @@ export class Keepalive {
     this.timer.unref();
   }
 
+  // Aborts a running visit and closes its browser at once; waits for it only briefly (shutdown's own close of all
+  // sessions and pending opens is bounded and follows).
   async stop() {
     this.stopped = true;
     clearInterval(this.timer);
-    if (this.current) { this.current.abort(); await this.current.done; }
+    const run = this.current;
+    if (!run) return;
+    run.abort();
+    if (run.session) this.manager.dispose(run.session, 'shutdown');
+    await Promise.race([run.done, sleep(3000)]);
+  }
+
+  // Background saves (after a visit, a skip) report failures instead of losing them; the next tick retries.
+  persist() {
+    try { this.store.save(); } catch (e) { console.error(`bosun keepalive: cannot save ${this.store.file}: ${e.code || e.message}`); }
   }
 
   profileDir(tenant, profile) { return path.join(this.cfg.dataDir, 'profiles', tenant, profile); }
@@ -140,12 +161,13 @@ export class Keepalive {
     if (!check || !(check.text || check.selector || check.url_not_contains)) throw new Error('logged_in_check needs text, selector or url_not_contains');
     const key = `${tenant}/${profile}`;
     const old = this.store.entries.get(key);
-    const e = {
-      tenant, profile, url, everyHours, jitterMin, enabled,
-      check: Object.fromEntries(['text', 'selector', 'url_not_contains'].filter((k) => check[k]).map((k) => [k, check[k]])),
-      nextAt: old?.nextAt ?? null, history: old?.history ?? [], lastSkip: old?.lastSkip ?? null, created: old?.created ?? this.now(),
-    };
     const rescheduled = !old || !old.enabled || old.everyHours !== everyHours || old.jitterMin !== jitterMin;
+    // Updated in place: a visit running right now records its result on this same entry.
+    const e = old || { tenant, profile, nextAt: null, history: [], lastSkip: null, created: this.now() };
+    Object.assign(e, {
+      url, everyHours, jitterMin, enabled,
+      check: Object.fromEntries(['text', 'selector', 'url_not_contains'].filter((k) => check[k]).map((k) => [k, check[k]])),
+    });
     if (enabled && (rescheduled || !e.nextAt)) e.nextAt = nextRun(this.now(), e, this.rnd);
     this.store.entries.set(key, e);
     this.store.save();
@@ -174,6 +196,7 @@ export class Keepalive {
 
   // Runs at most one due visit. Visits are spread: one at a time, gapMs apart, the most overdue first.
   async tick() {
+    if (this.store.dirty) this.persist();
     if (this.current || this.stopped || this.manager.closing) return null;
     const now = this.now();
     if (now < this.notBefore) return null;
@@ -205,7 +228,7 @@ export class Keepalive {
   skip(e, reason, nextAt) {
     e.lastSkip = { at: this.now(), reason };
     e.nextAt = nextAt;
-    this.store.save();
+    this.persist();
     return { skipped: reason };
   }
 
@@ -215,35 +238,53 @@ export class Keepalive {
     return this.cfg.engine === 'camoufox' ? 'chromium' : this.cfg.engine;
   }
 
+  // Error reasons are fixed categories or Bosun's own messages, never raw browser errors (which can quote the page).
   async visit(e, signal, run) {
     const t0 = this.now();
     const m = this.manager;
     const owner = `keepalive:${e.tenant}`;
-    let status = 'error', reason = null, s = null;
+    const key = `${e.tenant}/${e.profile}`;
+    const { url, check } = { url: e.url, check: { ...e.check } }; // this visit's configuration
+    let status = 'error', reason = null, s = null, phase = 'open';
     try {
       const meta = readProfileMeta(this.profileDir(e.tenant, e.profile));
       // Same mode as normal use, so the fingerprint stays consistent: never open a headful profile headless.
-      if (this.cfg.headless && meta?.headless !== true) throw new Error('profile is used headful; keepalive will not open it headless (run the service headful)');
-      s = run.session = await m.open({ owner, tenant: e.tenant, profile: e.profile, engine: this.engineFor(meta), preempt: false });
+      if (this.cfg.headless && meta?.headless !== true) { reason = 'profile is used headful; keepalive will not open it headless (run the service headful)'; throw new Error(reason); }
+      try {
+        s = run.session = await m.open({ owner, tenant: e.tenant, profile: e.profile, engine: this.engineFor(meta), preempt: false });
+      } catch (err) {
+        reason = /^(engine \S+ (is not installed|: browser binary missing)|session limit|profile \S+ is already open|profile was created with|service is shutting down)/.test(err?.message || '')
+          ? String(err.message).split('\n')[0].slice(0, 200) : 'could not open the profile';
+        throw err;
+      }
       if (signal.aborted) throw new Error('aborted');
       const r = await m.run(owner, s.id, async (ss) => {
-        await ss.page.goto(e.url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+        phase = 'navigate';
+        try {
+          await ss.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+        } catch (err) {
+          const code = /\b(net::ERR_[A-Z_]+|NS_ERROR_[A-Z_]+)\b/.exec(err?.message || '')?.[1];
+          reason = /Timeout/.test(err?.name || '') || /timeout/i.test(err?.message || '') ? 'navigation timeout' : `navigation failed${code ? ` (${code})` : ''}`;
+          throw err;
+        }
         await ss.page.waitForLoadState('load', { timeout: 15_000 }).catch(() => {});
+        phase = 'activity';
         if (await this.wall(ss.page)) return { status: 'bot_check', reason: 'bot check page' };
         await humanActivity(ss.page, Math.round(between(this.rnd, this.activityMs)), { rnd: this.rnd, signal });
         if (signal.aborted) throw new Error('aborted');
+        phase = 'check';
         if (await this.wall(ss.page)) return { status: 'bot_check', reason: 'bot check page' };
-        const c = await evaluateCheck(ss.page, e.check);
+        const c = await evaluateCheck(ss.page, check);
         return c.ok ? { status: 'ok' } : { status: 'logged_out', reason: c.reason };
       });
       ({ status, reason = null } = r);
-    } catch (err) {
+    } catch {
       if (signal.aborted) status = 'aborted';
-      else reason = String(err?.message || err).split('\n')[0].replace(/\x1b\[[0-9;]*m/g, '').slice(0, 200);
+      else if (!reason) reason = `${phase} failed`;
     } finally {
       if (s) await m.dispose(s, 'keepalive-done');
     }
-    if (!this.store.entries.has(`${e.tenant}/${e.profile}`)) return { status };
+    if (this.store.entries.get(key) !== e) return { status }; // removed (or removed and re-added) meanwhile
     if (status === 'aborted') {
       this.skip(e, this.stopped ? 'service stopped' : 'taken over by an agent', e.nextAt <= this.now() && !this.stopped ? nextRun(this.now(), e, this.rnd) : e.nextAt);
       return { status };
@@ -251,10 +292,11 @@ export class Keepalive {
     e.history.push({ at: t0, status, durationMs: this.now() - t0, ...(reason ? { reason } : {}) });
     if (e.history.length > HISTORY) e.history.splice(0, e.history.length - HISTORY);
     e.nextAt = nextRun(this.now(), e, this.rnd);
-    this.store.save();
+    // The human has to hear about it even if the result can't be saved right now.
     if (status === 'logged_out' || status === 'bot_check') {
-      this.emit({ tenant: e.tenant, profile: e.profile, url: e.url, kind: status, reason });
+      Promise.resolve().then(() => this.emit({ tenant: e.tenant, profile: e.profile, url, kind: status, reason })).catch(() => {});
     }
+    this.persist();
     return { status, reason };
   }
 }

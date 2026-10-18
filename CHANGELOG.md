@@ -18,6 +18,8 @@
   MCPL and whose host granted `pushEvents` via a `featureSets/update` Request (a notification can only narrow it).
   Up to 20 undelivered events per tenant wait for the next such connection. `mcpl/manifest` returns the manifest.
 - Profiles record the engine and mode they were last opened with (`bosun-profile.json`).
+- Visit failures are stored as fixed categories (`navigation failed (net::ERR_…)`, `activity failed`, …), never
+  as browser error text. A failed save of `keepalive.json` is logged and retried; the event is raised regardless.
 
 ### Fixed
 

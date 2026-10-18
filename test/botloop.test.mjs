@@ -21,8 +21,9 @@ test('a challenge page that keeps reloading itself gives a clear error on every 
     assert.equal(r.isError, true, `${tool}: ${r.text}`);
     assert.match(r.text, LOOP, tool);
   }
-  // Leaving the loop: a normal page reads fine again.
-  const r = await c.call('navigate', { session: s, url: `${pages.base}/` });
+  // Leaving the loop: a normal page reads fine again. (The loop's own reload may interrupt the first attempt.)
+  let r;
+  for (let i = 0; i < 3 && !(r && !r.isError); i++) r = await c.call('navigate', { session: s, url: `${pages.base}/` });
   assert.equal(r.isError, false, r.text);
   assert.equal((await c.call('read', { session: s, mode: 'text' })).isError, false);
   await c.close();

@@ -105,6 +105,24 @@ export class SessionManager {
     const def = this.engines.get(engine || this.cfg.engine);
     if (this.goneOwners.has(owner)) throw new Error('connection closed');
     const profileKey = profile ? `${tenant}/${profile}` : null;
+    // Counted as this owner's open from here, so a disconnect while it waits below still makes it close itself.
+    this.ownerOpens.set(owner, (this.ownerOpens.get(owner) || 0) + 1);
+    let tracked = true;
+    const untrack = () => {
+      if (!tracked) return;
+      tracked = false;
+      const n = this.ownerOpens.get(owner) - 1;
+      if (n) this.ownerOpens.set(owner, n);
+      else { this.ownerOpens.delete(owner); this.goneOwners.delete(owner); }
+    };
+    try {
+      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt });
+    } finally {
+      untrack();
+    }
+  }
+
+  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt }) {
     // The profile was just closed (by session_close, a dropped connection, idle or crash) and its browser is still
     // shutting down; or a background keepalive holds it. Wait for it rather than refusing.
     if (profileKey && this.profilesInUse.has(profileKey)) {
@@ -180,13 +198,7 @@ export class SessionManager {
       }
     })();
     this.pendingOpens.add(p);
-    this.ownerOpens.set(owner, (this.ownerOpens.get(owner) || 0) + 1);
-    p.catch(() => {}).finally(() => {
-      this.pendingOpens.delete(p);
-      const n = this.ownerOpens.get(owner) - 1;
-      if (n) this.ownerOpens.set(owner, n);
-      else { this.ownerOpens.delete(owner); this.goneOwners.delete(owner); }
-    });
+    p.catch(() => {}).finally(() => this.pendingOpens.delete(p));
     return p;
   }
 

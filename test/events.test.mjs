@@ -68,8 +68,10 @@ test('no push before the grant, or without pushEvents, or with the feature set d
   await c.notification({ method: 'featureSets/update', params: ALL });
   await send();
   assert.equal(c.pushes.length, 0);
-  // Overlapping allow/deny is malformed: refused, nothing granted.
-  await assert.rejects(c.grant({ effectiveCapabilities: ['pushEvents'], deniedCapabilities: ['pushEvents'] }), /overlap/);
+  // Overlapping allow/deny is malformed (also through wildcards): refused, nothing granted.
+  for (const [eff, den] of [[['pushEvents'], ['pushEvents']], [['*'], ['pushEvents']], [['pushEvents'], ['*']], [['push*', 'pushEvents'], ['pushEvents']]]) {
+    await assert.rejects(c.grant({ effectiveCapabilities: eff, deniedCapabilities: den }), /overlap/, JSON.stringify([eff, den]));
+  }
   // The queued events arrive once the host grants (bounded queue).
   await c.grant({ effectiveCapabilities: ['p*', 'pushEvents'] });
   await until(() => c.pushes.length === 5);
@@ -102,6 +104,34 @@ test('the queue per tenant is bounded', async () => {
   svc.events.pending.clear();
   for (let i = 0; i < 30; i++) await svc.events.needsHuman(event(`p${i}`));
   assert.equal(svc.events.pending.get('alice').length, 20);
-  assert.match(svc.events.pending.get('alice')[0].payload.content[0].text, /"p10"/);
+  assert.match(svc.events.pending.get('alice')[0].params.payload.content[0].text, /"p10"/);
   svc.events.pending.clear();
+});
+
+test('wildcard overlap in a request or notification clears an existing grant', async () => {
+  svc.events.pending.clear();
+  const c = await host();
+  await c.grant(ALL);
+  await c.notification({ method: 'featureSets/update', params: { effectiveCapabilities: ['*'], deniedCapabilities: ['pushEvents'] } });
+  await sleep(50);
+  await svc.events.needsHuman(event());
+  await sleep(100);
+  assert.equal(c.pushes.length, 0);
+  await c.close();
+  svc.events.pending.clear();
+});
+
+test('a connection attaching while a delivery is failing still gets the event', async () => {
+  const { EventBus } = await import('../src/events.mjs');
+  const bus = new EventBus();
+  let fail;
+  bus.attach('t', () => new Promise((r) => { fail = () => r(false); })); // old connection, about to drop
+  const p = bus.publish('t', { eventId: 'x' });
+  await until(() => fail);
+  const got = [];
+  bus.attach('t', async (params) => { got.push(params.eventId); return true; }); // its replacement
+  fail();
+  await p;
+  await until(() => got.length === 1);
+  assert.equal(bus.pending.size, 0);
 });

@@ -19,6 +19,7 @@ function startSite() {
     if (u.pathname === '/do-logout') return html('<title>bye</title>', { 'set-cookie': 'sid=; Path=/; Max-Age=0' });
     if (u.pathname === '/t') { for (const k of Object.keys(seen)) if (u.searchParams.has(k)) seen[k] += Number(u.searchParams.get(k)); res.writeHead(204); return res.end(); }
     if (u.pathname === '/signin') return html('<title>Sign in</title><form><input name="user"><input type="password"></form>');
+    if (u.pathname === '/slow') return; // never answers
     if (u.pathname === '/challenge') return html('<title>Just a moment...</title><p>Checking your browser</p>');
     if (u.pathname === '/app') {
       seen.app++;
@@ -203,7 +204,7 @@ test('an agent opening the profile during a visit takes it over at once', async 
     await sleep(500); // mid-activity
     const t0 = Date.now();
     const s = await c.open({ profile: 'shop' });
-    assert.ok(Date.now() - t0 < 15_000);
+    assert.ok(Date.now() - t0 < 6000, `took ${Date.now() - t0} ms`); // not the rest of the 30 s activity
     assert.deepEqual(await visit, { status: 'aborted' });
     const [v] = (await c.call('keepalive_list')).json();
     assert.equal(v.last_skip.reason, 'taken over by an agent');
@@ -211,7 +212,7 @@ test('an agent opening the profile during a visit takes it over at once', async 
     await c.call('navigate', { session: s, url: `${site.base}/app` });
     assert.match((await c.call('read', { session: s, mode: 'text' })).text, /Signed in as alice/);
     await c.close();
-  }, { keepalive: { activityMs: [8000, 8000] } });
+  }, { keepalive: { activityMs: [30_000, 30_000] } });
 });
 
 test('visits are spread: one at a time, gapMs apart', async () => {
@@ -260,7 +261,7 @@ test('configuration and results survive a restart; the file is private', async (
 test('history is bounded', async () => {
   await withService(async (svc) => {
     const c = await loggedInProfile(svc);
-    await c.call('keepalive_set', { profile: 'shop', url: `${site.base}/nowhere`, logged_in_check: { text: 'x' } });
+    await c.call('keepalive_set', { profile: 'shop', url: `${site.base}/signin`, logged_in_check: { text: 'x' } });
     const e = svc.keepalive.store.entries.get('alice/shop');
     e.history = Array.from({ length: HISTORY }, (_, i) => ({ at: i, status: 'ok', durationMs: 1 }));
     due(svc);
@@ -321,4 +322,107 @@ test('the store refuses a corrupt file instead of silently dropping schedules', 
   fs.writeFileSync(path.join(dir, 'keepalive.json'), '{oops');
   assert.throws(() => new Keepalive({ cfg: { dataDir: dir }, manager: {} }), /keepalive: cannot read/);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('an open waiting for a closing profile closes itself if its connection drops meanwhile', async () => {
+  await withService(async (svc) => {
+    const m = svc.manager;
+    let release;
+    m.profilesInUse.add('alice/w');
+    m.closingProfiles.set('alice/w', new Promise((r) => { release = r; }));
+    const c = await connect(svc);
+    const p = c.call('session_open', { profile: 'w' });
+    await sleep(200);
+    await c.close(); // gone while the open waits
+    await sleep(200);
+    m.profilesInUse.delete('alice/w');
+    m.closingProfiles.delete('alice/w');
+    release();
+    await p;
+    await until(() => m.pendingOpens.size === 0 && m.disposals.size === 0);
+    assert.equal(m.sessions.size, 0);
+    assert.equal(m.used, 0);
+    assert.ok(!m.profilesInUse.has('alice/w'));
+  });
+});
+
+test('shutdown during a visit stuck in navigation is quick', async () => {
+  await withService(async (svc) => {
+    const c = await loggedInProfile(svc);
+    await c.call('keepalive_set', { profile: 'shop', url: `${site.base}/slow`, logged_in_check: { text: 'x' } });
+    due(svc);
+    const visit = svc.keepalive.tick();
+    await until(() => svc.keepalive.current?.session);
+    await sleep(300);
+    const t0 = Date.now();
+    await c.close();
+    await svc.shutdown();
+    assert.ok(Date.now() - t0 < 15_000, `shutdown took ${Date.now() - t0} ms`);
+    assert.equal((await visit).status, 'aborted');
+    assert.equal(svc.manager.sessions.size, 0);
+  });
+});
+
+test('failures are stored as categories, never as browser error text', async () => {
+  await withService(async (svc) => {
+    const c = await loggedInProfile(svc);
+    await c.call('keepalive_set', { profile: 'shop', url: `${site.base}/app`, logged_in_check: { text: 'Signed in as' } });
+    svc.keepalive.wall = async () => { throw new Error('evaluate: Error: SECRET-4711 from the page'); };
+    due(svc);
+    assert.deepEqual(await svc.keepalive.tick(), { status: 'error', reason: 'activity failed' });
+    await c.call('keepalive_set', { profile: 'shop', url: 'http://127.0.0.1:1/app', logged_in_check: { text: 'x' } });
+    svc.keepalive.wall = async () => null;
+    due(svc);
+    const r = await svc.keepalive.tick();
+    assert.equal(r.status, 'error');
+    assert.match(r.reason, /^navigation failed( \((net::ERR|NS_ERROR)_[A-Z_]+\))?$/);
+    const list = JSON.stringify((await c.call('keepalive_list')).json());
+    assert.ok(!list.includes('SECRET-4711'));
+    assert.ok(!fs.readFileSync(path.join(svc.dataDir, 'keepalive.json'), 'utf8').includes('SECRET-4711'));
+    await c.close();
+  });
+});
+
+test('keepalive_set while a visit runs: the result lands on the entry and the next visit is a period later', async () => {
+  await withService(async (svc) => {
+    const c = await loggedInProfile(svc);
+    await c.call('keepalive_set', { profile: 'shop', url: `${site.base}/app`, logged_in_check: { text: 'Signed in as' } });
+    due(svc);
+    const visit = svc.keepalive.tick();
+    await until(() => svc.keepalive.current?.session);
+    await c.call('keepalive_set', { profile: 'shop', url: `${site.base}/app?v=2`, logged_in_check: { text: 'Signed in as' } }); // same schedule
+    assert.equal((await visit).status, 'ok');
+    const [v] = (await c.call('keepalive_list')).json();
+    assert.equal(v.url, `${site.base}/app?v=2`);
+    assert.equal(v.last.length, 1);
+    assert.ok(Date.parse(v.next_run) > Date.now() + 11 * 3_600_000);
+    svc.keepalive.notBefore = 0;
+    assert.equal(await svc.keepalive.tick(), null);
+    await c.close();
+  });
+});
+
+test('a failed save still raises the event, is reported, and is retried', async () => {
+  await withService(async (svc, events) => {
+    const c = await loggedInProfile(svc);
+    await c.call('keepalive_set', { profile: 'shop', url: `${site.base}/app`, logged_in_check: { text: 'nope' } });
+    const store = svc.keepalive.store;
+    const file = store.file;
+    store.file = path.join(svc.dataDir, 'missing-dir', 'keepalive.json');
+    const errors = [];
+    const orig = console.error;
+    console.error = (...a) => errors.push(a.join(' '));
+    try {
+      due(svc);
+      assert.equal((await svc.keepalive.tick()).status, 'logged_out');
+    } finally { console.error = orig; }
+    assert.equal(events.length, 1);
+    assert.match(errors.join('\n'), /bosun keepalive: cannot save .*ENOENT/);
+    assert.equal(store.dirty, true);
+    store.file = file;
+    await svc.keepalive.tick(); // retries the save
+    assert.equal(store.dirty, false);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).entries[0].history.at(-1).status, 'logged_out');
+    await c.close();
+  });
 });
