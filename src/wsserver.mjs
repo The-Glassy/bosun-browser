@@ -8,15 +8,26 @@ import { buildServer } from './tools.mjs';
 
 const MAX_PAYLOAD = 1024 * 1024;
 const HEARTBEAT_MS = 30_000;
+const MAX_OPEN_REQUESTS = 64; // requests (of any method) received and not yet answered
+const MAX_BUFFERED = 8 * 1024 * 1024; // bytes queued to a client that doesn't read
 
 // MCP Transport over a ws socket. send() settles from the socket's write callback and rejects on a closed socket.
+// A client that keeps too many requests open or stops reading its responses is disconnected.
 export class WsTransport {
-  constructor(ws) {
+  constructor(ws, { maxOpenRequests = MAX_OPEN_REQUESTS, maxBuffered = MAX_BUFFERED } = {}) {
     this.ws = ws;
     this.closed = false;
+    this.open = 0;
+    this.maxOpenRequests = maxOpenRequests;
+    this.maxBuffered = maxBuffered;
     ws.on('message', (d) => {
       let msg;
       try { msg = JSON.parse(d); } catch (e) { this.onerror?.(e); return; }
+      if (msg && typeof msg.method === 'string' && msg.id !== undefined && ++this.open > this.maxOpenRequests) {
+        this.onerror?.(new Error('too many open requests'));
+        return this.ws.terminate();
+      }
+      if (msg?.method === 'notifications/cancelled') this.open = Math.max(0, this.open - 1); // no response follows
       this.onmessage?.(msg);
     });
     ws.on('error', (e) => this.onerror?.(e));
@@ -26,6 +37,11 @@ export class WsTransport {
   send(msg) {
     return new Promise((resolve, reject) => {
       if (this.ws.readyState !== WebSocket.OPEN) return reject(new Error('websocket is not open'));
+      if (msg && msg.id !== undefined && ('result' in msg || 'error' in msg)) this.open = Math.max(0, this.open - 1);
+      if (this.ws.bufferedAmount > this.maxBuffered) {
+        this.ws.terminate();
+        return reject(new Error('client is not reading; disconnected'));
+      }
       this.ws.send(JSON.stringify(msg), (e) => (e ? reject(e) : resolve()));
     });
   }
