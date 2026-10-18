@@ -96,7 +96,7 @@ Not measured: no such host was available for this run. Expected differences, rou
 - Camoufox `humanize` (curved cursor paths) is **off**: with Playwright 1.64 it makes clicks hang in Playwright's
   actionability checks when the viewport matches the fingerprint window. Revisit when camoufox-js supports 1.64.
 - Live view on Firefox uses Playwright's cross-browser `page.screencast` (JPEG frames, acked after each WebSocket
-  write) and `page.mouse` / `page.keyboard` for input, with the same one-time link, single viewer, input drain and
+  write) and `page.mouse` / `page.keyboard` for input, with the same link rules (one viewer at a time, dead after the handoff), input drain and
   teardown guarantees as the CDP path.
 - Password masking: Bosun's sensitive-field scans run in an isolated world on patchright and camoufox (pages can't see
   them) and in the page's world on plain Chromium. The "was once a password field" tracker (a MutationObserver that

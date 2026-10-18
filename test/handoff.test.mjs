@@ -70,24 +70,51 @@ test('an operation in flight finishes before the handoff starts; later ones are 
   await c.close();
 });
 
-test('the live-view link is one-time: first socket claims it, then only its viewer key connects', async () => {
+test('the live-view link reopens while the handoff runs, one viewer at a time, and is dead after it', async () => {
   const c = await connect(svc);
   const { s, link } = await sessionWithHandoff(c, `${pages.base}/`);
   // GETs (e.g. link previews) don't consume it.
   for (let i = 0; i < 2; i++) assert.equal((await fetch(link)).status, 200);
   const v1 = await viewer(link);
-  await until(() => v1.key && v1.frames > 0);
-  await assert.rejects(viewer(link), /HTTP 403/); // replay of the bare link
-  await assert.rejects(viewer(link, { key: 'f'.repeat(32) }), /HTTP 403/);
-  await assert.rejects(viewer(link, { key: v1.key, origin: 'https://evil.example' }), /HTTP 403/);
-  const v2 = await viewer(link, { key: v1.key }); // the same human reconnecting replaces the old socket
+  await until(() => v1.frames > 0);
+  assert.ok(!v1.messages.some((m) => m.viewer)); // no per-tab credential (a duplicated tab would copy it)
+  // A second viewer while the first is connected and responsive is turned away (its page retries).
+  for (const query of ['', '?v=' + 'f'.repeat(32)]) {
+    const busy = await viewer(link, { query });
+    await until(() => busy.closed);
+    assert.equal(busy.closeCode, 4409);
+  }
+  await assert.rejects(viewer(link, { origin: 'https://evil.example' }), /HTTP 403/);
+  assert.equal(v1.closed, false);
+  v1.ws.close(); // network change: the tab reconnects
   await until(() => v1.closed);
+  const v2 = await viewer(link);
   await until(() => v2.frames > 0);
-  v2.ws.send(JSON.stringify({ type: 'giveup' }));
-  assert.equal((await c.call('handoff_wait', { session: s, timeoutSec: 5 })).json().status, 'human-gave-up');
+  // The phone closes the in-app browser; opening the same link again works, and shows the page at once.
+  v2.ws.close();
   await until(() => v2.closed);
+  const t0 = Date.now();
+  const v3 = await viewer(link);
+  await until(() => v3.frames > 0, 1000);
+  assert.ok(Date.now() - t0 < 1000);
+  assert.equal(v3.closed, false);
+  v3.ws.send(JSON.stringify({ type: 'giveup' }));
+  assert.equal((await c.call('handoff_wait', { session: s, timeoutSec: 5 })).json().status, 'human-gave-up');
+  await until(() => v3.closed);
+  // Finished: no replay.
   assert.equal((await fetch(link)).status, 404);
-  await assert.rejects(viewer(link, { key: v1.key }), /HTTP 404/);
+  await assert.rejects(viewer(link), /HTTP 404/);
+  await c.close();
+});
+
+test('a static page keeps getting frames during a handoff', async () => {
+  const c = await connect(svc);
+  const { link } = await sessionWithHandoff(c, `${pages.base}/second`);
+  const v = await viewer(link);
+  await until(() => v.frames > 0);
+  const n = v.frames;
+  await sleep(4500);
+  assert.ok(v.frames >= n + 2, `frames ${n} -> ${v.frames}`);
   await c.close();
 });
 
