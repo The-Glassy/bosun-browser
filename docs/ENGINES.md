@@ -11,18 +11,20 @@ Bosun can drive three browsers. Pick one per deployment (`ENGINE`) or per sessio
 ## Results
 
 Measured 2026-10-18 on a Mac (Apple M4, macOS, residential IP in Austria), **headful** on the real display,
-one fresh ephemeral session per engine, Bosun's default `de-AT` / `Europe/Vienna`.
+one fresh ephemeral session per engine, Bosun's default `de-AT` / `Europe/Vienna`. Two full runs; the table shows the
+final run (on the code in this branch), ranges where the runs differed.
 Reproduce with `npm run measure:engines` (needs internet). Raw data: [engines/results-darwin.json](engines/results-darwin.json).
 
 | test | chromium | patchright | camoufox |
 |---|---|---|---|
-| [bot.sannysoft.com](https://bot.sannysoft.com/) | 31/31 checks passed ([shot](engines/chromium-sannysoft.jpg)) | 31/31 passed ([shot](engines/patchright-sannysoft.jpg)) | 10/11 passed; the one failure is "Chrome (New): missing", expected for Firefox ([shot](engines/camoufox-sannysoft.jpg)) |
+| [bot.sannysoft.com](https://bot.sannysoft.com/) | 31/31 checks passed ([shot](engines/chromium-sannysoft.jpg)) | 31/31 passed ([shot](engines/patchright-sannysoft.jpg)) | 30/31 passed; the one failure is "Chrome (New): missing", expected for Firefox ([shot](engines/camoufox-sannysoft.jpg)) |
 | [CreepJS](https://abrahamjuliot.github.io/creepjs/) ¹ | 44% like headless, 0% headless, 0% stealth ([shot](engines/chromium-creepjs.jpg)) | 31% like headless, 0% headless, 0% stealth ([shot](engines/patchright-creepjs.jpg)) | **6% like headless**, 0% headless, 0% stealth ([shot](engines/camoufox-creepjs.jpg)) |
 | [BrowserScan bot detection](https://www.browserscan.net/bot-detection) | Normal ([shot](engines/chromium-browserscan.jpg)) | Normal ([shot](engines/patchright-browserscan.jpg)) | Normal ([shot](engines/camoufox-browserscan.jpg)) |
-| kaufland.at (Cloudflare) ² | 403 "Just a moment…", passed by itself after ~2 s, no click ([shot](engines/chromium-kaufland.jpg)) | same, ~2 s, no click ([shot](engines/patchright-kaufland.jpg)) | "Nur einen Moment…", passed by itself after ~6 s, no click ([shot](engines/camoufox-kaufland.jpg)) |
-| `session_open` time | 3.6 s (incl. first browser launch) | 2.3 s | 6.1 s (fingerprint generation + launch) |
-| **RAM, 3 heavy pages open** ³ | RSS 1111 MB · footprint 1215 MB · 14 processes | RSS 1643 MB · footprint 1579 MB · 16 processes | RSS 1377 MB · footprint 1617 MB · 11 processes |
-| **RAM, idle after closing the tabs** ³ | RSS 692 MB · footprint 564 MB | RSS 1435 MB · footprint 943 MB | RSS 1127 MB · footprint 1098 MB |
+| kaufland.at (Cloudflare) ² | 403 "Just a moment…", passed by itself after ~2 s, no click ([shot](engines/chromium-kaufland.jpg)) | same, ~2 s, no click ([shot](engines/patchright-kaufland.jpg)) | 403 interstitial, passed by itself after ~2–6 s, no click ([shot](engines/camoufox-kaufland.jpg)) |
+| `session_open` time (warm – cold) | 0.6 – 3.6 s (cold incl. the shared browser's launch) | 0.6 – 2.3 s | 1.6 – 6.1 s (fingerprint generation + launch) |
+| **RAM footprint, 3 heavy pages open** ³ | **1210 MB** (14 processes) | **1517 MB** (16 processes) | **1810 MB** (11 processes) |
+| **RAM footprint, idle after closing the tabs** ³ | **584 MB** | **990 MB** | **1331 MB** |
+| RAM RSS sum, 3 pages / idle ³ | 1111–2359 MB / 692–1489 MB | 1643–2850 MB / 1435–2213 MB | 1377–2997 MB / 1127–2145 MB |
 
 ¹ CreepJS no longer publishes a "trust score"; its Headless panel reports *like headless* (share of headless-like
 traits), *headless* and *stealth* (detected anti-fingerprinting patches). Lower is better.
@@ -32,7 +34,9 @@ checkbox. All three got Cloudflare's 403 interstitial, and it cleared without in
 
 ³ One session, three tabs open together: geizhals.at search (`?fs=mac+mini`), a hornbach.at product page (first
 result for "akkuschrauber"), willhaben.at marketplace search (`fahrrad`); measured 10 s after load. Idle = the same
-session with the two extra tabs closed and the first on `about:blank`, 10 s later.
+session with the two extra tabs closed and the first on `about:blank`, 10 s later. Footprint was stable between the
+two runs (±200 MB); summed RSS more than doubled from one run to the next for the same pages, which is the shared-page
+over-count at work — use footprint (or PSS on Linux) for sizing.
 **RSS** is the sum over the browser's whole process tree and over-counts memory shared between processes (frameworks,
 shared GPU/IPC buffers are counted once per process). **footprint** is macOS's `phys_footprint` (`footprint` tool),
 the closest local stand-in for Linux PSS: private dirty + compressed memory per process, so shared pages aren't
