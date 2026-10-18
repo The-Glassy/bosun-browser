@@ -6,13 +6,15 @@ import { SessionManager } from './sessions.mjs';
 import { startWsServer } from './wsserver.mjs';
 import { buildServer } from './tools.mjs';
 
-export async function startService(cfg, { launcher } = {}) {
+export async function startService(cfg, { engines } = {}) {
   let live = null;
   if (cfg.live) {
     live = createLiveView({ port: cfg.live.port, host: cfg.live.host, baseUrl: cfg.live.baseUrl, ttlMs: cfg.handoffTtlMs });
     await live.listen();
   }
-  const manager = new SessionManager(cfg, { live, launcher });
+  const manager = new SessionManager(cfg, { live, engines });
+  // The default engine (package and browser binary) must be installed; others are checked when a session asks.
+  try { await manager.engines.check(cfg.engine, cfg); } catch (e) { await live?.close(); throw e; }
   const ws = cfg.ws ? await startWsServer({ cfg, manager }) : null;
 
   let closing = null;
