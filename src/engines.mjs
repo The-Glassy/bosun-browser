@@ -128,6 +128,20 @@ export function createEngines({ importer = defaultImporter, overrides = {} } = {
   };
 }
 
+const META = 'bosun-profile.json';
+export function readProfileMeta(dir) {
+  try { return JSON.parse(fs.readFileSync(path.join(dir, META), 'utf8')); } catch { return null; }
+}
+
+// After a successful open: remember the engine and mode (headless or not) the profile was last used with, so
+// background work (keepalive) opens it the same way and its fingerprint stays consistent.
+export function recordProfileUse(dir, { engine, headless }) {
+  const meta = { ...(readProfileMeta(dir) || {}), engine, headless };
+  const tmp = path.join(dir, `${META}.${crypto.randomBytes(4).toString('hex')}`);
+  fs.writeFileSync(tmp, JSON.stringify(meta), { mode: 0o600 });
+  fs.renameSync(tmp, path.join(dir, META));
+}
+
 // Undo a fresh claim if nothing but the marker was written (the open failed before a browser touched the profile).
 export function unclaimProfile(dir) {
   try { if (fs.readdirSync(dir).join() === 'bosun-profile.json') fs.rmSync(path.join(dir, 'bosun-profile.json')); } catch {}

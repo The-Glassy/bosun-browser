@@ -14,7 +14,10 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
   passes and what it costs.
 - MCP server over **stdio** (Claude Code, Codex, …) or **WebSocket** (shared service).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
-  refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`.
+  refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
+  `keepalive_set` / `keepalive_list` / `keepalive_remove`.
+- **Keepalive** for persistent profiles: scheduled visits keep sliding login sessions alive without a model, and a
+  logged-out profile raises an MCPL `bosun:needs-human` push event. See [Keeping logins alive](#keeping-logins-alive).
 - Sessions are **ephemeral** (wiped on close) or use a named **persistent profile** of the tenant (stays logged in;
   no RAM while idle). A session belongs to the connection that opened it: other connections can't see, use or close
   it, and it is closed when that connection goes away or after `IDLE_TIMEOUT_SEC` without use.
@@ -75,6 +78,7 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `MAX_SESSIONS_PER_TENANT` | `MAX_SESSIONS` | |
 | `IDLE_TIMEOUT_SEC` | 900 | close sessions unused this long (`0` = never; a session in handoff is never idle) |
 | `MAX_PAGES_PER_SESSION` | 5 | popups beyond this are closed |
+| `KEEPALIVE` | `1` | `0` = don't run scheduled keepalive visits (schedules are kept) |
 | `MAX_DOM_NODES` | 60000 | `read` (a11y, whole page) refuses larger pages; pass `selector` |
 | `SAVE_SHOTS` / `SHOTS_PER_SESSION` | – / 20 | `1` = also keep screenshots on disk (0600, deleted when the session closes) |
 
@@ -132,6 +136,53 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
   widgets that aren't `<input>`/`<textarea>` (e.g. per-digit OTP boxes built from `div`s), closed shadow roots.
   Those are visible to the agent after Done. Ask the human to finish the login (submit it) before pressing Done.
 
+## Keeping logins alive
+
+A persistent profile stays logged in only as long as the site's session does. Many sites extend the session each
+time it is used ("sliding" sessions) and end it after some idle time. Bosun can visit a profile on a schedule so
+that idle time never runs out — **without a model**:
+
+```jsonc
+// once, after the human logged the profile in (session_open({profile:"shop"}) + request_human)
+keepalive_set({ "profile": "shop", "url": "https://shop.example/account",
+                "every_hours": 12, "jitter_min": 30,                     // defaults; every_hours >= 1
+                "logged_in_check": { "text": "My account" } })          // or selector / url_not_contains
+keepalive_list()     // schedule, next run, last results: ok | logged_out | bot_check | error
+keepalive_remove({ "profile": "shop" })
+```
+
+Each visit, at `every_hours` ± `jitter_min` (first one a period after `keepalive_set`):
+
+- opens the profile with the **engine and mode it was last used with** (recorded in the profile; a profile used
+  headful is never opened headless, so the fingerprint stays the same);
+- loads `url`, then for 20–60 s moves the mouse along human-looking paths (the live view's trackpad interpolation),
+  scrolls 1–3 times and sometimes rests over a link. It **never clicks, types or navigates**;
+- checks `logged_in_check` (every given condition must hold: `text` visible, `selector` visible, URL doesn't
+  contain `url_not_contains`), closes the profile and records the result (time, status, duration; last 10 kept).
+
+Visits run one at a time, a few minutes apart, and never take the last free session slot from agents. A profile an
+agent has open is skipped (it's in use anyway); an agent opening a profile during a visit takes it over at once.
+Schedules and results live in `BROWSER_DATA/keepalive.json` (mode 0600) and survive restarts. Nothing from the
+page is stored or logged beyond the check result.
+
+When a visit finds the profile **logged out** or stuck at a **bot check**, Bosun pushes an MCPL event to the
+tenant's agent (feature set `bosun.handoff`, tags `bosun:needs-human`, `bosun:source=keepalive`,
+`bosun:reason=logged-out|bot-check`, `bosun:profile=<name>`; origin `{profile, url, reason}`), so the agent can open
+the profile and call `request_human`. Events are only sent to connections whose host asked for MCPL at
+initialize and granted `pushEvents` (`featureSets/update`); if none is connected, up to 20 per tenant wait for the
+next one. There is no retry loop: the next attempt is the next scheduled visit.
+
+**Limits — what this can't do:**
+
+- It only helps sites with **sliding sessions**. A cookie with an absolute expiry (e.g. "remember me for 30 days")
+  ends on that date however often the profile is visited.
+- **Device re-verification, periodic re-login and 2FA prompts** still need a human (that's what the event is for).
+- Visits look like a person glancing at the page, but **too-frequent visits can look bot-like**, especially at
+  the same time every day — hence the 12 h default and the jitter. Don't go below a few hours unless the site's
+  idle timeout requires it.
+- The visit runs from Bosun's IP with Bosun's browser; if the site ties the session to a different network or
+  device, keeping it alive here doesn't help.
+
 ## Security notes
 
 - One service is one trust domain per **tenant** (token): a tenant's connections share its persistent profiles;
@@ -148,8 +199,8 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
 
 ## Roadmap
 
-M1 tenant quotas/audit log, mobile viewport for handoff · M2 vault (`fill_credential`), downloads as content
-references, watch · M3 stealth engines (patchright, Camoufox), macros · MCPL push events (`bosun:needs-human`, …).
+M1 tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
+references, watch · M3 macros.
 
 ## License
 
