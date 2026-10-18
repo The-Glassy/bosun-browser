@@ -86,6 +86,16 @@ test('session_open: default engine, explicit engine, no silent fallback when one
   }
 });
 
+test('temp profiles left by a killed process are removed at startup', async () => {
+  const { SessionManager } = await import('../src/sessions.mjs');
+  const dataDir = tmpDir();
+  fs.mkdirSync(path.join(dataDir, 'tmp', 'camoufox-stale'), { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'tmp', 'camoufox-stale', 'cookies.sqlite'), 'x');
+  const m = new SessionManager(loadConfig({ BROWSER_DATA: dataDir, IDLE_TIMEOUT_SEC: '0' }));
+  assert.ok(!fs.existsSync(path.join(dataDir, 'tmp')));
+  await m.closeAll();
+});
+
 test('a persistent profile keeps its engine family', () => {
   const dir = tmpDir();
   const chromium = { family: 'chromium' }, firefox = { family: 'firefox' };
