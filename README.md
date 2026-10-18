@@ -83,7 +83,9 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
 - After the handoff the agent can read the page again. What the human typed into **password, PIN, OTP and card
   security-code fields** (detected by input type, `autocomplete`, name/id and label, across frames and open shadow
   roots, including show-password toggles) is masked as `[masked]` in `read` output and blacked out in screenshots.
-  After **Give up / timeout / cancel** those fields are emptied before the agent resumes.
+  After **Give up / timeout / cancel** those fields are emptied before the agent resumes; if that fails, the
+  session is closed instead. If a frame can't be inspected, `read`/`screenshot` fail rather than return unmasked
+  output. The handoff ends only after the human's last input has reached the page.
 - Not protected: text the human types into ordinary fields, secrets the page itself echoes as normal text, custom
   widgets that aren't `<input>`/`<textarea>` (e.g. per-digit OTP boxes built from `div`s), closed shadow roots.
   Those are visible to the agent after Done. Ask the human to finish the login (submit it) before pressing Done.

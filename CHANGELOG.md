@@ -60,6 +60,22 @@ noted under **Changed behaviour**.
 - B24 `npm test` (node:test): config/auth, service, handoff and live-view race suites against a local page server.
 - B25 `package-lock.json` committed (`npm ci` works); README corrected.
 
+### Round 2 (second Codex review, R01–R09)
+
+- R01 MCP connections with more than 64 unanswered requests, or more than 8 MiB of unread output, are disconnected.
+- R02 A handoff ends only after the human's in-flight input has returned and the screencast is detached; if that
+  hangs (10 s) the session is closed.
+- R03 A connection that disconnects while `session_open` is still launching no longer leaves an orphaned session.
+- R04 Inputs that are or ever were `type=password` are tracked from document start (init script, incl. open shadow
+  roots), so show-password toggles count even before Bosun's first scan.
+- R05 `aria-labelledby` resolves inside the input's own shadow tree.
+- R06 Masking fails closed: `read`/`screenshot` return an error if a (non-detached) frame can't be inspected, and if
+  clearing credential fields after give-up/timeout fails, the session is closed instead of handed back.
+- R07 Shutdown also waits for disposals that were already in progress.
+- R08 The `read` DOM-size guard counts frames and open shadow roots.
+- R09 A screenshot write that finishes after its session closed is deleted and the call fails.
+- Calls on a session closed by Bosun (idle, crash, cleanup failure) say why: `no session <id> (closed: <reason>)`.
+
 ## 0.0.1
 
 M0 prototype.
