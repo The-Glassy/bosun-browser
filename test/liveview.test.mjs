@@ -72,9 +72,13 @@ test('input queued behind a slow CDP call is dropped once the human presses Done
     v.ws.send(JSON.stringify({ type: 'text', text: 'after done' }));
     await until(() => cdp.sent.includes('Input.dispatchMouseEvent'));
     v.ws.send(JSON.stringify({ type: 'done' }));
-    assert.equal(await h.wait, 'human-done');
+    let settled = false;
+    h.wait.then(() => { settled = true; });
+    await sleep(100);
+    assert.equal(settled, false); // not before the in-flight input has returned
     inputGate.resolve();
-    await until(() => cdp.detached);
+    assert.equal(await h.wait, 'human-done');
+    assert.ok(cdp.detached); // and CDP is detached by then
     await sleep(50);
     assert.ok(!cdp.sent.includes('Input.insertText'), cdp.sent.join());
     // The press that was in flight is released during teardown (mousePressed, then the cleanup mouseReleased).

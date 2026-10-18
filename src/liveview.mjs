@@ -60,6 +60,7 @@ const MAX_COORD = 20000, MAX_DELTA = 20000, MAX_TEXT = 500, MAX_QUEUE = 64;
 const MAX_BUFFERED = 1 << 20; // drop frames above 1 MiB queued to a slow viewer
 const MAX_DROPS = 200; // ... and disconnect one that stays slow
 const HEARTBEAT_MS = 20_000;
+const DRAIN_DEADLINE_MS = 10_000;
 
 const finite = (v, lim) => typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= lim;
 
@@ -197,9 +198,13 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
   }
 
   // One command at a time, in order; re-checked before every CDP call so nothing is dispatched after finish.
-  async function pump(h, v) {
+  // v.pumpP lets teardown wait for the command that is already in flight.
+  function pump(h, v) {
     if (v.pumping || !v.cdp) return;
     v.pumping = true;
+    v.pumpP = drain(h, v);
+  }
+  async function drain(h, v) {
     try {
       while (v.queue.length && active(h, v)) {
         const m = v.queue.shift();
@@ -223,7 +228,6 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       }
     } finally {
       v.pumping = false;
-      if (v.closed) cleanup(v);
     }
   }
 
@@ -238,16 +242,21 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     await cdp.detach().catch(() => {});
   }
 
+  // Revokes the viewer at once; the returned promise settles when its in-flight input has returned and CDP is detached.
   function teardown(h, v) {
-    if (v.closed) return;
+    if (v.closed) return v.finished;
     v.closed = true;
     v.queue.length = 0;
     clearInterval(v.hb);
     if (h.viewer === v) h.viewer = null;
-    if (!v.pumping) cleanup(v);
+    v.finished = (async () => { await v.pumpP?.catch(() => {}); await cleanup(v); })();
+    h.teardowns.add(v.finished);
     try { if (v.ws.readyState === WebSocket.OPEN) v.ws.close(); else v.ws.terminate(); } catch {}
+    return v.finished;
   }
 
+  // The handoff resolves only after every viewer's input has drained, so nothing the human sent can reach the page
+  // once the agent is back. If draining hangs, drainFailed tells the owner to give up on the session.
   function finish(h, status) {
     if (h.done) return;
     h.done = true;
@@ -258,7 +267,15 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       try { v.ws.send(JSON.stringify({ end: status === 'human-done' ? 'Done — the agent continues.' : status })); } catch {}
       teardown(h, v);
     }
-    h.resolve(status);
+    let timer;
+    Promise.race([
+      Promise.all([...h.teardowns]).then(() => true),
+      new Promise((r) => { timer = setTimeout(() => r(false), DRAIN_DEADLINE_MS); }),
+    ]).then((drained) => {
+      clearTimeout(timer);
+      if (!drained) h.drainFailed = true;
+      h.resolve(status);
+    });
   }
 
   return {
@@ -272,17 +289,17 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       }
       return { port: a.port, baseUrl: base };
     },
-    // Starts a handoff; returns {token, url, expiresAt, wait: Promise<status>, cancel}
+    // Starts a handoff; returns {token, url, expiresAt, wait: Promise<status>, cancel, drainFailed}
     start(page, reason, opts = {}) {
       const token = crypto.randomBytes(16).toString('hex');
       let resolve;
       const wait = new Promise((r) => (resolve = r));
       const ttl = opts.ttlMs || ttlMs;
-      const h = { token, page, reason, resolve, viewer: null, viewerKey: null, done: false, expiresAt: Date.now() + ttl };
+      const h = { token, page, reason, resolve, viewer: null, viewerKey: null, done: false, expiresAt: Date.now() + ttl, teardowns: new Set(), drainFailed: false };
       h.timer = setTimeout(() => finish(h, 'handoff-timeout'), ttl);
       h.timer.unref?.();
       handoffs.set(token, h);
-      return { token, url: `${base}/v/${token}`, expiresAt: h.expiresAt, wait, cancel: () => finish(h, 'cancelled') };
+      return { token, url: `${base}/v/${token}`, expiresAt: h.expiresAt, wait, cancel: () => finish(h, 'cancelled'), get drainFailed() { return h.drainFailed; } };
     },
     get size() { return handoffs.size; },
     get port() { return srv.address()?.port; },
