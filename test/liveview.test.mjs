@@ -99,6 +99,19 @@ test('inputs run strictly in order, one at a time', async () => {
   });
 });
 
+test('simultaneous claims: exactly one socket gets the link', async () => {
+  await withLive(async (live) => {
+    const { page } = fakePage();
+    const h = live.start(page, 'r');
+    const res = await Promise.allSettled(Array.from({ length: 5 }, () => viewer(h.url)));
+    await sleep(200);
+    const open = res.filter((r) => r.status === 'fulfilled' && !r.value.closed).map((r) => r.value);
+    assert.equal(open.length, 1);
+    assert.ok(open[0].key);
+    h.cancel();
+  });
+});
+
 test('invalid input is ignored', () => {
   for (const raw of ['nope', 'null', '[]', '{"type":"click","x":null,"y":1}', '{"type":"click","x":1e9,"y":1}', '{"type":"click","x":-5,"y":1}',
     '{"type":"wheel","x":1,"y":1,"dy":"9"}', '{"type":"key","key":"__proto__"}', '{"type":"key","key":"constructor"}', '{"type":"text","text":42}',

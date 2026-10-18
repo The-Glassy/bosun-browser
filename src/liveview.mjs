@@ -127,14 +127,16 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       if (!h || h.done) return reject(sock, 404, 'Not Found');
       if (req.headers.origin && req.headers.origin !== origin) return reject(sock, 403, 'Forbidden');
       const key = new URLSearchParams(q).get('v');
-      let issued = null;
-      if (h.viewerKey) {
-        if (!key || !safeEqual(key, h.viewerKey)) return reject(sock, 403, 'Forbidden'); // link already claimed
-      } else {
-        if (key) return reject(sock, 403, 'Forbidden');
-        issued = h.viewerKey = crypto.randomBytes(16).toString('hex'); // claimed: the link alone no longer connects
-      }
-      wss.handleUpgrade(req, sock, head, (ws) => attach(h, ws, issued).catch(() => {}));
+      // Without a key: only an unclaimed link. With a key: only the claimed link's key.
+      const allowed = () => (h.viewerKey ? !!key && safeEqual(key, h.viewerKey) : !key);
+      if (!allowed()) return reject(sock, 403, 'Forbidden');
+      wss.handleUpgrade(req, sock, head, (ws) => {
+        // Claim only once the handshake succeeded, re-checking in case another socket claimed it meanwhile.
+        if (h.done || !allowed()) { ws.on('error', () => {}); return ws.close(4403, 'link already used'); }
+        let issued = null;
+        if (!h.viewerKey) issued = h.viewerKey = crypto.randomBytes(16).toString('hex'); // the link alone no longer connects
+        attach(h, ws, issued).catch(() => {});
+      });
     } catch {
       reject(sock, 400, 'Bad Request');
     }
