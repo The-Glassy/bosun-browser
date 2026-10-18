@@ -1,7 +1,7 @@
 // MCP tool surface. One McpServer per connection; every session lookup is scoped to that connection (owner).
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
+import { countNodes, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
 import { TENANT_RE } from './auth.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
@@ -86,8 +86,8 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
       let out, total;
       if ((a.mode || 'a11y') === 'a11y') {
         if (!a.selector) {
-          const nodes = await s.page.evaluate(() => document.getElementsByTagName('*').length).catch(() => 0);
-          if (nodes > cfg.maxDomNodes) throw new Error(`page has ${nodes} elements (limit ${cfg.maxDomNodes}); read a part of it with selector, or use mode text`);
+          const nodes = await countNodes(s.page, cfg.maxDomNodes);
+          if (nodes > cfg.maxDomNodes) throw new Error(`page has more than ${cfg.maxDomNodes} elements (frames and shadow roots included); read a part of it with selector, or use mode text`);
         }
         out = await (a.selector ? root.ariaSnapshot({ mode: 'ai', timeout: 15000 }) : s.page.ariaSnapshot({ mode: 'ai', timeout: 15000 }));
         total = out.length;

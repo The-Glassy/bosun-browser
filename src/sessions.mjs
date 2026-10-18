@@ -4,7 +4,7 @@ import { chromium } from 'playwright';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { clearSensitive } from './redact.mjs';
+import { clearSensitive, passwordTracker } from './redact.mjs';
 
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
 const LAUNCH_ARGS = ['--disable-blink-features=AutomationControlled'];
@@ -35,6 +35,10 @@ export class SessionManager {
     this.tenantUse = new Map();
     this.profilesInUse = new Set();
     this.pendingOpens = new Set();
+    this.disposals = new Set(); // disposals still closing their context
+    this.ownerOpens = new Map(); // owner -> number of opens in progress
+    this.goneOwners = new Set(); // disconnected owners that still have opens in progress
+    this.closed = new Map(); // recently closed id -> {owner, reason}, so the owner learns why (bounded)
     this.browserP = null;
     this.launches = 0;
     this.closing = false;
@@ -67,6 +71,7 @@ export class SessionManager {
 
   async open({ owner, tenant, profile, locale, timezone }) {
     if (this.closing) throw new Error('service is shutting down');
+    if (this.goneOwners.has(owner)) throw new Error('connection closed');
     if (this.used >= this.cfg.maxSessions) throw new Error(`session limit ${this.cfg.maxSessions} reached; close one`);
     const tUse = this.tenantUse.get(tenant) || 0;
     if (tUse >= this.cfg.maxSessionsPerTenant) throw new Error(`session limit ${this.cfg.maxSessionsPerTenant} for this tenant reached; close one`);
@@ -94,11 +99,13 @@ export class SessionManager {
           browser = await this.getBrowser();
           ctx = await browser.newContext(o);
         }
+        await ctx.addInitScript(passwordTracker);
         const page = ctx.pages()[0] || await ctx.newPage();
         if (this.closing) throw new Error('service is shutting down');
+        if (this.goneOwners.has(owner)) throw new Error('connection closed'); // owner left while we were launching
         const s = {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, ctx, page, browser,
-          queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], disposed: false, release,
+          queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
         };
         this.sessions.set(s.id, s);
         page.on('close', () => this.dispose(s, 'page-closed'));
@@ -113,14 +120,23 @@ export class SessionManager {
       }
     })();
     this.pendingOpens.add(p);
-    p.catch(() => {}).finally(() => this.pendingOpens.delete(p));
+    this.ownerOpens.set(owner, (this.ownerOpens.get(owner) || 0) + 1);
+    p.catch(() => {}).finally(() => {
+      this.pendingOpens.delete(p);
+      const n = this.ownerOpens.get(owner) - 1;
+      if (n) this.ownerOpens.set(owner, n);
+      else { this.ownerOpens.delete(owner); this.goneOwners.delete(owner); }
+    });
     return p;
   }
 
   // Same error for "doesn't exist" and "belongs to someone else", so IDs can't be probed.
   get(owner, id) {
     const s = this.sessions.get(id);
-    if (!s || s.owner !== owner) throw new Error(`no session ${id}`);
+    if (!s || s.owner !== owner) {
+      const c = this.closed.get(id);
+      throw new Error(`no session ${id}${c && c.owner === owner ? ` (closed: ${c.reason})` : ''}`);
+    }
     return s;
   }
 
@@ -167,11 +183,21 @@ export class SessionManager {
       s.lastHandoff = null;
       const end = (status) => { if (s.handoff === h) { s.handoff = null; s.lastHandoff = status; s.gen++; s.lastUsed = Date.now(); } };
       h.settled = h.wait.then((status) => s.queue.run(async () => {
-        // Give up / timeout / cancel may leave half-typed credentials in the form: clear them before the agent resumes.
-        if (status !== 'human-done' && !s.disposed) await Promise.race([clearSensitive(s.page).catch(() => {}), sleep(5000)]);
+        // Human input that could not be drained: the page may still change under the agent. Give the session up.
+        if (h.drainFailed) throw new Error('live-view input did not drain');
+        // Give up / timeout / cancel may leave half-typed credentials in the form: clear them before the agent
+        // resumes. If that fails or hangs, the session is closed rather than handed back with them in it.
+        if (status !== 'human-done' && !s.disposed) {
+          const cleared = await Promise.race([clearSensitive(s.page).then(() => true, () => false), sleep(5000).then(() => false)]);
+          if (!cleared) throw new Error('could not clear credential fields');
+        }
         end(status);
         return status;
-      }).catch(() => { end(status); return status; }));
+      }).catch(async () => {
+        if (!s.disposed) await this.dispose(s, 'handoff-cleanup-failed');
+        end(status);
+        return status;
+      }));
       return h;
     });
   }
@@ -201,10 +227,16 @@ export class SessionManager {
 
   async saveShot(s, buf) {
     if (!this.cfg.saveShots) return null;
+    if (s.disposed) throw new Error(`session ${s.id} was closed (${s.closeReason})`);
     const dir = path.join(this.cfg.dataDir, 'shots', s.tenant, s.id);
     await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
-    const file = path.join(dir, `${Date.now()}-${s.shots.length}.jpg`);
-    await fs.promises.writeFile(file, buf, { mode: 0o600, flag: 'wx' });
+    const file = path.join(dir, `${Date.now()}-${crypto.randomBytes(3).toString('hex')}.jpg`);
+    const gone = async () => { await fs.promises.rm(dir, { recursive: true, force: true }); return new Error(`session ${s.id} was closed (${s.closeReason})`); };
+    if (s.disposed) throw await gone();
+    const write = fs.promises.writeFile(file, buf, { mode: 0o600, flag: 'wx' });
+    s.writes.add(write);
+    try { await write; } finally { s.writes.delete(write); }
+    if (s.disposed) throw await gone(); // closed while writing: the disposal may already have removed the directory
     s.shots.push(file);
     while (s.shots.length > this.cfg.shotsPerSession) await fs.promises.rm(s.shots.shift(), { force: true });
     return file;
@@ -216,21 +248,32 @@ export class SessionManager {
     s.disposed = true;
     s.closeReason = reason;
     this.sessions.delete(s.id);
+    this.closed.set(s.id, { owner: s.owner, reason });
+    if (this.closed.size > 200) this.closed.delete(this.closed.keys().next().value);
     if (s.handoff) s.handoff.cancel();
     s.disposing = (async () => {
       try {
         await Promise.race([s.ctx.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
+        await Promise.allSettled([...s.writes]); // a screenshot being written must not outlive the directory removal
         await fs.promises.rm(path.join(this.cfg.dataDir, 'shots', s.tenant, s.id), { recursive: true, force: true }).catch(() => {});
       } finally {
         s.release();
       }
     })();
+    this.disposals.add(s.disposing);
+    s.disposing.finally(() => this.disposals.delete(s.disposing));
     return s.disposing;
   }
 
   close(owner, id) { return this.dispose(this.get(owner, id), 'closed'); }
 
-  disposeOwner(owner) { return Promise.all(this.list(owner).map((s) => this.dispose(s, 'owner-disconnected'))); }
+  // The owner is gone: close its sessions, and make opens still in progress for it close themselves.
+  disposeOwner(owner) {
+    if (this.ownerOpens.has(owner)) this.goneOwners.add(owner);
+    const done = Promise.all(this.list(owner).map((s) => this.dispose(s, 'owner-disconnected')));
+    for (const [id, c] of this.closed) if (c.owner === owner) this.closed.delete(id); // nobody left to tell
+    return done;
+  }
 
   reapIdle(now = Date.now()) {
     for (const s of this.sessions.values()) {
@@ -242,7 +285,9 @@ export class SessionManager {
     this.closing = true;
     clearInterval(this.reaper);
     await Promise.race([Promise.allSettled([...this.pendingOpens]), sleep(CLOSE_DEADLINE_MS)]);
-    await Promise.allSettled([...this.sessions.values()].map((s) => this.dispose(s, 'shutdown')));
+    for (const s of [...this.sessions.values()]) this.dispose(s, 'shutdown');
+    // Includes disposals that started earlier (explicit close, disconnect) and are still closing.
+    await Promise.race([Promise.allSettled([...this.disposals]), sleep(CLOSE_DEADLINE_MS + 1000)]);
     const bp = this.browserP;
     this.browserP = null;
     if (bp) await Promise.race([bp.then((b) => b.close(), () => {}), sleep(CLOSE_DEADLINE_MS)]).catch(() => {});
