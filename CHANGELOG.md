@@ -1,6 +1,50 @@
 # Changelog
 
-## Unreleased — engines
+## 0.3.0 — live view on phones
+
+From testing the handoff on an iPhone (Safari and Telegram's in-app browser, plain http over a mesh VPN).
+
+### Changed behaviour
+
+- **The live-view link can be reopened.** It used to be claimed by the first browser tab for good (viewer key in
+  `sessionStorage`), so closing Telegram's in-app browser and tapping the link again showed "closed". Now the link
+  admits **one viewer at a time** until Done, Give up, expiry or cancel: a second viewer is refused (WebSocket close
+  `4409`, and the page waits and retries) while the first is connected, and may take over once the first has been
+  silent for more than 5 s (it is pinged every 2 s). The same tab reconnecting with its viewer key replaces its old
+  socket at once. A finished handoff's link answers 404, with or without a key.
+
+### Added
+
+- **First frame at once:** the last frame is cached per handoff and sent to a (re)connecting viewer before the stream
+  starts; a page that doesn't repaint is re-captured at least every 2 s (`Page.captureScreenshot` /
+  `page.screenshot`), so the screen is never black.
+- **Paste bar:** a masked text field (eye button to show it) with **Insert** (or Enter). The text is inserted into the
+  page's focused field (`insertText`) and the field is cleared and masked again; with a clipboard API (https or
+  localhost) the empty field's button reads **Paste** and inserts the clipboard directly. Desktop ⌘V/Ctrl+V on the
+  live view also inserts. Pasted text is never logged and never reaches the agent; the service drops it once
+  dispatched.
+- **Trackpad mode** (default on touch devices; toggle **Tap | Trackpad**): a cursor drawn over the stream; one finger
+  moves it (relative, accelerated), tap clicks at the cursor, two fingers scroll, hold then drag presses the button
+  (sliders, drag-to-verify). The service turns each move into a human-looking path (eased steps of ~8 px on a slight
+  curve with sub-pixel jitter) instead of jumping. Tap mode behaves as before (scroll now happens at the finger).
+  A desktop mouse sends real hover moves and press/release (drag works there too).
+- **Bot-check loop detection:** if a bot-check page keeps reloading (more than 5 navigations to the same page within
+  30 s) or page tools keep failing with "Execution context was destroyed" (3 within 30 s), page tools return
+  `bot check keeps reloading (likely IP reputation); try engine chromium + request_human, or another network`. The
+  history is reset when a handoff ends.
+- **Mobile layout:** one-line status bar that never covers the page, the stream fitted between the bars, every
+  control (Done, Give up, Keys, paste bar, Tap/Trackpad) in a bottom bar within thumb reach, 44 px targets,
+  `viewport-fit=cover` with safe-area insets, `100dvh` so Safari's toolbar doesn't hide the controls, a key strip
+  (Tab, Enter, ⌫, Esc, arrows) behind **Keys**. Screenshots in [docs/liveview/](docs/liveview/).
+- `scripts/liveview-shots.mjs` regenerates those screenshots.
+
+### Live-view protocol (viewer → service)
+
+`move {x,y}`, `down {x,y}`, `up {x,y}` and `wheel {x,y,dx?,dy}` join `click`, `text`, `key`, `done`, `giveup`.
+Consecutive queued moves collapse into the latest, queued scrolling at one point adds up, and a release is never
+dropped from a full queue. The service sends `{cursor:{x,y}}` so a new viewer starts where the pointer is.
+
+## 0.2.0 — engines
 
 ### Added
 

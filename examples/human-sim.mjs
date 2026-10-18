@@ -1,4 +1,4 @@
-// simulates the human: node examples/human-sim.mjs <link-file>. Opens the link page, claims the live view over
+// simulates the human: node examples/human-sim.mjs <link-file>. Opens the link page, attaches to the live view over
 // WebSocket, saves the first frame, scrolls, presses Done. Never prints the link.
 import WebSocket from 'ws';
 import fs from 'fs';
@@ -11,7 +11,7 @@ const ws = new WebSocket(link.replace('http', 'ws').replace('/v/', '/ws/'));
 let frames = 0;
 ws.on('message', (d) => {
   const m = JSON.parse(d);
-  if (m.viewer) console.log('claimed the link (it no longer works for anyone else)');
+  if (m.viewer) console.log('attached (other viewers are refused while this one is connected)');
   if (m.frame) {
     frames++;
     if (frames === 1) { fs.writeFileSync('./liveview-frame.jpg', Buffer.from(m.frame, 'base64'), { mode: 0o600 }); console.log('frame', m.w, m.h); ws.send(JSON.stringify({ type: 'wheel', x: 600, y: 400, dy: 200 })); setTimeout(() => ws.send(JSON.stringify({ type: 'done' })), 1500); }
