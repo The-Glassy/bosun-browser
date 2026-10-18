@@ -4,3 +4,4 @@ pw-browsers/
 *.jpg
 *.png
 !docs/**/*.png
+!docs/engines/*.jpg
