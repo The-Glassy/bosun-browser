@@ -219,3 +219,60 @@ test('handoff_wait honours cancellation and clears its timer', async () => {
   assert.equal((await c.call('sessions')).isError, false);
   await c.close();
 });
+
+test('a password field revealed by the page before any scan stays masked', async () => {
+  const c = await connect(svc);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${pages.base}/toggle` });
+  const page = svc.manager.sessions.get(s).page;
+  assert.equal(await page.$eval('#t', (e) => e.type), 'text');
+  const r = await c.call('read', { session: s });
+  assert.equal(r.isError, false, r.text);
+  assert.ok(!r.text.includes('pre-scan-toggled'), r.text);
+  await c.close();
+});
+
+test('inputs labelled inside an open shadow root are detected (mask, clear)', async () => {
+  const c = await connect(svc);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${pages.base}/shadow` });
+  await c.call('type', { session: s, selector: '#s', value: '8642' });
+  const { sensitiveValues, clearSensitive } = await import('../src/redact.mjs');
+  const page = svc.manager.sessions.get(s).page;
+  assert.deepEqual(await sensitiveValues(page), ['8642']);
+  assert.ok(!(await c.call('read', { session: s })).text.includes('8642'));
+  await clearSensitive(page);
+  assert.equal(await page.locator('#s').inputValue(), '');
+  await c.close();
+});
+
+test('if credential clearing fails after give-up, the session is closed instead of resumed', async () => {
+  const c = await connect(svc);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${pages.base}/login` });
+  const link = (await c.call('request_human', { session: s, reason: 'x' })).json().link;
+  const page = svc.manager.sessions.get(s).page;
+  page.frames = () => [{ evaluate: async () => { throw new Error('Execution context was destroyed'); }, isDetached: () => false }];
+  const v = await viewer(link);
+  v.ws.send(JSON.stringify({ type: 'giveup' }));
+  await until(() => !svc.manager.sessions.has(s));
+  assert.match((await c.call('handoff_wait', { session: s })).text, /no session \S+ \(closed: handoff-cleanup-failed\)/);
+  assert.match((await c.call('read', { session: s })).text, /closed: handoff-cleanup-failed/);
+  await c.close();
+});
+
+test('read/screenshot fail closed when a frame cannot be inspected', async () => {
+  const c = await connect(svc);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${pages.base}/login` });
+  const page = svc.manager.sessions.get(s).page;
+  const real = page.frames.bind(page);
+  page.frames = () => [...real(), { evaluate: async () => { throw new Error('boom'); }, isDetached: () => false, locator: (x) => real()[0].locator(x) }];
+  for (const [tool, args] of [['read', {}], ['read', { mode: 'text' }], ['screenshot', {}]]) {
+    const r = await c.call(tool, { session: s, ...args });
+    assert.equal(r.isError, true, tool);
+    assert.match(r.text, /could not inspect a frame/, tool);
+  }
+  page.frames = real;
+  await c.close();
+});

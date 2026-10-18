@@ -264,3 +264,85 @@ test('shutdown is idempotent and closes everything', async () => {
   assert.match((await c.call('session_open', {})).text, /./);
   await s2.stop();
 });
+
+test('a disconnect while session_open is still launching does not leak the session', async () => {
+  const s2 = await startBosun();
+  try {
+    const c = await connect(s2);
+    c.callTool({ name: 'session_open', arguments: {} }).catch(() => {});
+    await until(() => s2.manager.used === 1, 2000, 1);
+    await c.close();
+    await until(() => s2.manager.pendingOpens.size === 0);
+    await until(() => s2.manager.used === 0);
+    assert.equal(s2.manager.sessions.size, 0);
+    assert.equal(s2.manager.goneOwners.size, 0);
+  } finally {
+    await s2.stop();
+  }
+});
+
+test('shutdown waits for disposals already in progress', async () => {
+  const s2 = await startBosun();
+  const c = await connect(s2);
+  const id = await c.open();
+  const s = s2.manager.sessions.get(id);
+  const realClose = s.ctx.close.bind(s.ctx);
+  let closed = false;
+  s.ctx.close = async () => { await new Promise((r) => setTimeout(r, 500)); await realClose(); closed = true; };
+  s2.manager.dispose(s, 'closed');
+  await s2.shutdown();
+  assert.equal(closed, true);
+  assert.equal(s2.manager.used, 0);
+  await s2.stop();
+});
+
+test('a screenshot finishing after its session closed is not kept', async () => {
+  const s2 = await startBosun({ SAVE_SHOTS: '1' });
+  try {
+    const c = await connect(s2);
+    const id = await c.open();
+    const s = s2.manager.sessions.get(id);
+    const save = s2.manager.saveShot(s, Buffer.from('jpeg'));
+    const disp = s2.manager.dispose(s, 'closed');
+    await assert.rejects(save, /was closed/);
+    await disp;
+    assert.ok(!fs.existsSync(path.join(s2.dataDir, 'shots', 'alice', id)));
+    await c.close();
+  } finally {
+    await s2.stop();
+  }
+});
+
+test('DOM-size guard counts shadow roots too', async () => {
+  const s2 = await startBosun({ MAX_DOM_NODES: '100' });
+  try {
+    const c = await connect(s2);
+    const id = await c.open();
+    await c.call('navigate', { session: id, url: `${pages.base}/bigshadow` });
+    assert.match((await c.call('read', { session: id })).text, /more than 100 elements/);
+    assert.equal((await c.call('read', { session: id, selector: 'body' })).isError, false);
+    await c.close();
+  } finally {
+    await s2.stop();
+  }
+});
+
+test('transport disconnects clients that keep too many requests open or stop reading', async () => {
+  const { EventEmitter } = await import('events');
+  const mk = () => { const w = new EventEmitter(); w.readyState = WebSocket.OPEN; w.bufferedAmount = 0; w.terminated = 0; w.terminate = () => { w.terminated++; }; w.send = (_d, cb) => cb(); return w; };
+  const w1 = mk();
+  const t1 = new WsTransport(w1, { maxOpenRequests: 3 });
+  let got = 0;
+  t1.onmessage = () => got++;
+  for (let i = 0; i < 5; i++) w1.emit('message', JSON.stringify({ jsonrpc: '2.0', id: i, method: 'tools/list' }));
+  assert.equal(got, 3);
+  assert.ok(w1.terminated >= 1);
+  const w2 = mk();
+  const t2 = new WsTransport(w2, { maxOpenRequests: 3 });
+  t2.onmessage = () => {};
+  for (let i = 0; i < 10; i++) { w2.emit('message', JSON.stringify({ jsonrpc: '2.0', id: i, method: 'tools/list' })); await t2.send({ jsonrpc: '2.0', id: i, result: {} }); }
+  assert.equal(w2.terminated, 0); // answered requests don't count
+  w2.bufferedAmount = 9 * 1024 * 1024;
+  await assert.rejects(t2.send({ jsonrpc: '2.0', id: 99, result: {} }), /not reading/);
+  assert.equal(w2.terminated, 1);
+});

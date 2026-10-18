@@ -25,6 +25,9 @@ const PAGES = {
     <input id="note" name="note">
   </form>`,
   '/late': `<title>Late</title><p>waiting</p><script>setTimeout(() => { const d = document.createElement('div'); d.id = 'late'; d.textContent = 'arrived'; document.body.append(d); }, 800)</script>`,
+  '/toggle': `<title>Toggle</title><input id="t" type="password" value="pre-scan-toggled"><script>document.getElementById('t').type = 'text'</script>`,
+  '/shadow': `<title>Shadow</title><div id="host"></div><script>const r = document.getElementById('host').attachShadow({ mode: 'open' }); r.innerHTML = '<span id="l">PIN</span><input id="s" aria-labelledby="l">';</script>`,
+  '/bigshadow': `<title>Big</title><div id="host"></div><script>document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<i></i>'.repeat(500);</script>`,
   '/popups': `<title>Popups</title><script>for (let i = 0; i < 10; i++) window.open('/second?' + i)</script>`,
 };
 
