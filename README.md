@@ -20,9 +20,13 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
   it, and it is closed when that connection goes away or after `IDLE_TIMEOUT_SEC` without use.
 - `navigate` accepts only `http://` and `https://` URLs.
 - **Bot-wall detection** after navigation/click (Cloudflare challenge pages, CAPTCHA iframes, "access denied" texts).
-- **Human handoff:** `request_human` returns a link (15 min) to a **live view** of the tab (CDP screencast; taps,
-  scroll and typing are forwarded; works on a phone). **Done** resumes the agent. See [Handoff](#handoff) for what
-  is and isn't protected.
+  A bot check that keeps reloading itself (IP reputation) is reported as such: `bot check keeps reloading (likely IP
+  reputation); try engine chromium + request_human, or another network`.
+- **Human handoff:** `request_human` returns a link (15 min) to a **live view** of the tab, made for a phone:
+  **Trackpad** mode (cursor, drag to move, tap to click, two fingers scroll, hold and drag for sliders) or **Tap**
+  mode, a masked **paste bar** for passwords and codes, a key strip, a desktop mouse works as usual. The link can be
+  reopened (one viewer at a time) until **Done** resumes the agent. See [Handoff](#handoff) for what is and isn't
+  protected.
 
 ## Run
 
@@ -47,7 +51,7 @@ Clients authenticate with `Authorization: Bearer <token>` (the old `?token=` que
 the secret in URLs and logs; prefer the header). The WebSocket listener **refuses to start** on a non-loopback
 address without a token; on loopback an unauthenticated listener needs `ALLOW_NO_TOKEN=1` (local development only).
 The two listeners are separate: `WS_HOST`/`WS_PORT` carry MCP (token-protected), `LIVE_HOST`/`LIVE_PORT` serve the
-human's live view (protected by the one-time link). Both default to `127.0.0.1`; bind them to a VPN/mesh address or
+human's live view (protected by the handoff link). Both default to `127.0.0.1`; bind them to a VPN/mesh address or
 put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the human's phone uses.
 
 ### Environment
@@ -92,9 +96,23 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
 
 ## Handoff
 
-- The link is **one-time**: opening the page (e.g. a chat app's link preview) doesn't use it up, but the first live
-  view that connects claims it. From then on only that browser tab (it holds a viewer key) can connect, one socket
-  at a time. Done, Give up, expiry, `session_close` and disconnect of the agent revoke it.
+<p><img src="docs/liveview/iphone-trackpad.png" width="240" alt="Live view on an iPhone, trackpad mode">
+<img src="docs/liveview/iphone-tap.png" width="240" alt="Live view on an iPhone, tap mode with the key strip"></p>
+
+- **One viewer at a time, reopenable until the end.** While the handoff runs, the link opens the live view whenever
+  nobody else is connected — closing a chat app's in-app browser and tapping the link again works. A second viewer
+  is refused (its page says the link is open on another device and retries) until the first disconnects or has been
+  silent for more than 5 s. Opening the page alone (e.g. a link preview) doesn't connect. Done, Give up, expiry,
+  `session_close` and disconnect of the agent end the handoff; from then on the link is dead (404).
+- **Controls** (bottom bar): **Tap | Trackpad** (trackpad is the default on touch screens), **Keys** (Tab, Enter, ⌫,
+  Esc, arrows, and the phone keyboard), the **paste bar**, **Give up**, **Done**. Trackpad: one finger moves the
+  cursor (accelerated), tap clicks at the cursor, two fingers scroll, hold then drag holds the button down. The
+  service moves the page's mouse along an interpolated, slightly jittered path rather than jumping.
+- **Paste bar:** paste (long-press → Paste on iOS) or type into the masked field, then **Insert** or Enter: the text
+  goes into the page's focused field (tap that field first) and the bar is cleared. The eye button shows what's in
+  it. The text is not logged, not kept by the service after it is typed, and never sent to the agent — but once it
+  is in the page, the page field rules below apply (a password field is masked; an ordinary field is not).
+- A reconnecting viewer gets the last frame at once, and a page that doesn't repaint is re-captured every 2 s.
 - While a handoff is active **every** page tool (`read`, `screenshot`, `navigate`, `click`, `type`, `select`,
   `press`, `back`, `wait_for`) is refused, and `sessions`/`handoff_wait` report no URL or title. Tool calls that were
   already running when `request_human` came in finish first; the human gets the tab after them.
@@ -121,8 +139,11 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
 - Web content is untrusted (prompt injection). Run the service where it **can't reach private networks**
   (block 10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16 egress) — otherwise a page can steer it at your LAN.
   The `http(s)`-only check on `navigate` does not replace that boundary. Run it as a user that can't read secrets.
-- Live-view links are bearer tokens until claimed: serve them on a private network (VPN/mesh) or behind TLS, and
-  send them over a private channel.
+- Live-view links are **bearer tokens for the whole handoff** (up to `HANDOFF_TTL_SEC`): anyone holding the link can
+  open the live view whenever nobody else is connected, or 5 s after the connected viewer went silent. Serve them on
+  a private network (VPN/mesh) or behind TLS, send them over a private channel, and press Done or Give up when
+  finished — that revokes the link for good (no replay afterwards). A connected, responsive viewer can't be pushed
+  out by a second one.
 - No rate limiting yet beyond the connection, in-flight and session caps.
 
 ## Roadmap

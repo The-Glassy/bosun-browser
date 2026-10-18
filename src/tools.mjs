@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { countNodes, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
 import { TENANT_RE } from './auth.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
+import { urlKey } from './sessions.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
@@ -20,6 +21,24 @@ async function wall(p) {
   } catch {}
   return null;
 }
+// A bot check that keeps reloading itself (typically Cloudflare refusing the IP): more than LOOP_NAVS main-frame
+// navigations to the same page within LOOP_WINDOW_MS while it looks like a bot check, or LOOP_CTX_ERRORS page tools
+// failing because the page navigated away under them.
+export const BOT_LOOP = 'bot check keeps reloading (likely IP reputation); try engine chromium + request_human, or another network';
+const LOOP_WINDOW_MS = 30_000, LOOP_NAVS = 5, LOOP_CTX_ERRORS = 3;
+const CTX_GONE = /Execution context was destroyed|interrupted by another navigation/i;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const prune = (arr, now) => { while (arr.length && (arr[0].t ?? arr[0]) < now - LOOP_WINDOW_MS) arr.shift(); };
+function reloads(s) {
+  prune(s.navs, Date.now());
+  const here = urlKey(s.page.url());
+  return s.navs.filter((n) => n.at === here).length;
+}
+async function botLoop(s) {
+  if (reloads(s) <= LOOP_NAVS) return false;
+  return !!((await wall(s.page)) || (await sleep(300), await wall(s.page))); // the title may be mid-reload once
+}
+
 const ok = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1) }] });
 async function pageInfo(p) { return { url: p.url(), title: await p.title().catch(() => '') }; }
 
@@ -48,7 +67,22 @@ const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
 
 export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 } }) {
   const server = new McpServer({ name: 'bosun', version: '0.0.2' });
-  const run = (id, fn) => manager.run(owner, id, fn);
+  // Page tools: serialized per session, and turned into BOT_LOOP when the page is stuck in a reloading bot check.
+  const run = (id, fn) => manager.run(owner, id, async (s) => {
+    let r;
+    try {
+      r = await fn(s);
+    } catch (e) {
+      if (CTX_GONE.test(String(e?.message || e))) {
+        s.ctxErrors.push(Date.now());
+        prune(s.ctxErrors, Date.now());
+        if (s.ctxErrors.length >= LOOP_CTX_ERRORS || reloads(s) > LOOP_NAVS) throw new Error(BOT_LOOP);
+      }
+      throw e;
+    }
+    if (await botLoop(s)) throw new Error(BOT_LOOP);
+    return r;
+  });
 
   // Every tool: bounded concurrency per connection, sanitized errors.
   const tool = (name, desc, shape, fn) => server.tool(name, desc, shape, async (a, extra) => {
@@ -163,7 +197,7 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
     return ok({ status, ...info });
   };
 
-  tool('request_human', `Ask a human to take over this tab (CAPTCHA, cookie wall, login, 2FA). Returns a one-time live-view link at once (wait=false, default) — send it to your human, then call handoff_wait. With wait=true it also waits up to ${POLL_SEC}s and may return still_waiting. While a handoff is active, every page tool (read, screenshot, click, type, navigate, …) is refused and no URL/title is reported.`,
+  tool('request_human', `Ask a human to take over this tab (CAPTCHA, cookie wall, login, 2FA). Returns a live-view link at once (one viewer at a time, valid until the handoff ends) (wait=false, default) — send it to your human, then call handoff_wait. With wait=true it also waits up to ${POLL_SEC}s and may return still_waiting. While a handoff is active, every page tool (read, screenshot, click, type, navigate, …) is refused and no URL/title is reported.`,
     { session: str(40), reason: z.string().min(1).max(300), wait: z.boolean().optional() }, async (a, extra) => {
       const h = await manager.requestHuman(owner, a.session, a.reason);
       const pending = { status: 'waiting_for_human', link: h.url, expires_in_min: Math.max(0, Math.round((h.expiresAt - Date.now()) / 60000)), next: 'send the link to your human, then call handoff_wait' };

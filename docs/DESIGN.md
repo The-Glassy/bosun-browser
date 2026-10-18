@@ -31,7 +31,7 @@ Non-goals (v1)
                                    │  auth: token → tenant              Chromium headful under Xvfb
                                    │  sessions, profiles, quotas         (one process per session)
                                    │  event bus → push/event
- human (phone, NetBird/LAN) ──https──► live view (/v/<one-time-token>): CDP screencast + input
+ human (phone, NetBird/LAN) ──https──► live view (/v/<handoff-token>): CDP screencast + input
 ```
 
 - One server process (Node/TS, Playwright for engine control, raw CDP for screencast/input).
@@ -84,7 +84,8 @@ Triggers
   Detection pauses the session and answers the pending tool call with `{status:'waiting_for_human', handoff}`.
 
 Flow
-1. Server creates a handoff: one-time link `/v/<token>` (TTL 15 min, bound to this session + tenant).
+1. Server creates a handoff: link `/v/<token>` (TTL 15 min, bound to this session + tenant; one viewer at a time,
+   reopenable until the handoff ends, dead afterwards).
 2. Push event `browser:needs-human` (feature set `browser.handoff`) with session, reason, URL, a small screenshot, the link.
    The agent's host decides whether it wakes (tags are claims, not authority, §16.6).
 3. The agent tells its human (e.g. Telegram) and waits (no polling — a later event wakes it).
@@ -144,5 +145,5 @@ Namespace = server name: `browser:`. Declared as an ontology on the feature sets
 
 ## Open questions
 - Which MCPL server toolkit to build on (mcpl-core-ts) and how other anima servers structure feature sets.
-- Live view auth: one-time link only, or also tenant login?
+- Live view auth: handoff link only, or also tenant login?
 - Shared Xvfb vs Xvfb per session (RAM vs isolation).

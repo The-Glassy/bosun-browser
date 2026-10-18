@@ -32,6 +32,18 @@ const PAGES = {
   '/probe': `<title>Probe</title><button id="check" onclick="document.getElementById('out').textContent = 'syms=' + JSON.stringify(Object.getOwnPropertySymbols(window).map(String)) + ' shadow=' + (/native code/.test(Element.prototype.attachShadow.toString()) ? 'native' : 'patched')">check</button><p id="out"></p>`,
   '/toggle-later': `<title>Toggle later</title><input id="t" type="password" value="pre-scan-toggled"><script>setTimeout(() => { document.getElementById('t').type = 'text'; }, 400)</script>`,
   '/dshadow': `<title>Declarative shadow</title><div id="host"><template shadowrootmode="open"><input id="dp" type="password" value="decl-shadow-secret"></template></div><script>setTimeout(() => { document.getElementById('host').shadowRoot.getElementById('dp').type = 'text'; }, 400)</script>`,
+  '/loop': `<title>Just a moment...</title><p>Checking your browser before accessing the site.</p><script>setTimeout(() => location.reload(), 250)</script>`,
+  '/reloader': `<title>Dashboard</title><p>live numbers</p><script>setTimeout(() => location.reload(), 250)</script>`,
+  // Pointer events, logged into #log (readable from Bosun's isolated world too); a 'reset-log' DOM event clears it.
+  '/pointer': `<title>Pointer</title><style>body{margin:0}#pw{position:absolute;left:300px;top:300px}</style>
+    <input id="pw" type="password"><input id="name" style="position:absolute;left:300px;top:400px"><pre id="log" hidden>{}</pre>
+    <script>let L; const reset = () => { L = { moves: [], clicks: [], wheels: 0, buttons: [] }; out(); };
+    const out = () => { document.getElementById('log').textContent = JSON.stringify(L); };
+    addEventListener('mousemove', (e) => { L.moves.push([e.clientX, e.clientY, e.buttons]); out(); });
+    addEventListener('click', (e) => { L.clicks.push([e.clientX, e.clientY]); out(); });
+    addEventListener('wheel', () => { L.wheels++; out(); });
+    addEventListener('mousedown', () => { L.buttons.push('down'); out(); }); addEventListener('mouseup', () => { L.buttons.push('up'); out(); });
+    document.addEventListener('reset-log', reset); reset();</script>`,
   '/popups': `<title>Popups</title><script>for (let i = 0; i < 10; i++) window.open('/second?' + i)</script>`,
 };
 
@@ -129,19 +141,22 @@ export async function until(fn, ms = 5000, step = 25) {
   }
 }
 
-// Live-view viewer: claim a link over WebSocket. Resolves once open, with the issued viewer key when given.
-export function viewer(link, { key, origin } = {}) {
+// Live-view viewer: attach to a link over WebSocket. Resolves once open (a busy link closes again with 4409).
+// key: the viewer key of an earlier socket (its own tab reconnecting). autoPong: false = a frozen phone (no pongs).
+export function viewer(link, { key, origin, autoPong = true } = {}) {
   const u = link.replace(/^http/, 'ws').replace('/v/', '/ws/') + (key ? `?v=${key}` : '');
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(u, origin ? { origin } : {});
-    const v = { ws, frames: 0, ends: [], key: null, closed: false };
+    const ws = new WebSocket(u, { autoPong, ...(origin ? { origin } : {}) });
+    const v = { ws, frames: 0, ends: [], key: null, closed: false, closeCode: null, cursor: null, messages: [] };
     ws.on('message', (d) => {
       const m = JSON.parse(d);
+      v.messages.push(m);
       if (m.viewer) v.key = m.viewer;
+      if (m.cursor) v.cursor = m.cursor;
       if (m.frame) v.frames++;
       if (m.end) v.ends.push(m.end);
     });
-    ws.on('close', () => { v.closed = true; });
+    ws.on('close', (code) => { v.closed = true; v.closeCode = code; });
     ws.on('open', () => resolve(v));
     ws.on('unexpected-response', (_r, res) => reject(new Error(`HTTP ${res.statusCode}`)));
     ws.on('error', reject);
