@@ -1,5 +1,6 @@
 // Environment -> validated configuration. Anything malformed or unsafe throws, so the service refuses to start.
 import { isLoopbackHost, parseTokens } from './auth.mjs';
+import { ENGINE_NAMES } from './engines.mjs';
 
 function int(env, name, def, min, max) {
   const raw = env[name];
@@ -24,10 +25,14 @@ export function loadConfig(env = process.env) {
     maxInflight: int(env, 'MAX_INFLIGHT', 8, 1, 1000), // concurrent tool calls per connection
     maxPagesPerSession: int(env, 'MAX_PAGES_PER_SESSION', 5, 1, 100),
     maxDomNodes: int(env, 'MAX_DOM_NODES', 60000, 100, 10_000_000),
+    engine: env.ENGINE || 'chromium',
+    camoufoxOs: env.CAMOUFOX_OS || null, // null: the host's OS
     tokens: parseTokens(env),
     ws: null,
     live: null,
   };
+  if (!ENGINE_NAMES.includes(cfg.engine)) throw new Error(`ENGINE must be one of ${ENGINE_NAMES.join(', ')} (got "${cfg.engine}")`);
+  if (cfg.camoufoxOs && !['macos', 'windows', 'linux'].includes(cfg.camoufoxOs)) throw new Error('CAMOUFOX_OS must be macos, windows or linux');
   cfg.maxSessionsPerTenant = int(env, 'MAX_SESSIONS_PER_TENANT', cfg.maxSessions, 1, cfg.maxSessions);
 
   if (env.WS_PORT !== undefined && env.WS_PORT !== '') {

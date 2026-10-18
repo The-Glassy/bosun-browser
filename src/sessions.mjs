@@ -1,14 +1,14 @@
 // Session registry and lifecycle: ownership, capacity, single-flight browser launch, crash handling, idle reaping,
 // per-session operation serialization and the handoff state that blinds the agent.
-import { chromium } from 'playwright';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { clearSensitive, passwordTracker } from './redact.mjs';
+import { clearSensitive, notePasswords, passwordTracker } from './redact.mjs';
+import { createEngines, claimProfile } from './engines.mjs';
 
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
-const LAUNCH_ARGS = ['--disable-blink-features=AutomationControlled'];
 const CLOSE_DEADLINE_MS = 10_000;
+const NOTE_POLL_MS = 500;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms).unref?.());
 
@@ -26,10 +26,10 @@ class SerialQueue {
 }
 
 export class SessionManager {
-  constructor(cfg, { live = null, launcher = chromium } = {}) {
+  constructor(cfg, { live = null, engines = createEngines() } = {}) {
     this.cfg = cfg;
     this.live = live;
-    this.launcher = launcher;
+    this.engines = engines;
     this.sessions = new Map(); // id -> session
     this.used = 0; // reserved + open + still closing
     this.tenantUse = new Map();
@@ -49,10 +49,11 @@ export class SessionManager {
     }
   }
 
-  getBrowser() {
+  // The shared browser of the shared engine (chromium): launched once, relaunched after it goes away.
+  getBrowser(def, bt) {
     if (!this.browserP) {
       this.launches++;
-      const p = this.browserP = this.launcher.launch({ headless: this.cfg.headless, args: LAUNCH_ARGS }).then((b) => {
+      const p = this.browserP = def.launchShared(bt, this.cfg).then((b) => {
         b.on('disconnected', () => this.onBrowserGone(b, p));
         return b;
       }, (e) => { if (this.browserP === p) this.browserP = null; throw e; });
@@ -65,12 +66,9 @@ export class SessionManager {
     for (const s of this.sessions.values()) if (s.browser === browser) this.dispose(s, 'browser-crashed');
   }
 
-  ctxOpts(o) {
-    return { viewport: { width: 1366, height: 900 }, locale: o.locale || 'de-AT', timezoneId: o.timezone || 'Europe/Vienna' };
-  }
-
-  async open({ owner, tenant, profile, locale, timezone }) {
+  async open({ owner, tenant, profile, locale, timezone, engine }) {
     if (this.closing) throw new Error('service is shutting down');
+    const def = this.engines.get(engine || this.cfg.engine);
     if (this.goneOwners.has(owner)) throw new Error('connection closed');
     if (this.used >= this.cfg.maxSessions) throw new Error(`session limit ${this.cfg.maxSessions} reached; close one`);
     const tUse = this.tenantUse.get(tenant) || 0;
@@ -88,33 +86,36 @@ export class SessionManager {
     };
 
     const p = (async () => {
-      let ctx = null, browser = null;
+      let ctx = null, browser = null, own = null, tmpDir = null;
       try {
-        const o = this.ctxOpts({ locale, timezone });
+        let profileDir = null;
         if (profile) {
-          const dir = path.join(this.cfg.dataDir, 'profiles', tenant, profile);
-          fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-          ctx = await this.launcher.launchPersistentContext(dir, { headless: this.cfg.headless, args: LAUNCH_ARGS, ...o });
-        } else {
-          browser = await this.getBrowser();
-          ctx = await browser.newContext(o);
+          profileDir = path.join(this.cfg.dataDir, 'profiles', tenant, profile);
+          fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+          claimProfile(profileDir, def);
         }
-        await ctx.addInitScript(passwordTracker);
+        ({ ctx, browser = null, own = null, tmpDir } = await this.engines.open(def.name, {
+          cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', shared: (d, bt) => this.getBrowser(d, bt),
+        }));
+        if (def.isolatedInitScripts) await ctx.addInitScript(passwordTracker);
         const page = ctx.pages()[0] || await ctx.newPage();
         if (this.closing) throw new Error('service is shutting down');
         if (this.goneOwners.has(owner)) throw new Error('connection closed'); // owner left while we were launching
         const s = {
-          id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, ctx, page, browser,
+          id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, own, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
         };
         this.sessions.set(s.id, s);
         page.on('close', () => this.dispose(s, 'page-closed'));
         page.on('crash', () => this.dispose(s, 'page-crashed'));
         ctx.on('close', () => this.dispose(s, 'context-closed'));
+        own?.on('disconnected', () => this.dispose(s, 'browser-crashed'));
         ctx.on('page', (extra) => { if (ctx.pages().length > this.cfg.maxPagesPerSession) extra.close().catch(() => {}); });
         return s;
       } catch (e) {
         if (ctx) await Promise.race([ctx.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
+        if (own) await Promise.race([own.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
+        if (tmpDir) await fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
         release();
         throw e;
       }
@@ -177,10 +178,15 @@ export class SessionManager {
       if (s.disposed) throw new Error(`session ${id} was closed (${s.closeReason})`);
       if (s.handoff) return s.handoff;
       s.gen++;
-      const h = this.live.start(s.page, reason, { ttlMs: this.cfg.handoffTtlMs });
+      await notePasswords(s.page).catch(() => {});
+      const h = this.live.start(s.page, reason, { ttlMs: this.cfg.handoffTtlMs, driver: s.cdp ? 'cdp' : 'playwright' });
       s.handoff = h;
       // settled: resolves with the status once the session is usable by the agent again.
       s.lastHandoff = null;
+      // While the human works, keep noting password inputs (new pages, new fields) before they can be revealed.
+      const poll = setInterval(() => { if (!s.disposed) notePasswords(s.page).catch(() => {}); }, NOTE_POLL_MS);
+      poll.unref();
+      h.wait.finally(() => clearInterval(poll));
       const end = (status) => { if (s.handoff === h) { s.handoff = null; s.lastHandoff = status; s.gen++; s.lastUsed = Date.now(); } };
       h.settled = h.wait.then((status) => s.queue.run(async () => {
         // Human input that could not be drained: the page may still change under the agent. Give the session up.
@@ -254,6 +260,8 @@ export class SessionManager {
     s.disposing = (async () => {
       try {
         await Promise.race([s.ctx.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
+        if (s.own) await Promise.race([s.own.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
+        if (s.tmpDir) await fs.promises.rm(s.tmpDir, { recursive: true, force: true }).catch(() => {});
         await Promise.allSettled([...s.writes]); // a screenshot being written must not outlive the directory removal
         await fs.promises.rm(path.join(this.cfg.dataDir, 'shots', s.tenant, s.id), { recursive: true, force: true }).catch(() => {});
       } finally {
