@@ -30,7 +30,9 @@ function inPage({ op, css, hint, attr }) {
       let sensitive = seen.has(el) || el.matches(css);
       if (!sensitive) {
         const labels = [...(el.labels || [])].map(text);
-        const by = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => text(document.getElementById(id)));
+        const root = el.getRootNode(); // aria-labelledby resolves within the input's own (shadow) tree
+        const byId = (id) => (root.getElementById ? root.getElementById(id) : null) || document.getElementById(id);
+        const by = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => text(byId(id)));
         const hints = [el.name, el.id, el.getAttribute('autocomplete'), el.getAttribute('aria-label'), el.placeholder, ...labels, ...by]
           .join(' ').replace(/[_\-.[\]]+/g, ' ');
         sensitive = re.test(hints);
@@ -48,22 +50,64 @@ function inPage({ op, css, hint, attr }) {
   return out;
 }
 
-async function eachFrame(page, op) {
-  const arg = { op, css: SENSITIVE_CSS, hint: HINT_WORDS, attr: MARK_ATTR };
-  const res = await Promise.all(page.frames().map((f) => f.evaluate(inPage, arg).catch(() => [])));
+// Runs fn in every frame. A frame that detached meanwhile is skipped; any other failure throws, so callers fail
+// closed instead of returning unmasked output.
+export async function eachFrame(page, fn, arg) {
+  const res = await Promise.all(page.frames().map((f) => f.evaluate(fn, arg).catch((e) => {
+    if (f.isDetached()) return [];
+    throw new Error(`could not inspect a frame of the page for sensitive fields (${String(e?.message || e).split('\n')[0]})`);
+  })));
   return res.flat();
 }
+const scan = (page, op) => eachFrame(page, inPage, { op, css: SENSITIVE_CSS, hint: HINT_WORDS, attr: MARK_ATTR });
 
-export const sensitiveValues = (page) => eachFrame(page, 'values');
-export const clearSensitive = (page) => eachFrame(page, 'clear');
+export const sensitiveValues = (page) => scan(page, 'values');
+export const clearSensitive = (page) => scan(page, 'clear');
+
+// Installed as a context init script, so it runs in every document and frame before page scripts: remembers every
+// input that is or ever becomes type=password (incl. inside open shadow roots), so a show-password toggle that
+// happened before Bosun's first scan still counts as sensitive.
+export function passwordTracker() {
+  const KEY = Symbol.for('bosun.sensitive');
+  const seen = window[KEY] || (window[KEY] = new WeakSet());
+  const note = (n) => {
+    if (!n || n.nodeType !== 1) return;
+    if (n.localName === 'input' && n.type === 'password') seen.add(n);
+    if (n.querySelectorAll) for (const el of n.querySelectorAll('input[type=password]')) seen.add(el);
+  };
+  const onMut = (muts) => {
+    for (const m of muts) {
+      if (m.type === 'attributes') { if (m.oldValue === 'password' || m.target.type === 'password') seen.add(m.target); }
+      else for (const n of m.addedNodes) note(n);
+    }
+  };
+  const watch = (root) => new MutationObserver(onMut).observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ['type'], attributeOldValue: true });
+  const orig = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function (...a) { const r = orig.apply(this, a); try { watch(r); } catch {} return r; };
+  watch(document);
+  document.addEventListener('DOMContentLoaded', () => note(document.documentElement));
+}
+
+// Element count across all frames and open shadow roots (what the a11y snapshot walks), stopping at limit+1.
+export async function countNodes(page, limit) {
+  const counts = await eachFrame(page, (lim) => {
+    let n = 0;
+    const roots = [document];
+    for (let i = 0; i < roots.length && n <= lim; i++) {
+      for (const el of roots[i].querySelectorAll('*')) { n++; if (el.shadowRoot) roots.push(el.shadowRoot); if (n > lim) break; }
+    }
+    return [n];
+  }, limit);
+  return counts.reduce((a, b) => a + b, 0);
+}
 
 // Screenshot with sensitive inputs masked in every frame; the marker attribute is removed afterwards.
 export async function maskedScreenshot(page, take) {
-  await eachFrame(page, 'mark');
   try {
+    await scan(page, 'mark');
     return await take(page.frames().map((f) => f.locator(`${SENSITIVE_CSS},[${MARK_ATTR}]`)));
   } finally {
-    await eachFrame(page, 'unmark');
+    await scan(page, 'unmark').catch(() => {});
   }
 }
 
