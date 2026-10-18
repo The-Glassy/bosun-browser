@@ -6,7 +6,7 @@ Bosun can drive three browsers. Pick one per deployment (`ENGINE`) or per sessio
 |---|---|---|---|
 | `chromium` | Playwright's Chromium, `--disable-blink-features=AutomationControlled` | one shared browser, a context per session | CDP screencast + `Input.*` |
 | `patchright` | [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) 1.64.1: Playwright fork that avoids `Runtime.enable` and the other CDP/automation leaks | a browser per session; persistent context (temp profile for ephemeral sessions), `channel: chromium`, no custom UA, `viewport: null` | CDP screencast + `Input.*` |
-| `camoufox` | [Camoufox](https://github.com/daijro/camoufox) 152.0.4-beta.30 (anti-detect Firefox) via [camoufox-js](https://github.com/apify/camoufox-js) 0.13.0 | a browser per session; fingerprint (UA, screen, window, fonts, WebGL) generated per launch for the host OS | Playwright `page.screencast` + `page.mouse`/`keyboard` |
+| `camoufox` | [Camoufox](https://github.com/daijro/camoufox) 152.0.4-beta.30 (anti-detect Firefox) via [camoufox-js](https://github.com/apify/camoufox-js) 0.13.0 | a browser per session; persistent context (temp profile for ephemeral sessions); fingerprint (UA, screen, window, fonts, WebGL) generated per launch for the host OS | Playwright `page.screencast` + `page.mouse`/`keyboard` |
 
 ## Results
 
@@ -76,8 +76,13 @@ Not measured: no such host was available for this run. Expected differences, rou
 
 - Engines are `optionalDependencies`; `npm ci --omit=optional` leaves only `chromium`. Browsers are separate
   downloads: `npx patchright install chromium`, `npx camoufox-js fetch` (camoufox-js needs Node 22+).
-- A missing package or browser binary is an error naming the install command. The default `ENGINE` is checked at
-  startup (the service refuses to start without it); others on first use. Bosun never falls back to another engine.
+- A missing package or browser binary is an error naming the install command. The default `ENGINE` (package and
+  binary; for headless `chromium` the headless shell is only found at launch) is checked at startup, and the service
+  refuses to start without it; other engines on first use. Bosun never falls back to another engine.
+- Every `patchright`/`camoufox` session, and every session with a persistent profile, is a persistent context in a
+  directory Bosun owns. If closing it hangs (10 s), Bosun kills the processes running on that directory and only
+  then deletes the temp profile and frees the slot; a browser that survives `SIGKILL` keeps its slot (logged).
+  Temp profiles left by a killed Bosun are removed at startup.
 - camoufox-js declares `playwright-core <1.63`; npm installs a nested 1.62 for it. Bosun only calls its
   `launchOptions()` and launches Camoufox with its own Playwright 1.64.1 (`firefox.launch`, Juggler protocol). This
   combination is what the test suite runs (`ENGINE=camoufox npm test`: all suites pass). The alternative, camoufox's
@@ -90,8 +95,11 @@ Not measured: no such host was available for this run. Expected differences, rou
   write) and `page.mouse` / `page.keyboard` for input, with the same one-time link, single viewer, input drain and
   teardown guarantees as the CDP path.
 - Password masking: Bosun's sensitive-field scans run in an isolated world on patchright and camoufox (pages can't see
-  them) and in the page's world on plain Chromium. The "was once a password field" tracker runs from document start
-  only on Camoufox (its init scripts are isolated); elsewhere Bosun notes password fields when a handoff starts and
-  every 500 ms during it.
+  them) and in the page's world on plain Chromium. The "was once a password field" tracker (a MutationObserver that
+  follows open and declarative shadow roots, no prototype patching) must run in that same world: it is an init
+  script on `chromium` (page world) and `camoufox` (isolated world), so it runs from document start; on `patchright`
+  init scripts land in the page's world, so Bosun installs it in the isolated world on every frame navigation (a page
+  that reveals a password while its own document is still parsing can beat it there). On top, Bosun notes password
+  fields when a handoff starts and every 500 ms during it.
 - A persistent profile records its engine family (`bosun-profile.json`): Chromium profiles open with `chromium` or
   `patchright`, Firefox profiles only with `camoufox`.

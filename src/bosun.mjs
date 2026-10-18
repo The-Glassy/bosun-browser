@@ -13,8 +13,8 @@ export async function startService(cfg, { engines } = {}) {
     await live.listen();
   }
   const manager = new SessionManager(cfg, { live, engines });
-  // The default engine must be installed; others are loaded (and reported if missing) when a session asks for them.
-  try { await manager.engines.load(cfg.engine); } catch (e) { await live?.close(); throw e; }
+  // The default engine (package and browser binary) must be installed; others are checked when a session asks.
+  try { await manager.engines.check(cfg.engine, cfg); } catch (e) { await live?.close(); throw e; }
   const ws = cfg.ws ? await startWsServer({ cfg, manager }) : null;
 
   let closing = null;

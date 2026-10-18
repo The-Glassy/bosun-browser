@@ -64,13 +64,15 @@ const DRAIN_DEADLINE_MS = 10_000;
 
 // Live-view drivers: stream frames and forward input. cdp (Chromium engines): CDP screencast with per-frame acks and
 // Input.* events. playwright (any engine, used for Firefox/Camoufox): Playwright's page.screencast and page.mouse /
-// page.keyboard. start(onFrame(base64Jpeg, cssWidth, cssHeight, ack)).
+// page.keyboard. start(onFrame(base64Jpeg, cssWidth, cssHeight, ack), guard). guard() throws once the viewer is
+// revoked; drivers call it between the steps of compound actions, so nothing is dispatched after that.
 async function cdpDriver(page) {
   const cdp = await page.context().newCDPSession(page);
   const vp = page.viewportSize() || { width: 1366, height: 900 };
   const mouse = (type, x, y) => cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
   return {
-    async start(onFrame) {
+    async start(onFrame, guard) {
+      guard();
       cdp.on('Page.screencastFrame', (f) => onFrame(f.data, f.metadata.deviceWidth || vp.width, f.metadata.deviceHeight || vp.height,
         () => cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }).catch(() => {})));
       await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 60, maxWidth: vp.width, maxHeight: vp.height, everyNthFrame: 1 });
@@ -90,17 +92,18 @@ async function cdpDriver(page) {
 
 async function playwrightDriver(page) {
   return {
-    async start(onFrame) {
+    async start(onFrame, guard) {
       const size = page.viewportSize() || await page.evaluate(() => ({ width: innerWidth, height: innerHeight })).catch(() => ({ width: 1366, height: 900 }));
+      guard(); // revoked while measuring: don't start capturing
       await page.screencast.start({
         size, quality: 60,
         onFrame: (f) => new Promise((ack) => onFrame(f.data.toString('base64'), f.viewportWidth || size.width, f.viewportHeight || size.height, ack)),
       });
     },
-    async mouse(dir, x, y) {
-      if (dir === 'down') { await page.mouse.move(x, y); await page.mouse.down(); } else await page.mouse.up();
+    async mouse(dir, x, y, guard) {
+      if (dir === 'down') { await page.mouse.move(x, y); guard(); await page.mouse.down(); } else await page.mouse.up();
     },
-    async wheel(x, y, dy) { await page.mouse.move(x, y); await page.mouse.wheel(0, dy); },
+    async wheel(x, y, dy, guard) { await page.mouse.move(x, y); guard(); await page.mouse.wheel(0, dy); },
     text: (text) => page.keyboard.insertText(text),
     key: (k, dir) => (dir === 'down' ? page.keyboard.down(k) : page.keyboard.up(k)),
     async stop() { await page.screencast.stop().catch(() => {}); },
@@ -197,8 +200,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     const v = { ws, drv: null, queue: [], pumping: false, pressed: false, closed: false, drops: 0, alive: true, hb: null };
     // Register before the first await so finish() or a closing socket can always find and tear this viewer down.
     if (h.done) return ws.close(4410, 'handoff ended');
-    const prev = h.viewer;
-    if (prev) teardown(h, prev); // single viewer: the key holder reconnecting replaces the old socket
+    if (h.viewer) teardown(h, h.viewer); // single viewer: the key holder reconnecting replaces the old socket
     h.viewer = v;
     ws.on('close', () => teardown(h, v));
     ws.on('pong', () => { v.alive = true; });
@@ -206,18 +208,17 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     v.hb.unref();
     ws.on('message', (raw) => onInput(h, v, raw));
     if (issued) ws.send(JSON.stringify({ viewer: issued }));
-    try {
-      if (prev) await prev.finished; // one stream per page: let the old one stop first
+    const before = [...h.teardowns]; // every earlier viewer, incl. ones that already disconnected
+    // v.startP is part of this viewer's teardown barrier: a handoff can't resolve while a stream is still starting.
+    v.startP = (async () => {
+      await Promise.all(before); // one stream and one input source per page: earlier viewers fully stopped first
       if (!active(h, v)) return;
       const drv = await DRIVERS[h.driver](h.page);
-      if (!active(h, v)) { await drv.stop(); return; }
-      v.drv = drv;
-      await drv.start((data, w, ht, ack) => onFrame(h, v, data, w, ht, ack));
-      if (!active(h, v)) { await drv.stop(); return; } // teardown may have run before the stream was up
-      pump(h, v);
-    } catch {
-      teardown(h, v);
-    }
+      v.drv = drv; // from here on cleanup() stops it
+      if (!active(h, v)) return;
+      await drv.start((data, w, ht, ack) => onFrame(h, v, data, w, ht, ack), () => { if (!active(h, v)) throw new Error('inactive'); });
+      if (active(h, v)) pump(h, v);
+    })().catch(() => { if (!v.closed) teardown(h, v); });
   }
 
   function onFrame(h, v, data, w, ht, ack) {
@@ -258,11 +259,11 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
         try {
           if (m.type === 'click') {
             v.pressed = { x: m.x, y: m.y }; // set first: teardown must release even if it lands mid-press
-            guard(); await d.mouse('down', m.x, m.y);
-            guard(); await d.mouse('up', m.x, m.y);
+            guard(); await d.mouse('down', m.x, m.y, guard);
+            guard(); await d.mouse('up', m.x, m.y, guard);
             v.pressed = false;
           } else if (m.type === 'wheel') {
-            guard(); await d.wheel(m.x, m.y, m.dy);
+            guard(); await d.wheel(m.x, m.y, m.dy, guard);
           } else if (m.type === 'text') {
             guard(); await d.text(m.text);
           } else if (m.type === 'key') {
@@ -281,7 +282,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     const d = v.drv;
     if (!d || v.cleaned) return;
     v.cleaned = true;
-    if (v.pressed) await d.mouse('up', v.pressed.x, v.pressed.y).catch(() => {});
+    if (v.pressed) await d.mouse('up', v.pressed.x, v.pressed.y, () => {}).catch(() => {});
     v.pressed = false;
     await d.stop();
   }
@@ -293,7 +294,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     v.queue.length = 0;
     clearInterval(v.hb);
     if (h.viewer === v) h.viewer = null;
-    v.finished = (async () => { await v.pumpP?.catch(() => {}); await cleanup(v); })();
+    v.finished = (async () => { await v.startP?.catch(() => {}); await v.pumpP?.catch(() => {}); await cleanup(v); })();
     h.teardowns.add(v.finished);
     try { if (v.ws.readyState === WebSocket.OPEN) v.ws.close(); else v.ws.terminate(); } catch {}
     return v.finished;

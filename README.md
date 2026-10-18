@@ -106,10 +106,10 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
   After **Give up / timeout / cancel** those fields are emptied before the agent resumes; if that fails, the
   session is closed instead. If a frame can't be inspected, `read`/`screenshot` fail rather than return unmasked
   output. The handoff ends only after the human's last input has reached the page.
-- A password field the human reveals with a show-password toggle stays masked: Bosun notes password inputs when the
-  handoff starts and every 500 ms during it (Camoufox also from document start, via an init script that pages can't
-  see). On `chromium` Bosun's helpers run in the page's own JavaScript world, so a page can detect them; on
-  `patchright` and `camoufox` they run in an isolated world.
+- A password field that is revealed with a show-password toggle stays masked: an event-driven tracker remembers every
+  input that ever was `type=password` (incl. shadow roots), and Bosun also notes them when a handoff starts and every
+  500 ms during it. On `chromium` Bosun's helpers run in the page's own JavaScript world, so a page can detect them;
+  on `patchright` and `camoufox` they run in an isolated world (details in [docs/ENGINES.md](docs/ENGINES.md)).
 - Not protected: text the human types into ordinary fields, secrets the page itself echoes as normal text, custom
   widgets that aren't `<input>`/`<textarea>` (e.g. per-digit OTP boxes built from `div`s), closed shadow roots.
   Those are visible to the agent after Done. Ask the human to finish the login (submit it) before pressing Done.
