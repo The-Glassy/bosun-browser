@@ -59,18 +59,18 @@
   "ram": {
    "loaded": {
     "processes": 14,
-    "rssMB": 1111,
-    "footprintMB": 1215
+    "rssMB": 2359,
+    "footprintMB": 1210
    },
    "idle": {
     "processes": 11,
-    "rssMB": 692,
-    "footprintMB": 564
+    "rssMB": 1489,
+    "footprintMB": 584
    }
   },
-  "openMs": 3601,
+  "openMs": 593,
   "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
-  "measuredAt": "2026-10-18T18:56:49.760Z",
+  "measuredAt": "2026-10-18T19:27:41.627Z",
   "host": "darwin 25.5.0 arm64",
   "headless": false
  },
@@ -134,18 +134,18 @@
   "ram": {
    "loaded": {
     "processes": 16,
-    "rssMB": 1643,
-    "footprintMB": 1579
+    "rssMB": 2850,
+    "footprintMB": 1517
    },
    "idle": {
     "processes": 14,
-    "rssMB": 1435,
-    "footprintMB": 943
+    "rssMB": 2213,
+    "footprintMB": 990
    }
   },
-  "openMs": 2291,
+  "openMs": 551,
   "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
-  "measuredAt": "2026-10-18T18:58:01.115Z",
+  "measuredAt": "2026-10-18T19:28:40.539Z",
   "host": "darwin 25.5.0 arm64",
   "headless": false
  },
@@ -153,8 +153,8 @@
   "engine": "camoufox",
   "tests": {
    "sannysoft": {
-    "rows": 37,
-    "passed": 10,
+    "rows": 57,
+    "passed": 30,
     "failed": [
      "Chrome\n(New): missing (failed)"
     ],
@@ -182,19 +182,13 @@
       "shop": false
      },
      {
-      "t": "load+4s",
+      "t": "load+2s",
       "title": "Just a moment...",
       "turnstile": false,
       "shop": false
      },
      {
-      "t": "load+5s",
-      "title": "",
-      "turnstile": false,
-      "shop": false
-     },
-     {
-      "t": "load+6s",
+      "t": "load+4s",
       "title": "Kaufland.at — Angebote entdecken & günstig einkaufen",
       "turnstile": false,
       "shop": true
@@ -223,18 +217,18 @@
   "ram": {
    "loaded": {
     "processes": 11,
-    "rssMB": 1377,
-    "footprintMB": 1617
+    "rssMB": 2997,
+    "footprintMB": 1810
    },
    "idle": {
     "processes": 9,
-    "rssMB": 1127,
-    "footprintMB": 1098
+    "rssMB": 2145,
+    "footprintMB": 1331
    }
   },
-  "openMs": 6149,
+  "openMs": 1633,
   "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0",
-  "measuredAt": "2026-10-18T18:59:27.875Z",
+  "measuredAt": "2026-10-18T19:29:44.278Z",
   "host": "darwin 25.5.0 arm64",
   "headless": false
  }
