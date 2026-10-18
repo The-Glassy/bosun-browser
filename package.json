@@ -1,0 +1,16 @@
+{
+  "name": "bosun-browser",
+  "version": "0.0.1",
+  "description": "Bosun — the boatswain browser for agents: a self-hosted, multi-tenant browser service with human handoff, over MCP / MCPL.",
+  "type": "module",
+  "bin": { "bosun-browser": "src/server.mjs" },
+  "main": "src/server.mjs",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "playwright": "1.64.1",
+    "ws": "8.22.0",
+    "zod": "4.6.7"
+  }
+}
