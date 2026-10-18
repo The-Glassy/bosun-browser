@@ -3,6 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { countNodes, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
 import { TENANT_RE } from './auth.mjs';
+import { ENGINE_NAMES } from './engines.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
@@ -57,10 +58,11 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
   });
 
   tool('session_open', 'Open a browser session. Without profile: ephemeral (wiped on close). With profile: persistent per-tenant profile (stays logged in).',
-    { profile: z.string().regex(TENANT_RE).optional(), locale: str(35).optional(), timezone: str(64).optional() },
+    { profile: z.string().regex(TENANT_RE).optional(), locale: str(35).optional(), timezone: str(64).optional(),
+      engine: z.enum(ENGINE_NAMES).optional().describe(`browser engine (default ${cfg.engine}): chromium, patchright (stealthier Chromium), camoufox (anti-detect Firefox)`) },
     async (a) => {
-      const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone });
-      return ok({ session: s.id, profile: a.profile || 'ephemeral' });
+      const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine });
+      return ok({ session: s.id, profile: a.profile || 'ephemeral', engine: s.engine });
     });
 
   tool('session_close', 'Close a session (persistent profile stays on disk).', { session: str(40) }, async ({ session }) => {
@@ -179,7 +181,7 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
     });
 
   tool('sessions', 'List your open sessions.', {}, async () => ok(manager.list(owner).map((s) => (
-    s.handoff ? { id: s.id, profile: s.profile || 'ephemeral', handoff: 'active' } : { id: s.id, profile: s.profile || 'ephemeral', url: s.page.url() }
+    s.handoff ? { id: s.id, profile: s.profile || 'ephemeral', engine: s.engine, handoff: 'active' } : { id: s.id, profile: s.profile || 'ephemeral', engine: s.engine, url: s.page.url() }
   ))));
 
   return server;
