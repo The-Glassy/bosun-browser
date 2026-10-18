@@ -5,12 +5,13 @@ import { countNodes, maskText, maskedScreenshot, sensitiveValues } from './redac
 import { TENANT_RE } from './auth.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
 import { urlKey } from './sessions.mjs';
+import { MANIFEST, mcplConnection } from './events.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
 
 // Heuristic bot-wall detection after navigation/click.
-async function wall(p) {
+export async function wall(p) {
   try {
     const title = (await p.title()).toLowerCase();
     if (/just a moment|nur einen moment|attention required|verify you are human|robot/.test(title)) return 'bot check page';
@@ -79,7 +80,13 @@ const target = { ref: str(20).optional().describe('element ref from read (e.g. "
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
 
 export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 } }) {
-  const server = new McpServer({ name: 'bosun', version: '0.0.2' });
+  const server = new McpServer({ name: 'bosun', version: '0.4.0' }, { capabilities: { experimental: { mcpl: MANIFEST } } });
+  // MCPL push events (needs-human) for this tenant, once the host has granted them.
+  if (manager.events) {
+    const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
+    const prev = server.server.onclose;
+    server.server.onclose = () => { mcpl.close(); prev?.(); };
+  }
   // Page tools: serialized per session, and turned into BOT_LOOP (success or failure) when the page is stuck in a
   // reloading bot check.
   const run = (id, fn) => manager.run(owner, id, async (s) => {
@@ -224,6 +231,18 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
       const status = await manager.waitHandoff(owner, a.session, (a.timeoutSec ?? POLL_SEC) * 1000, extra?.signal);
       return waitResult(a.session, status ?? 'no_active_handoff', h);
     });
+
+  // Keepalive: per tenant (like profiles, shared by the tenant's connections).
+  const keepalive = manager.keepalive;
+  if (keepalive) {
+    tool('keepalive_set', 'Keep a persistent profile logged in without a model: every every_hours (± jitter_min) the service opens the profile, loads url, moves the mouse and scrolls for 20–60 s (no clicks, typing or navigation), then checks logged_in_check. Logged out or a bot check -> a bosun:needs-human event; no retries before the next visit. Only helps sites with sliding sessions.',
+      { profile: z.string().regex(TENANT_RE), url: z.string().max(4096).url(), every_hours: z.number().int().min(1).max(720).optional(), jitter_min: z.number().int().min(0).max(720).optional(),
+        logged_in_check: z.object({ text: str(1000).optional(), selector: str(2000).optional(), url_not_contains: str(1000).optional() }).describe('what proves it is still logged in; every given condition must hold'),
+        enabled: z.boolean().optional() },
+      async (a) => ok(keepalive.set(tenant, { profile: a.profile, url: httpUrl(a.url), everyHours: a.every_hours ?? 12, jitterMin: a.jitter_min ?? 30, check: a.logged_in_check, enabled: a.enabled ?? true })));
+    tool('keepalive_list', 'Keepalive schedules of your profiles with the next run and the last results (ok, logged_out, bot_check, error).', {}, async () => ok(keepalive.list(tenant)));
+    tool('keepalive_remove', 'Stop keeping a profile alive.', { profile: z.string().regex(TENANT_RE) }, async (a) => ok(keepalive.remove(tenant, a.profile)));
+  }
 
   tool('sessions', 'List your open sessions.', {}, async () => ok(manager.list(owner).map((s) => (
     s.handoff ? { id: s.id, profile: s.profile || 'ephemeral', engine: s.engine, handoff: 'active' } : { id: s.id, profile: s.profile || 'ephemeral', engine: s.engine, url: s.page.url() }
