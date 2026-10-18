@@ -107,6 +107,9 @@ Flow
 ## 7. Events / tags (MCPL §9, §16)
 
 Namespace = server name: `browser:`. Declared as an ontology on the feature sets.
+
+Implemented so far (0.4.0): `bosun:needs-human` from keepalive (feature set `bosun.handoff`, see README ›
+Keeping logins alive); the server's namespace is `bosun:`.
 - `browser:needs-human`, `browser:human-done`, `browser:handoff-timeout`
 - `browser:download-finished` (with a bulk content reference, §19), `browser:download-failed`
 - `browser:watch-changed`

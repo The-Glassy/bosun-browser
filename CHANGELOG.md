@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.0 — keepalive
+
+### Added
+
+- **Keepalive for persistent profiles** (`keepalive_set` / `keepalive_list` / `keepalive_remove`, per tenant): a
+  scheduler inside the service visits a profile every `every_hours` (default 12, min 1) ± `jitter_min` (default 30),
+  with the engine and headful/headless mode the profile was last used with, loads one URL, moves the mouse along
+  interpolated paths and scrolls for 20–60 s (no clicks, typing or navigation), checks `logged_in_check`
+  (`text` / `selector` / `url_not_contains`) and closes the profile. Results (time, ok / logged_out / bot_check /
+  error, duration; last 10) and schedules persist in `BROWSER_DATA/keepalive.json`. One visit at a time, a few
+  minutes apart; skipped while an agent has the profile open, postponed at the session limit, taken over at once by
+  an agent that opens the profile. `KEEPALIVE=0` pauses the scheduler.
+- **MCPL push events** (first one): `push/event` with feature set `bosun.handoff`, tags `bosun:needs-human`,
+  `bosun:source=keepalive`, `bosun:reason=…`, `bosun:profile=…`, when a kept-alive profile is logged out or at a bot
+  check. The manifest is in `capabilities.experimental.mcpl`; pushes go only to connections whose client asked for
+  MCPL and whose host granted `pushEvents` via a `featureSets/update` Request (a notification can only narrow it).
+  Up to 20 undelivered events per tenant wait for the next such connection. `mcpl/manifest` returns the manifest.
+- Profiles record the engine and mode they were last opened with (`bosun-profile.json`).
+
+### Fixed
+
+- Opening a persistent profile right after its session was closed — in particular when the closing was triggered by
+  a dropped connection, idle timeout or crash, whose browser is still shutting down — failed with "profile … is
+  already open in another session". The open now waits for that close to finish (bounded by the close deadline).
+
+
 ## 0.3.0 — live view on phones
 
 From testing the handoff on an iPhone (Safari and Telegram's in-app browser, plain http over a mesh VPN).
