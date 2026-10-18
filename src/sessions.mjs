@@ -11,6 +11,9 @@ export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) â
 const CLOSE_DEADLINE_MS = 10_000; // default; manager.closeDeadlineMs
 const NOTE_POLL_MS = 500;
 
+// Where a navigation landed, without query and fragment (a challenge page reloads itself with fresh tokens).
+export const urlKey = (u) => { try { const x = new URL(u); return x.origin + x.pathname; } catch { return String(u); } };
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms).unref?.());
 
 // Browser processes started for a persistent context carry its directory on their command line
@@ -142,8 +145,14 @@ export class SessionManager {
         const s = {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
+          navs: [], ctxErrors: [], wallSeen: null, // recent main-frame navigations {t, at: origin+path}, "context destroyed" failures, last bot check seen (bot-check loops)
         };
         this.sessions.set(s.id, s);
+        page.on('framenavigated', (f) => {
+          if (f !== page.mainFrame()) return;
+          s.navs.push({ t: Date.now(), at: urlKey(f.url()) });
+          if (s.navs.length > 100) s.navs.shift();
+        });
         page.on('close', () => this.dispose(s, 'page-closed'));
         page.on('crash', () => this.dispose(s, 'page-crashed'));
         ctx.on('close', () => this.dispose(s, 'context-closed'));
@@ -224,7 +233,8 @@ export class SessionManager {
       const poll = setInterval(() => { if (!s.disposed) notePasswords(s.page).catch(() => {}); }, NOTE_POLL_MS);
       poll.unref();
       h.wait.finally(() => clearInterval(poll));
-      const end = (status) => { if (s.handoff === h) { s.handoff = null; s.lastHandoff = status; s.gen++; s.lastUsed = Date.now(); } };
+      // The human may have got past a bot check: earlier navigation history no longer says anything about a loop.
+      const end = (status) => { if (s.handoff === h) { s.handoff = null; s.lastHandoff = status; s.gen++; s.lastUsed = Date.now(); s.navs.length = 0; s.ctxErrors.length = 0; s.wallSeen = null; } };
       h.settled = h.wait.then((status) => s.queue.run(async () => {
         // Human input that could not be drained: the page may still change under the agent. Give the session up.
         if (h.drainFailed) throw new Error('live-view input did not drain');
