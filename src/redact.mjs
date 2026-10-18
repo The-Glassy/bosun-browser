@@ -27,6 +27,7 @@ function inPage({ op, css, hint, attr }) {
       if (op === 'unmark') { if (el.hasAttribute(attr)) el.removeAttribute(attr); continue; }
       if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) continue;
       if (el.type === 'password') seen.add(el);
+      if (op === 'note') continue;
       let sensitive = seen.has(el) || el.matches(css);
       if (!sensitive) {
         const labels = [...(el.labels || [])].map(text);
@@ -63,10 +64,14 @@ const scan = (page, op) => eachFrame(page, inPage, { op, css: SENSITIVE_CSS, hin
 
 export const sensitiveValues = (page) => scan(page, 'values');
 export const clearSensitive = (page) => scan(page, 'clear');
+// Remember the inputs that are type=password right now (in Bosun's evaluation world), so they stay sensitive if
+// they are later switched to type=text. Polled while a human has the tab.
+export const notePasswords = (page) => scan(page, 'note');
 
-// Installed as a context init script, so it runs in every document and frame before page scripts: remembers every
-// input that is or ever becomes type=password (incl. inside open shadow roots), so a show-password toggle that
-// happened before Bosun's first scan still counts as sensitive.
+// Context init script for engines whose init scripts run in the same isolated world as Bosun's evaluations
+// (Camoufox): remembers every input that is or ever becomes type=password from document start (incl. open shadow
+// roots). Not used where init scripts land in the page's own world (Playwright Chromium, patchright): there it
+// would be visible to the page, a detection signal, and for patchright not even reachable from Bosun's scans.
 export function passwordTracker() {
   const KEY = Symbol.for('bosun.sensitive');
   const seen = window[KEY] || (window[KEY] = new WeakSet());
