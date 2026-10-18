@@ -27,6 +27,7 @@ export function loadConfig(env = process.env) {
     maxDomNodes: int(env, 'MAX_DOM_NODES', 60000, 100, 10_000_000),
     engine: env.ENGINE || 'chromium',
     camoufoxOs: env.CAMOUFOX_OS || null, // null: the host's OS
+    keepalive: env.KEEPALIVE !== '0', // run scheduled keepalive visits (configured with keepalive_set)
     tokens: parseTokens(env),
     ws: null,
     live: null,

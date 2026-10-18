@@ -4,9 +4,11 @@ import { loadConfig } from './config.mjs';
 import { createLiveView } from './liveview.mjs';
 import { SessionManager } from './sessions.mjs';
 import { startWsServer } from './wsserver.mjs';
-import { buildServer } from './tools.mjs';
+import { buildServer, wall } from './tools.mjs';
+import { Keepalive } from './keepalive.mjs';
+import { EventBus } from './events.mjs';
 
-export async function startService(cfg, { engines } = {}) {
+export async function startService(cfg, { engines, keepalive: kaOpts = {} } = {}) {
   let live = null;
   if (cfg.live) {
     live = createLiveView({ port: cfg.live.port, host: cfg.live.host, baseUrl: cfg.live.baseUrl, ttlMs: cfg.handoffTtlMs });
@@ -15,16 +17,23 @@ export async function startService(cfg, { engines } = {}) {
   const manager = new SessionManager(cfg, { live, engines });
   // The default engine (package and browser binary) must be installed; others are checked when a session asks.
   try { await manager.engines.check(cfg.engine, cfg); } catch (e) { await live?.close(); throw e; }
+  const events = manager.events = new EventBus();
+  let keepalive;
+  try {
+    keepalive = manager.keepalive = new Keepalive({ cfg, manager, wall, emit: (e) => events.needsHuman(e), ...kaOpts });
+  } catch (e) { await live?.close(); throw e; }
+  if (cfg.keepalive) keepalive.start();
   const ws = cfg.ws ? await startWsServer({ cfg, manager }) : null;
 
   let closing = null;
   const shutdown = () => (closing ??= (async () => {
     // Stop admission first, then tear down handoffs and sessions (each close is deadline-bounded).
     manager.closing = true;
+    await keepalive.stop().catch(() => {});
     await Promise.allSettled([ws?.close(), live?.close()]);
     await manager.closeAll();
   })());
-  return { cfg, live, manager, ws, shutdown };
+  return { cfg, live, manager, ws, keepalive, events, shutdown };
 }
 
 export async function main(env = process.env) {

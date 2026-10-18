@@ -5,7 +5,7 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { clearSensitive, installTracker, notePasswords, passwordTracker } from './redact.mjs';
-import { createEngines, claimProfile, unclaimProfile } from './engines.mjs';
+import { createEngines, claimProfile, unclaimProfile, recordProfileUse } from './engines.mjs';
 
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
 const CLOSE_DEADLINE_MS = 10_000; // default; manager.closeDeadlineMs
@@ -66,6 +66,8 @@ export class SessionManager {
     this.disposals = new Set(); // disposals still closing their context
     this.ownerOpens = new Map(); // owner -> number of opens in progress
     this.goneOwners = new Set(); // disconnected owners that still have opens in progress
+    this.closingProfiles = new Map(); // tenant/profile -> disposal still closing it (an open waits for it)
+    this.preemptible = new Map(); // tenant/profile -> () => Promise: give the profile up (background keepalive runs)
     this.closed = new Map(); // recently closed id -> {owner, reason}, so the owner learns why (bounded)
     this.closeDeadlineMs = CLOSE_DEADLINE_MS;
     this.stuck = new Set(); // per-session browsers that survived SIGKILL; their slots stay reserved
@@ -98,14 +100,42 @@ export class SessionManager {
     for (const s of this.sessions.values()) if (s.browser === browser) this.dispose(s, 'browser-crashed');
   }
 
-  async open({ owner, tenant, profile, locale, timezone, engine }) {
+  async open({ owner, tenant, profile, locale, timezone, engine, preempt = true }) {
     if (this.closing) throw new Error('service is shutting down');
     const def = this.engines.get(engine || this.cfg.engine);
     if (this.goneOwners.has(owner)) throw new Error('connection closed');
+    const profileKey = profile ? `${tenant}/${profile}` : null;
+    // Counted as this owner's open from here, so a disconnect while it waits below still makes it close itself.
+    this.ownerOpens.set(owner, (this.ownerOpens.get(owner) || 0) + 1);
+    let tracked = true;
+    const untrack = () => {
+      if (!tracked) return;
+      tracked = false;
+      const n = this.ownerOpens.get(owner) - 1;
+      if (n) this.ownerOpens.set(owner, n);
+      else { this.ownerOpens.delete(owner); this.goneOwners.delete(owner); }
+    };
+    try {
+      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt });
+    } finally {
+      untrack();
+    }
+  }
+
+  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt }) {
+    // The profile was just closed (by session_close, a dropped connection, idle or crash) and its browser is still
+    // shutting down; or a background keepalive holds it. Wait for it rather than refusing.
+    if (profileKey && this.profilesInUse.has(profileKey)) {
+      const yieldP = preempt && this.preemptible.get(profileKey);
+      if (yieldP) await yieldP().catch(() => {});
+      const closing = this.closingProfiles.get(profileKey);
+      if (closing) await Promise.race([closing.catch(() => {}), sleep(this.closeDeadlineMs + 6000)]);
+      if (this.closing) throw new Error('service is shutting down');
+      if (this.goneOwners.has(owner)) throw new Error('connection closed');
+    }
     if (this.used >= this.cfg.maxSessions) throw new Error(`session limit ${this.cfg.maxSessions} reached; close one`);
     const tUse = this.tenantUse.get(tenant) || 0;
     if (tUse >= this.cfg.maxSessionsPerTenant) throw new Error(`session limit ${this.cfg.maxSessionsPerTenant} for this tenant reached; close one`);
-    const profileKey = profile ? `${tenant}/${profile}` : null;
     if (profileKey && this.profilesInUse.has(profileKey)) throw new Error(`profile ${profile} is already open in another session`);
     // Reserve synchronously, before any await, so concurrent opens can't overshoot the caps.
     this.used++;
@@ -142,6 +172,7 @@ export class SessionManager {
         }
         if (this.closing) throw new Error('service is shutting down');
         if (this.goneOwners.has(owner)) throw new Error('connection closed'); // owner left while we were launching
+        if (profileDir) recordProfileUse(profileDir, { engine: def.name, headless: this.cfg.headless });
         const s = {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
@@ -167,13 +198,7 @@ export class SessionManager {
       }
     })();
     this.pendingOpens.add(p);
-    this.ownerOpens.set(owner, (this.ownerOpens.get(owner) || 0) + 1);
-    p.catch(() => {}).finally(() => {
-      this.pendingOpens.delete(p);
-      const n = this.ownerOpens.get(owner) - 1;
-      if (n) this.ownerOpens.set(owner, n);
-      else { this.ownerOpens.delete(owner); this.goneOwners.delete(owner); }
-    });
+    p.catch(() => {}).finally(() => this.pendingOpens.delete(p));
     return p;
   }
 
@@ -304,6 +329,7 @@ export class SessionManager {
     this.closed.set(s.id, { owner: s.owner, reason });
     if (this.closed.size > 200) this.closed.delete(this.closed.keys().next().value);
     if (s.handoff) s.handoff.cancel();
+    const profileKey = s.profile ? `${s.tenant}/${s.profile}` : null;
     s.disposing = (async () => {
       let reclaimed = false;
       try {
@@ -316,7 +342,11 @@ export class SessionManager {
       }
     })();
     this.disposals.add(s.disposing);
-    s.disposing.finally(() => this.disposals.delete(s.disposing));
+    if (profileKey) this.closingProfiles.set(profileKey, s.disposing);
+    s.disposing.finally(() => {
+      this.disposals.delete(s.disposing);
+      if (this.closingProfiles.get(profileKey) === s.disposing) this.closingProfiles.delete(profileKey);
+    });
     return s.disposing;
   }
 

@@ -98,9 +98,10 @@ class ClientWsTransport {
   async close() { this.ws.close(); }
 }
 
-export async function connect(svc, token = TOKEN) {
+// capabilities: client capabilities (e.g. experimental.mcpl for an MCPL host).
+export async function connect(svc, token = TOKEN, { capabilities } = {}) {
   const t = new ClientWsTransport(svc.wsUrl, token ? { authorization: `Bearer ${token}` } : {});
-  const c = new Client({ name: 'test', version: '0' });
+  const c = new Client({ name: 'test', version: '0' }, capabilities ? { capabilities } : undefined);
   await c.connect(t);
   c.transportWs = t;
   // call: returns { text, isError, result }
