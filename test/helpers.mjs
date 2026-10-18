@@ -10,6 +10,7 @@ import { loadConfig } from '../src/config.mjs';
 import { startService } from '../src/bosun.mjs';
 
 export const TOKEN = 'test-token-0123456789abcdef';
+export const ENGINE = process.env.ENGINE || 'chromium'; // run the suites per engine: ENGINE=camoufox npm test
 export const TOKEN_B = 'test-token-bbbbbbbbbbbbbbbb';
 
 const PAGES = {
@@ -28,6 +29,9 @@ const PAGES = {
   '/toggle': `<title>Toggle</title><input id="t" type="password" value="pre-scan-toggled"><script>document.getElementById('t').type = 'text'</script>`,
   '/shadow': `<title>Shadow</title><div id="host"></div><script>const r = document.getElementById('host').attachShadow({ mode: 'open' }); r.innerHTML = '<span id="l">PIN</span><input id="s" aria-labelledby="l">';</script>`,
   '/bigshadow': `<title>Big</title><div id="host"></div><script>document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<i></i>'.repeat(500);</script>`,
+  '/probe': `<title>Probe</title><button id="check" onclick="document.getElementById('out').textContent = 'syms=' + JSON.stringify(Object.getOwnPropertySymbols(window).map(String)) + ' shadow=' + (/native code/.test(Element.prototype.attachShadow.toString()) ? 'native' : 'patched')">check</button><p id="out"></p>`,
+  '/toggle-later': `<title>Toggle later</title><input id="t" type="password" value="pre-scan-toggled"><script>setTimeout(() => { document.getElementById('t').type = 'text'; }, 400)</script>`,
+  '/dshadow': `<title>Declarative shadow</title><div id="host"><template shadowrootmode="open"><input id="dp" type="password" value="decl-shadow-secret"></template></div><script>setTimeout(() => { document.getElementById('host').shadowRoot.getElementById('dp').type = 'text'; }, 400)</script>`,
   '/popups': `<title>Popups</title><script>for (let i = 0; i < 10; i++) window.open('/second?' + i)</script>`,
 };
 
@@ -53,7 +57,7 @@ export async function startBosun(env = {}, opts = {}) {
   const dataDir = tmpDir();
   const cfg = loadConfig({
     HEADLESS: '1', BROWSER_DATA: dataDir, WS_PORT: '0', LIVE_PORT: '0', BROWSER_TOKENS: `alice:${TOKEN},bob:${TOKEN_B}`,
-    MAX_SESSIONS: '4', ...env,
+    MAX_SESSIONS: '4', ...(process.env.ENGINE ? { ENGINE: process.env.ENGINE } : {}), ...env,
   });
   const svc = await startService(cfg, opts);
   return {

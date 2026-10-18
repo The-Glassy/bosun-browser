@@ -1,0 +1,235 @@
+{
+ "chromium": {
+  "engine": "chromium",
+  "tests": {
+   "sannysoft": {
+    "rows": 57,
+    "passed": 31,
+    "failed": [],
+    "warn": [],
+    "shot": "docs/engines/chromium-sannysoft.jpg"
+   },
+   "creepjs": {
+    "likeHeadless": "44",
+    "headless": "0",
+    "stealth": "0",
+    "lies": null,
+    "trustScore": null,
+    "shot": "docs/engines/chromium-creepjs.jpg"
+   },
+   "browserscan": {
+    "verdict": "Normal",
+    "shot": "docs/engines/chromium-browserscan.jpg"
+   },
+   "kaufland": {
+    "timeline": [
+     {
+      "t": "load+1s",
+      "title": "Just a moment...",
+      "turnstile": false,
+      "shop": false
+     },
+     {
+      "t": "load+2s",
+      "title": "Kaufland.at — Angebote entdecken & günstig einkaufen",
+      "turnstile": false,
+      "shop": true
+     }
+    ],
+    "status": 403,
+    "challenged": true,
+    "outcome": "passed without a click (challenge cleared itself)",
+    "shot": "docs/engines/chromium-kaufland.jpg"
+   },
+   "ram": {
+    "geizhals": {
+     "url": "https://geizhals.at/?fs=mac+mini",
+     "title": "mac mini Geizhals Österreich"
+    },
+    "hornbach": {
+     "url": "https://www.hornbach.at/p/akku-bohrschrauber-gsr-18v-65-bosch-professional-inkl-l-boxx-2x-akkus-4-0-ah-und-ladegeraet/12314733/",
+     "title": "Akku-Bohrschrauber GSR 18V-65 Bosch Professional inkl. | HORNBACH AT"
+    },
+    "willhaben": {
+     "url": "https://www.willhaben.at/iad/kaufen-und-verkaufen/marktplatz?keyword=fahrrad",
+     "title": "Marktplatz | willhaben"
+    }
+   }
+  },
+  "ram": {
+   "loaded": {
+    "processes": 14,
+    "rssMB": 2359,
+    "footprintMB": 1210
+   },
+   "idle": {
+    "processes": 11,
+    "rssMB": 1489,
+    "footprintMB": 584
+   }
+  },
+  "openMs": 593,
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+  "measuredAt": "2026-10-18T19:27:41.627Z",
+  "host": "darwin 25.5.0 arm64",
+  "headless": false
+ },
+ "patchright": {
+  "engine": "patchright",
+  "tests": {
+   "sannysoft": {
+    "rows": 57,
+    "passed": 31,
+    "failed": [],
+    "warn": [],
+    "shot": "docs/engines/patchright-sannysoft.jpg"
+   },
+   "creepjs": {
+    "likeHeadless": "31",
+    "headless": "0",
+    "stealth": "0",
+    "lies": null,
+    "trustScore": null,
+    "shot": "docs/engines/patchright-creepjs.jpg"
+   },
+   "browserscan": {
+    "verdict": "Normal",
+    "shot": "docs/engines/patchright-browserscan.jpg"
+   },
+   "kaufland": {
+    "timeline": [
+     {
+      "t": "load+1s",
+      "title": "Just a moment...",
+      "turnstile": false,
+      "shop": false
+     },
+     {
+      "t": "load+2s",
+      "title": "Kaufland.at — Angebote entdecken & günstig einkaufen",
+      "turnstile": false,
+      "shop": true
+     }
+    ],
+    "status": 403,
+    "challenged": true,
+    "outcome": "passed without a click (challenge cleared itself)",
+    "shot": "docs/engines/patchright-kaufland.jpg"
+   },
+   "ram": {
+    "geizhals": {
+     "url": "https://geizhals.at/?fs=mac+mini",
+     "title": "mac mini Geizhals Österreich"
+    },
+    "hornbach": {
+     "url": "https://www.hornbach.at/p/akku-bohrschrauber-gsr-18v-65-bosch-professional-inkl-l-boxx-2x-akkus-4-0-ah-und-ladegeraet/12314733/",
+     "title": "Akku-Bohrschrauber GSR 18V-65 Bosch Professional inkl. | HORNBACH AT"
+    },
+    "willhaben": {
+     "url": "https://www.willhaben.at/iad/kaufen-und-verkaufen/marktplatz?keyword=fahrrad",
+     "title": "Marktplatz | willhaben"
+    }
+   }
+  },
+  "ram": {
+   "loaded": {
+    "processes": 16,
+    "rssMB": 2850,
+    "footprintMB": 1517
+   },
+   "idle": {
+    "processes": 14,
+    "rssMB": 2213,
+    "footprintMB": 990
+   }
+  },
+  "openMs": 551,
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+  "measuredAt": "2026-10-18T19:28:40.539Z",
+  "host": "darwin 25.5.0 arm64",
+  "headless": false
+ },
+ "camoufox": {
+  "engine": "camoufox",
+  "tests": {
+   "sannysoft": {
+    "rows": 57,
+    "passed": 30,
+    "failed": [
+     "Chrome\n(New): missing (failed)"
+    ],
+    "warn": [],
+    "shot": "docs/engines/camoufox-sannysoft.jpg"
+   },
+   "creepjs": {
+    "likeHeadless": "6",
+    "headless": "0",
+    "stealth": "0",
+    "lies": null,
+    "trustScore": null,
+    "shot": "docs/engines/camoufox-creepjs.jpg"
+   },
+   "browserscan": {
+    "verdict": "Normal",
+    "shot": "docs/engines/camoufox-browserscan.jpg"
+   },
+   "kaufland": {
+    "timeline": [
+     {
+      "t": "load+1s",
+      "title": "Nur einen Moment…",
+      "turnstile": false,
+      "shop": false
+     },
+     {
+      "t": "load+2s",
+      "title": "Just a moment...",
+      "turnstile": false,
+      "shop": false
+     },
+     {
+      "t": "load+4s",
+      "title": "Kaufland.at — Angebote entdecken & günstig einkaufen",
+      "turnstile": false,
+      "shop": true
+     }
+    ],
+    "status": 403,
+    "challenged": true,
+    "outcome": "passed without a click (challenge cleared itself)",
+    "shot": "docs/engines/camoufox-kaufland.jpg"
+   },
+   "ram": {
+    "geizhals": {
+     "url": "https://geizhals.at/?fs=mac+mini",
+     "title": "mac mini Geizhals Österreich"
+    },
+    "hornbach": {
+     "url": "https://www.hornbach.at/p/akku-bohrschrauber-gsr-18v-65-bosch-professional-inkl-l-boxx-2x-akkus-4-0-ah-und-ladegeraet/12314733/",
+     "title": "Akku-Bohrschrauber GSR 18V-65 Bosch Professional inkl. | HORNBACH AT"
+    },
+    "willhaben": {
+     "url": "https://www.willhaben.at/iad/kaufen-und-verkaufen/marktplatz?keyword=fahrrad",
+     "title": "Marktplatz | willhaben"
+    }
+   }
+  },
+  "ram": {
+   "loaded": {
+    "processes": 11,
+    "rssMB": 2997,
+    "footprintMB": 1810
+   },
+   "idle": {
+    "processes": 9,
+    "rssMB": 2145,
+    "footprintMB": 1331
+   }
+  },
+  "openMs": 1633,
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0",
+  "measuredAt": "2026-10-18T19:29:44.278Z",
+  "host": "darwin 25.5.0 arm64",
+  "headless": false
+ }
+}

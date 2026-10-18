@@ -39,11 +39,16 @@ test('a handoff that ends while a viewer is attaching never streams or accepts i
     v.ws.send(JSON.stringify({ type: 'text', text: 'late input' }));
     await sleep(50);
     h.cancel(); // expiry/finish while newCDPSession is still pending
-    assert.equal(await h.wait, 'cancelled');
+    let resolved = false;
+    h.wait.then(() => { resolved = true; });
+    await sleep(50);
+    assert.equal(resolved, false); // the handoff waits for the attach to wind down
     attachGate.resolve();
+    assert.equal(await h.wait, 'cancelled');
+    assert.equal(h.drainFailed, false);
     await until(() => cdp.detached);
     await until(() => v.closed);
-    assert.deepEqual(cdp.sent, []);
+    assert.deepEqual(cdp.sent.filter((m) => m !== 'Page.stopScreencast'), []); // never started, no input
     assert.equal(v.frames, 0);
   });
 });
@@ -54,8 +59,10 @@ test('expiry by TTL during attachment behaves the same', async () => {
     const { page, cdp } = fakePage({ attachGate });
     const h = live.start(page, 'r', { ttlMs: 100 });
     const v = await viewer(h.url);
-    assert.equal(await h.wait, 'handoff-timeout');
+    await sleep(200); // expired meanwhile
     attachGate.resolve();
+    assert.equal(await h.wait, 'handoff-timeout');
+    assert.equal(h.drainFailed, false);
     await until(() => cdp.detached && v.closed);
     assert.ok(!cdp.sent.includes('Page.startScreencast'));
   });
@@ -92,7 +99,10 @@ test('inputs run strictly in order, one at a time', async () => {
     const { page, cdp } = fakePage();
     let inFlight = 0, maxInFlight = 0;
     const orig = cdp.send;
-    cdp.send = async (m, p) => { inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); await sleep(5); await orig(m, p); inFlight--; };
+    cdp.send = async (m, p) => {
+      if (!m.startsWith('Input.')) return orig(m, p); // frame acks may overlap input; input must not overlap input
+      inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); await sleep(5); await orig(m, p); inFlight--;
+    };
     const h = live.start(page, 'r');
     const v = await viewer(h.url);
     await until(() => v.frames > 0);
@@ -161,4 +171,124 @@ test('close() ends every handoff and disconnects viewers', async () => {
   assert.equal(await h.wait, 'cancelled');
   await until(() => v.closed);
   assert.equal(live.size, 0);
+});
+
+// Firefox/Camoufox path: frames from page.screencast, input through page.mouse / page.keyboard.
+function fakePlaywrightPage({ gates = {} } = {}) {
+  const calls = [];
+  const gated = async (name, ...a) => { calls.push([name, ...a]); if (gates[name]) await gates[name].promise; };
+  let onFrame = null, timer = null;
+  const page = {
+    calls,
+    viewportSize: () => null,
+    evaluate: async () => { if (gates.evaluate) await gates.evaluate.promise; return { width: 800, height: 600 }; },
+    screencast: {
+      async start(o) {
+        calls.push(['start', o.size]);
+        onFrame = o.onFrame;
+        let busy = false;
+        timer = setInterval(async () => {
+          if (busy || !onFrame) return;
+          busy = true;
+          await onFrame({ data: Buffer.from('jpeg'), viewportWidth: 800, viewportHeight: 600 }); // awaits the ack
+          busy = false;
+        }, 5);
+      },
+      async stop() { calls.push(['stop']); clearInterval(timer); onFrame = null; },
+    },
+    mouse: { move: (x, y) => gated('move', x, y), down: () => gated('down'), up: () => gated('up'), wheel: (dx, dy) => gated('wheel', dy) },
+    keyboard: { insertText: async (t) => calls.push(['text', t]), down: async (k) => calls.push(['keydown', k]), up: async (k) => calls.push(['keyup', k]) },
+  };
+  return page;
+}
+
+test('playwright driver: screencast frames, mouse/keyboard input, stopped on finish', async () => {
+  await withLive(async (live) => {
+    const page = fakePlaywrightPage();
+    const h = live.start(page, 'r', { driver: 'playwright' });
+    const v = await viewer(h.url);
+    await until(() => v.frames > 2);
+    assert.deepEqual(page.calls[0], ['start', { width: 800, height: 600 }]);
+    v.ws.send(JSON.stringify({ type: 'click', x: 10, y: 20 }));
+    v.ws.send(JSON.stringify({ type: 'wheel', x: 1, y: 2, dy: 50 }));
+    v.ws.send(JSON.stringify({ type: 'text', text: 'hi' }));
+    v.ws.send(JSON.stringify({ type: 'key', key: 'Enter' }));
+    await until(() => page.calls.some((c) => c[0] === 'keyup'));
+    const input = page.calls.filter((c) => c[0] !== 'start');
+    assert.deepEqual(input, [['move', 10, 20], ['down'], ['up'], ['move', 1, 2], ['wheel', 50], ['text', 'hi'], ['keydown', 'Enter'], ['keyup', 'Enter']]);
+    v.ws.send(JSON.stringify({ type: 'done' }));
+    assert.equal(await h.wait, 'human-done');
+    assert.deepEqual(page.calls.at(-1), ['stop']);
+    const n = page.calls.length;
+    await sleep(50);
+    assert.equal(page.calls.length, n); // nothing after finish
+  });
+});
+
+test('unknown live-view driver is refused', async () => {
+  await withLive(async (live) => {
+    assert.throws(() => live.start(fakePlaywrightPage(), 'r', { driver: 'vnc' }), /unknown live-view driver/);
+  });
+});
+
+test('playwright driver: a handoff ending while the stream is starting never starts capture after resolving', async () => {
+  await withLive(async (live) => {
+    const evaluate = deferred();
+    const page = fakePlaywrightPage({ gates: { evaluate } });
+    const h = live.start(page, 'r', { driver: 'playwright' });
+    await viewer(h.url);
+    await sleep(50); // attach is now measuring the viewport
+    h.cancel();
+    let resolved = false;
+    h.wait.then(() => { resolved = true; });
+    await sleep(50);
+    assert.equal(resolved, false); // waits for the start path
+    evaluate.resolve();
+    assert.equal(await h.wait, 'cancelled');
+    assert.ok(!page.calls.some((c) => c[0] === 'start'), JSON.stringify(page.calls));
+  });
+});
+
+test('playwright driver: Done during a slow mouse move dispatches nothing more', async () => {
+  await withLive(async (live) => {
+    const move = deferred();
+    const page = fakePlaywrightPage({ gates: { move } });
+    const h = live.start(page, 'r', { driver: 'playwright' });
+    const v = await viewer(h.url);
+    await until(() => v.frames > 0);
+    v.ws.send(JSON.stringify({ type: 'click', x: 5, y: 5 }));
+    await until(() => page.calls.some((c) => c[0] === 'move'));
+    v.ws.send(JSON.stringify({ type: 'done' }));
+    await sleep(30);
+    move.resolve();
+    assert.equal(await h.wait, 'human-done');
+    const after = page.calls.slice(page.calls.findIndex((c) => c[0] === 'move') + 1).map((c) => c[0]);
+    assert.ok(!after.includes('down'), after.join());
+  });
+});
+
+test('a reconnecting viewer waits until the previous viewer has drained and stopped', async () => {
+  await withLive(async (live) => {
+    const down = deferred();
+    const page = fakePlaywrightPage({ gates: { down } });
+    const h = live.start(page, 'r', { driver: 'playwright' });
+    const v1 = await viewer(h.url);
+    await until(() => v1.frames > 0);
+    v1.ws.send(JSON.stringify({ type: 'click', x: 1, y: 1 }));
+    await until(() => page.calls.some((c) => c[0] === 'down'));
+    v1.ws.close(); // phone drops; its press is still in flight
+    await until(() => v1.closed);
+    const v2 = await viewer(h.url, { key: v1.key });
+    v2.ws.send(JSON.stringify({ type: 'text', text: 'second' }));
+    await sleep(100);
+    assert.ok(!page.calls.some((c) => c[0] === 'text'), 'second viewer ran before the first drained');
+    const starts = page.calls.filter((c) => c[0] === 'start').length;
+    assert.equal(starts, 1); // and no second stream yet
+    down.resolve();
+    await until(() => page.calls.filter((c) => c[0] === 'start').length === 2);
+    const names = page.calls.map((c) => c[0]);
+    assert.ok(names.lastIndexOf('stop') < names.lastIndexOf('start'), names.join()); // old stream stopped first
+    h.cancel();
+    await h.wait;
+  });
 });
