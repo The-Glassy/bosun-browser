@@ -62,6 +62,53 @@ const MAX_DROPS = 200; // ... and disconnect one that stays slow
 const HEARTBEAT_MS = 20_000;
 const DRAIN_DEADLINE_MS = 10_000;
 
+// Live-view drivers: stream frames and forward input. cdp (Chromium engines): CDP screencast with per-frame acks and
+// Input.* events. playwright (any engine, used for Firefox/Camoufox): Playwright's page.screencast and page.mouse /
+// page.keyboard. start(onFrame(base64Jpeg, cssWidth, cssHeight, ack)).
+async function cdpDriver(page) {
+  const cdp = await page.context().newCDPSession(page);
+  const vp = page.viewportSize() || { width: 1366, height: 900 };
+  const mouse = (type, x, y) => cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
+  return {
+    async start(onFrame) {
+      cdp.on('Page.screencastFrame', (f) => onFrame(f.data, f.metadata.deviceWidth || vp.width, f.metadata.deviceHeight || vp.height,
+        () => cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }).catch(() => {})));
+      await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 60, maxWidth: vp.width, maxHeight: vp.height, everyNthFrame: 1 });
+    },
+    mouse: (dir, x, y) => mouse(dir === 'down' ? 'mousePressed' : 'mouseReleased', x, y),
+    wheel: (x, y, dy) => cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: 0, deltaY: dy }),
+    text: (text) => cdp.send('Input.insertText', { text }),
+    key(k, dir) {
+      const [code, text] = KEYDEF[k];
+      return cdp.send('Input.dispatchKeyEvent', dir === 'down'
+        ? { type: 'keyDown', key: k, windowsVirtualKeyCode: code, ...(text ? { text } : {}) }
+        : { type: 'keyUp', key: k, windowsVirtualKeyCode: code });
+    },
+    async stop() { await cdp.send('Page.stopScreencast').catch(() => {}); await cdp.detach().catch(() => {}); },
+  };
+}
+
+async function playwrightDriver(page) {
+  return {
+    async start(onFrame) {
+      const size = page.viewportSize() || await page.evaluate(() => ({ width: innerWidth, height: innerHeight })).catch(() => ({ width: 1366, height: 900 }));
+      await page.screencast.start({
+        size, quality: 60,
+        onFrame: (f) => new Promise((ack) => onFrame(f.data.toString('base64'), f.viewportWidth || size.width, f.viewportHeight || size.height, ack)),
+      });
+    },
+    async mouse(dir, x, y) {
+      if (dir === 'down') { await page.mouse.move(x, y); await page.mouse.down(); } else await page.mouse.up();
+    },
+    async wheel(x, y, dy) { await page.mouse.move(x, y); await page.mouse.wheel(0, dy); },
+    text: (text) => page.keyboard.insertText(text),
+    key: (k, dir) => (dir === 'down' ? page.keyboard.down(k) : page.keyboard.up(k)),
+    async stop() { await page.screencast.stop().catch(() => {}); },
+  };
+}
+
+const DRIVERS = { cdp: cdpDriver, playwright: playwrightDriver };
+
 const finite = (v, lim) => typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= lim;
 
 // Validated input command, or null.
@@ -147,10 +194,11 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
 
   async function attach(h, ws, issued) {
     ws.on('error', () => {});
-    const v = { ws, cdp: null, queue: [], pumping: false, pressed: false, closed: false, drops: 0, alive: true, hb: null };
+    const v = { ws, drv: null, queue: [], pumping: false, pressed: false, closed: false, drops: 0, alive: true, hb: null };
     // Register before the first await so finish() or a closing socket can always find and tear this viewer down.
     if (h.done) return ws.close(4410, 'handoff ended');
-    if (h.viewer) teardown(h, h.viewer); // single viewer: the key holder reconnecting replaces the old socket
+    const prev = h.viewer;
+    if (prev) teardown(h, prev); // single viewer: the key holder reconnecting replaces the old socket
     h.viewer = v;
     ws.on('close', () => teardown(h, v));
     ws.on('pong', () => { v.alive = true; });
@@ -159,31 +207,28 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     ws.on('message', (raw) => onInput(h, v, raw));
     if (issued) ws.send(JSON.stringify({ viewer: issued }));
     try {
-      const cdp = await h.page.context().newCDPSession(h.page);
-      if (!active(h, v)) { await cdp.detach().catch(() => {}); return; }
-      v.cdp = cdp;
-      const vp = h.page.viewportSize() || { width: 1366, height: 900 };
-      v.vp = vp;
-      cdp.on('Page.screencastFrame', (f) => onFrame(h, v, f));
-      await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 60, maxWidth: vp.width, maxHeight: vp.height, everyNthFrame: 1 });
-      if (!active(h, v)) return teardown(h, v);
+      if (prev) await prev.finished; // one stream per page: let the old one stop first
+      if (!active(h, v)) return;
+      const drv = await DRIVERS[h.driver](h.page);
+      if (!active(h, v)) { await drv.stop(); return; }
+      v.drv = drv;
+      await drv.start((data, w, ht, ack) => onFrame(h, v, data, w, ht, ack));
+      if (!active(h, v)) { await drv.stop(); return; } // teardown may have run before the stream was up
       pump(h, v);
     } catch {
       teardown(h, v);
     }
   }
 
-  function onFrame(h, v, f) {
-    const ack = () => v.cdp?.send('Page.screencastFrameAck', { sessionId: f.sessionId }).catch(() => {});
+  function onFrame(h, v, data, w, ht, ack) {
     if (!active(h, v)) return;
     if (v.ws.bufferedAmount > MAX_BUFFERED) {
       if (++v.drops > MAX_DROPS) return teardown(h, v);
       return ack();
     }
     v.drops = 0;
-    const w = f.metadata.deviceWidth || v.vp.width, ht = f.metadata.deviceHeight || v.vp.height;
     // Ack once written, so the browser never runs far ahead of the viewer.
-    v.ws.send(JSON.stringify({ frame: f.data, w, h: ht }), () => ack());
+    v.ws.send(JSON.stringify({ frame: data, w, h: ht }), () => ack());
   }
 
   function onInput(h, v, raw) {
@@ -197,32 +242,32 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     pump(h, v);
   }
 
-  // One command at a time, in order; re-checked before every CDP call so nothing is dispatched after finish.
+  // One command at a time, in order; re-checked before every driver call so nothing is dispatched after finish.
   // v.pumpP lets teardown wait for the command that is already in flight.
   function pump(h, v) {
-    if (v.pumping || !v.cdp) return;
+    if (v.pumping || !v.drv) return;
     v.pumping = true;
     v.pumpP = drain(h, v);
   }
   async function drain(h, v) {
+    const d = v.drv;
+    const guard = () => { if (!active(h, v)) throw new Error('inactive'); };
     try {
       while (v.queue.length && active(h, v)) {
         const m = v.queue.shift();
-        const send = async (method, params) => { if (!active(h, v)) throw new Error('inactive'); await v.cdp.send(method, params); };
         try {
           if (m.type === 'click') {
             v.pressed = { x: m.x, y: m.y }; // set first: teardown must release even if it lands mid-press
-            await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: m.x, y: m.y, button: 'left', clickCount: 1 });
-            await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: m.x, y: m.y, button: 'left', clickCount: 1 });
+            guard(); await d.mouse('down', m.x, m.y);
+            guard(); await d.mouse('up', m.x, m.y);
             v.pressed = false;
           } else if (m.type === 'wheel') {
-            await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: m.x, y: m.y, deltaX: 0, deltaY: m.dy });
+            guard(); await d.wheel(m.x, m.y, m.dy);
           } else if (m.type === 'text') {
-            await send('Input.insertText', { text: m.text });
+            guard(); await d.text(m.text);
           } else if (m.type === 'key') {
-            const [code, text] = KEYDEF[m.key];
-            await send('Input.dispatchKeyEvent', { type: 'keyDown', key: m.key, windowsVirtualKeyCode: code, ...(text ? { text } : {}) });
-            await send('Input.dispatchKeyEvent', { type: 'keyUp', key: m.key, windowsVirtualKeyCode: code });
+            guard(); await d.key(m.key, 'down');
+            guard(); await d.key(m.key, 'up');
           }
         } catch { /* a single failed input is not fatal */ }
       }
@@ -231,15 +276,14 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     }
   }
 
-  // Release a held button, stop the stream and detach. Runs once, after any in-flight input has returned.
+  // Release a held button and stop the stream. Runs once, after any in-flight input has returned.
   async function cleanup(v) {
-    const cdp = v.cdp;
-    if (!cdp || v.cleaned) return;
+    const d = v.drv;
+    if (!d || v.cleaned) return;
     v.cleaned = true;
-    if (v.pressed) await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...v.pressed, button: 'left', clickCount: 1 }).catch(() => {});
+    if (v.pressed) await d.mouse('up', v.pressed.x, v.pressed.y).catch(() => {});
     v.pressed = false;
-    await cdp.send('Page.stopScreencast').catch(() => {});
-    await cdp.detach().catch(() => {});
+    await d.stop();
   }
 
   // Revokes the viewer at once; the returned promise settles when its in-flight input has returned and CDP is detached.
@@ -295,7 +339,9 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       let resolve;
       const wait = new Promise((r) => (resolve = r));
       const ttl = opts.ttlMs || ttlMs;
-      const h = { token, page, reason, resolve, viewer: null, viewerKey: null, done: false, expiresAt: Date.now() + ttl, teardowns: new Set(), drainFailed: false };
+      const driver = opts.driver || 'cdp';
+      if (!DRIVERS[driver]) throw new Error(`unknown live-view driver ${driver}`);
+      const h = { token, page, reason, driver, resolve, viewer: null, viewerKey: null, done: false, expiresAt: Date.now() + ttl, teardowns: new Set(), drainFailed: false };
       h.timer = setTimeout(() => finish(h, 'handoff-timeout'), ttl);
       h.timer.unref?.();
       handoffs.set(token, h);
