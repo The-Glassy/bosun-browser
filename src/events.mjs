@@ -39,37 +39,56 @@ export function pushEvent({ profile, url, reason, kind }) {
   };
 }
 
+// Delivery per tenant is serialized: an event waits in `pending` until a connection accepts it; every attach and
+// every new event triggers a pass over what is pending, so a connection that attaches while a delivery is in flight
+// still gets offered what that delivery failed to place. A connection that refused an event isn't asked again.
 export class EventBus extends EventEmitter {
   constructor() {
     super();
     this.sinks = new Map(); // tenant -> Set<sink(params) => Promise<boolean>>
-    this.pending = new Map(); // tenant -> [params]
+    this.pending = new Map(); // tenant -> [{params, refused: WeakSet<sink>}]
+    this.passes = new Map(); // tenant -> tail of the delivery chain
   }
 
   // A connection that may receive pushes. Returns detach().
   attach(tenant, sink) {
     if (!this.sinks.has(tenant)) this.sinks.set(tenant, new Set());
     this.sinks.get(tenant).add(sink);
-    this.flush(tenant).catch(() => {});
+    this.deliver(tenant).catch(() => {});
     return () => this.sinks.get(tenant)?.delete(sink);
   }
 
-  // Delivered to every ready connection of the tenant; kept for the next one if none accepted it.
+  // Resolves true once some connection of the tenant accepted it, false if it stays pending.
   async publish(tenant, params) {
-    const results = await Promise.all([...(this.sinks.get(tenant) || [])].map((s) => s(params).catch(() => false)));
-    if (results.some(Boolean)) return true;
     const q = this.pending.get(tenant) || [];
-    q.push(params);
+    const item = { params, refused: new WeakSet() };
+    q.push(item);
     if (q.length > MAX_PENDING) q.shift();
     this.pending.set(tenant, q);
-    return false;
+    await this.deliver(tenant);
+    return !this.pending.get(tenant)?.includes(item);
   }
 
-  async flush(tenant) {
-    const q = this.pending.get(tenant);
-    if (!q?.length) return;
-    this.pending.delete(tenant);
-    for (const p of q) await this.publish(tenant, p);
+  deliver(tenant) {
+    const run = (this.passes.get(tenant) || Promise.resolve()).then(() => this.pass(tenant));
+    const tail = run.catch(() => {});
+    this.passes.set(tenant, tail);
+    tail.then(() => { if (this.passes.get(tenant) === tail) this.passes.delete(tenant); });
+    return run;
+  }
+
+  async pass(tenant) {
+    for (const item of [...(this.pending.get(tenant) || [])]) {
+      const sinks = [...(this.sinks.get(tenant) || [])].filter((s) => !item.refused.has(s));
+      const results = await Promise.all(sinks.map((s) => s(item.params).catch(() => false)));
+      results.forEach((ok, i) => { if (!ok) item.refused.add(sinks[i]); });
+      if (results.some(Boolean)) {
+        const q = this.pending.get(tenant) || [];
+        const i = q.indexOf(item);
+        if (i >= 0) q.splice(i, 1);
+        if (!q.length) this.pending.delete(tenant);
+      }
+    }
   }
 
   // From the keepalive scheduler: e = {tenant, profile, url, reason, kind}.
@@ -79,8 +98,10 @@ export class EventBus extends EventEmitter {
   }
 }
 
-// Pattern match for effectiveCapabilities entries: exact paths, '*', or 'prefix.*'.
+// Pattern match for effectiveCapabilities entries: exact paths, '*', or 'prefix.*'. `cap` may itself be a pattern.
 const grants = (patterns, cap) => patterns.some((p) => p === cap || p === '*' || (p.endsWith('.*') && cap.startsWith(p.slice(0, -1))));
+// Two patterns overlap when some capability path matches both.
+const overlaps = (a, b) => grants([a], b) || grants([b], a);
 
 // MCPL on one MCP connection: the manifest is advertised statically (plain MCP clients ignore experimental); the
 // grant comes from featureSets/update. Attaches the connection to the bus once push is allowed.
@@ -97,7 +118,7 @@ export function mcplConnection(server, { bus, tenant }) {
   const apply = (p, form) => {
     const caps = Array.isArray(p?.effectiveCapabilities) ? p.effectiveCapabilities.filter((c) => typeof c === 'string') : [];
     const denied = Array.isArray(p?.deniedCapabilities) ? p.deniedCapabilities : [];
-    if (caps.some((c) => denied.includes(c))) { grant = { caps: [], enabled: new Set() }; return false; } // malformed: fail closed
+    if (caps.some((c) => denied.some((d) => typeof d === 'string' && overlaps(c, d)))) { grant = { caps: [], enabled: new Set() }; return false; } // malformed: fail closed
     const selected = Array.isArray(p?.enabled) ? p.enabled : null;
     const disabled = Array.isArray(p?.disabled) ? p.disabled : [];
     const enabled = new Set(Object.entries(MANIFEST.featureSets)
@@ -120,7 +141,7 @@ export function mcplConnection(server, { bus, tenant }) {
       .map((featureSet) => ({ featureSet, missingCapabilities: MANIFEST.featureSets[featureSet].uses.filter((u) => !grants(grant.caps, u)), effect: 'disabled' }));
     return { accepted: true, unavailableFeatures, notes: [], ...(unavailableFeatures.length ? { mode: 'degraded' } : {}) };
   });
-  server.setNotificationHandler(z.object({ method: z.literal('featureSets/update'), params: z.any().optional() }), async (n) => { apply(n.params, 'notification'); update(); });
+  server.setNotificationHandler(z.object({ method: z.literal('featureSets/update'), params: z.any().optional() }), async (n) => { apply(n.params, 'notification'); update(); }); // malformed: grant already cleared
   server.setRequestHandler(z.object({ method: z.literal('mcpl/manifest'), params: z.any().optional() }), async () => MANIFEST);
   return { close: () => { detach?.(); detach = null; }, get pushAllowed() { return pushAllowed(); } };
 }
