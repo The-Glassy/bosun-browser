@@ -220,7 +220,7 @@ test('handoff_wait honours cancellation and clears its timer', async () => {
   await c.close();
 });
 
-test('a password field revealed by the page before any scan stays masked (camoufox: init-script tracker)', { skip: ENGINE !== 'camoufox' && 'tracker init script is only used where it is invisible to the page' }, async () => {
+test('a password field the page reveals while it is still parsing stays masked (init-script tracker)', { skip: ENGINE === 'patchright' && 'patchright gets the tracker just after navigation, not at document start' }, async () => {
   const c = await connect(svc);
   const s = await c.open();
   await c.call('navigate', { session: s, url: `${pages.base}/toggle` });
@@ -306,5 +306,31 @@ test('the page cannot see Bosun\'s tracker on stealth engines', { skip: ENGINE =
   await c.call('click', { session: s, selector: '#check' });
   const r = await c.call('read', { session: s, mode: 'text' });
   assert.match(r.text, /syms=\[\] shadow=native/, r.text);
+  await c.close();
+});
+
+for (const [page, secret] of [['/toggle-later', 'pre-scan-toggled'], ['/dshadow', 'decl-shadow-secret']]) {
+  test(`a password field the page reveals before any scan stays masked (${page})`, async () => {
+    const c = await connect(svc);
+    const s = await c.open();
+    await c.call('navigate', { session: s, url: `${pages.base}${page}` }); // navigate waits 1.2 s: the toggle has run
+    const r = await c.call('read', { session: s });
+    assert.equal(r.isError, false, r.text);
+    assert.ok(!r.text.includes(secret), r.text);
+    await c.close();
+  });
+}
+
+test('a password field created and revealed between two polls during a handoff stays masked', async () => {
+  const c = await connect(svc);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${pages.base}/` });
+  const link = (await c.call('request_human', { session: s, reason: 'x' })).json().link;
+  const page = svc.manager.sessions.get(s).page;
+  await page.evaluate(() => { const i = document.createElement('input'); i.type = 'password'; i.value = 'between-polls'; document.body.append(i); i.type = 'text'; });
+  const v = await viewer(link);
+  v.ws.send(JSON.stringify({ type: 'done' }));
+  assert.equal((await c.call('handoff_wait', { session: s, timeoutSec: 5 })).json().status, 'human-done');
+  assert.ok(!(await c.call('read', { session: s })).text.includes('between-polls'));
   await c.close();
 });

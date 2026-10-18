@@ -68,30 +68,41 @@ export const clearSensitive = (page) => scan(page, 'clear');
 // they are later switched to type=text. Polled while a human has the tab.
 export const notePasswords = (page) => scan(page, 'note');
 
-// Context init script for engines whose init scripts run in the same isolated world as Bosun's evaluations
-// (Camoufox): remembers every input that is or ever becomes type=password from document start (incl. open shadow
-// roots). Not used where init scripts land in the page's own world (Playwright Chromium, patchright): there it
-// would be visible to the page, a detection signal, and for patchright not even reachable from Bosun's scans.
+// Remembers every input that is or ever becomes type=password (incl. open and declarative shadow roots), so a
+// show-password toggle doesn't make a typed password readable. Event-driven (MutationObserver), idempotent, no
+// prototype patching. Must run in the same JavaScript world as Bosun's scans: installed as an init script where init
+// scripts share that world (Playwright Chromium: the page's world; Camoufox: an isolated world), and by evaluate on
+// every frame navigation where they don't (patchright: init scripts go to the page's world, scans to an isolated one).
 export function passwordTracker() {
   const KEY = Symbol.for('bosun.sensitive');
   const seen = window[KEY] || (window[KEY] = new WeakSet());
-  const note = (n) => {
-    if (!n || n.nodeType !== 1) return;
-    if (n.localName === 'input' && n.type === 'password') seen.add(n);
-    if (n.querySelectorAll) for (const el of n.querySelectorAll('input[type=password]')) seen.add(el);
-  };
+  if (seen.tracking) return;
+  seen.tracking = true;
+  const observed = new WeakSet();
+  const isPw = (el) => el && el.localName === 'input' && el.type === 'password';
   const onMut = (muts) => {
     for (const m of muts) {
-      if (m.type === 'attributes') { if (m.oldValue === 'password' || m.target.type === 'password') seen.add(m.target); }
-      else for (const n of m.addedNodes) note(n);
+      if (m.type === 'attributes') { if (m.oldValue === 'password' || isPw(m.target)) seen.add(m.target); continue; }
+      if (m.target.shadowRoot) watch(m.target.shadowRoot); // declarative shadow roots attach while children parse
+      for (const n of m.addedNodes) if (n.nodeType === 1) { if (isPw(n)) seen.add(n); sweep(n); }
     }
   };
-  const watch = (root) => new MutationObserver(onMut).observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ['type'], attributeOldValue: true });
-  const orig = Element.prototype.attachShadow;
-  Element.prototype.attachShadow = function (...a) { const r = orig.apply(this, a); try { watch(r); } catch {} return r; };
+  const sweep = (root) => {
+    if (root.shadowRoot) watch(root.shadowRoot);
+    for (const el of root.querySelectorAll ? root.querySelectorAll('*') : []) { if (isPw(el)) seen.add(el); if (el.shadowRoot) watch(el.shadowRoot); }
+  };
+  function watch(root) {
+    if (observed.has(root)) return;
+    observed.add(root);
+    new MutationObserver(onMut).observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ['type'], attributeOldValue: true });
+    sweep(root);
+  }
   watch(document);
-  document.addEventListener('DOMContentLoaded', () => note(document.documentElement));
+  document.addEventListener('DOMContentLoaded', () => sweep(document), { once: true });
 }
+
+// For engines without same-world init scripts: install the tracker in Bosun's world in every frame.
+export const installTracker = (page) => Promise.all(page.frames().map((f) => f.evaluate(passwordTracker).catch(() => {})));
 
 // Element count across all frames and open shadow roots (what the a11y snapshot walks), stopping at limit+1.
 export async function countNodes(page, limit) {

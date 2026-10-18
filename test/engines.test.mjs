@@ -7,6 +7,7 @@ import path from 'path';
 import { spawn } from 'child_process';
 import { loadConfig } from '../src/config.mjs';
 import { createEngines, claimProfile, ENGINE_NAMES, EngineUnavailableError } from '../src/engines.mjs';
+import { procsUsing, terminate } from '../src/sessions.mjs';
 import { startBosun, startPageServer, connect, tmpDir, until } from './helpers.mjs';
 
 const SERVER = new URL('../src/server.mjs', import.meta.url).pathname;
@@ -39,15 +40,19 @@ test('a missing engine package is a clear error, and loading is retried later', 
   }
 });
 
-test('a missing browser binary is a clear error', async () => {
-  const engines = createEngines({
-    overrides: {
-      chromium: { name: 'chromium', family: 'chromium', cdp: true, shared: false, load: async () => ({}), open: async () => { throw new Error("browserType.launch: Executable doesn't exist at /nope/chrome"); } },
-    },
-  });
-  const cfg = { dataDir: tmpDir(), headless: true };
-  await assert.rejects(engines.open('chromium', { cfg }), /engine chromium: browser binary missing — run: npx playwright install chromium/);
-  assert.deepEqual(fs.readdirSync(path.join(cfg.dataDir, 'tmp')), []); // its temp profile was removed
+test('a missing browser binary is a clear error, and the failed open leaves no temp profile', async () => {
+  const broken = { name: 'patchright', family: 'chromium', cdp: true, shared: false, tracker: 'navigate', load: async () => ({}), open: async () => { throw new Error("browserType.launchPersistentContext: Executable doesn't exist at /nope/chrome"); } };
+  const svc = await startBosun({ ENGINE: 'chromium' }, { engines: createEngines({ overrides: { patchright: broken } }) });
+  try {
+    const c = await connect(svc);
+    const r = await c.call('session_open', { engine: 'patchright' });
+    assert.match(r.text, /engine patchright: browser binary missing — run: npm install patchright@1\.64\.1 && npx patchright install chromium/);
+    assert.deepEqual(fs.readdirSync(path.join(svc.dataDir, 'tmp')), []);
+    assert.equal(svc.manager.used, 0);
+    await c.close();
+  } finally {
+    await svc.stop();
+  }
 });
 
 test('the service refuses to start when the default engine is missing', async () => {
@@ -135,8 +140,8 @@ for (const engine of ['patchright', 'camoufox']) {
   });
 }
 
-test('profiles: opening a Chromium profile with camoufox is refused before launching anything', async () => {
-  const svc = await startBosun({ ENGINE: 'chromium' }, { engines: createEngines({ importer: without('camoufox-js') }) });
+test('profiles: opening a Chromium profile with camoufox is refused before launching anything', { skip: !(await installed('camoufox-js')) && 'camoufox not installed' }, async () => {
+  const svc = await startBosun({ ENGINE: 'chromium' });
   try {
     const c = await connect(svc);
     const id = (await c.call('session_open', { profile: 'work' })).json().session;
@@ -149,3 +154,59 @@ test('profiles: opening a Chromium profile with camoufox is refused before launc
     await svc.stop();
   }
 });
+
+test('startup also checks the default engine\'s browser binary', async () => {
+  const engines = createEngines({
+    overrides: { chromium: { ...createEngines().get('chromium'), check: () => { throw Object.assign(new Error('Executable doesn\'t exist at /nope'), { binary: true }); } } },
+  });
+  await assert.rejects(startBosun({ ENGINE: 'chromium' }, { engines }), /engine chromium: browser binary missing — run: npx playwright install chromium/);
+});
+
+test('a failed open with a missing engine does not claim a fresh profile for that engine', async () => {
+  const svc = await startBosun({ ENGINE: 'chromium' }, { engines: createEngines({ importer: without('camoufox-js') }) });
+  try {
+    const c = await connect(svc);
+    assert.match((await c.call('session_open', { profile: 'fresh', engine: 'camoufox' })).text, /not installed/);
+    const r = await c.call('session_open', { profile: 'fresh' });
+    assert.equal(r.isError, false, r.text);
+    await c.close();
+  } finally {
+    await svc.stop();
+  }
+});
+
+test('process lookup by directory matches exactly (…/work is not …/work2)', async () => {
+  const base = tmpDir();
+  const spawnOn = (d) => spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)', '--', `--user-data-dir=${d}`], { stdio: 'ignore' });
+  const a = spawnOn(path.join(base, 'work')), b = spawnOn(path.join(base, 'work2'));
+  try {
+    await until(() => procsUsing(path.join(base, 'work')).length === 1 && procsUsing(path.join(base, 'work2')).length === 1);
+    assert.deepEqual(procsUsing(path.join(base, 'work')), [a.pid]);
+    assert.equal(await terminate(path.join(base, 'work')), true);
+    assert.deepEqual(procsUsing(path.join(base, 'work2')), [b.pid]); // untouched
+  } finally {
+    a.kill('SIGKILL'); b.kill('SIGKILL');
+  }
+});
+
+for (const engine of ['patchright', 'camoufox']) {
+  test(`${engine}: a close that hangs is escalated; the slot is released only once the browser is gone`, { skip: !(await installed(engine === 'camoufox' ? 'camoufox-js' : engine)) && `${engine} not installed` }, async () => {
+    const svc = await startBosun();
+    try {
+      svc.manager.closeDeadlineMs = 300;
+      const c = await connect(svc);
+      const id = (await c.call('session_open', { engine })).json().session;
+      const s = svc.manager.sessions.get(id);
+      assert.ok(procsUsing(s.dir).length > 0);
+      s.ctx.close = () => new Promise(() => {}); // hangs forever
+      s.ctx.removeAllListeners('close');
+      await svc.manager.dispose(s, 'closed');
+      assert.deepEqual(procsUsing(s.dir), []);
+      assert.ok(!fs.existsSync(s.tmpDir));
+      assert.equal(svc.manager.used, 0);
+      await c.close();
+    } finally {
+      await svc.stop();
+    }
+  });
+}

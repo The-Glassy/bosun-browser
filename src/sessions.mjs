@@ -1,16 +1,41 @@
 // Session registry and lifecycle: ownership, capacity, single-flight browser launch, crash handling, idle reaping,
 // per-session operation serialization and the handoff state that blinds the agent.
 import crypto from 'crypto';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { clearSensitive, notePasswords, passwordTracker } from './redact.mjs';
-import { createEngines, claimProfile } from './engines.mjs';
+import { clearSensitive, installTracker, notePasswords, passwordTracker } from './redact.mjs';
+import { createEngines, claimProfile, unclaimProfile } from './engines.mjs';
 
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
-const CLOSE_DEADLINE_MS = 10_000;
+const CLOSE_DEADLINE_MS = 10_000; // default; manager.closeDeadlineMs
 const NOTE_POLL_MS = 500;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms).unref?.());
+
+// Browser processes started for a persistent context carry its directory on their command line
+// (--user-data-dir=… / -profile …), which is how they're found when a close hangs.
+export function procsUsing(dir) {
+  const abs = path.resolve(dir);
+  try {
+    return execFileSync('ps', ['-A', '-ww', '-o', 'pid=,command='], { maxBuffer: 64 << 20 }).toString().split('\n')
+      .filter((l) => { const i = `${l} `.indexOf(abs); return i >= 0 && /[\s/]/.test(`${l} `[i + abs.length]); }) // not …/work2 for …/work
+      .map((l) => Number(l.trim().split(/\s+/)[0])).filter((p) => p && p !== process.pid);
+  } catch { return []; }
+}
+
+// Make sure nothing is running on dir any more: SIGKILL what's left and wait until it's gone. false = still alive.
+export async function terminate(dir) {
+  let pids = procsUsing(dir);
+  if (!pids.length) return true;
+  for (const p of pids) { try { process.kill(p, 'SIGKILL'); } catch {} }
+  for (let i = 0; i < 50; i++) {
+    await sleep(100);
+    pids = procsUsing(dir);
+    if (!pids.length) return true;
+  }
+  return false;
+}
 
 // FIFO of async jobs with a bound on queued work. Jobs never overlap.
 class SerialQueue {
@@ -39,6 +64,8 @@ export class SessionManager {
     this.ownerOpens = new Map(); // owner -> number of opens in progress
     this.goneOwners = new Set(); // disconnected owners that still have opens in progress
     this.closed = new Map(); // recently closed id -> {owner, reason}, so the owner learns why (bounded)
+    this.closeDeadlineMs = CLOSE_DEADLINE_MS;
+    this.stuck = new Set(); // per-session browsers that survived SIGKILL; their slots stay reserved
     this.browserP = null;
     this.launches = 0;
     this.closing = false;
@@ -88,37 +115,45 @@ export class SessionManager {
     };
 
     const p = (async () => {
-      let ctx = null, browser = null, own = null, tmpDir = null;
+      let ctx = null, browser = null, dir = null, tmpDir = null, profileDir = null, claimed = false;
       try {
-        let profileDir = null;
         if (profile) {
           profileDir = path.join(this.cfg.dataDir, 'profiles', tenant, profile);
           fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
-          claimProfile(profileDir, def);
+          await this.engines.load(def.name); // a missing engine must not claim the profile for its family
+          claimed = claimProfile(profileDir, def);
         }
-        ({ ctx, browser = null, own = null, tmpDir } = await this.engines.open(def.name, {
-          cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', shared: (d, bt) => this.getBrowser(d, bt),
-        }));
-        if (def.isolatedInitScripts) await ctx.addInitScript(passwordTracker);
+        try {
+          ({ ctx, browser = null, dir = null, tmpDir = null } = await this.engines.open(def.name, {
+            cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', shared: (d, bt) => this.getBrowser(d, bt),
+          }));
+        } catch (e) {
+          ({ dir = null, tmpDir = null } = e);
+          throw e;
+        }
+        if (def.tracker === 'init') await ctx.addInitScript(passwordTracker);
         const page = ctx.pages()[0] || await ctx.newPage();
+        if (def.tracker === 'navigate') {
+          page.on('framenavigated', (f) => { f.evaluate(passwordTracker).catch(() => {}); });
+          await installTracker(page);
+        }
         if (this.closing) throw new Error('service is shutting down');
         if (this.goneOwners.has(owner)) throw new Error('connection closed'); // owner left while we were launching
         const s = {
-          id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, own, tmpDir,
+          id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
         };
         this.sessions.set(s.id, s);
         page.on('close', () => this.dispose(s, 'page-closed'));
         page.on('crash', () => this.dispose(s, 'page-crashed'));
         ctx.on('close', () => this.dispose(s, 'context-closed'));
-        own?.on('disconnected', () => this.dispose(s, 'browser-crashed'));
         ctx.on('page', (extra) => { if (ctx.pages().length > this.cfg.maxPagesPerSession) extra.close().catch(() => {}); });
         return s;
       } catch (e) {
         if (ctx) await Promise.race([ctx.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
-        if (own) await Promise.race([own.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
-        if (tmpDir) await fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-        release();
+        if (await this.reclaim({ dir, tmpDir, release, what: `failed open (${def.name})` })) {
+          if (claimed) unclaimProfile(profileDir);
+        }
         throw e;
       }
     })();
@@ -260,19 +295,32 @@ export class SessionManager {
     if (this.closed.size > 200) this.closed.delete(this.closed.keys().next().value);
     if (s.handoff) s.handoff.cancel();
     s.disposing = (async () => {
+      let reclaimed = false;
       try {
-        await Promise.race([s.ctx.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
-        if (s.own) await Promise.race([s.own.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
-        if (s.tmpDir) await fs.promises.rm(s.tmpDir, { recursive: true, force: true }).catch(() => {});
+        await Promise.race([s.ctx.close().catch(() => {}), sleep(this.closeDeadlineMs)]);
         await Promise.allSettled([...s.writes]); // a screenshot being written must not outlive the directory removal
         await fs.promises.rm(path.join(this.cfg.dataDir, 'shots', s.tenant, s.id), { recursive: true, force: true }).catch(() => {});
-      } finally {
-        s.release();
+        reclaimed = await this.reclaim({ dir: s.dir, tmpDir: s.tmpDir, release: s.release, what: `session ${s.id} (${s.engine})` });
+      } catch {
+        if (!reclaimed && !s.dir) s.release(); // shared-browser context: nothing per session left to wait for
       }
     })();
     this.disposals.add(s.disposing);
     s.disposing.finally(() => this.disposals.delete(s.disposing));
     return s.disposing;
+  }
+
+  // After a persistent context closed (or its close timed out): no process may still run on its directory before the
+  // temp profile is deleted and the capacity released. If one survives SIGKILL, the slot stays taken (and is logged).
+  async reclaim({ dir, tmpDir, release, what }) {
+    if (dir && !(await terminate(dir))) {
+      console.error(`bosun: ${what}: browser still running on ${dir} after SIGKILL; keeping its slot`);
+      this.stuck.add({ dir, tmpDir, release, what });
+      return false;
+    }
+    if (tmpDir) await fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    release();
+    return true;
   }
 
   close(owner, id) { return this.dispose(this.get(owner, id), 'closed'); }
@@ -298,6 +346,7 @@ export class SessionManager {
     for (const s of [...this.sessions.values()]) this.dispose(s, 'shutdown');
     // Includes disposals that started earlier (explicit close, disconnect) and are still closing.
     await Promise.race([Promise.allSettled([...this.disposals]), sleep(CLOSE_DEADLINE_MS + 1000)]);
+    for (const x of [...this.stuck]) { this.stuck.delete(x); await this.reclaim(x); }
     const bp = this.browserP;
     this.browserP = null;
     if (bp) await Promise.race([bp.then((b) => b.close(), () => {}), sleep(CLOSE_DEADLINE_MS)]).catch(() => {});
