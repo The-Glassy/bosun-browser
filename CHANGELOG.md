@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — engines
+
+### Added
+
+- **Engines:** `ENGINE` (default `chromium`) and an optional `engine` parameter on `session_open`:
+  `patchright` (Chromium fork without the CDP/automation leaks; persistent context per session, its recommended
+  settings) and `camoufox` (anti-detect Firefox; camoufox-js `launchOptions()` driven by our Playwright 1.64, one
+  browser per session). Both are `optionalDependencies` (`npm ci --omit=optional` skips them). `session_open` and
+  `sessions` report the engine.
+- Live view for non-CDP engines: frames from Playwright's `page.screencast`, input via `page.mouse`/`page.keyboard`.
+- `npm run test:engines` runs the suite once per installed engine; `npm run measure:engines` re-runs the
+  bot-detection/RAM measurements in [docs/ENGINES.md](docs/ENGINES.md).
+- `CAMOUFOX_OS` (fingerprint OS, default: the host's).
+
+### Changed
+
+- The startup refuses to run if the default `ENGINE` is not installed (clear message with the install command).
+  Requesting a missing engine on `session_open` is an error; nothing falls back to another engine silently.
+- Persistent profiles record their engine family (`bosun-profile.json`); existing profiles count as Chromium.
+- The password tracker init script is only installed where it runs in an isolated world (Camoufox). On Chromium and
+  patchright it was visible to pages (a `Symbol(bosun.sensitive)` on `window`, a wrapped `attachShadow`); instead
+  Bosun notes password inputs when a handoff starts and every 500 ms while it runs.
+
 ## 0.0.2 — review fixes (Codex round 1)
 
 Fixes from the first security/correctness review (B01–B26). Tool names and parameters are unchanged except where

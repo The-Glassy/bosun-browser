@@ -9,6 +9,9 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 ## What it does today
 
 - Headful Chromium (Playwright) under Xvfb — fewer bot flags than headless.
+- **Engines** (`ENGINE`, or `engine` on `session_open`): `chromium` (default), `patchright` (Chromium without the
+  CDP/automation leaks) and `camoufox` (anti-detect Firefox). See [docs/ENGINES.md](docs/ENGINES.md) for what each one
+  passes and what it costs.
 - MCP server over **stdio** (Claude Code, Codex, …) or **WebSocket** (shared service).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`.
@@ -24,9 +27,12 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 ## Run
 
 ```sh
-npm ci
+npm ci                                   # add --omit=optional to skip patchright/camoufox
 npx playwright install --with-deps chromium
+npx patchright install chromium          # only for ENGINE=patchright
+npx camoufox-js fetch                    # only for ENGINE=camoufox (Node 22+)
 npm test            # headless, against a local test server; no internet needed
+npm run test:engines  # the same suite once per installed engine
 
 # stdio (an MCP client spawns it)
 xvfb-run -a node src/server.mjs
@@ -58,7 +64,9 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `LIVE_HOST` / `LIVE_PORT` / `LIVE_BASE_URL` | `127.0.0.1` / – / derived | live view listener and the URL put in links |
 | `HANDOFF_TTL_SEC` | 900 | handoff link lifetime |
 | `BROWSER_DATA` | `./data` | profiles (`profiles/<tenant>/<name>`) and saved screenshots |
-| `HEADLESS` | – | `1` = headless Chromium |
+| `HEADLESS` | – | `1` = headless browser (more detectable; use for tests) |
+| `ENGINE` | `chromium` | default engine: `chromium`, `patchright`, `camoufox` (must be installed, or startup fails) |
+| `CAMOUFOX_OS` | host OS | OS of the Camoufox fingerprint: `macos`, `windows`, `linux` |
 | `MAX_SESSIONS` | 3 | sessions across all tenants |
 | `MAX_SESSIONS_PER_TENANT` | `MAX_SESSIONS` | |
 | `IDLE_TIMEOUT_SEC` | 900 | close sessions unused this long (`0` = never; a session in handoff is never idle) |
@@ -67,6 +75,18 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `SAVE_SHOTS` / `SHOTS_PER_SESSION` | – / 20 | `1` = also keep screenshots on disk (0600, deleted when the session closes) |
 
 All numbers are validated at startup; a bad value stops the service instead of silently disabling a limit.
+
+### Engines
+
+| engine | process model | live view | notes |
+|---|---|---|---|
+| `chromium` | one shared browser, a context per session | CDP screencast | Playwright's Chromium |
+| `patchright` | a browser per session (persistent context; temp profile for ephemeral sessions) | CDP screencast | patchright's recommended setup: no custom UA, no automation-flag args, window-sized viewport |
+| `camoufox` | a browser per session | Playwright screencast + `page.mouse`/`keyboard` | fingerprint (window, screen, fonts, UA) from Camoufox; `humanize` off (hangs clicks with Playwright 1.64) |
+
+A session asking for an engine that isn't installed gets an error naming the install command; there is no silent
+fallback to another engine. A persistent profile remembers its engine family (Chromium or Firefox) and refuses the
+other. patchright and camoufox-js are `optionalDependencies`; their browsers are separate downloads.
 
 Chromium spawns many threads: under systemd give the unit a generous `TasksMax` (e.g. 2000).
 
@@ -86,6 +106,10 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
   After **Give up / timeout / cancel** those fields are emptied before the agent resumes; if that fails, the
   session is closed instead. If a frame can't be inspected, `read`/`screenshot` fail rather than return unmasked
   output. The handoff ends only after the human's last input has reached the page.
+- A password field the human reveals with a show-password toggle stays masked: Bosun notes password inputs when the
+  handoff starts and every 500 ms during it (Camoufox also from document start, via an init script that pages can't
+  see). On `chromium` Bosun's helpers run in the page's own JavaScript world, so a page can detect them; on
+  `patchright` and `camoufox` they run in an isolated world.
 - Not protected: text the human types into ordinary fields, secrets the page itself echoes as normal text, custom
   widgets that aren't `<input>`/`<textarea>` (e.g. per-digit OTP boxes built from `div`s), closed shadow roots.
   Those are visible to the agent after Done. Ask the human to finish the login (submit it) before pressing Done.
