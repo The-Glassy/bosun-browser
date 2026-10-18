@@ -43,6 +43,8 @@ export class SessionManager {
     this.launches = 0;
     this.closing = false;
     fs.mkdirSync(path.join(cfg.dataDir, 'profiles'), { recursive: true });
+    // Temp profiles of ephemeral per-browser sessions: anything left here is from a process that was killed.
+    fs.rmSync(path.join(cfg.dataDir, 'tmp'), { recursive: true, force: true });
     if (cfg.idleTimeoutMs > 0) {
       this.reaper = setInterval(() => this.reapIdle(), Math.min(30_000, Math.max(250, cfg.idleTimeoutMs / 4)));
       this.reaper.unref();
