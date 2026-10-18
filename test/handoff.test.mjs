@@ -2,7 +2,7 @@
 // started before takeover finish before the human gets the tab, the link is one-time, secrets stay masked.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { startBosun, startPageServer, connect, viewer, until, sleep } from './helpers.mjs';
+import { startBosun, startPageServer, connect, viewer, until, sleep, ENGINE } from './helpers.mjs';
 
 let pages, svc;
 before(async () => { pages = await startPageServer(); svc = await startBosun(); });
@@ -35,7 +35,7 @@ test('every page tool is refused during a handoff, and nothing leaks URL/title',
     assert.ok(!r.text.includes('424242') && !r.text.includes(pages.base), `${tool} leaked: ${r.text}`);
   }
   const list = await c.call('sessions');
-  assert.deepEqual(list.json(), [{ id: s, profile: 'ephemeral', handoff: 'active' }]);
+  assert.deepEqual(list.json(), [{ id: s, profile: 'ephemeral', engine: ENGINE, handoff: 'active' }]);
   const w = await c.call('handoff_wait', { session: s, timeoutSec: 1 });
   assert.equal(w.json().status, 'still_waiting');
   assert.ok(!w.text.includes('424242') && !w.text.includes(pages.base), w.text);
@@ -220,7 +220,7 @@ test('handoff_wait honours cancellation and clears its timer', async () => {
   await c.close();
 });
 
-test('a password field revealed by the page before any scan stays masked', async () => {
+test('a password field revealed by the page before any scan stays masked (camoufox: init-script tracker)', { skip: ENGINE !== 'camoufox' && 'tracker init script is only used where it is invisible to the page' }, async () => {
   const c = await connect(svc);
   const s = await c.open();
   await c.call('navigate', { session: s, url: `${pages.base}/toggle` });
@@ -274,5 +274,37 @@ test('read/screenshot fail closed when a frame cannot be inspected', async () =>
     assert.match(r.text, /could not inspect a frame/, tool);
   }
   page.frames = real;
+  await c.close();
+});
+
+test('a password the human types and then reveals (show-password) stays masked after Done', async () => {
+  const c = await connect(svc);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${pages.base}/login` });
+  await c.call('click', { session: s, selector: '#unnamed' }); // type=password, no label/name/id hints
+  const link = (await c.call('request_human', { session: s, reason: 'log in' })).json().link;
+  const v = await viewer(link);
+  await until(() => v.frames > 0);
+  v.ws.send(JSON.stringify({ type: 'text', text: 'Revealed-Secret-1' }));
+  await sleep(700); // at least one note poll
+  const page = svc.manager.sessions.get(s).page;
+  await page.$eval('#unnamed', (e) => { e.type = 'text'; }); // the human pressed "show password"
+  v.ws.send(JSON.stringify({ type: 'done' }));
+  assert.equal((await c.call('handoff_wait', { session: s, timeoutSec: 5 })).json().status, 'human-done');
+  assert.equal(await page.$eval('#unnamed', (e) => e.type), 'text');
+  for (const mode of ['a11y', 'text']) assert.ok(!(await c.call('read', { session: s, mode })).text.includes('Revealed-Secret-1'), mode);
+  await c.close();
+});
+
+test('the page cannot see Bosun\'s tracker on stealth engines', { skip: ENGINE === 'chromium' && 'plain Chromium evaluates in the page world' }, async () => {
+  const c = await connect(svc);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${pages.base}/probe` });
+  const { sensitiveValues } = await import('../src/redact.mjs');
+  const page = svc.manager.sessions.get(s).page;
+  await sensitiveValues(page); // Bosun has scanned
+  await c.call('click', { session: s, selector: '#check' });
+  const r = await c.call('read', { session: s, mode: 'text' });
+  assert.match(r.text, /syms=\[\] shadow=native/, r.text);
   await c.close();
 });

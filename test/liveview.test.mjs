@@ -43,7 +43,7 @@ test('a handoff that ends while a viewer is attaching never streams or accepts i
     attachGate.resolve();
     await until(() => cdp.detached);
     await until(() => v.closed);
-    assert.deepEqual(cdp.sent, []);
+    assert.deepEqual(cdp.sent.filter((m) => m !== 'Page.stopScreencast'), []); // never started, no input
     assert.equal(v.frames, 0);
   });
 });
@@ -92,7 +92,10 @@ test('inputs run strictly in order, one at a time', async () => {
     const { page, cdp } = fakePage();
     let inFlight = 0, maxInFlight = 0;
     const orig = cdp.send;
-    cdp.send = async (m, p) => { inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); await sleep(5); await orig(m, p); inFlight--; };
+    cdp.send = async (m, p) => {
+      if (!m.startsWith('Input.')) return orig(m, p); // frame acks may overlap input; input must not overlap input
+      inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); await sleep(5); await orig(m, p); inFlight--;
+    };
     const h = live.start(page, 'r');
     const v = await viewer(h.url);
     await until(() => v.frames > 0);
@@ -161,4 +164,61 @@ test('close() ends every handoff and disconnects viewers', async () => {
   assert.equal(await h.wait, 'cancelled');
   await until(() => v.closed);
   assert.equal(live.size, 0);
+});
+
+// Firefox/Camoufox path: frames from page.screencast, input through page.mouse / page.keyboard.
+function fakePlaywrightPage() {
+  const calls = [];
+  let onFrame = null, timer = null;
+  const page = {
+    calls,
+    viewportSize: () => null,
+    evaluate: async () => ({ width: 800, height: 600 }),
+    screencast: {
+      async start(o) {
+        calls.push(['start', o.size]);
+        onFrame = o.onFrame;
+        let busy = false;
+        timer = setInterval(async () => {
+          if (busy || !onFrame) return;
+          busy = true;
+          await onFrame({ data: Buffer.from('jpeg'), viewportWidth: 800, viewportHeight: 600 }); // awaits the ack
+          busy = false;
+        }, 5);
+      },
+      async stop() { calls.push(['stop']); clearInterval(timer); onFrame = null; },
+    },
+    mouse: { move: async (x, y) => calls.push(['move', x, y]), down: async () => calls.push(['down']), up: async () => calls.push(['up']), wheel: async (dx, dy) => calls.push(['wheel', dy]) },
+    keyboard: { insertText: async (t) => calls.push(['text', t]), down: async (k) => calls.push(['keydown', k]), up: async (k) => calls.push(['keyup', k]) },
+  };
+  return page;
+}
+
+test('playwright driver: screencast frames, mouse/keyboard input, stopped on finish', async () => {
+  await withLive(async (live) => {
+    const page = fakePlaywrightPage();
+    const h = live.start(page, 'r', { driver: 'playwright' });
+    const v = await viewer(h.url);
+    await until(() => v.frames > 2);
+    assert.deepEqual(page.calls[0], ['start', { width: 800, height: 600 }]);
+    v.ws.send(JSON.stringify({ type: 'click', x: 10, y: 20 }));
+    v.ws.send(JSON.stringify({ type: 'wheel', x: 1, y: 2, dy: 50 }));
+    v.ws.send(JSON.stringify({ type: 'text', text: 'hi' }));
+    v.ws.send(JSON.stringify({ type: 'key', key: 'Enter' }));
+    await until(() => page.calls.some((c) => c[0] === 'keyup'));
+    const input = page.calls.filter((c) => c[0] !== 'start');
+    assert.deepEqual(input, [['move', 10, 20], ['down'], ['up'], ['move', 1, 2], ['wheel', 50], ['text', 'hi'], ['keydown', 'Enter'], ['keyup', 'Enter']]);
+    v.ws.send(JSON.stringify({ type: 'done' }));
+    assert.equal(await h.wait, 'human-done');
+    assert.deepEqual(page.calls.at(-1), ['stop']);
+    const n = page.calls.length;
+    await sleep(50);
+    assert.equal(page.calls.length, n); // nothing after finish
+  });
+});
+
+test('unknown live-view driver is refused', async () => {
+  await withLive(async (live) => {
+    assert.throws(() => live.start(fakePlaywrightPage(), 'r', { driver: 'vnc' }), /unknown live-view driver/);
+  });
 });
