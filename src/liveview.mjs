@@ -1,7 +1,8 @@
 // Live view + human handoff.
 // GET /v/<token> serves a page with a canvas streaming the tab (CDP screencast) and forwarding input (CDP Input.*).
 // One viewer at a time: a WebSocket on /ws/<token> attaches while nobody else is connected (or the connected viewer
-// has gone quiet for staleMs); the link can be reopened until Done, Give up, timeout or cancel revoke it for good.
+// has gone quiet for staleMs: no pong or message); the link can be reopened until Done, Give up, timeout or cancel
+// revoke it for good. There is no per-tab credential: a duplicated tab or a reconnect waits like any other viewer.
 import http from 'http';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -36,6 +37,8 @@ button{font:inherit;font-size:15px;min-height:44px;padding:0 11px;border-radius:
 #mode button[aria-pressed=true],#kb[aria-pressed=true]{background:#636366}
 #t{position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;font-size:16px;border:0;padding:0}
 body.ended #wrap,body.ended footer{opacity:.5;pointer-events:none}
+footer .row{flex-wrap:wrap} #pf{flex-wrap:nowrap} #keys{flex-wrap:nowrap}
+@media (max-width:359px){.row{gap:4px} button{font-size:14px;padding:0 6px} #mode button{padding:0 6px} #eye{padding:0}}
 </style></head><body>
 <header><span id="reason">🤖 ${esc(reason)}</span><span id="st">connecting…</span></header>
 <main id="wrap"><div id="stage"><canvas id="c" width="1366" height="900"></canvas><div id="cur"><svg width="20" height="20" viewBox="0 0 20 20"><path d="M1 1v16l4.5-4.2 3 6.4 2.6-1.2-3-6.3H14z" fill="#fff" stroke="#000" stroke-width="1.2"/></svg></div></div></main>
@@ -46,12 +49,11 @@ body.ended #wrap,body.ended footer{opacity:.5;pointer-events:none}
 </footer>
 <input id="t" autocomplete="off" autocapitalize="off" autocorrect="off" aria-hidden="true">
 <script nonce="${nonce}">
-const tok='${token}',kk='bosun-viewer-'+tok,$=(id)=>document.getElementById(id);
+const tok='${token}',$=(id)=>document.getElementById(id);
 const c=$('c'),x=c.getContext('2d'),st=$('st'),t=$('t'),wrap=$('wrap'),stage=$('stage'),cur=$('cur'),p=$('p'),ins=$('ins'),eye=$('eye');
 let vw=1366,vh=900,ws=null,ended=false,cx=683,cy=450,mode='tap',rt=0;
 const status=(s)=>{st.textContent=s};
 const hint=()=>{if(!ended&&ws&&ws.readyState===1)status(mode==='pad'?'live — drag to move · tap to click · 2 fingers scroll · hold to drag':'live — tap to click, drag to scroll')};
-const key=()=>{try{return sessionStorage.getItem(kk)}catch{return null}};
 // Canvas fitted into the space between the bars; the cursor overlay is positioned in page coordinates.
 function layout(){const s=Math.min(wrap.clientWidth/c.width,wrap.clientHeight/c.height);stage.style.width=Math.floor(c.width*s)+'px';stage.style.height=Math.floor(c.height*s)+'px';drawCur()}
 function drawCur(){cur.style.transform='translate('+(cx/vw*stage.clientWidth)+'px,'+(cy/vh*stage.clientHeight)+'px)'}
@@ -61,8 +63,7 @@ const retry=(ms)=>{clearTimeout(rt);rt=setTimeout(connect,ms)};
 function finish(msg){ended=true;clearTimeout(rt);status(msg);document.body.classList.add('ended');try{if(ws)ws.close()}catch{}}
 function connect(){
  if(ended||ws)return;
- const k=key();
- const s=ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/'+tok+(k?'?v='+encodeURIComponent(k):''));
+ const s=ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/'+tok);
  s.onopen=hint;
  s.onclose=(e)=>{if(ws!==s)return;ws=null;if(ended)return;
   // One viewer at a time: wait while another device has it; otherwise ask whether the link is still valid.
@@ -70,7 +71,6 @@ function connect(){
   status('reconnecting…');
   fetch(location.pathname,{method:'HEAD',cache:'no-store'}).then((r)=>{if(r.ok)retry(1000);else finish('This link has expired or the handoff is over.')},()=>retry(3000))};
  s.onmessage=(e)=>{const m=JSON.parse(e.data);
-  if(m.viewer){try{sessionStorage.setItem(kk,m.viewer)}catch{}}
   if(m.cursor){cx=m.cursor.x;cy=m.cursor.y;drawCur()}
   if(m.frame){vw=m.w;vh=m.h;const i=new Image();i.onload=()=>{if(c.width!==i.width||c.height!==i.height){c.width=i.width;c.height=i.height;layout()}x.drawImage(i,0,0)};i.src='data:image/jpeg;base64,'+m.frame}
   if(m.end)finish(m.end)};
@@ -171,7 +171,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // captures the viewport once (static pages produce no screencast frames). size is the CSS viewport after start().
 async function cdpDriver(page) {
   const cdp = await page.context().newCDPSession(page);
-  const vp = page.viewportSize() || { width: 1366, height: 900 };
+  // The CSS viewport; measured where the page has no fixed viewport (patchright: the window decides).
+  const measure = async () => {
+    const m = await cdp.send('Page.getLayoutMetrics').catch(() => null);
+    return m?.cssLayoutViewport?.clientWidth ? { width: m.cssLayoutViewport.clientWidth, height: m.cssLayoutViewport.clientHeight } : null;
+  };
+  const vp = page.viewportSize() || await measure() || { width: 1366, height: 900 };
   const mouse = (type, x, y, buttons) => cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons, clickCount: 1 });
   return {
     size: vp,
@@ -182,8 +187,9 @@ async function cdpDriver(page) {
       await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 60, maxWidth: vp.width, maxHeight: vp.height, everyNthFrame: 1 });
     },
     async snapshot() {
+      const size = page.viewportSize() || await measure() || vp;
       const r = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 60 });
-      return r?.data ? { data: r.data, w: vp.width, h: vp.height } : null;
+      return r?.data ? { data: r.data, w: size.width, h: size.height } : null;
     },
     move: (x, y, pressed) => cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: pressed ? 'left' : 'none', buttons: pressed ? 1 : 0 }),
     mouse: (dir, x, y) => (dir === 'down' ? mouse('mousePressed', x, y, 1) : mouse('mouseReleased', x, y, 0)),
@@ -211,8 +217,9 @@ async function playwrightDriver(page) {
       });
     },
     async snapshot() {
+      const size = page.viewportSize() || await page.evaluate(() => ({ width: innerWidth, height: innerHeight })).catch(() => d.size);
       const buf = await page.screenshot({ type: 'jpeg', quality: 60, timeout: 5000 });
-      return { data: buf.toString('base64'), w: d.size.width, h: d.size.height };
+      return { data: buf.toString('base64'), w: size.width, h: size.height };
     },
     move: (x, y) => page.mouse.move(x, y),
     async mouse(dir, x, y, guard) {
@@ -266,11 +273,6 @@ export function glidePath(from, to, rnd = Math.random) {
   return pts;
 }
 
-const safeEqual = (a, b) => {
-  const d = (s) => crypto.createHash('sha256').update(String(s)).digest();
-  return crypto.timingSafeEqual(d(a), d(b));
-};
-
 function reject(sock, code, text) {
   try { sock.end(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); } catch {}
   sock.destroy();
@@ -309,22 +311,17 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
   srv.on('upgrade', (req, sock, head) => {
     sock.on('error', () => {});
     try {
-      const [p, q = ''] = String(req.url).split('?');
+      const [p] = String(req.url).split('?');
       const m = /^\/ws\/([a-f0-9]{32})$/.exec(p);
       const h = m && handoffs.get(m[1]);
       if (!h || h.done) return reject(sock, 404, 'Not Found');
       if (req.headers.origin && req.headers.origin !== origin) return reject(sock, 403, 'Forbidden');
-      const key = new URLSearchParams(q).get('v');
       wss.handleUpgrade(req, sock, head, (ws) => {
         ws.on('error', () => {});
         if (h.done) return ws.close(4410, 'handoff ended');
-        // One viewer at a time. A viewer heard from within staleMs keeps the link, except against its own tab
-        // reconnecting (it holds the current viewer key); a viewer that went quiet can be replaced.
-        const cur = h.viewer;
-        const own = !!key && !!h.viewerKey && safeEqual(key, h.viewerKey);
-        if (cur && !own && Date.now() - cur.lastSeen < staleMs) return ws.close(4409, 'another viewer is connected');
-        h.viewerKey = crypto.randomBytes(16).toString('hex');
-        attach(h, ws, h.viewerKey).catch(() => {});
+        // One viewer at a time. A viewer heard from within staleMs keeps the link; one that went quiet is replaced.
+        if (h.viewer && Date.now() - h.viewer.lastSeen < staleMs) return ws.close(4409, 'another viewer is connected');
+        attach(h, ws).catch(() => {});
       });
     } catch {
       reject(sock, 400, 'Bad Request');
@@ -333,17 +330,16 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
 
   const active = (h, v) => !h.done && h.viewer === v && !v.closed && v.ws.readyState === WebSocket.OPEN;
 
-  async function attach(h, ws, issued) {
+  async function attach(h, ws) {
     const v = { ws, drv: null, queue: [], pumping: false, pressed: false, closed: false, drops: 0, lastSeen: Date.now(), lastFrameAt: 0, hb: null, refresh: null, snapP: null };
     // Register before the first await so finish() or a closing socket can always find and tear this viewer down.
-    if (h.viewer) teardown(h, h.viewer); // single viewer: the newcomer replaces the old (stale or own) socket
+    if (h.viewer) teardown(h, h.viewer); // single viewer: the newcomer replaces a stale one
     h.viewer = v;
     ws.on('close', () => teardown(h, v));
     ws.on('pong', () => { v.lastSeen = Date.now(); });
     v.hb = setInterval(() => { if (Date.now() - v.lastSeen > DEAD_MS) return teardown(h, v); try { ws.ping(); } catch {} }, Math.min(PING_MS, staleMs / 2));
     v.hb.unref();
     ws.on('message', (raw) => { v.lastSeen = Date.now(); onInput(h, v, raw); });
-    ws.send(JSON.stringify({ viewer: issued }));
     if (h.mouse) ws.send(JSON.stringify({ cursor: h.mouse }));
     // A (re)connecting viewer sees the page at once, before the stream has started.
     if (h.lastFrame) { ws.send(JSON.stringify(h.lastFrame)); v.lastFrameAt = Date.now(); }
@@ -399,11 +395,12 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     if (!m) return;
     if (m.type === 'done') return finish(h, 'human-done');
     if (m.type === 'giveup') return finish(h, 'human-gave-up');
-    // Coalesce: a queued move is superseded by the next one, queued scrolling at one point adds up.
+    // Coalesce: a queued move (or release) is superseded by the next one, queued scrolling at one point adds up.
     const last = v.queue.at(-1);
-    if (m.type === 'move' && last?.type === 'move') v.queue[v.queue.length - 1] = m;
+    // A release is never dropped: repeated ones collapse, and one slot beyond MAX_QUEUE is kept for it.
+    if ((m.type === 'move' || m.type === 'up') && last?.type === m.type) v.queue[v.queue.length - 1] = m;
     else if (m.type === 'wheel' && last?.type === 'wheel' && last.x === m.x && last.y === m.y) { last.dx = clampDelta(last.dx + m.dx); last.dy = clampDelta(last.dy + m.dy); }
-    else if (v.queue.length < MAX_QUEUE || m.type === 'up') v.queue.push(m);
+    else if (v.queue.length < MAX_QUEUE || (m.type === 'up' && v.queue.length === MAX_QUEUE)) v.queue.push(m);
     else return;
     pump(h, v);
   }
@@ -423,6 +420,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       if (!final && v.queue[0]?.type === 'move') return;
       guard(); await v.drv.move(pt.x, pt.y, !!v.pressed);
       h.mouse = pt;
+      if (v.pressed) v.pressed = pt; // a drag cut off by teardown is released where the pointer is
       if (stepMs && !v.queue.length) await sleep(stepMs);
     }
   }
@@ -538,7 +536,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       const ttl = opts.ttlMs || ttlMs;
       const driver = opts.driver || 'cdp';
       if (!DRIVERS[driver]) throw new Error(`unknown live-view driver ${driver}`);
-      const h = { token, page, reason, driver, resolve, viewer: null, viewerKey: null, done: false, expiresAt: Date.now() + ttl, teardowns: new Set(), drainFailed: false, lastFrame: null, mouse: null };
+      const h = { token, page, reason, driver, resolve, viewer: null, done: false, expiresAt: Date.now() + ttl, teardowns: new Set(), drainFailed: false, lastFrame: null, mouse: null };
       h.timer = setTimeout(() => finish(h, 'handoff-timeout'), ttl);
       h.timer.unref?.();
       handoffs.set(token, h);

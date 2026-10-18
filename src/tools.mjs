@@ -21,9 +21,10 @@ async function wall(p) {
   } catch {}
   return null;
 }
-// A bot check that keeps reloading itself (typically Cloudflare refusing the IP): more than LOOP_NAVS main-frame
-// navigations to the same page within LOOP_WINDOW_MS while it looks like a bot check, or LOOP_CTX_ERRORS page tools
-// failing because the page navigated away under them.
+// A bot check that keeps reloading itself (typically Cloudflare refusing the IP): the page looks like a bot check
+// (now, or at the same URL within LOOP_WINDOW_MS) and either had more than LOOP_NAVS main-frame navigations to that
+// URL within LOOP_WINDOW_MS, or LOOP_CTX_ERRORS page tools failed because it navigated away under them. A page that
+// merely reloads itself (a dashboard) is not reported.
 export const BOT_LOOP = 'bot check keeps reloading (likely IP reputation); try engine chromium + request_human, or another network';
 const LOOP_WINDOW_MS = 30_000, LOOP_NAVS = 5, LOOP_CTX_ERRORS = 3;
 const CTX_GONE = /Execution context was destroyed|interrupted by another navigation/i;
@@ -34,9 +35,21 @@ function reloads(s) {
   const here = urlKey(s.page.url());
   return s.navs.filter((n) => n.at === here).length;
 }
+// Remember that the page at its current URL looked like a bot check (navigate/click see it before the loop shows).
+function noteWall(s, w) { if (w) s.wallSeen = { t: Date.now(), at: urlKey(s.page.url()) }; return w; }
+async function looksLikeBotCheck(s) {
+  const seen = s.wallSeen;
+  if (seen && seen.at === urlKey(s.page.url()) && seen.t > Date.now() - LOOP_WINDOW_MS) return true;
+  for (let i = 0; i < 3; i++) { // the title may be mid-reload
+    if (noteWall(s, await wall(s.page))) return true;
+    await sleep(250);
+  }
+  return false;
+}
 async function botLoop(s) {
-  if (reloads(s) <= LOOP_NAVS) return false;
-  return !!((await wall(s.page)) || (await sleep(300), await wall(s.page))); // the title may be mid-reload once
+  prune(s.ctxErrors, Date.now());
+  if (reloads(s) <= LOOP_NAVS && s.ctxErrors.length < LOOP_CTX_ERRORS) return false;
+  return looksLikeBotCheck(s);
 }
 
 const ok = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1) }] });
@@ -67,17 +80,15 @@ const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
 
 export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 } }) {
   const server = new McpServer({ name: 'bosun', version: '0.0.2' });
-  // Page tools: serialized per session, and turned into BOT_LOOP when the page is stuck in a reloading bot check.
+  // Page tools: serialized per session, and turned into BOT_LOOP (success or failure) when the page is stuck in a
+  // reloading bot check.
   const run = (id, fn) => manager.run(owner, id, async (s) => {
     let r;
     try {
       r = await fn(s);
     } catch (e) {
-      if (CTX_GONE.test(String(e?.message || e))) {
-        s.ctxErrors.push(Date.now());
-        prune(s.ctxErrors, Date.now());
-        if (s.ctxErrors.length >= LOOP_CTX_ERRORS || reloads(s) > LOOP_NAVS) throw new Error(BOT_LOOP);
-      }
+      if (CTX_GONE.test(String(e?.message || e))) s.ctxErrors.push(Date.now());
+      if (await botLoop(s).catch(() => false)) throw new Error(BOT_LOOP);
       throw e;
     }
     if (await botLoop(s)) throw new Error(BOT_LOOP);
@@ -109,7 +120,7 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
     return run(a.session, async (s) => {
       const r = await s.page.goto(url, { waitUntil: a.wait || 'domcontentloaded', timeout: 45000 });
       await s.page.waitForTimeout(1200);
-      const w = await wall(s.page);
+      const w = noteWall(s, await wall(s.page));
       return ok({ status: r?.status(), ...(await pageInfo(s.page)), ...(w ? { blocked: w, hint: 'call request_human to let a person solve it' } : {}) });
     });
   });
@@ -139,7 +150,7 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
   tool('click', 'Click an element (by ref from read, role+name, selector or text).', { session: str(40), ...target }, async (a) => run(a.session, async (s) => {
     await locate(s.page, a).click({ timeout: 15000 });
     await s.page.waitForTimeout(1000);
-    const w = await wall(s.page);
+    const w = noteWall(s, await wall(s.page));
     return ok({ ...(await pageInfo(s.page)), ...(w ? { blocked: w } : {}) });
   }));
 

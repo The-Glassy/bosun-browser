@@ -125,7 +125,6 @@ test('simultaneous claims: exactly one socket gets the link', async () => {
     await sleep(200);
     const open = res.filter((r) => r.status === 'fulfilled' && !r.value.closed).map((r) => r.value);
     assert.equal(open.length, 1);
-    assert.ok(open[0].key);
     h.cancel();
   });
 });
@@ -153,8 +152,8 @@ test('oversized live-view messages close only that socket', async () => {
     const v = await viewer(h.url);
     v.ws.send('x'.repeat(64 * 1024));
     await until(() => v.closed);
-    assert.equal(live.size, 1); // handoff still alive; the key holder may reconnect
-    const v2 = await viewer(h.url, { key: v.key });
+    assert.equal(live.size, 1); // handoff still alive; the human may reconnect
+    const v2 = await viewer(h.url);
     assert.equal(v2.closed, false);
     h.cancel();
   });
@@ -288,7 +287,7 @@ test('a reconnecting viewer waits until the previous viewer has drained and stop
     await until(() => page.calls.some((c) => c[0] === 'down'));
     v1.ws.close(); // phone drops; its press is still in flight
     await until(() => v1.closed);
-    const v2 = await viewer(h.url, { key: v1.key });
+    const v2 = await viewer(h.url);
     v2.ws.send(JSON.stringify({ type: 'text', text: 'second' }));
     await sleep(100);
     assert.ok(!page.calls.some((c) => c[0] === 'text'), 'second viewer ran before the first drained');
@@ -492,6 +491,61 @@ test('playwright driver: moves, drag and snapshot refresh', async () => {
     const iDown = seq.findIndex((c) => c[0] === 'down');
     assert.ok(seq.slice(iDown + 1, -1).length >= 5 && seq.slice(iDown + 1, -1).every((c) => c[0] === 'move'));
     assert.deepEqual(seq.at(-1), ['up']);
+    h.cancel();
+  }, { refreshMs: 100 });
+});
+
+test('a flood of releases while input is blocked stays bounded and keeps one release', async () => {
+  await withLive(async (live) => {
+    const inputGate = deferred();
+    const { page, cdp } = fakePage({ inputGate });
+    const h = live.start(page, 'r');
+    const v = await viewer(h.url);
+    await until(() => v.frames > 0);
+    v.ws.send(JSON.stringify({ type: 'down', x: 5, y: 5 }));
+    await until(() => cdp.sent.includes('Input.dispatchMouseEvent')); // the move to the press point is stuck
+    for (let i = 0; i < 70; i++) v.ws.send(JSON.stringify({ type: 'key', key: 'Tab' })); // fill the queue
+    for (let i = 0; i < 5000; i++) v.ws.send(JSON.stringify({ type: i % 2 ? 'up' : 'move', x: 5 + (i % 50), y: 5 }));
+    await sleep(200);
+    inputGate.resolve();
+    await until(() => cdp.params.some(([, p]) => p?.type === 'mouseReleased'));
+    await sleep(100);
+    const keys = cdp.params.filter(([m, p]) => m === 'Input.dispatchKeyEvent' && p.type === 'keyDown').length;
+    assert.ok(keys <= 64, `${keys} queued keys`);
+    assert.equal(cdp.params.filter(([, p]) => p?.type === 'mouseReleased').length, 1);
+    h.cancel();
+  });
+});
+
+test('a drag cut off by Done is released where the pointer is, not where it was pressed', async () => {
+  await withLive(async (live) => {
+    const { page, cdp } = fakePage();
+    const h = live.start(page, 'r');
+    const v = await viewer(h.url);
+    await until(() => v.frames > 0);
+    v.ws.send(JSON.stringify({ type: 'move', x: 10, y: 50 }));
+    v.ws.send(JSON.stringify({ type: 'down', x: 10, y: 50 }));
+    v.ws.send(JSON.stringify({ type: 'move', x: 90, y: 50 }));
+    await until(() => moved(cdp).at(-1)?.x === 90);
+    v.ws.send(JSON.stringify({ type: 'done' }));
+    assert.equal(await h.wait, 'human-done');
+    const up = cdp.params.find(([, p]) => p?.type === 'mouseReleased')[1];
+    assert.deepEqual([up.x, up.y], [90, 50]);
+  });
+});
+
+test('without a fixed viewport (patchright) frames and the cursor use the measured CSS viewport', async () => {
+  await withLive(async (live) => {
+    const { page, cdp } = fakePage({ screencastFrames: 0 });
+    page.viewportSize = () => null;
+    const send = cdp.send;
+    cdp.send = async (m, p) => (m === 'Page.getLayoutMetrics' ? (cdp.sent.push(m), { cssLayoutViewport: { clientWidth: 1280, clientHeight: 720 } }) : send(m, p));
+    const h = live.start(page, 'r');
+    const v = await viewer(h.url);
+    await until(() => v.frames > 0, 3000);
+    assert.deepEqual(v.messages.find((m) => m.frame), { frame: 'SNAP', w: 1280, h: 720 });
+    assert.deepEqual(v.cursor, { x: 640, y: 360 });
+    assert.deepEqual(cdp.params.find(([m]) => m === 'Page.startScreencast')[1].maxWidth, 1280);
     h.cancel();
   }, { refreshMs: 100 });
 });
