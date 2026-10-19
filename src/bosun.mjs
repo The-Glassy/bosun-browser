@@ -1,6 +1,7 @@
 // Service assembly: config -> live view, session manager, transports; idempotent bounded shutdown.
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { loadConfig } from './config.mjs';
+import { policyOf } from './auth.mjs';
 import { createLiveView } from './liveview.mjs';
 import { SessionManager } from './sessions.mjs';
 import { startWsServer } from './wsserver.mjs';
@@ -53,7 +54,7 @@ export async function main(env = process.env) {
     console.error(`bosun: MCP over WebSocket on ${cfg.ws.host}:${svc.ws.port}${cfg.ws.allowNoToken ? ' (NO AUTH — local development)' : ''}`);
   } else {
     process.stdin.on('close', () => exit(0));
-    await buildServer({ manager: svc.manager, owner: 'stdio', tenant: 'default', cfg }).connect(new StdioServerTransport());
+    await buildServer({ manager: svc.manager, owner: 'stdio', tenant: 'default', cfg, policy: policyOf(cfg, 'default') }).connect(new StdioServerTransport());
   }
   if (svc.live) console.error(`bosun: live view on ${cfg.live.host}:${svc.live.port}`);
   return svc;

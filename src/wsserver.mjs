@@ -3,7 +3,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createAuthenticator, tokenFromRequest } from './auth.mjs';
+import { createAuthenticator, policyOf, tokenFromRequest } from './auth.mjs';
 import { buildServer } from './tools.mjs';
 
 const MAX_PAYLOAD = 1024 * 1024;
@@ -90,7 +90,7 @@ export async function startWsServer({ cfg, manager }) {
     ws.on('pong', () => { alive = true; });
     const hb = setInterval(() => { if (!alive) return ws.terminate(); alive = false; try { ws.ping(); } catch {} }, HEARTBEAT_MS);
     hb.unref();
-    const server = buildServer({ manager, owner, tenant, cfg, conn: { inflight: 0 } });
+    const server = buildServer({ manager, owner, tenant, cfg, policy: policyOf(cfg, tenant), conn: { inflight: 0 } });
     ws.on('close', () => {
       clearInterval(hb);
       conns.delete(ws);

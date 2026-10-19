@@ -1,10 +1,27 @@
 # Changelog
 
-## Unreleased — meetings against real Google Meet
+## 0.7.0 — read-only tokens for subagents
+
+### Added
+
+- **Per-tenant policies: `BROWSER_TOKEN_POLICIES=<tenant>=ephemeral,…`.** Tenants not named keep policy `full`,
+  which is the behaviour so far. A named tenant must have a token, and an unknown policy stops the service.
+- **Policy `ephemeral`, enforced by the server.**
+  - `tools/list` shows only the session and page tools: `session_open`, `session_close`, `navigate`, `read`,
+    `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot` and `sessions`.
+  - Every other tool answers "not allowed for this token", whatever its arguments.
+  - `session_open` refuses `profile`, and so does the session manager.
+  - Screenshots are never saved to disk, and the connection gets no MCPL push events.
+  - The tenant's session cap is `BROWSER_EPHEMERAL_MAX_SESSIONS` (default 2).
+- **`bosun-mcp-stdio`, a stdio bridge.** It lets stdio-only MCP clients such as `claude --mcp-config` use a Bosun
+  WebSocket. It reads `BOSUN_URL` and `BOSUN_TOKEN`, sends the token as a Bearer header, and pipes newline-delimited
+  JSON-RPC, one message per WebSocket frame. A refused token exits 3 with one line on stderr, without the token.
+
+### Meetings against real Google Meet
 
 From a live run on a Linux server (datacenter IP, de-AT locale).
 
-### Fixed
+#### Fixed
 
 - **Joining a German Meet UI failed** with "locator.click: Timeout": "Teilnahme erbitten" and the placeholder-only
   "Ihr Name" field weren't recognized.
@@ -24,7 +41,7 @@ From a live run on a Linux server (datacenter IP, de-AT locale).
     visible challenge frame.
   - Anywhere else, a reCAPTCHA frame still counts as a captcha.
 
-### Added
+#### Added
 
 - **`meeting_join({profile})` with a Bosun profile signed in to Google.** The profile must exist; Firefox profiles
   are refused. There is no name step, since Meet uses the account's name, and the profile opens with the engine it

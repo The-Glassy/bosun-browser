@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { countNodes, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
-import { TENANT_RE } from './auth.mjs';
+import { NOT_ALLOWED, PROFILES_REFUSED, TENANT_RE } from './auth.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
 import { urlKey, httpUrl } from './sessions.mjs';
 
@@ -80,10 +80,15 @@ const str = (n) => z.string().max(n);
 const target = { ref: str(20).optional().describe('element ref from read (e.g. "e12")'), role: str(40).optional(), name: str(1000).optional(), selector: str(2000).optional(), text: str(1000).optional() };
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
 
-export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 } }) {
-  const server = new McpServer({ name: 'bosun', version: '0.6.0' }, { capabilities: { experimental: { mcpl: MANIFEST } } });
+// The tools a token with policy "ephemeral" may call: ephemeral sessions and page tools. No profiles, keepalive,
+// meetings or handoff.
+export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for', 'screenshot', 'sessions']);
+
+export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn = { inflight: 0 } }) {
+  const ephemeral = policy === 'ephemeral';
+  const server = new McpServer({ name: 'bosun', version: '0.7.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
-  if (manager.events) {
+  if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
     const prev = server.server.onclose;
     server.server.onclose = () => { mcpl.close(); prev?.(); };
@@ -103,17 +108,22 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
     return r;
   });
 
-  // Every tool: bounded concurrency per connection, sanitized errors.
-  const tool = (name, desc, shape, fn) => server.tool(name, desc, shape, async (a, extra) => {
-    if (conn.inflight >= cfg.maxInflight) throw new Error(`too many concurrent requests on this connection (max ${cfg.maxInflight})`);
-    conn.inflight++;
-    try { return await fn(a, extra); } catch (e) { throw new Error(cleanError(e)); } finally { conn.inflight--; }
-  });
+  // Every tool: bounded concurrency per connection, sanitized errors. A tool the policy doesn't allow is registered
+  // as a stub that only refuses (its handler is never wired up) and is left out of tools/list below.
+  const tool = (name, desc, shape, fn) => {
+    if (ephemeral && !EPHEMERAL_TOOLS.has(name)) return server.tool(name, NOT_ALLOWED, {}, async () => { throw new Error(`${name}: ${NOT_ALLOWED}`); });
+    return server.tool(name, desc, shape, async (a, extra) => {
+      if (conn.inflight >= cfg.maxInflight) throw new Error(`too many concurrent requests on this connection (max ${cfg.maxInflight})`);
+      conn.inflight++;
+      try { return await fn(a, extra); } catch (e) { throw new Error(cleanError(e)); } finally { conn.inflight--; }
+    });
+  };
 
-  tool('session_open', 'Open a browser session. Without profile: ephemeral (wiped on close). With profile: persistent per-tenant profile (stays logged in).',
+  tool('session_open', ephemeral ? 'Open an ephemeral browser session (wiped on close; profiles are not allowed for this token).' : 'Open a browser session. Without profile: ephemeral (wiped on close). With profile: persistent per-tenant profile (stays logged in).',
     { profile: z.string().regex(TENANT_RE).optional(), locale: str(35).optional(), timezone: str(64).optional(),
       engine: z.enum(ENGINE_NAMES).optional().describe(`browser engine (default ${cfg.engine}): chromium, patchright (stealthier Chromium), camoufox (anti-detect Firefox)`) },
     async (a) => {
+      if (ephemeral && a.profile !== undefined) throw new Error(PROFILES_REFUSED);
       const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine });
       return ok({ session: s.id, profile: a.profile || 'ephemeral', engine: s.engine });
     });
@@ -289,5 +299,16 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
     s.handoff ? { id: s.id, profile: s.profile || 'ephemeral', engine: s.engine, handoff: 'active' } : { id: s.id, profile: s.profile || 'ephemeral', engine: s.engine, url: s.page.url() }
   ))));
 
+  if (ephemeral) {
+    // McpServer has no public filter for tools/list; wrap its handler (the SDK version is pinned, and the tests check
+    // the list). Without the handler, refuse to build the server rather than list every tool.
+    const handlers = server.server._requestHandlers;
+    const list = handlers?.get('tools/list');
+    if (!list) throw new Error('cannot restrict tools/list for policy ephemeral');
+    handlers.set('tools/list', async (req, extra) => {
+      const r = await list(req, extra);
+      return { ...r, tools: r.tools.filter((t) => EPHEMERAL_TOOLS.has(t.name)) };
+    });
+  }
   return server;
 }
