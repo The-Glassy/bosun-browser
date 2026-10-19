@@ -36,28 +36,43 @@ export function parseQuiet(q) {
 }
 
 const formatters = new Map();
-// Minutes since local midnight (with fractions) at time t in time zone tz.
-function localMinutes(t, tz) {
-  if (!formatters.has(tz)) formatters.set(tz, new Intl.DateTimeFormat('en-GB', { timeZone: tz, hourCycle: 'h23', hour: 'numeric', minute: 'numeric', second: 'numeric' }));
+// The wall clock in time zone tz at instant t, as if it were UTC (so wall(t) - t is the zone's offset then).
+function wall(t, tz) {
+  if (!formatters.has(tz)) formatters.set(tz, new Intl.DateTimeFormat('en-GB', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }));
   const p = Object.fromEntries(formatters.get(tz).formatToParts(t).filter((x) => x.type !== 'literal').map((x) => [x.type, Number(x.value)]));
-  return (p.hour % 24) * 60 + p.minute + p.second / 60 + (t % 1000) / 60_000;
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second) + (((t % 1000) + 1000) % 1000);
 }
+const offset = (t, tz) => wall(t, tz) - t;
 const inQuiet = (m, q) => (q.start < q.end ? m >= q.start && m < q.end : m >= q.start || m < q.end);
 
-// `from` plus `ms` of schedule time, where quiet hours run QUIET_FACTOR times slower: a 30 min interval that starts
-// at 21:50 with quiet hours 22-08 ends at 23:20 (10 min, then 20 min x4). A DST shift on the way may move the
-// result by up to the size of the shift.
+// The first instant in (a, b] where the zone's offset differs from the one at a (a DST change), to the second.
+function transition(a, b, tz) {
+  const off = offset(a, tz);
+  while (b - a > 1000) {
+    const mid = a + Math.floor((b - a) / 2000) * 1000 || a + 1000;
+    if (offset(mid, tz) === off) a = mid; else b = mid;
+  }
+  return b;
+}
+
+// `from` plus `ms` of schedule time, where quiet hours (local wall-clock time in tz) run QUIET_FACTOR times slower:
+// a 30 min interval that starts at 21:50 with quiet hours 22-08 ends at 23:20 (10 min, then 20 min x4). The time is
+// integrated piece by piece between quiet edges and DST changes, so a skipped or repeated hour is counted as it
+// really passes.
 export function advance(from, ms, quiet, tz) {
   if (!quiet) return from + ms;
   let t = from, left = ms;
   for (let i = 0; i < 1000 && left > 0; i++) {
-    const m = localMinutes(t, tz), q = inQuiet(m, quiet);
+    const off = offset(t, tz);
+    const m = ((((t + off) % 86_400_000) + 86_400_000) % 86_400_000) / 60_000;
+    const q = inQuiet(m, quiet);
     const edge = q ? quiet.end : quiet.start;
-    const toEdge = (((edge - m) % 1440 + 1440) % 1440 || 1440) * 60_000;
+    let next = t + ((((edge - m) % 1440) + 1440) % 1440 || 1440) * 60_000; // right while the offset stays the same
+    if (offset(next, tz) !== off) next = transition(t, next, tz);
     const rate = q ? 1 / QUIET_FACTOR : 1; // schedule time per real time
-    if (left <= toEdge * rate) return t + left / rate;
-    t += toEdge;
-    left -= toEdge * rate;
+    if (left <= (next - t) * rate) return t + left / rate;
+    left -= (next - t) * rate;
+    t = next;
   }
   return t + left;
 }
@@ -93,10 +108,18 @@ export async function evaluateCheck(page, check) {
 // runs in the page, never in the service, and only the result crosses over. kind count: the first whole number in it
 // (thousands separators ignored); no match counts as 0 (a badge that vanishes when nothing is new). kind text: the
 // text with whitespace collapsed, at most WATCH_MAX_TEXT chars; no match is null. Throws if it can't be read.
-export async function extractWatch(page, w, { timeoutMs = CHECK_TIMEOUT_MS } = {}) {
+export async function extractWatch(page, w, { timeoutMs = CHECK_TIMEOUT_MS, signal } = {}) {
   let raw = null;
   const root = w.selector ? page.locator(w.selector).first() : page.locator('body');
-  const found = await root.waitFor({ state: 'attached', timeout: timeoutMs }).then(() => true, () => false);
+  // Absent means the selector matched nothing for timeoutMs. A selector error or a closed page throws (count()
+  // does), so a failed read is never mistaken for "nothing new".
+  const end = Date.now() + timeoutMs;
+  let found = false;
+  for (;;) {
+    if (signal?.aborted) throw new Error('aborted');
+    if ((found = (await root.count()) > 0) || Date.now() >= end) break;
+    await sleep(Math.min(250, Math.max(0, end - Date.now())), signal);
+  }
   if (found) {
     let timer;
     const read = root.evaluate((el, [bySelector, src, max]) => {
@@ -108,6 +131,7 @@ export async function extractWatch(page, w, { timeoutMs = CHECK_TIMEOUT_MS } = {
     raw = await Promise.race([read, new Promise((_, no) => { timer = setTimeout(() => no(new Error('watch timeout')), timeoutMs); })]).finally(() => clearTimeout(timer));
     if (raw !== null && typeof raw !== 'string') throw new Error('watch read failed');
   }
+  if (signal?.aborted) throw new Error('aborted');
   if (w.kind === 'count') {
     if (raw === null) return 0;
     const n = /\d(?:[\d.,'\u00a0\u202f]*\d)?/.exec(raw)?.[0].replace(/\D/g, '');
@@ -264,9 +288,10 @@ export class Keepalive {
     // Updated in place: a visit running right now records its result on this same entry.
     const e = old || { tenant, profile, nextAt: null, history: [], lastSkip: null, created: this.now() };
     const w = watch && Object.fromEntries(['selector', 'textRegex', 'kind', 'label'].filter((k) => watch[k]).map((k) => [k, watch[k]]));
-    // Watching something else starts from a new baseline; a new label alone keeps it.
-    const sameWatch = w && e.watch && ['selector', 'textRegex', 'kind'].every((k) => (w[k] || null) === (e.watch[k] || null));
-    if (!sameWatch) delete e.watchState;
+    // Watching something else, or on another page, starts from a new baseline (and a new generation, so a visit
+    // still running for the old one can't record into it); a new label alone keeps it.
+    const sameWatch = w && e.watch && e.url === url && ['selector', 'textRegex', 'kind'].every((k) => (w[k] || null) === (e.watch[k] || null));
+    if (!sameWatch) { delete e.watchState; e.watchGen = (e.watchGen || 0) + 1; }
     delete e.everyHours; delete e.everyMinutes;
     Object.assign(e, {
       url, ...(everyMinutes != null ? { everyMinutes } : { everyHours }), jitterMin, quietHours: quietHours || null, enabled,
@@ -345,9 +370,9 @@ export class Keepalive {
   // A visit's watched value against the stored one. The first value is the baseline (no event); after that a count
   // that went up or a text that differs is an event. A count that went down is kept silently, so the next rise is
   // measured from there. Returns what happened, for the history.
-  recordWatch(e, watch, { value, error }, url) {
-    // keepalive_set changed what is watched while this visit ran: the value belongs to the old watch.
-    if (!e.watch || ['selector', 'textRegex', 'kind'].some((k) => (e.watch[k] || null) !== (watch[k] || null))) return null;
+  recordWatch(e, watch, { value, error }, url, gen) {
+    // keepalive_set changed what is watched (or where) while this visit ran: the value belongs to the old watch.
+    if (!e.watch || e.watchGen !== gen) return null;
     if (error) return error;
     const at = this.now(), prev = e.watchState;
     if (!prev) { e.watchState = { value, at, changedAt: null }; return 'baseline'; }
@@ -372,7 +397,7 @@ export class Keepalive {
     const m = this.manager;
     const owner = `keepalive:${e.tenant}`;
     const key = `${e.tenant}/${e.profile}`;
-    const { url, check, watch } = { url: e.url, check: { ...e.check }, watch: e.watch && { ...e.watch } }; // this visit's configuration
+    const { url, check, watch, watchGen } = { url: e.url, check: { ...e.check }, watch: e.watch && { ...e.watch }, watchGen: e.watchGen }; // this visit's configuration
     let status = 'error', reason = null, s = null, phase = 'open', watched = null;
     try {
       try { httpUrl(url); } catch { reason = 'url is not http(s)'; throw new Error(reason); }
@@ -407,9 +432,11 @@ export class Keepalive {
         if (!c.ok) return { status: 'logged_out', reason: c.reason };
         if (watch) {
           phase = 'watch';
-          watched = await extractWatch(ss.page, watch).then((value) => ({ value }), (err) => ({
-            error: /^(watch timeout|no number in the watched text)$/.test(err?.message || '') ? err.message : 'watch failed',
-          }));
+          watched = await extractWatch(ss.page, watch, { signal }).then((value) => ({ value }), (err) => {
+            if (signal.aborted) throw err; // taken over: the visit is aborted, nothing is recorded
+            return { error: /^(watch timeout|no number in the watched text)$/.test(err?.message || '') ? err.message : 'watch failed' };
+          });
+          if (signal.aborted) throw new Error('aborted');
         }
         return { status: 'ok' };
       });
@@ -425,7 +452,7 @@ export class Keepalive {
       this.skip(e, this.stopped ? 'service stopped' : 'taken over by an agent', e.nextAt <= this.now() && !this.stopped ? this.nextRun(this.now(), e) : e.nextAt);
       return { status };
     }
-    const w = status === 'ok' && watched ? this.recordWatch(e, watch, watched, url) : null;
+    const w = status === 'ok' && watched ? this.recordWatch(e, watch, watched, url, watchGen) : null;
     e.history.push({ at: t0, status, durationMs: this.now() - t0, ...(reason ? { reason } : {}), ...(w ? { watch: w } : {}) });
     if (e.history.length > HISTORY) e.history.splice(0, e.history.length - HISTORY);
     e.nextAt = this.nextRun(this.now(), e);
