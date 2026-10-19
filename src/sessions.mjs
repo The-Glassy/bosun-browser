@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { clearSensitive, installTracker, notePasswords, passwordTracker } from './redact.mjs';
 import { createEngines, claimProfile, unclaimProfile, recordProfileUse } from './engines.mjs';
+import { NOT_ALLOWED, PROFILES_REFUSED, policyOf } from './auth.mjs';
 
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
 const CLOSE_DEADLINE_MS = 10_000; // default; manager.closeDeadlineMs
@@ -114,6 +115,10 @@ export class SessionManager {
     if (this.closing) throw new Error('service is shutting down');
     const def = this.engines.get(engine || this.cfg.engine);
     if (this.goneOwners.has(owner)) throw new Error('connection closed');
+    const ephemeral = policyOf(this.cfg, tenant) === 'ephemeral';
+    if (ephemeral && (profile || media)) throw new Error(profile ? PROFILES_REFUSED : NOT_ALLOWED);
+    // Only the default engine, which startup checked: another one may fetch its browser into a shared cache.
+    if (ephemeral && def.name !== this.cfg.engine) throw new Error(`engine ${def.name} is ${NOT_ALLOWED}; use the default (${this.cfg.engine})`);
     const profileKey = profile ? `${tenant}/${profile}` : null;
     // Counted as this owner's open from here, so a disconnect while it waits below still makes it close itself.
     this.ownerOpens.set(owner, (this.ownerOpens.get(owner) || 0) + 1);
@@ -126,13 +131,13 @@ export class SessionManager {
       else { this.ownerOpens.delete(owner); this.goneOwners.delete(owner); }
     };
     try {
-      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media });
+      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral });
     } finally {
       untrack();
     }
   }
 
-  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media }) {
+  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral }) {
     // The profile was just closed (by session_close, a dropped connection, idle or crash) and its browser is still
     // shutting down; or a background keepalive holds it. Wait for it rather than refusing.
     if (profileKey && this.profilesInUse.has(profileKey)) {
@@ -145,7 +150,8 @@ export class SessionManager {
     }
     if (this.used >= this.cfg.maxSessions) throw new Error(`session limit ${this.cfg.maxSessions} reached; close one`);
     const tUse = this.tenantUse.get(tenant) || 0;
-    if (tUse >= this.cfg.maxSessionsPerTenant) throw new Error(`session limit ${this.cfg.maxSessionsPerTenant} for this tenant reached; close one`);
+    const tMax = ephemeral ? this.cfg.ephemeralMaxSessions : this.cfg.maxSessionsPerTenant;
+    if (tUse >= tMax) throw new Error(`session limit ${tMax} for this tenant reached; close one`);
     if (profileKey && this.profilesInUse.has(profileKey)) throw new Error(`profile ${profile} is already open in another session`);
     // Reserve synchronously, before any await, so concurrent opens can't overshoot the caps.
     this.used++;
@@ -314,7 +320,7 @@ export class SessionManager {
   }
 
   async saveShot(s, buf) {
-    if (!this.cfg.saveShots) return null;
+    if (!this.cfg.saveShots || policyOf(this.cfg, s.tenant) === 'ephemeral') return null; // ephemeral: nothing on disk
     if (s.disposed) throw new Error(`session ${s.id} was closed (${s.closeReason})`);
     const dir = path.join(this.cfg.dataDir, 'shots', s.tenant, s.id);
     await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });

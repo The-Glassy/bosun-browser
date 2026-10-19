@@ -3,6 +3,10 @@ import crypto from 'crypto';
 
 export const TENANT_RE = /^[a-z0-9_-]{1,40}$/;
 export const MIN_TOKEN_LENGTH = 16;
+// full: every tool. ephemeral: ephemeral sessions and page tools only (see EPHEMERAL_TOOLS in tools.mjs).
+export const POLICIES = ['full', 'ephemeral'];
+export const NOT_ALLOWED = 'not allowed for this token';
+export const PROFILES_REFUSED = `profiles are not allowed for this token (policy ephemeral); open the session without profile`;
 
 const digest = (s) => crypto.createHash('sha256').update(String(s)).digest();
 
@@ -48,3 +52,22 @@ export function parseTokens(env) {
   }
   return out;
 }
+
+// BROWSER_TOKEN_POLICIES=<tenant>=<policy>,… -> Map tenant -> policy. Tenants not named get "full". A named tenant
+// must have a token, so a typo can't leave the intended tenant on "full".
+export function parsePolicies(env, tokens) {
+  const out = new Map();
+  const tenants = new Set(tokens.map((t) => t.tenant));
+  for (const part of (env.BROWSER_TOKEN_POLICIES || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    const i = part.indexOf('=');
+    if (i < 1) throw new Error('BROWSER_TOKEN_POLICIES entries must look like <tenant>=<policy>');
+    const tenant = part.slice(0, i).trim(), policy = part.slice(i + 1).trim();
+    if (!tenants.has(tenant)) throw new Error(`BROWSER_TOKEN_POLICIES names tenant "${tenant}", which has no token`);
+    if (!POLICIES.includes(policy)) throw new Error(`policy for tenant "${tenant}" must be one of ${POLICIES.join(', ')} (got "${policy}")`);
+    if (out.has(tenant)) throw new Error(`BROWSER_TOKEN_POLICIES names tenant "${tenant}" twice`);
+    out.set(tenant, policy);
+  }
+  return out;
+}
+
+export const policyOf = (cfg, tenant) => cfg.policies?.get(tenant) ?? 'full';

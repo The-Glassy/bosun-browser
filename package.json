@@ -1,10 +1,11 @@
 {
   "name": "bosun-browser",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Bosun — the boatswain browser for agents: a self-hosted, multi-tenant browser service with human handoff, over MCP / MCPL.",
   "type": "module",
   "bin": {
-    "bosun-browser": "src/server.mjs"
+    "bosun-browser": "src/server.mjs",
+    "bosun-mcp-stdio": "bin/bosun-mcp-stdio.mjs"
   },
   "main": "src/server.mjs",
   "scripts": {

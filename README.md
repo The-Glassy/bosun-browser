@@ -70,6 +70,8 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 |---|---|---|
 | `BROWSER_TOKEN` | – | token for tenant `default` (16+ chars) |
 | `BROWSER_TOKENS` | – | more tenants: `alice:<token>,bob:<token>` |
+| `BROWSER_TOKEN_POLICIES` | – (all `full`) | per-tenant policy: `swarm=ephemeral` (see [Read-only tokens for subagents](#read-only-tokens-for-subagents)) |
+| `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
 | `WS_HOST` / `WS_PORT` | `127.0.0.1` / – | WebSocket MCP listener (stdio when `WS_PORT` is unset) |
 | `WS_ALLOWED_ORIGINS` | – | comma list of browser Origins allowed to connect (non-browser clients send none) |
 | `ALLOW_NO_TOKEN` | – | `1` = no auth, loopback only |
@@ -356,6 +358,52 @@ Meetings need a **headful** browser (headless Chromium plays no audio), so run t
 - **One mixed audio track.** There is no speaker separation and no live transcript.
 - **Consent is the operator's responsibility.** The announcement and the opt-out are a courtesy, not a legal basis.
   Check what applies where the participants are; some places require everyone's explicit consent before recording.
+
+## Read-only tokens for subagents
+
+Give helper agents (for example `claude -p` subprocesses) a browser without your logins, keepalive, meetings or
+handoff: a tenant of their own with policy `ephemeral`.
+
+```sh
+BROWSER_TOKENS=me:<token>,swarm:<other token>
+BROWSER_TOKEN_POLICIES=swarm=ephemeral       # tenants not named stay "full"
+BROWSER_EPHEMERAL_MAX_SESSIONS=2             # default
+```
+
+With policy `ephemeral` the server enforces, not just hides:
+
+- `tools/list` shows only `session_open`, `session_close`, `navigate`, `read`, `click`, `type`, `select`, `press`,
+  `back`, `wait_for`, `screenshot` and `sessions`. Any other tool answers `not allowed for this token`, whatever its
+  arguments; its handler is never wired up for the connection.
+- `session_open` refuses `profile` ("profiles are not allowed for this token") and any engine but the default
+  (`ENGINE`, which startup checked, so a session never installs a browser). The session manager enforces both for
+  the tenant as well, and refuses meeting browsers.
+- The tenant has `BROWSER_EPHEMERAL_MAX_SESSIONS` sessions at most, across all its connections. Sessions belong to
+  the connection and close when it closes (or after `IDLE_TIMEOUT_SEC`).
+- Nothing is written to `BROWSER_DATA`: screenshots are returned but never saved, even with `SAVE_SHOTS=1`. Ephemeral
+  sessions use temporary browser profiles that are deleted on close; Playwright keeps downloads in its own temporary
+  directory and deletes them with the session. There is no upload tool.
+- No MCPL push events.
+
+A policy only narrows what the token can do; the tenant is still separate from yours, so it never sees your profiles
+anyway. Egress is not narrowed: block private networks around the service (see [Security notes](#security-notes)).
+
+### stdio bridge
+
+MCP clients that only start stdio servers (such as `claude --mcp-config`) use `bosun-mcp-stdio` (this package's
+second bin). It reads `BOSUN_URL` (`ws://` or `wss://`) and `BOSUN_TOKEN`, sends the token as
+`Authorization: Bearer` (never in the URL, never printed), and pipes newline-delimited JSON-RPC between
+stdin/stdout and the WebSocket, one message per frame.
+
+```json
+{ "mcpServers": { "bosun": { "command": "bosun-mcp-stdio",
+  "env": { "BOSUN_URL": "ws://127.0.0.1:7360", "BOSUN_TOKEN": "<swarm token>" } } } }
+```
+
+Records are split on LF only (CRLF is accepted); a record that is not JSON or is over 1 MiB is dropped with a line
+on stderr. The opening handshake times out after 15 s. Exit codes: `0` stdin ended, `1` connection failed or lost,
+`2` bad configuration (missing variable, a non-ws URL, credentials in the URL), `3` token refused. The bridge needs
+only Node and the `ws` package.
 
 ## Security notes
 

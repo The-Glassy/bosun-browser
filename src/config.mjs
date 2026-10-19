@@ -1,5 +1,5 @@
 // Environment -> validated configuration. Anything malformed or unsafe throws, so the service refuses to start.
-import { isLoopbackHost, parseTokens } from './auth.mjs';
+import { isLoopbackHost, parsePolicies, parseTokens } from './auth.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
 
 function int(env, name, def, min, max) {
@@ -32,6 +32,7 @@ export function loadConfig(env = process.env) {
     recordingRetentionDays: int(env, 'RECORDING_RETENTION_DAYS', 30, 1, 3650), // meeting recordings are deleted after this
     meetingOwner: (env.MEETING_OWNER || '').trim().slice(0, 60) || null, // named in the meeting announcement ("X's AI notetaker")
     tokens: parseTokens(env),
+    policies: null,
     ws: null,
     live: null,
   };
@@ -39,6 +40,9 @@ export function loadConfig(env = process.env) {
   try { new Intl.DateTimeFormat('en', { timeZone: cfg.tz }); } catch { throw new Error(`TZ must be an IANA time zone such as Europe/Vienna (got "${cfg.tz}")`); }
   if (cfg.camoufoxOs && !['macos', 'windows', 'linux'].includes(cfg.camoufoxOs)) throw new Error('CAMOUFOX_OS must be macos, windows or linux');
   cfg.maxSessionsPerTenant = int(env, 'MAX_SESSIONS_PER_TENANT', cfg.maxSessions, 1, cfg.maxSessions);
+  cfg.policies = parsePolicies(env, cfg.tokens);
+  // Session cap of each tenant with policy "ephemeral".
+  cfg.ephemeralMaxSessions = int(env, 'BROWSER_EPHEMERAL_MAX_SESSIONS', Math.min(2, cfg.maxSessionsPerTenant), 1, cfg.maxSessionsPerTenant);
 
   if (env.WS_PORT !== undefined && env.WS_PORT !== '') {
     const host = env.WS_HOST || '127.0.0.1';
