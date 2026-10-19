@@ -14,6 +14,15 @@ const NOTE_POLL_MS = 500;
 // Where a navigation landed, without query and fragment (a challenge page reloads itself with fresh tokens).
 export const urlKey = (u) => { try { const x = new URL(u); return x.origin + x.pathname; } catch { return String(u); } };
 
+// Pages the agent (navigate) or a keepalive visit may load: the web only. file:, javascript:, data:, blob:, chrome:,
+// about:, view-source:, ftp: … are refused.
+export function httpUrl(raw) {
+  let u;
+  try { u = new URL(raw); } catch { throw new Error('invalid URL'); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`only http:// and https:// URLs are allowed (got ${u.protocol})`);
+  return u.href;
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms).unref?.());
 
 // Browser processes started for a persistent context carry its directory on their command line

@@ -108,8 +108,9 @@ Flow
 
 Namespace = server name: `browser:`. Declared as an ontology on the feature sets.
 
-Implemented so far (0.4.0): `bosun:needs-human` from keepalive (feature set `bosun.handoff`, see README ›
-Keeping logins alive); the server's namespace is `bosun:`.
+Implemented so far: `bosun:needs-human` from keepalive (0.4.0, feature set `bosun.handoff`, see README › Keeping
+logins alive) and `bosun:watch-changed` from a keepalive visit's watch (0.5.0, feature set `bosun.watch`, see
+README › Watching a value); the server's namespace is `bosun:`.
 - `browser:needs-human`, `browser:human-done`, `browser:handoff-timeout`
 - `browser:download-finished` (with a bulk content reference, §19), `browser:download-failed`
 - `browser:watch-changed`

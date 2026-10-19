@@ -153,6 +153,39 @@ test('trackpad (default on touch): drag = many mouse moves between two points, t
   }
 });
 
+test('an idle trackpad cursor sends nothing: no input for 5 s, and a finger resting on the glass (sensor noise) for 5 s', async () => {
+  const c = await connect(svc);
+  const { page, link } = await handoff(c, '/pointer');
+  const { ctx, vp } = await openViewer(link);
+  try {
+    assert.equal(await vp.evaluate(() => document.body.dataset.mode), 'pad');
+    const cdp = await vp.context().newCDPSession(vp);
+    const ev = (type, pts) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: pts.map(([x, y], id) => ({ x, y, id })) });
+    const cursor = () => vp.evaluate(() => { const r = document.getElementById('cur').getBoundingClientRect(); return [r.left, r.top]; });
+    await resetLog(page);
+    await sleep(5000);
+    assert.equal((await log(page)).moves.length, 0);
+    // Drag, then keep the finger down and still: it reports ±1 px of noise every 16 ms.
+    await ev('touchStart', [[100, 300]]);
+    for (let i = 1; i <= 12; i++) { await ev('touchMove', [[100 + 8 * i, 300 + 4 * i]]); await sleep(16); }
+    await settled(page);
+    const before = await cursor();
+    await resetLog(page);
+    const t0 = Date.now();
+    for (let i = 0; Date.now() - t0 < 5000; i++) { await ev('touchMove', [[196 + [1, -1, 0.5, -0.5][i % 4], 348 + [0.7, -0.7, -0.3, 0.3][i % 4]]]); await sleep(16); }
+    assert.deepEqual((await log(page)).moves, []);
+    assert.deepEqual(await cursor(), before); // the overlay did not shake either
+    // Then a real move is still followed right away.
+    for (let i = 1; i <= 6; i++) { await ev('touchMove', [[196 + 6 * i, 348]]); await sleep(16); }
+    await ev('touchEnd', []);
+    await until(async () => (await log(page)).moves.length > 0);
+    assert.deepEqual((await log(page)).buttons, []);
+  } finally {
+    await ctx.close();
+    await c.close();
+  }
+});
+
 test('tap mode clicks where tapped; a desktop mouse hovers (real mouse moves) and clicks', async () => {
   const c = await connect(svc);
   const { page, link } = await handoff(c, '/pointer');

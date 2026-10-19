@@ -98,23 +98,26 @@ c.addEventListener('pointerup',mup);c.addEventListener('pointercancel',mup);
 c.addEventListener('wheel',(e)=>{e.preventDefault();const q=at(e.clientX,e.clientY);wheel(q.x,q.y,e.deltaX,e.deltaY)},{passive:false});
 // Touch. Tap mode: tap = click there, drag = scroll. Trackpad mode: drag moves the cursor (relative, accelerated),
 // tap = click at the cursor, two fingers = scroll, hold then drag = press, move, release.
-const SLOP=8,HOLD=450;let g=null;
+// A finger resting on the glass still reports tiny movements. Once it has stayed within REST px for REST_MS it counts
+// as resting and those reports are ignored (the cursor stays put, nothing is sent) until it really moves again.
+const SLOP=8,HOLD=450,REST=3,REST_MS=120;let g=null;
 const avg=(ts)=>{let X=0,Y=0;for(const q of ts){X+=q.clientX;Y+=q.clientY}return{x:X/ts.length,y:Y/ts.length}};
 wrap.addEventListener('touchstart',(e)=>{e.preventDefault();if(ended)return;const a=avg(e.touches),now=performance.now();
  if(!g)g={t0:now,t:now,x:a.x,y:a.y,moved:0,maxN:0,drag:false,lp:0};
- g.x=a.x;g.y=a.y;g.t=now;g.maxN=Math.max(g.maxN,e.touches.length);clearTimeout(g.lp);
+ g.x=g.ox=g.rx=a.x;g.y=g.oy=g.ry=a.y;g.t=g.rt=now;g.maxN=Math.max(g.maxN,e.touches.length);clearTimeout(g.lp);
  if(mode==='pad'&&g.maxN===1)g.lp=setTimeout(()=>{if(g&&!g.drag&&g.moved<SLOP){g.drag=true;flushMove();send({type:'down',x:r1(cx),y:r1(cy)});cur.classList.add('down')}},HOLD);
 },{passive:false});
 wrap.addEventListener('touchmove',(e)=>{e.preventDefault();if(!g||ended)return;
  const a=avg(e.touches),now=performance.now(),dx=a.x-g.x,dy=a.y-g.y,dt=Math.max(1,now-g.t),k=vw/(stage.clientWidth||1);
- g.x=a.x;g.y=a.y;g.t=now;g.moved+=Math.hypot(dx,dy);
+ if(Math.hypot(a.x-g.rx,a.y-g.ry)>=REST){g.rx=a.x;g.ry=a.y;g.rt=now}else if(now-g.rt>=REST_MS)return;
+ g.x=a.x;g.y=a.y;g.t=now;g.moved=Math.max(g.moved,Math.hypot(a.x-g.ox,a.y-g.oy));
  if(g.moved<SLOP)return;
  clearTimeout(g.lp);
  if(e.touches.length>1||mode!=='pad'){if(g.drag)return;const q=mode==='pad'?{x:cx,y:cy}:at(a.x,a.y);wheel(q.x,q.y,-dx*k,-dy*k);return}
  const gain=Math.min(3.2,0.9+1.1*Math.hypot(dx,dy)/dt);
  moveTo(cx+dx*gain*k,cy+dy*gain*k);
 },{passive:false});
-const tend=(e,cancel)=>{e.preventDefault();if(!g)return;if(e.touches.length){const a=avg(e.touches);g.x=a.x;g.y=a.y;return}
+const tend=(e,cancel)=>{e.preventDefault();if(!g)return;if(e.touches.length){const a=avg(e.touches);g.x=g.ox=g.rx=a.x;g.y=g.oy=g.ry=a.y;g.rt=performance.now();return}
  clearTimeout(g.lp);const G=g;g=null;if(ended)return;
  if(G.drag){flushMove();send({type:'up',x:r1(cx),y:r1(cy)});cur.classList.remove('down');return}
  if(cancel||G.maxN!==1||G.moved>=SLOP||performance.now()-G.t0>=HOLD)return;
