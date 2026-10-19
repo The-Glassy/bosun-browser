@@ -159,7 +159,7 @@ The interval is `every_hours` (default 12) or `every_minutes` (at least 30), eac
 ± `jitter_min` (default 30, or a quarter of a shorter interval). `quiet_hours` (`"22-08"`, `"22:30-07:00"`, local
 time in `TZ`, default `Europe/Vienna`) makes the interval **four times longer** while it lasts, so a 30-minute
 watch visits about every two hours at night. An interval that starts before a quiet window is stretched only for
-its part inside it. Calling `keepalive_set` again replaces the whole configuration of that profile.
+its part inside it. Quiet hours follow the wall clock, and on DST nights the time is counted as it really passes. Calling `keepalive_set` again replaces the whole configuration of that profile.
 
 Each visit, at the interval ± `jitter_min` (first one an interval after `keepalive_set`):
 
@@ -217,9 +217,11 @@ keepalive_set({ "profile": "willhaben", "url": "https://www.willhaben.at/iad/myp
   that **went up** or a text that **differs** raises one `bosun:watch-changed` event. A count that went down (you
   read the messages) is stored silently, and the next rise is measured from there.
   - Nothing is read when the visit isn't logged in.
-  - A read that fails is recorded as `watch timeout`, `no number in the watched text` or `watch failed` and leaves
-    the stored value alone.
-  - Changing `selector`, `text_regex` or `kind` starts a new baseline; a new `label` doesn't.
+  - A read that fails is recorded as `watch timeout`, `no number in the watched text` or `watch failed` (say, a
+    selector that isn't valid) and leaves the stored value alone. Only a selector or regex that matches nothing
+    counts as "no match". An agent taking the profile over mid-read aborts the visit, and nothing is recorded.
+  - Changing `selector`, `text_regex`, `kind` or the `url` starts a new baseline; a new `label` doesn't. A visit
+    still running for the old configuration records nothing.
 - **What is stored:** only the value (a number, or at most 200 characters), when it was read and when it last
   changed, shown under `watch` in `keepalive_list`, plus `baseline` / `unchanged` / `changed` / `lower` per visit
   in `last`. Nothing else from the page.

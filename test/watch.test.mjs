@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
-import { startBosun, connect, tmpDir, sleep } from './helpers.mjs';
+import { startBosun, connect, tmpDir, sleep, until } from './helpers.mjs';
 import { nextRun, advance, parseQuiet, extractWatch, watchChanged } from '../src/keepalive.mjs';
 import { loadConfig } from '../src/config.mjs';
 
@@ -144,6 +144,12 @@ test('watch is read only when logged in; a failed read is a category and keeps t
     await setWatch(c, { selector: '#status', text_regex: 'Paket\\s+(\\w+)', kind: 'count', label: 'n' });
     assert.deepEqual(await visit(svc), { status: 'ok', reason: null, watch: 'no number in the watched text' });
     assert.equal((await c.call('keepalive_list')).json()[0].watch.value, null);
+    // A baseline, then a selector that can't be evaluated: a failure, not "0 new".
+    await setWatch(c, { selector: '#badge b', kind: 'count', label: 'n' });
+    assert.equal((await visit(svc)).watch, 'baseline');
+    svc.keepalive.store.entries.get('alice/wh').watch.selector = 'div[';
+    assert.equal((await visit(svc)).watch, 'watch failed');
+    assert.equal((await c.call('keepalive_list')).json()[0].watch.value, 43);
     // Logged out (the check fails): no watch read at all.
     await c.call('keepalive_set', { profile: 'wh', url: `${site.base}/inbox`, logged_in_check: { text: 'Kein solcher Text' }, watch: COUNT });
     const r = await visit(svc);
@@ -181,7 +187,7 @@ test('extractWatch and watchChanged on their own', async () => {
   const page = (text, sel = {}) => ({
     locator: (s) => {
       const l = {
-        waitFor: async () => { if (s !== 'body' && !(s in sel)) throw new Error('timeout'); },
+        count: async () => { if (s === 'bad[') throw new Error('Unexpected token'); return s === 'body' || s in sel ? 1 : 0; },
         evaluate: async (fn, args) => fn(s === 'body' ? { innerText: text } : { textContent: sel[s] }, args),
       };
       return { ...l, first: () => l };
@@ -194,6 +200,11 @@ test('extractWatch and watchChanged on their own', async () => {
   assert.equal(await extractWatch(page('x'), { selector: '#gone', kind: 'text' }, { timeoutMs: 10 }), null);
   assert.equal(await extractWatch(page('Status:\n  versandt\t heute'), { textRegex: 'Status:\\s+(.+)', kind: 'text' }), 'versandt heute');
   await assert.rejects(extractWatch(page('keine'), { textRegex: 'keine', kind: 'count' }), /no number/);
+  await assert.rejects(extractWatch(page('x'), { selector: 'bad[', kind: 'count' }), /Unexpected token/); // not 0
+  const ac = new AbortController();
+  const p = extractWatch(page('x'), { selector: '#late', kind: 'count' }, { timeoutMs: 5000, signal: ac.signal });
+  setTimeout(() => ac.abort(), 50);
+  await assert.rejects(p, /aborted/);
   assert.equal(watchChanged('count', 3, 4), true);
   assert.equal(watchChanged('count', 4, 3), false);
   assert.equal(watchChanged('text', 'a', 'b'), true);
@@ -224,6 +235,13 @@ test('schedule: every_minutes (at least 30), jitter kept, quiet hours stretch th
   // Every hours, and a non-wrapping window.
   assert.equal(nextRun(t, { everyHours: 12, jitterMin: 0, quietHours: '01:30-05' }, () => 0.5, tz), at('2026-10-20T00:00:00+02:00'));
   assert.equal(advance(at('2026-10-20T01:00:00+02:00'), 60 * 60_000, parseQuiet('01:30-05'), tz), at('2026-10-20T03:30:00+02:00'));
+  // DST: time is counted as it really passes. Spring forward (02:00 CET -> 03:00 CEST on 2026-03-29):
+  assert.equal(advance(at('2026-03-29T01:00:00+01:00'), 180 * 60_000, parseQuiet('03-04'), tz), at('2026-03-29T05:45:00+02:00'));
+  assert.equal(advance(at('2026-03-28T21:00:00+01:00'), 12 * 3_600_000, parseQuiet('22-08'), tz), at('2026-03-29T16:45:00+02:00')); // a 9 h night
+  assert.equal(advance(at('2026-03-29T01:00:00+01:00'), 120 * 60_000, parseQuiet('02:30-03:30'), tz), at('2026-03-29T04:22:30+02:00')); // starts in the skipped hour
+  // Fall back (03:00 CEST -> 02:00 CET on 2026-10-25): 02-03 happens twice, both quiet.
+  assert.equal(advance(at('2026-10-25T01:00:00+02:00'), 90 * 60_000, parseQuiet('02-03'), tz), at('2026-10-25T03:00:00+01:00'));
+  assert.equal(advance(at('2026-10-24T21:00:00+02:00'), 12 * 3_600_000, parseQuiet('22-08'), tz), at('2026-10-25T16:15:00+01:00')); // an 11 h night
   for (const bad of ['8-8', '25-03', '22-08:60', 'night', '']) assert.throws(() => parseQuiet(bad), /quiet_hours/, bad);
   assert.equal(loadConfig({}).tz, 'Europe/Vienna');
   assert.equal(loadConfig({ TZ: 'UTC' }).tz, 'UTC');
@@ -281,6 +299,59 @@ test('URLs are http(s) only: keepalive_set (tool and core), navigate; a stored n
     assert.deepEqual(await visit(svc), { status: 'error', reason: 'url is not http(s)' });
     assert.equal(svc.manager.used, used);
     assert.equal(site.state.loads, loads);
+    await c.close();
+  });
+});
+
+test('an agent taking the profile over while the watch is being read: the visit is aborted, the baseline stays', async () => {
+  site.state.count = 43;
+  try {
+    await withService(async (svc, seen) => {
+      const c = await loggedInProfile(svc);
+      await setWatch(c, { selector: '#badge', kind: 'count', label: 'badge' });
+      assert.equal((await visit(svc)).watch, 'baseline');
+      site.state.count = 0; // the badge is gone: the read waits up to 5 s for it
+      const loads = site.state.loads;
+      const run = visit(svc);
+      await until(() => site.state.loads > loads, 20_000);
+      await sleep(1500); // past the activity (<= 0.5 s) and the check: inside the read's wait
+      const s = await c.open({ profile: 'wh' });
+      assert.equal((await run).status, 'aborted');
+      const [v] = (await c.call('keepalive_list')).json();
+      assert.equal(v.watch.value, 43); // not "0"
+      assert.equal(v.last_skip.reason, 'taken over by an agent');
+      await c.call('session_close', { session: s });
+      site.state.count = 43;
+      assert.equal((await visit(svc)).watch, 'unchanged');
+      assert.deepEqual(seen.watch, []);
+      await c.close();
+    });
+  } finally {
+    site.state.count = 43;
+  }
+});
+
+test('another URL starts a new baseline; a visit that began under an older watch configuration records nothing', async () => {
+  await withService(async (svc, seen) => {
+    const c = await loggedInProfile(svc);
+    await setWatch(c);
+    assert.equal((await visit(svc)).watch, 'baseline');
+    await setWatch(c, COUNT, { url: `${site.base}/inbox?folder=archive` });
+    assert.equal((await c.call('keepalive_list')).json()[0].watch.value, null);
+    assert.equal((await visit(svc)).watch, 'baseline');
+    // A -> B -> A while a visit for A runs: its result belongs to an old generation.
+    const loads = site.state.loads;
+    const run = visit(svc);
+    await until(() => site.state.loads > loads, 20_000);
+    await setWatch(c, { selector: '#status', kind: 'text', label: 'other' });
+    await setWatch(c, COUNT, { url: `${site.base}/inbox?folder=archive` });
+    const r = await run;
+    assert.equal(r.status, 'ok');
+    assert.equal(r.watch, undefined);
+    const [v] = (await c.call('keepalive_list')).json();
+    assert.equal(v.watch.value, null);
+    assert.equal(v.watch.baseline, 'not read yet');
+    assert.deepEqual(seen.watch, []);
     await c.close();
   });
 });
