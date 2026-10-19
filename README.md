@@ -264,4 +264,6 @@ references, watching pages outside keepalive visits · M3 macros.
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+**Status: early preview (0.x).** APIs, tool names and config may change without notice.

@@ -13,7 +13,7 @@
     "test:engines": "node scripts/test-engines.mjs",
     "measure:engines": "node scripts/measure-engines.mjs"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=20"
   },
