@@ -211,3 +211,56 @@ test('bridge: exits 1 when the server goes away', async () => {
   assert.equal(await b.exited, 1);
   assert.match(b.stderr(), /connection to ws:\/\/127\.0\.0\.1:1\/ failed/);
 });
+
+test('an ephemeral token may use the default engine only', async () => {
+  const e = await connect(svc, TOKEN_E);
+  try {
+    const other = ['chromium', 'patchright', 'camoufox'].find((n) => n !== svc.cfg.engine);
+    const r = await e.call('session_open', { engine: other });
+    assert.ok(r.isError);
+    assert.match(r.text, new RegExp(`engine ${other} is not allowed for this token`));
+    await assert.rejects(svc.manager.open({ owner: 'direct', tenant: 'swarm', engine: other }), /not allowed for this token/);
+    const id = await e.open({ engine: svc.cfg.engine });
+    await e.call('session_close', { session: id });
+  } finally { await e.close(); }
+});
+
+test('bridge: LF-only framing, CRLF accepted, oversized records dropped without buffering them whole', async () => {
+  const b = bridge({ BOSUN_URL: svc.wsUrl, BOSUN_TOKEN: TOKEN_E });
+  try {
+    b.send(INIT);
+    await b.reply(1);
+    // A bare CR inside a record does not split it: this record is not JSON as a whole, so it is dropped.
+    b.p.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 10, method: 'ping' })}\r${JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'ping' })}\n`);
+    b.p.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 12, method: 'ping' })}\r\n`); // CRLF is fine
+    assert.deepEqual((await b.reply(12)).result, {});
+    // 3 MiB without a newline, in chunks, then a newline and a normal request.
+    const chunk = 'x'.repeat(256 * 1024);
+    for (let i = 0; i < 12; i++) b.p.stdin.write(chunk);
+    b.p.stdin.write(`\n${JSON.stringify({ jsonrpc: '2.0', id: 13, method: 'ping' })}\n`);
+    assert.deepEqual((await b.reply(13)).result, {});
+    assert.ok(!b.lines.some((l) => [10, 11].includes(JSON.parse(l).id)));
+    assert.match(b.stderr(), /dropped a line that is not JSON/);
+    assert.match(b.stderr(), /dropped a message over 1 MiB/);
+    b.p.stdin.end();
+    assert.equal(await b.exited, 0);
+  } finally { b.p.kill(); }
+});
+
+test('bridge: a server that never completes the handshake times out; stdin EOF before that exits 0', async () => {
+  const net = await import('net');
+  const socks = [];
+  const srv = net.createServer((s) => socks.push(s)); // accepts TCP, never answers the upgrade
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const url = `ws://127.0.0.1:${srv.address().port}`;
+  try {
+    const eof = bridge({ BOSUN_URL: url, BOSUN_TOKEN: TOKEN_E });
+    eof.p.stdin.end();
+    assert.equal(await eof.exited, 0);
+    const t0 = Date.now();
+    const hung = bridge({ BOSUN_URL: url, BOSUN_TOKEN: TOKEN_E });
+    assert.equal(await hung.exited, 1);
+    assert.ok(Date.now() - t0 < 20000);
+    assert.match(hung.stderr(), /failed/);
+  } finally { for (const s of socks) s.destroy(); srv.close(); }
+});

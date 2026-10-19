@@ -119,11 +119,12 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     });
   };
 
-  tool('session_open', ephemeral ? 'Open an ephemeral browser session (wiped on close; profiles are not allowed for this token).' : 'Open a browser session. Without profile: ephemeral (wiped on close). With profile: persistent per-tenant profile (stays logged in).',
+  tool('session_open', ephemeral ? `Open an ephemeral browser session (wiped on close). Profiles, and engines other than ${cfg.engine}, are not allowed for this token.` : 'Open a browser session. Without profile: ephemeral (wiped on close). With profile: persistent per-tenant profile (stays logged in).',
     { profile: z.string().regex(TENANT_RE).optional(), locale: str(35).optional(), timezone: str(64).optional(),
       engine: z.enum(ENGINE_NAMES).optional().describe(`browser engine (default ${cfg.engine}): chromium, patchright (stealthier Chromium), camoufox (anti-detect Firefox)`) },
     async (a) => {
       if (ephemeral && a.profile !== undefined) throw new Error(PROFILES_REFUSED);
+      if (ephemeral && a.engine && a.engine !== cfg.engine) throw new Error(`engine ${a.engine} is ${NOT_ALLOWED}; use the default (${cfg.engine})`);
       const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine });
       return ok({ session: s.id, profile: a.profile || 'ephemeral', engine: s.engine });
     });

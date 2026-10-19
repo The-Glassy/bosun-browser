@@ -10,12 +10,13 @@
   - `tools/list` shows only the session and page tools: `session_open`, `session_close`, `navigate`, `read`,
     `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot` and `sessions`.
   - Every other tool answers "not allowed for this token", whatever its arguments.
-  - `session_open` refuses `profile`, and so does the session manager.
+  - `session_open` refuses `profile` and any engine but the default, and so does the session manager.
   - Screenshots are never saved to disk, and the connection gets no MCPL push events.
   - The tenant's session cap is `BROWSER_EPHEMERAL_MAX_SESSIONS` (default 2).
 - **`bosun-mcp-stdio`, a stdio bridge.** It lets stdio-only MCP clients such as `claude --mcp-config` use a Bosun
   WebSocket. It reads `BOSUN_URL` and `BOSUN_TOKEN`, sends the token as a Bearer header, and pipes newline-delimited
-  JSON-RPC, one message per WebSocket frame. A refused token exits 3 with one line on stderr, without the token.
+  JSON-RPC, one message per WebSocket frame. Records split on LF only and are capped at 1 MiB while reading, and the
+  handshake times out after 15 s. A refused token exits 3 with one line on stderr, without the token.
 
 ### Meetings against real Google Meet
 

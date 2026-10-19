@@ -375,8 +375,9 @@ With policy `ephemeral` the server enforces, not just hides:
 - `tools/list` shows only `session_open`, `session_close`, `navigate`, `read`, `click`, `type`, `select`, `press`,
   `back`, `wait_for`, `screenshot` and `sessions`. Any other tool answers `not allowed for this token`, whatever its
   arguments; its handler is never wired up for the connection.
-- `session_open` refuses `profile` ("profiles are not allowed for this token"). The session manager refuses profiles
-  and meeting browsers for the tenant as well.
+- `session_open` refuses `profile` ("profiles are not allowed for this token") and any engine but the default
+  (`ENGINE`, which startup checked, so a session never installs a browser). The session manager enforces both for
+  the tenant as well, and refuses meeting browsers.
 - The tenant has `BROWSER_EPHEMERAL_MAX_SESSIONS` sessions at most, across all its connections. Sessions belong to
   the connection and close when it closes (or after `IDLE_TIMEOUT_SEC`).
 - Nothing is written to `BROWSER_DATA`: screenshots are returned but never saved, even with `SAVE_SHOTS=1`. Ephemeral
@@ -399,8 +400,10 @@ stdin/stdout and the WebSocket, one message per frame.
   "env": { "BOSUN_URL": "ws://127.0.0.1:7360", "BOSUN_TOKEN": "<swarm token>" } } } }
 ```
 
-Exit codes: `0` stdin ended, `1` connection failed or lost, `2` bad configuration (missing variable, a non-ws URL,
-credentials in the URL), `3` token refused. The bridge needs only Node and the `ws` package.
+Records are split on LF only (CRLF is accepted); a record that is not JSON or is over 1 MiB is dropped with a line
+on stderr. The opening handshake times out after 15 s. Exit codes: `0` stdin ended, `1` connection failed or lost,
+`2` bad configuration (missing variable, a non-ws URL, credentials in the URL), `3` token refused. The bridge needs
+only Node and the `ws` package.
 
 ## Security notes
 

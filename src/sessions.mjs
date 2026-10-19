@@ -117,6 +117,8 @@ export class SessionManager {
     if (this.goneOwners.has(owner)) throw new Error('connection closed');
     const ephemeral = policyOf(this.cfg, tenant) === 'ephemeral';
     if (ephemeral && (profile || media)) throw new Error(profile ? PROFILES_REFUSED : NOT_ALLOWED);
+    // Only the default engine, which startup checked: another one may fetch its browser into a shared cache.
+    if (ephemeral && def.name !== this.cfg.engine) throw new Error(`engine ${def.name} is ${NOT_ALLOWED}; use the default (${this.cfg.engine})`);
     const profileKey = profile ? `${tenant}/${profile}` : null;
     // Counted as this owner's open from here, so a disconnect while it waits below still makes it close itself.
     this.ownerOpens.set(owner, (this.ownerOpens.get(owner) || 0) + 1);
