@@ -9,15 +9,19 @@ import { urlKey, httpUrl } from './sessions.mjs';
 export { httpUrl };
 import { MANIFEST, mcplConnection } from './events.mjs';
 import { MIN_PERIOD_MIN } from './keepalive.mjs';
+import { meetCantJoin } from './meetings/platforms/meet.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
 
 // Heuristic bot-wall detection after navigation/click.
+export const MEET_REFUSED = "Google Meet refused this guest (\"You can't join this video call\"), not a captcha: use a profile signed in to Google, or a residential IP";
 export async function wall(p) {
   try {
     const title = (await p.title()).toLowerCase();
     if (/just a moment|nur einen moment|attention required|verify you are human|robot/.test(title)) return 'bot check page';
+    // Meet's refusal page embeds reCAPTCHA frames but is a refusal; solving nothing gets past it.
+    if (meetCantJoin((await p.locator('body').innerText({ timeout: 2000 }).catch(() => '')).slice(0, 5000))) return MEET_REFUSED;
     const f = p.frames().map((f) => f.url()).join(' ');
     if (/recaptcha|hcaptcha|challenges\.cloudflare\.com|turnstile|captcha-delivery|geo\.captcha/.test(f)) return 'captcha';
     const t = (await p.locator('body').innerText({ timeout: 2000 }).catch(() => '')).slice(0, 3000).toLowerCase();
@@ -257,10 +261,10 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
   const meetings = manager.meetings;
   if (meetings) {
     const mid = { meeting_id: z.string().max(20) };
-    tool('meeting_join', 'Join a Google Meet as an unauthenticated guest notetaker (mic and camera off), ask to be let in and wait (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or it is alone for 2 min; then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting.',
+    tool('meeting_join', 'Join a Google Meet as an unauthenticated guest notetaker, or with profile (a Bosun profile signed in to Google: the account name is used) (mic and camera off), ask to be let in and wait (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or it is alone for 2 min; then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting.',
       { url: z.string().max(2048).url().describe('https://meet.google.com/abc-defg-hij'), name: str(60).optional().describe('display name (default "Glassy (notetaker)")'),
         announce_text: str(1000).optional(), max_wait_admit_min: z.number().int().min(1).max(60).optional(),
-        profile: z.string().regex(TENANT_RE).optional().describe('join with a persistent profile instead of a fresh guest browser'),
+        profile: z.string().regex(TENANT_RE).optional().describe('join with an existing Bosun profile signed in to Google (gets refused less often than an anonymous guest)'),
         engine: z.enum(ENGINE_NAMES).optional().describe('chromium (default) or patchright; camoufox is not supported for meetings'),
         leave_on_optout: z.boolean().optional() },
       async (a) => ok(await meetings.join(tenant, {

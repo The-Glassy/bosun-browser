@@ -6,35 +6,59 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 
-const APP = `<!doctype html><meta charset="utf-8"><title>Meet</title>
+// UI texts per language. de mirrors what a German-locale server saw on real Meet: "Wie heißen Sie?", placeholder
+// "Ihr Name", "Teilnahme erbitten", no devices ("Kamera nicht gefunden").
+const UI = {
+  en: { ready: 'Ready to join?', name: 'Your name', ask: 'Ask to join', joinNow: 'Join now', micOff: 'Turn off microphone', micOn: 'Turn on microphone',
+    camOff: 'Turn off camera', camOn: 'Turn on camera', noCam: 'Camera not found', noMic: 'Microphone not found', waiting: 'Asking to be let in…',
+    cantJoin: 'You can’t join this video call', home: 'Return to home screen', safe: 'Your meeting is safe', denied: 'Someone in the call denied your request to join',
+    chat: 'Chat with everyone', send: 'Send a message', leave: 'Leave call', ended: 'The call has ended', removed: 'You’ve been removed from the meeting', left: 'You left the meeting' },
+  de: { ready: 'Wie heißen Sie?', name: 'Ihr Name', ask: 'Teilnahme erbitten', joinNow: 'Jetzt teilnehmen', micOff: 'Mikrofon deaktivieren', micOn: 'Mikrofon aktivieren',
+    camOff: 'Kamera deaktivieren', camOn: 'Kamera aktivieren', noCam: 'Kamera nicht gefunden', noMic: 'Mikrofon nicht gefunden', waiting: 'Teilnahme wird angefragt…',
+    cantJoin: 'Sie können nicht an diesem Videoanruf teilnehmen.', home: 'Zurück zum Startbildschirm', safe: 'Ihre Besprechung ist sicher', denied: 'Jemand im Anruf hat Ihre Anfrage abgelehnt',
+    chat: 'Chat mit allen', send: 'Nachricht senden', leave: 'Anruf verlassen', ended: 'Der Anruf wurde beendet', removed: 'Sie wurden aus dem Meeting entfernt', left: 'Sie haben das Meeting verlassen' },
+};
+const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+
+// opts: lang (en|de), toggles ('ok' | 'none': no mic/camera buttons | 'stuck': the mic button does nothing |
+// 'nodevices': no buttons, Meet says no camera/microphone found), signedIn (no name field, "Join now"), bareName (a
+// name field without label or placeholder).
+function app({ lang = 'en', toggles = 'ok', signedIn = false, bareName = false }) {
+  const L = UI[lang];
+  const nameField = signedIn ? '' : bareName ? '<input type="text">' : `<input type="text" placeholder="${esc(L.name)}"${lang === 'en' ? ` aria-label="${esc(L.name)}"` : ''}>`;
+  return `<!doctype html><meta charset="utf-8"><title>Meet</title>
 <style>[hidden]{display:none!important} .tile{display:inline-block;width:80px;height:60px;background:#333;margin:4px}</style>
-<div id="lobby"><h1>Ready to join?</h1>
-  <button id="mic" aria-label="Turn off microphone">mic</button><button id="cam" aria-label="Turn off camera">cam</button>
-  <input aria-label="Your name" placeholder="Your name"><button id="ask"><span>Ask to join</span></button></div>
-<div id="waiting" hidden><p>Asking to be let in…</p><p>You’ll join the call when someone lets you in</p></div>
-<div id="denied" hidden><h1>You can’t join this call</h1><p>Someone in the call denied your request to join</p></div>
+<div id="lobby"><h1>${esc(L.ready)}</h1>
+  <button id="mic" aria-label="${esc(L.micOff)}">mic</button><button id="cam" aria-label="${esc(L.camOff)}">cam</button>
+  ${toggles === 'nodevices' ? `<p>${esc(L.noCam)}</p><p>${esc(L.noMic)}</p>` : ''}
+  ${nameField}<button id="ask"><span>${esc(signedIn ? L.joinNow : L.ask)}</span></button>
+  <button id="other">${lang === 'de' ? 'Weitere Möglichkeiten zur Teilnahme' : 'Other ways to join'}</button></div>
+<div id="waiting" hidden><p>${esc(L.waiting)}</p></div>
+<div id="denied" hidden><h1>${esc(L.cantJoin)}</h1><p>${esc(L.denied)}</p></div>
+<div id="refused" hidden><h1>${esc(L.cantJoin)}</h1><button>${esc(L.home)}</button><p>${esc(L.safe)}</p><iframe src="/recaptcha/api2/anchor?k=x" title="reCAPTCHA" width="10" height="10"></iframe></div>
 <div id="call" hidden><div id="tiles"></div>
-  <div role="toolbar"><button aria-label="Chat with everyone">chat</button><button aria-label="Leave call">leave</button></div>
-  <aside id="panel" hidden><div role="list" id="msgs"></div><textarea aria-label="Send a message"></textarea></aside></div>
+  <div role="toolbar"><button aria-label="${esc(L.chat)}">chat</button><button aria-label="${esc(L.leave)}">leave</button></div>
+  <aside id="panel" hidden><div role="list" id="msgs"></div><textarea aria-label="${esc(L.send)}"></textarea></aside></div>
 <div id="over" hidden><h1 id="overText"></h1></div>
 <script>
+const L = ${JSON.stringify(L)}, TOGGLES = ${JSON.stringify(toggles)};
 const code = location.pathname.slice(1), $ = (id) => document.getElementById(id);
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, ...b }) });
 let mic = true, cam = true, shown = new Set(), toned = false;
-$('mic').onclick = () => { mic = !mic; $('mic').setAttribute('aria-label', mic ? 'Turn off microphone' : 'Turn on microphone'); };
-$('cam').onclick = () => { cam = !cam; $('cam').setAttribute('aria-label', cam ? 'Turn off camera' : 'Turn on camera'); };
-$('ask').onclick = () => post('ask', { name: document.querySelector('input[aria-label="Your name"]').value, mic, cam });
-document.querySelector('[aria-label="Chat with everyone"]').onclick = () => { $('panel').hidden = false; };
-document.querySelector('[aria-label="Leave call"]').onclick = () => post('leave', {});
+$('mic').onclick = () => { mic = !mic; $('mic').setAttribute('aria-label', mic ? L.micOff : L.micOn); };
+$('cam').onclick = () => { cam = !cam; $('cam').setAttribute('aria-label', cam ? L.camOff : L.camOn); };
+if (TOGGLES === 'none' || TOGGLES === 'nodevices') { $('mic').hidden = $('cam').hidden = true; }
+if (TOGGLES === 'nodevices') { mic = cam = false; }
+if (TOGGLES === 'stuck') $('mic').onclick = null;
+$('ask').onclick = () => { const f = document.querySelector('#lobby input'); post('ask', { name: f ? f.value : null, mic, cam }); };
+document.querySelector('[aria-label="' + L.chat + '"]').onclick = () => { $('panel').hidden = false; };
+document.querySelector('[aria-label="' + L.leave + '"]').onclick = () => post('leave', {});
 const box = document.querySelector('textarea');
 box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); const t = box.value.trim(); box.value = ''; if (t) post('chat', { text: t }); } });
-const TOGGLES = '__TOGGLES__'; // 'none': no mic/camera buttons, 'stuck': the mic button does nothing
-$('mic').hidden = $('cam').hidden = TOGGLES === 'none';
-if (TOGGLES === 'stuck') $('mic').onclick = null;
 async function poll() {
   const s = await (await fetch('/api/state?code=' + code)).json();
-  for (const id of ['lobby', 'waiting', 'denied', 'call', 'over']) $(id).hidden = s.view !== id;
-  if (s.view === 'over') $('overText').textContent = s.over;
+  for (const id of ['lobby', 'waiting', 'denied', 'refused', 'call', 'over']) $(id).hidden = s.view !== id;
+  if (s.view === 'over') $('overText').textContent = L[s.over];
   if (s.view === 'call') {
     const want = s.participants.join();
     if ($('tiles').dataset.p !== want) {
@@ -58,11 +82,12 @@ async function poll() {
 }
 poll();
 </script>`;
+}
 
 export async function startFakeMeet({ tone = false } = {}) {
   const rooms = new Map();
   const room = (code) => {
-    if (!rooms.has(code)) rooms.set(code, { phase: 'lobby', guest: null, chat: [], others: ['host-1', 'guest-2'], over: null, tone, log: [], seq: 0 });
+    if (!rooms.has(code)) rooms.set(code, { phase: 'lobby', guest: null, chat: [], others: ['host-1', 'guest-2'], over: null, tone, log: [], seq: 0, loads: [] });
     return rooms.get(code);
   };
   const body = (req) => new Promise((r) => { let b = ''; req.on('data', (d) => { b += d; }); req.on('end', () => r(b ? JSON.parse(b) : {})); });
@@ -70,21 +95,23 @@ export async function startFakeMeet({ tone = false } = {}) {
     const u = new URL(req.url, 'http://x');
     const json = (o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
     if (/^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(u.pathname)) {
+      const r = room(u.pathname.slice(1));
+      r.loads.push({ hl: u.searchParams.get('hl'), acceptLanguage: req.headers['accept-language'] || null });
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      return res.end(APP.replace('__TOGGLES__', room(u.pathname.slice(1)).toggles || 'ok'));
+      return res.end(app(r));
     }
     if (u.pathname === '/api/state') {
       const r = room(u.searchParams.get('code'));
-      const view = r.over ? 'over' : r.phase === 'waiting' ? 'waiting' : r.phase === 'denied' ? 'denied' : r.phase === 'admitted' ? 'call' : 'lobby';
+      const view = r.over ? 'over' : ['waiting', 'denied', 'refused'].includes(r.phase) ? r.phase : r.phase === 'admitted' ? 'call' : 'lobby';
       const chat = r.chat.map((m) => (m.fillAt && Date.now() < m.fillAt ? { ...m, text: '' } : m));
       return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone });
     }
     if (req.method === 'POST') {
       const b = await body(req);
       const r = room(b.code);
-      if (u.pathname === '/api/ask') { r.guest = { name: b.name, mic: b.mic, cam: b.cam }; r.phase = r.open ? 'admitted' : 'waiting'; r.log.push(['ask', Date.now()]); }
+      if (u.pathname === '/api/ask') { r.guest = { name: b.name, mic: b.mic, cam: b.cam }; r.phase = r.refuse ? 'refused' : r.open ? 'admitted' : 'waiting'; r.log.push(['ask', Date.now()]); }
       if (u.pathname === '/api/chat') { r.chat.push({ id: `c${++r.seq}`, sender: r.guest?.name, self: true, text: b.text }); r.log.push(['chat', Date.now(), b.text]); }
-      if (u.pathname === '/api/leave') { r.left = true; r.over = 'You left the meeting'; r.log.push(['leave', Date.now()]); }
+      if (u.pathname === '/api/leave') { r.left = true; r.over = 'left'; r.log.push(['leave', Date.now()]); }
       return json({ ok: true });
     }
     res.writeHead(404); res.end();
@@ -101,10 +128,13 @@ export async function startFakeMeet({ tone = false } = {}) {
     deny: (c) => { room(c).phase = 'denied'; },
     // lateMs: the message shows up empty first and gets its text that much later (incremental rendering).
     say: (c, sender, text, { lateMs = 0 } = {}) => { const r = room(c); r.chat.push({ id: `c${++r.seq}`, sender, text, ...(lateMs ? { fillAt: Date.now() + lateMs } : {}) }); },
-    toggles: (c, mode) => { room(c).toggles = mode; }, // 'none': no mic/camera buttons, 'stuck': the mic button does nothing
+    toggles: (c, mode) => { room(c).toggles = mode; },
     setOthers: (c, others) => { room(c).others = others; },
-    end: (c) => { room(c).over = 'The call has ended'; },
-    remove: (c) => { room(c).over = 'You’ve been removed from the meeting'; },
+    end: (c) => { room(c).over = 'ended'; },
+    remove: (c) => { room(c).over = 'removed'; },
+    // Variants of a room (set before the page loads): lang, toggles, signedIn, bareName; refuse = Google turns the
+    // guest away right after "Ask to join".
+    set: (c, opts) => { Object.assign(room(c), opts); },
     close: () => new Promise((r) => { srv.close(r); srv.closeAllConnections(); }),
   };
 }

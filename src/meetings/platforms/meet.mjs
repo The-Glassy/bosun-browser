@@ -1,35 +1,71 @@
-// Google Meet, joined as an unauthenticated guest. Everything Meet-specific (texts, labels, DOM markers) lives here;
-// the meeting manager only uses the platform interface:
+// Google Meet, joined as an unauthenticated guest, or with a Bosun profile that is signed in to a Google account
+// (then Meet takes the name from the account and shows no name field). Everything Meet-specific (texts, labels, DOM
+// markers) lives here; the meeting manager only uses the platform interface:
 //
-//   name, matches(url)
-//   lobby(page, {name})   mic and camera off, guest name filled in, "Ask to join" clicked -> 'waiting' | 'admitted'
-//   state(page)           'lobby' | 'waiting' | 'admitted' | 'denied' | 'removed' | 'ended' | 'unknown'
+//   name, matches(url), locale
+//   joinUrl(url)          the URL to load: forces Meet's English UI (hl=en)
+//   lobby(page, {name})   mic and camera off, guest name filled in (if asked), join clicked
+//                         -> 'waiting' | 'admitted' | 'denied' | 'refused' | 'ended'
+//   state(page)           'lobby' | 'waiting' | 'admitted' | 'denied' | 'refused' | 'removed' | 'ended' | 'unknown'
 //   openChat(page), sendChat(page, text)
 //   watchChat(page, key)  install a MutationObserver that queues new chat messages; drainChat(page, key) -> [{id, sender, text}]
 //   participants(page)    number of people in the call (incl. the bot), or null if the page doesn't show it
 //   leave(page)
 //
-// Meet's markup changes without notice. The markers are kept to labels and texts a person sees (English and German
-// UI) plus a few stable data attributes; a run against real Meet that fails here is fixed here.
+// Meet's markup changes without notice and its language follows the account, the browser and the hl parameter. The
+// session asks for English (joinUrl, locale), and every text and label is still matched in English, German, Slovak,
+// Ukrainian and Russian, so a UI that comes up in another of those languages works too. Markers are labels, roles
+// and texts a person sees; a run against real Meet that fails here is fixed here.
 
-const one = (re) => (s) => re.test(String(s || '').replace(/[‘’]/g, "'"));
+const norm = (s) => String(s || '').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ');
+const any = (...parts) => new RegExp(parts.join('|'), 'i');
 const TEXT = {
-  waiting: /asking to be let in|you'll join the call when someone lets you in|waiting for the host|please wait until a meeting host|teilnahme wird angefragt|sie nehmen teil, sobald|sobald (?:dich|sie) jemand (?:in den anruf )?(?:lässt|zulässt)/i,
-  denied: /denied your request|can't join this (?:video )?call|cannot join this call|not allowed to join|weren't allowed to join|anfrage.*abgelehnt|(?:sie können|du kannst) (?:an )?diese[mn]? (?:video)?anruf nicht (?:beitreten|teilnehmen)/i,
-  removed: /you've been removed|you have been removed|removed you from the (?:meeting|call)|aus (?:dem|der) (?:meeting|besprechung|anruf|videoanruf) entfernt/i,
-  ended: /the call has ended|call ended|meeting (?:has )?ended|you left the meeting|you left the call|der anruf wurde beendet|(?:besprechung|meeting) (?:wurde )?beendet|sie haben (?:das meeting|den anruf) verlassen/i,
+  waiting: any("asking to be let in", "you'll join the call when someone lets you in", 'waiting for the host', 'please wait until a meeting host',
+    'teilnahme wird (?:angefragt|erbeten)', 'sie nehmen teil, sobald', 'sobald (?:dich|sie) jemand', 'warten, bis sie jemand',
+    'žiadate o (?:pripojenie|vpustenie)', 'pripojíte sa, keď vás niekto',
+    'просимо дозволу', 'ви приєднаєтеся до дзвінка, коли вас',
+    'запрашиваем разрешение', 'вы присоединитесь к звонку, когда вас'),
+  // A participant (the host) said no.
+  denied: any('denied your request', 'request to join was denied', "weren't allowed to join", 'not allowed to join',
+    'hat ihre anfrage (?:auf teilnahme )?abgelehnt', 'anfrage.*abgelehnt', 'zamietol (?:vašu )?žiadosť', 'відхилив (?:ваш )?запит', 'отклонил (?:ваш )?запрос'),
+  // "You can't join this (video) call": Google turning the guest away, usually before anyone could be asked.
+  cantJoin: any("(?:can't|cannot|can not) join this (?:video )?call", 'sie können nicht an diesem (?:video)?anruf teilnehmen',
+    'sie können diesem (?:video)?anruf nicht beitreten', 'du kannst nicht an diesem (?:video)?anruf teilnehmen',
+    'k tomuto (?:video)?hovoru sa nemôžete pripojiť', 'nemôžete sa pripojiť k tomuto (?:video)?hovoru',
+    'ви не можете приєднатися до цього (?:відео)?дзвінка', 'вы не можете присоединиться к этому (?:видео)?(?:звонку|вызову)'),
+  removed: any("you've been removed", 'you have been removed', 'removed you from the (?:meeting|call)', 'aus (?:dem|der) (?:meeting|besprechung|anruf|videoanruf) entfernt',
+    'vás odstránil', 'вас видалено', 'вас удалили'),
+  ended: any('the call has ended', 'call ended', 'meeting (?:has )?ended', 'you left the meeting', 'you left the call', 'der anruf wurde beendet',
+    '(?:besprechung|meeting) (?:wurde )?beendet', 'sie haben (?:das meeting|den anruf|die besprechung) verlassen',
+    'hovor sa skončil', 'opustili ste (?:hovor|stretnutie)', 'дзвінок завершено', 'ви вийшли', 'звонок завершен', 'вы покинули'),
+  // Shown in the lobby when the browser has no such device: the control is off by construction.
+  noCamera: any('camera not found', 'no camera found', 'kamera nicht gefunden', 'keine kamera gefunden', 'kamera sa nenašla', 'камеру не знайдено', 'камера не найдена'),
+  noMic: any('microphone not found', 'no microphone found', 'mikrofon nicht gefunden', 'kein mikrofon gefunden', 'mikrofón sa nenašiel', 'мікрофон не знайдено', 'микрофон не найден'),
 };
 const LABEL = {
-  micOff: /^(?:turn off microphone|mikrofon (?:deaktivieren|ausschalten))/i, // the button that turns it off: it is on
-  micOn: /^(?:turn on microphone|mikrofon (?:aktivieren|einschalten))/i, // it is off
-  camOff: /^(?:turn off camera|kamera (?:deaktivieren|ausschalten))/i,
-  camOn: /^(?:turn on camera|kamera (?:aktivieren|einschalten))/i,
-  join: /^(?:ask to join|teilnahme anfragen|teilnehmen anfragen|join now|jetzt teilnehmen|beitreten)$/i,
-  chat: /^(?:chat with everyone|chat mit allen|open chat|chat öffnen|chat)$/i,
-  chatInput: /send a message|nachricht senden|nachricht an alle/i,
-  leave: /^(?:leave call|anruf verlassen|leave meeting|besprechung verlassen)$/i,
+  micOff: any('^turn off microphone', '^mikrofon (?:deaktivieren|ausschalten)', '^vypnúť mikrofón', '^вимкнути мікрофон', '^выключить микрофон'), // it is on
+  micOn: any('^turn on microphone', '^mikrofon (?:aktivieren|einschalten)', '^zapnúť mikrofón', '^увімкнути мікрофон', '^включить микрофон'), // it is off
+  camOff: any('^turn off camera', '^kamera (?:deaktivieren|ausschalten)', '^vypnúť kameru', '^вимкнути камеру', '^выключить камеру'),
+  camOn: any('^turn on camera', '^kamera (?:aktivieren|einschalten)', '^zapnúť kameru', '^увімкнути камеру', '^включить камеру'),
+  join: any('^ask to join$', '^join now$', '^join$', '^teilnahme erbitten$', '^teilnahme anfragen$', '^teilnehmen anfragen$', '^jetzt teilnehmen$', '^teilnehmen$', '^beitreten$',
+    '^požiadať o pripojenie$', '^pripojiť sa$', '^pripojiť sa teraz$', '^попросити приєднатися$', '^приєднатися$', '^приєднатися зараз$',
+    '^попросить разрешения присоединиться$', '^присоединиться$', '^присоединиться сейчас$'),
+  chat: any('^chat with everyone$', '^chat mit allen$', '^open chat$', '^chat öffnen$', '^chat$', '^chatovať so všetkými$', '^чат з усіма$', '^чат со всеми$', '^чат$'),
+  chatInput: any('send a message', 'nachricht senden', 'nachricht an alle', 'odoslať správu', 'надіслати повідомлення', 'отправить сообщение'),
+  leave: any('^leave call$', '^anruf verlassen$', '^leave meeting$', '^besprechung verlassen$', '^opustiť hovor$', '^вийти з дзвінка$', '^покинуть звонок$'),
 };
-const NAME_INPUT = 'input[aria-label="Your name"], input[aria-label="Ihr Name"], input[aria-label="Dein Name"], input[placeholder="Your name"], input[placeholder="Ihr Name"]';
+const NAME_LABELS = ['Your name', 'Ihr Name', 'Dein Name', 'Vaše meno', 'Ваше ім’я', "Ваше ім'я", 'Ваше имя'];
+// The guest-name field: by its label or placeholder in any of the languages, else the only text box on the page.
+async function nameInput(page) {
+  for (const n of NAME_LABELS) {
+    const l = page.locator(`input[aria-label="${n}"], input[placeholder="${n}"]`);
+    if (await visible(l)) return l.first();
+  }
+  const boxes = page.getByRole('textbox');
+  const shown = [];
+  for (let i = 0, c = Math.min(await boxes.count().catch(() => 0), 5); i < c; i++) if (await boxes.nth(i).isVisible().catch(() => false)) shown.push(boxes.nth(i));
+  return shown.length === 1 ? shown[0] : null;
+}
 
 // Visible page text outside anything participants control: chat messages, participant tiles and lists (names), and
 // form fields are skipped structurally, so a name or a chat line reading "The call has ended" neither ends the
@@ -47,13 +83,18 @@ function pageText(page) {
       if (vis.get(el)) out.push(n.nodeValue.trim());
     }
     return out.join('\n').slice(0, 20000);
-  }, PARTICIPANT_CONTROLLED);
+  }, PARTICIPANT_CONTROLLED).then(norm);
 }
 const visible = (l) => l.first().isVisible().catch(() => false);
 const button = (page, name) => page.getByRole('button', { name });
+const disabled = (l) => l.first().evaluate((b) => b.disabled || b.getAttribute('aria-disabled') === 'true').catch(() => false);
+
+// Whether a page text is Google's "You can't join this video call" page (also used by the bot-wall check).
+export const meetCantJoin = (text) => TEXT.cantJoin.test(norm(text));
 
 export const meet = {
   name: 'meet',
+  locale: 'en-US', // the meeting browser's language (Accept-Language, navigator.language)
 
   matches(url) {
     try {
@@ -62,42 +103,66 @@ export const meet = {
     } catch { return false; }
   },
 
+  joinUrl(url) {
+    const u = new URL(url);
+    u.searchParams.set('hl', 'en');
+    return u.href;
+  },
+
+  // Microphone or camera verified off: its control shows "turn on", or the device doesn't exist (Meet says it wasn't
+  // found, or its control is disabled). If it is on, it is switched off and checked again. Throws if neither can be
+  // established: joining with a live microphone or camera is not risked.
+  async ensureOff(page, what, { onLabel, offLabel, missing }, timeoutMs = 10_000) {
+    const until = Date.now() + timeoutMs;
+    for (;;) {
+      if (await visible(button(page, offLabel))) return 'off';
+      if (TEXT[missing].test(await pageText(page).catch(() => ''))) return 'no device';
+      const on = button(page, onLabel);
+      if (await visible(on)) {
+        if (await disabled(on)) return 'no device';
+        await on.first().click({ timeout: 3000 }).catch(() => {});
+      }
+      if (Date.now() > until) throw new Error(`could not make sure the ${what} is off before joining (Meet changed?); not joining`);
+      await page.waitForTimeout(300);
+    }
+  },
+
   async lobby(page, { name, timeoutMs = 30_000 }) {
     const end = Date.now() + timeoutMs;
-    // The lobby renders in steps; wait for the join button or the name field.
+    // The lobby renders in steps; wait for the join button (a guest also gets a name field first on some pages).
+    let input = null;
     for (;;) {
-      if (await visible(button(page, LABEL.join)) || await visible(page.locator(NAME_INPUT))) break;
+      if (await visible(button(page, LABEL.join))) break;
       const s = await this.state(page);
-      if (s === 'denied' || s === 'ended') return s;
-      if (Date.now() > end) throw new Error('no Meet lobby found (not a Meet page, or Meet changed)');
+      if (s === 'denied' || s === 'refused' || s === 'ended') return s;
+      if (Date.now() > end) throw new Error(`no "Ask to join" button found on the Meet page (not a Meet lobby, or Meet changed); page ${s}`);
       await page.waitForTimeout(500);
     }
-    // Microphone and camera off before joining, verified: each control must end up showing its "turn on" label.
-    // If that can't be confirmed (control missing, click failed, Meet changed) the join is refused rather than risked.
-    for (const [what, onLabel, offLabel] of [['microphone', LABEL.micOff, LABEL.micOn], ['camera', LABEL.camOff, LABEL.camOn]]) {
-      const until = Date.now() + 10_000;
-      for (;;) {
-        if (await visible(button(page, offLabel))) break;
-        const on = button(page, onLabel);
-        if (await visible(on)) await on.first().click({ timeout: 3000 }).catch(() => {});
-        if (Date.now() > until) throw new Error(`could not make sure the ${what} is off before joining (Meet changed?); not joining`);
-        await page.waitForTimeout(300);
-      }
+    await this.ensureOff(page, 'microphone', { onLabel: LABEL.micOff, offLabel: LABEL.micOn, missing: 'noMic' });
+    await this.ensureOff(page, 'camera', { onLabel: LABEL.camOff, offLabel: LABEL.camOn, missing: 'noCamera' });
+    // Signed in to Google: no name field, Meet uses the account's name.
+    input = await nameInput(page);
+    if (input) await input.fill(name, { timeout: 5000 });
+    const join = button(page, LABEL.join).first();
+    // Guests may have to type a name before the button is enabled.
+    for (let i = 0; i < 20 && await disabled(join); i++) await page.waitForTimeout(250);
+    await join.click({ timeout: 10_000 });
+    for (let i = 0; i < 10; i++) {
+      await page.waitForTimeout(500);
+      const s = await this.state(page);
+      if (s === 'admitted' || s === 'denied' || s === 'refused' || s === 'ended') return s;
+      if (s === 'waiting') return 'waiting';
     }
-    const input = page.locator(NAME_INPUT);
-    if (await visible(input)) await input.first().fill(name, { timeout: 5000 });
-    await button(page, LABEL.join).first().click({ timeout: 10_000 });
-    await page.waitForTimeout(1000);
-    const s = await this.state(page);
-    return s === 'admitted' ? 'admitted' : s === 'denied' || s === 'ended' ? s : 'waiting';
+    return 'waiting';
   },
 
   async state(page) {
     const t = await pageText(page).catch(() => '');
-    if (one(TEXT.denied)(t)) return 'denied';
-    if (one(TEXT.removed)(t)) return 'removed';
-    if (one(TEXT.ended)(t)) return 'ended';
-    if (one(TEXT.waiting)(t)) return 'waiting';
+    if (TEXT.denied.test(t)) return 'denied';
+    if (TEXT.cantJoin.test(t)) return 'refused';
+    if (TEXT.removed.test(t)) return 'removed';
+    if (TEXT.ended.test(t)) return 'ended';
+    if (TEXT.waiting.test(t)) return 'waiting';
     // In the call: participant tiles or the in-call chat button (the lobby has neither).
     if (await page.locator('[data-participant-id]').count().catch(() => 0) || await visible(button(page, LABEL.chat))) return 'admitted';
     if (await visible(button(page, LABEL.join))) return 'lobby';
