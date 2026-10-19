@@ -12,6 +12,8 @@ import path from 'path';
 import crypto from 'crypto';
 import { pathToFileURL } from 'url';
 import { httpUrl } from '../sessions.mjs';
+import { readProfileMeta } from '../engines.mjs';
+import { TENANT_RE } from '../auth.mjs';
 import { matchOptOut } from './optout.mjs';
 import { meet } from './platforms/meet.mjs';
 import { pulseAudio } from './audio.mjs';
@@ -49,6 +51,10 @@ export function announcement(name, owner) {
   ];
 }
 export const CONFIRM_DELETED = 'Recording stopped and deleted. / Aufnahme gestoppt und gelöscht.';
+// Google turned the guest away before anyone could admit it ("You can't join this video call").
+export const REFUSED_BY_GOOGLE = "Google refused to let this guest join (\"You can't join this video call\") before anyone could admit it. " +
+  'Google often does this for automated guests, especially from datacenter IPs. Join with a Bosun profile that is signed in to a ' +
+  'Google account (meeting_join with profile), or run Bosun from a residential IP.';
 
 const sleep = (ms, signal) => new Promise((r) => {
   if (signal?.aborted) return r();
@@ -115,7 +121,17 @@ export class Meetings {
     url = httpUrl(url);
     const platform = this.platformFor(url);
     if (!platform) throw new Error('only Google Meet links (https://meet.google.com/abc-defg-hij) are supported for now');
-    const eng = engine || (this.manager.engines.get(this.cfg.engine).family === 'chromium' ? this.cfg.engine : 'chromium');
+    // A signed-in profile: an existing Bosun profile (logged in to Google with session_open + request_human first),
+    // opened with the engine it was last used with unless one is given.
+    let meta = null;
+    if (profile) {
+      if (!TENANT_RE.test(profile)) throw new Error('invalid profile name');
+      const dir = path.join(this.cfg.dataDir, 'profiles', tenant, profile);
+      if (!fs.existsSync(dir)) throw new Error(`no profile ${profile}: open it with session_open({profile}), sign in to Google (request_human), close it, then join with it`);
+      meta = readProfileMeta(dir);
+      if (meta?.family === 'firefox') throw new Error(`profile ${profile} is a Firefox (camoufox) profile; meetings need a Chromium profile`);
+    }
+    const eng = engine || meta?.engine || (this.manager.engines.get(this.cfg.engine).family === 'chromium' ? this.cfg.engine : 'chromium');
     if (this.manager.engines.get(eng).family !== 'chromium') throw new Error(`meetings need a Chromium engine (chromium or patchright); ${eng} is not supported for meetings`);
     const why = await this.audio.unsupported();
     if (why) throw new Error(why);
@@ -155,19 +171,21 @@ export class Meetings {
     m.rig = rig;
     if (m.finishing) { await rig.close().catch(() => {}); return; }
     const session = await this.manager.open({
-      owner: m.owner, tenant: m.tenant, profile: m.profile || undefined, engine: m.engine,
+      owner: m.owner, tenant: m.tenant, profile: m.profile || undefined, engine: m.engine, locale: platform.locale,
       media: { args: [...MEDIA_ARGS, ...(rig.args || [])], env: rig.browserEnv },
     }).catch(async (e) => { await rig.close().catch(() => {}); throw e; });
     m.session = session;
     if (m.finishing) { await this.manager.dispose(session, 'meeting-ended').catch(() => {}); await rig.close().catch(() => {}); return; }
     await m.session.ctx.grantPermissions(['microphone', 'camera'], { origin: new URL(m.url).origin }).catch(() => {});
-    await this.page(m, (p) => p.goto(m.url, { waitUntil: 'domcontentloaded', timeout: 45_000 })).catch((e) => {
+    await this.page(m, (p) => p.goto(platform.joinUrl ? platform.joinUrl(m.url) : m.url, { waitUntil: 'domcontentloaded', timeout: 45_000 })).catch((e) => {
       throw new Error(`could not load the meeting page: ${String(e?.message || e).split('\n')[0].slice(0, 200)}`);
     });
     const first = await this.page(m, (p) => platform.lobby(p, { name: m.name }));
-    if (first === 'denied') return this.finish(m, 'denied', "can't join this call (denied, or guests are not allowed)");
+    if (first === 'denied') return this.finish(m, 'denied', 'the request to join was denied');
+    if (first === 'refused') return this.finish(m, 'refused_by_google', REFUSED_BY_GOOGLE);
     if (first === 'ended') return this.finish(m, 'meeting-ended', 'the meeting has ended');
-    if (first === 'waiting') {
+    if (first === 'waiting' || first === 'asked') {
+      m.knocked = first === 'waiting'; // the waiting room was seen: the request reached the meeting
       transition(m, 'waiting');
       m.joined.resolve();
       const until = this.now() + m.maxWaitMs;
@@ -176,7 +194,10 @@ export class Meetings {
         if (signal.aborted || m.state === 'ended') return;
         const s = await this.page(m, (p) => platform.state(p));
         if (s === 'admitted') break;
+        if (s === 'waiting') m.knocked = true;
         if (s === 'denied') return this.finish(m, 'denied', 'the request to join was denied');
+        // "Can't join" after the waiting room: the request was turned down. Without one: Google turned the guest away.
+        if (s === 'refused') return m.knocked ? this.finish(m, 'denied', 'the request to join was denied') : this.finish(m, 'refused_by_google', REFUSED_BY_GOOGLE);
         if (s === 'ended' || s === 'removed') return this.finish(m, 'meeting-ended', 'the meeting has ended');
         if (this.now() > until) return this.finish(m, 'not-admitted', `not admitted within ${Math.round(m.maxWaitMs / 60_000)} min`);
       }

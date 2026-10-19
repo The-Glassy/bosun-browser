@@ -251,8 +251,8 @@ arrived on average and up to about 40 minutes after (longer in quiet hours). Sev
 
 ## Meetings (PoC)
 
-Bosun can attend a **Google Meet** as a notetaker: it joins as an **unauthenticated guest**, records the meeting's
-audio and leaves. Nothing is transcribed live: the agent gets the recording when the meeting ends and transcribes it
+Bosun can attend a **Google Meet** as a notetaker: it joins as an **unauthenticated guest**, or with a Bosun
+profile that is **signed in to a Google account**, records the meeting's audio and leaves. Nothing is transcribed live: the agent gets the recording when the meeting ends and transcribes it
 afterwards with whatever it likes. Zoom and Teams are not supported yet; the Meet-specific parts live in
 `src/meetings/platforms/meet.mjs` behind a small platform interface, so another platform is one more file.
 
@@ -268,23 +268,42 @@ meeting_recording_delete({ "meeting_id": "…" })
 
 **How a meeting runs:**
 
-1. A fresh browser of its own (or `profile`; Chromium or patchright only, camoufox is refused). Media permission
-   prompts are accepted (`--use-fake-ui-for-media-stream`), but no fake devices are used: the microphone is a silent
-   audio source and there is no camera.
-2. In the lobby, the microphone and camera are switched off and the guest name is filled in (default
-   `Glassy (notetaker)`). Then **Ask to join** / **Teilnahme anfragen**, and Bosun waits up to `max_wait_admit_min`.
-   "You can't join this call", a denied request or no admission in time ends it with a clear error.
-3. Once admitted, Bosun opens the chat and **posts the announcement first**. Only then does recording start. The
+1. **Browser:** a fresh browser of its own, or `profile` (Chromium or patchright only; camoufox is refused).
+   - Media permission prompts are accepted (`--use-fake-ui-for-media-stream`), but no fake devices are used: the
+     microphone is a silent audio source and there is no camera.
+   - The browser asks for Meet's **English UI** (`hl=en`, Accept-Language `en-US`). Since the account or region can
+     still win, every text and label is also recognized in German, Slovak, Ukrainian and Russian.
+2. **Lobby:**
+   - Microphone and camera must be **verifiably off** before joining. Bosun switches a device off and checks it,
+     unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden") and no control shows
+     it on; then it already counts as off. If neither can be confirmed, Bosun does not join.
+   - A guest types its name (default `Glassy (notetaker)`); a signed-in profile has no name field and joins under
+     the account's name.
+   - Then **Ask to join** / **Teilnahme erbitten** / **Join now**, and Bosun waits up to `max_wait_admit_min`.
+3. **Not getting in:**
+   - A denied request or no admission in time ends the meeting with a clear error.
+   - **Google turning the guest away** ("You can't join this video call" / "Sie können nicht an diesem Videoanruf
+     teilnehmen" after asking, with no waiting room seen) ends with reason `refused_by_google`.
+   - That refusal comes with a hint: join with a signed-in profile, or from a residential IP. It is not a captcha,
+     and `navigate` reports it as a refusal too.
+4. Once admitted, Bosun opens the chat and **posts the announcement first**. Only then does recording start. The
    default text is in English and German: *"Hi, I'm Glassy, an AI notetaker. I'm recording audio for notes. If you'd
    rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the
    recording."* With `MEETING_OWNER` set it says whose notetaker it is.
-4. While in the call:
+5. While in the call:
    - Every chat message from someone else is pushed to the agent as `bosun:meeting-chat`, with `meeting_id`,
      `sender` and `text`. `meeting_chat_read` returns them too.
    - Bosun leaves by itself when the meeting ends, when it is removed, or after **2 minutes alone**.
    - The agent can leave with `meeting_leave`.
    - On leaving, `bosun:meeting-ended` carries `meeting_id`, `reason`, `duration_s`, `bytes` and the `recording`:
      path, a `file://` URI and size. The payload also has it as an MCP `resource_link`.
+
+**Signed-in profile.** Google turns away anonymous automated guests far more often than signed-in users.
+- **Setup:** `session_open({ "profile": "google" })`, `navigate` to `https://accounts.google.com`, `request_human`
+  so a person signs in, `session_close`.
+- **Joining:** `meeting_join({ "url": "…", "profile": "google" })`.
+- **Engine:** the profile is opened with the engine it was last used with. It can't be in use by an agent session at
+  the same time.
 
 The meeting runs in a session of its own, so it outlives the agent's connection. It counts against `MAX_SESSIONS`.
 Events use the MCPL feature set **`bosun.meeting`** (tags `bosun:meeting-chat`, `bosun:meeting-optout`,
@@ -328,11 +347,11 @@ Meetings need a **headful** browser (headless Chromium plays no audio), so run t
 
 - **Guests need a host.** Someone in the meeting has to admit the bot. Meetings that don't allow guests, or that
   only admit people from the organisation, can't be joined.
-- **Google reviews bot-like guests.** Join requests from automated browsers can land in a review queue, be refused
-  outright ("You can't join this call") or need several tries. Datacenter IPs make this much more likely; a
-  residential connection works best.
-- **Meet's markup changes without notice.** Labels and texts are matched in English and German; the chat sender
-  name is a best-effort guess. A change on Google's side breaks the join or the chat watch until
+- **Google reviews bot-like guests.** Join requests from automated browsers can land in a review queue or be refused
+  outright ("You can't join this video call", reason `refused_by_google`). Datacenter IPs make this much more
+  likely. A signed-in profile or a residential connection works best.
+- **Meet's markup changes without notice.** Labels and texts are matched in English, German, Slovak, Ukrainian and
+  Russian (English is requested); the chat sender name is a best-effort guess. A change on Google's side breaks the join or the chat watch until
   `platforms/meet.mjs` is updated. This PoC has been tested against a local Meet stand-in, not against live Meet.
 - **One mixed audio track.** There is no speaker separation and no live transcript.
 - **Consent is the operator's responsibility.** The announcement and the opt-out are a courtesy, not a legal basis.

@@ -201,10 +201,10 @@ test("denied, can't join, not admitted in time: clear errors and an ended event 
   await withService(async (svc, ev, audio) => {
     const c = await connect(svc);
     const a = fake.newRoom();
-    fake.deny(a.code); // the guest page says "You can't join this call" at once
+    fake.deny(a.code); // the host already said no: "You can't join this call" + "Someone in the call denied your request"
     const r = await c.call('meeting_join', { url: a.url });
     assert.equal(r.isError, true);
-    assert.match(r.text, /can't join this call/);
+    assert.match(r.text, /the request to join was denied/);
     const b = fake.newRoom();
     const id = (await c.call('meeting_join', { url: b.url })).json().meeting_id;
     fake.deny(b.code);
@@ -319,7 +319,9 @@ test('a chat message rendered empty first and filled in later still counts (opt-
 test('microphone and camera must be verifiably off, or Bosun does not join', async () => {
   await withService(async (svc) => {
     const c = await connect(svc);
-    for (const mode of ['none', 'stuck']) {
+    // No control at all; a control that won't switch; one showing "on" but disabled; a stale "not found" banner next
+    // to a control that still shows the microphone on.
+    for (const mode of ['none', 'stuck', 'disabledOn', 'staleBanner']) {
       const { code, url } = fake.newRoom();
       fake.toggles(code, mode);
       const r = await c.call('meeting_join', { url });
@@ -411,4 +413,134 @@ test('leaving while the meeting is still setting up releases its audio server an
     await Promise.all(joins);
     await until(() => audio.stats.closed === audio.stats.opened && svc.manager.used === 0, 15_000);
   }, { audioOpts: { openMs: 1500 } });
+});
+
+test('the meeting browser asks for English: hl=en on the URL and Accept-Language en-US', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    const id = (await c.call('meeting_join', { url })).json().meeting_id;
+    const [load] = fake.room(code).loads;
+    assert.equal(load.hl, 'en');
+    assert.match(load.acceptLanguage, /^en-US/);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('a German Meet UI without devices (as on a de-AT server): "Ihr Name", "Teilnahme erbitten", "Kamera nicht gefunden" -> joins, chats, ends', async () => {
+  await withService(async (svc, ev) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    fake.set(code, { lang: 'de', toggles: 'nodevices' });
+    const r = await c.call('meeting_join', { url });
+    assert.equal(r.isError, false, r.text);
+    const id = r.json().meeting_id;
+    assert.equal(r.json().state, 'waiting');
+    assert.deepEqual(fake.room(code).guest, { name: 'Glassy (notetaker)', mic: false, cam: false });
+    fake.admit(code);
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    assert.equal(fake.room(code).chat.length, 2); // announced through the German chat box
+    fake.say(code, 'Alex Example', 'Bitte nicht aufnehmen');
+    await until(() => ev.optout.length === 1, 5000);
+    await until(() => ev.ended.length === 1, 10_000);
+    assert.ok(fake.room(code).left, 'left through "Anruf verlassen"');
+    const { code: code2, url: url2 } = fake.newRoom();
+    fake.set(code2, { lang: 'de', toggles: 'nodevices', open: true });
+    const id2 = (await c.call('meeting_join', { url: url2 })).json().meeting_id;
+    await until(async () => (await status(c, id2)).state === 'recording', 15_000);
+    fake.end(code2); // "Der Anruf wurde beendet"
+    await until(() => ev.ended.some((e) => e.meeting_id === id2), 10_000);
+    assert.equal(ev.ended.find((e) => e.meeting_id === id2).reason, 'meeting-ended');
+    await c.close();
+  });
+});
+
+test('a name field without label or placeholder is found as the only text box', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    fake.set(code, { bareName: true });
+    const id = (await c.call('meeting_join', { url, name: 'Notes Bot' })).json().meeting_id;
+    assert.equal(fake.room(code).guest.name, 'Notes Bot');
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('Google refusing the guest ("You can\'t join this video call", EN and DE) ends with refused_by_google and a clear hint; navigate does not call it a captcha', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    for (const lang of ['en', 'de']) {
+      const { code, url } = fake.newRoom();
+      fake.set(code, { lang, refuse: true });
+      const r = await c.call('meeting_join', { url });
+      assert.equal(r.isError, true, lang);
+      assert.match(r.text, /Google refused to let this guest join .*signed in to a Google account.*residential IP/, lang);
+      assert.doesNotMatch(r.text, /captcha/i);
+      assert.ok(fake.room(code).guest, `${lang}: asked to join first`);
+    }
+    await until(() => ev.ended.length === 2, 10_000);
+    assert.deepEqual(ev.ended.map((e) => e.reason), ['refused_by_google', 'refused_by_google']);
+    assert.equal(audio.recorders.length, 0);
+    await until(() => svc.manager.used === 0, 10_000);
+    // Refused only after a while, with no waiting room in between: still Google, not the host.
+    const late = fake.newRoom();
+    fake.set(late.code, { refuse: true, refuseAfterMs: 7000 });
+    const lid = (await c.call('meeting_join', { url: late.url })).json().meeting_id;
+    await until(() => ev.ended.some((e) => e.meeting_id === lid), 20_000);
+    assert.equal(ev.ended.find((e) => e.meeting_id === lid).reason, 'refused_by_google');
+    assert.match((await status(c, lid)).error, /signed in to a Google account/);
+    await c.close();
+  });
+});
+
+test('the bot-wall check: Meet\'s refusal page (on Meet, as a heading, invisible reCAPTCHA) is a refusal; anything else with a challenge stays a captcha', async () => {
+  const { wall, MEET_REFUSED } = await import('../src/tools.mjs');
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    const s = await c.open();
+    const page = svc.manager.sessions.get(s).page;
+    const show = async (opts) => {
+      const { code, url } = fake.newRoom();
+      fake.set(code, { phase: 'refused', ...opts });
+      await page.goto(url);
+      await until(async () => (await page.locator('#refused').isVisible()), 5000);
+    };
+    const meetHost = new URL(fake.base).hostname;
+    await show({ lang: 'de' });
+    assert.equal(await wall(page, { meetHost }), MEET_REFUSED);
+    assert.equal(await wall(page), 'captcha'); // not on Meet: the reCAPTCHA frame counts as usual
+    assert.match((await c.call('navigate', { session: s, url: page.url() })).json().blocked, /captcha/);
+    await show({ bigChallenge: true }); // a visible challenge on the refusal page: a captcha after all
+    assert.equal(await wall(page, { meetHost }), 'captcha');
+    await page.setContent('<h1>Help</h1><p>If you see "You can’t join this video call", try again.</p><iframe src="https://example.com/recaptcha/api2/anchor"></iframe>');
+    assert.equal(await wall(page, { meetHost }), 'captcha'); // quoted in text, not Meet's heading (and setContent keeps the URL)
+    await c.close();
+  });
+});
+
+test('joining with a signed-in profile: no name field (the account name is used), "Join now"; unknown profiles are refused', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    const s = await c.open({ profile: 'google', engine: 'chromium' }); // where the human signed in to Google earlier
+    await c.call('session_close', { session: s });
+    const { code, url } = fake.newRoom();
+    fake.set(code, { signedIn: true, open: true, searchBox: true });
+    const r = await c.call('meeting_join', { url, profile: 'google' });
+    assert.equal(r.isError, false, r.text);
+    const id = r.json().meeting_id;
+    assert.deepEqual(fake.room(code).guest, { name: null, mic: false, cam: false, search: '' }); // the search box is left alone
+    const session = [...svc.manager.sessions.values()].find((x) => x.owner === `meeting:${id}`);
+    assert.equal(session.profile, 'google');
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    await c.call('meeting_leave', { meeting_id: id });
+    assert.match((await c.call('meeting_join', { url: fake.newRoom().url, profile: 'nobody' })).text, /no profile nobody: open it with session_open/);
+    if (process.env.ENGINE === 'camoufox') { // a Firefox profile can't host a meeting
+      const f = await c.open({ profile: 'firefox' });
+      await c.call('session_close', { session: f });
+      assert.match((await c.call('meeting_join', { url: fake.newRoom().url, profile: 'firefox' })).text, /Firefox \(camoufox\) profile; meetings need a Chromium profile/);
+    }
+    await c.close();
+  });
 });
