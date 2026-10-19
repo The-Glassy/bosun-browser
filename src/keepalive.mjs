@@ -2,12 +2,15 @@
 // service opens the profile with the engine and mode it is normally used with, loads one URL, moves the mouse and
 // scrolls a little like a person reading (no clicks, no typing, no navigation), checks that it is still logged in,
 // and closes it again. A logged-out profile or a bot check is reported as a needs-human event; nothing is retried
-// before the next scheduled visit. Only the check result is kept, never page content.
+// before the next scheduled visit. A visit can also watch one value on the page (a counter such as "43 neue
+// Nachrichten", or a short text) and report when it changed. Only the check result and the watched value are kept,
+// never page content.
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { glidePath } from './liveview.mjs';
 import { readProfileMeta } from './engines.mjs';
+import { httpUrl } from './sessions.mjs';
 
 export const HISTORY = 10; // results kept per profile
 const MIN_GAP_MS = 15 * 60_000; // a visit is never scheduled closer than this to the previous one
@@ -16,13 +19,58 @@ const TICK_MS = 30_000;
 const GAP_MS = [60_000, 300_000]; // between two visits of different profiles
 const ACTIVITY_MS = [20_000, 60_000];
 const CHECK_TIMEOUT_MS = 5000;
+export const MIN_PERIOD_MIN = 30;
+const QUIET_FACTOR = 4; // the interval is this much longer during quiet hours
+export const WATCH_MAX_TEXT = 200;
+const WATCH_SCAN_CHARS = 200_000; // page text a watch regex looks at, at most
 
 const between = (rnd, [a, b]) => a + (b - a) * rnd();
 
-// When the next visit is due: everyHours after `from`, shifted by up to ±jitterMin, never sooner than MIN_GAP_MS.
-export function nextRun(from, { everyHours, jitterMin }, rnd = Math.random) {
-  const at = from + everyHours * 3_600_000 + (rnd() * 2 - 1) * jitterMin * 60_000;
-  return Math.round(Math.max(from + MIN_GAP_MS, at));
+// quiet_hours "22-08" or "22:30-07:15" (local time, may wrap past midnight) -> {start, end} in minutes of the day.
+export function parseQuiet(q) {
+  const m = /^(\d{1,2})(?::(\d{2}))?-(\d{1,2})(?::(\d{2}))?$/.exec(String(q).trim());
+  const min = m && [[m[1], m[2]], [m[3], m[4]]].map(([h, mm]) => (Number(h) === 24 && !Number(mm) ? 0 : Number(h) < 24 && Number(mm || 0) < 60 ? Number(h) * 60 + Number(mm || 0) : NaN));
+  if (!min || min.some(Number.isNaN)) throw new Error('quiet_hours must look like "22-08" or "22:30-07:00"');
+  if (min[0] === min[1]) throw new Error('quiet_hours must not start and end at the same time');
+  return { start: min[0], end: min[1] };
+}
+
+const formatters = new Map();
+// Minutes since local midnight (with fractions) at time t in time zone tz.
+function localMinutes(t, tz) {
+  if (!formatters.has(tz)) formatters.set(tz, new Intl.DateTimeFormat('en-GB', { timeZone: tz, hourCycle: 'h23', hour: 'numeric', minute: 'numeric', second: 'numeric' }));
+  const p = Object.fromEntries(formatters.get(tz).formatToParts(t).filter((x) => x.type !== 'literal').map((x) => [x.type, Number(x.value)]));
+  return (p.hour % 24) * 60 + p.minute + p.second / 60 + (t % 1000) / 60_000;
+}
+const inQuiet = (m, q) => (q.start < q.end ? m >= q.start && m < q.end : m >= q.start || m < q.end);
+
+// `from` plus `ms` of schedule time, where quiet hours run QUIET_FACTOR times slower: a 30 min interval that starts
+// at 21:50 with quiet hours 22-08 ends at 23:20 (10 min, then 20 min x4). A DST shift on the way may move the
+// result by up to the size of the shift.
+export function advance(from, ms, quiet, tz) {
+  if (!quiet) return from + ms;
+  let t = from, left = ms;
+  for (let i = 0; i < 1000 && left > 0; i++) {
+    const m = localMinutes(t, tz), q = inQuiet(m, quiet);
+    const edge = q ? quiet.end : quiet.start;
+    const toEdge = (((edge - m) % 1440 + 1440) % 1440 || 1440) * 60_000;
+    const rate = q ? 1 / QUIET_FACTOR : 1; // schedule time per real time
+    if (left <= toEdge * rate) return t + left / rate;
+    t += toEdge;
+    left -= toEdge * rate;
+  }
+  return t + left;
+}
+
+// Interval in minutes of a schedule ({everyMinutes} or {everyHours}).
+export const periodMin = (e) => e.everyMinutes ?? e.everyHours * 60;
+
+// When the next visit is due: one interval after `from`, shifted by up to ±jitterMin (both stretched during quiet
+// hours), never sooner than MIN_GAP_MS.
+export function nextRun(from, e, rnd = Math.random, tz = 'Europe/Vienna') {
+  const ms = periodMin(e) * 60_000 + (rnd() * 2 - 1) * e.jitterMin * 60_000;
+  const quiet = e.quietHours ? parseQuiet(e.quietHours) : null;
+  return Math.round(Math.max(from + MIN_GAP_MS, advance(from, ms, quiet, tz)));
 }
 
 // logged_in_check: every given condition must hold. Returns {ok, reason}; reason names the failed condition, not
@@ -39,6 +87,38 @@ export async function evaluateCheck(page, check) {
   }
   return { ok: true };
 }
+
+// watch: {selector?, text_regex?, kind: count|text}. The text is the selector's textContent (default: the page's
+// visible text); text_regex picks the part that matters (its first capture group, else the whole match). The regex
+// runs in the page, never in the service, and only the result crosses over. kind count: the first whole number in it
+// (thousands separators ignored); no match counts as 0 (a badge that vanishes when nothing is new). kind text: the
+// text with whitespace collapsed, at most WATCH_MAX_TEXT chars; no match is null. Throws if it can't be read.
+export async function extractWatch(page, w, { timeoutMs = CHECK_TIMEOUT_MS } = {}) {
+  let raw = null;
+  const root = w.selector ? page.locator(w.selector).first() : page.locator('body');
+  const found = await root.waitFor({ state: 'attached', timeout: timeoutMs }).then(() => true, () => false);
+  if (found) {
+    let timer;
+    const read = root.evaluate((el, [bySelector, src, max]) => {
+      const t = String((bySelector ? el.textContent : el.innerText) || '').slice(0, max);
+      if (!src) return t.slice(0, 2000);
+      const m = new RegExp(src).exec(t);
+      return m ? String(m[1] ?? m[0]).slice(0, 2000) : null;
+    }, [!!w.selector, w.textRegex || null, WATCH_SCAN_CHARS]);
+    raw = await Promise.race([read, new Promise((_, no) => { timer = setTimeout(() => no(new Error('watch timeout')), timeoutMs); })]).finally(() => clearTimeout(timer));
+    if (raw !== null && typeof raw !== 'string') throw new Error('watch read failed');
+  }
+  if (w.kind === 'count') {
+    if (raw === null) return 0;
+    const n = /\d(?:[\d.,'\u00a0\u202f]*\d)?/.exec(raw)?.[0].replace(/\D/g, '');
+    if (!n) throw new Error('no number in the watched text');
+    return Math.min(Number(n), Number.MAX_SAFE_INTEGER);
+  }
+  return raw === null ? null : raw.replace(/\s+/g, ' ').trim().slice(0, WATCH_MAX_TEXT);
+}
+
+// Whether a watched value changed in a way worth telling: a count that went up, a text that differs.
+export const watchChanged = (kind, old, now) => (kind === 'count' ? now > old : now !== old);
 
 const sleep = (ms, signal) => new Promise((r) => {
   if (signal?.aborted) return r();
@@ -120,9 +200,11 @@ class Store {
 }
 
 export class Keepalive {
-  // opts: emit(event) for needs-human; rnd/now for tests; tickMs, gapMs, activityMs, wall (bot-check detector).
-  constructor({ cfg, manager, emit = () => {}, wall = async () => null, rnd = Math.random, now = Date.now, tickMs = TICK_MS, gapMs = GAP_MS, activityMs = ACTIVITY_MS }) {
-    Object.assign(this, { cfg, manager, emit, wall, rnd, now, tickMs, gapMs, activityMs });
+  // opts: emit(event) for needs-human, onWatch(event) for a changed watch value; rnd/now for tests; tickMs, gapMs,
+  // activityMs, wall (bot-check detector).
+  constructor({ cfg, manager, emit = () => {}, onWatch = () => {}, wall = async () => null, rnd = Math.random, now = Date.now, tickMs = TICK_MS, gapMs = GAP_MS, activityMs = ACTIVITY_MS }) {
+    Object.assign(this, { cfg, manager, emit, onWatch, wall, rnd, now, tickMs, gapMs, activityMs });
+    this.tz = cfg.tz || 'Europe/Vienna';
     this.store = new Store(path.join(cfg.dataDir, 'keepalive.json'));
     this.current = null; // {key, abort, done}
     this.notBefore = 0; // spacing between visits
@@ -155,20 +237,43 @@ export class Keepalive {
 
   profileDir(tenant, profile) { return path.join(this.cfg.dataDir, 'profiles', tenant, profile); }
 
-  set(tenant, { profile, url, everyHours = 12, jitterMin = 30, check, enabled = true }) {
+  nextRun(from, e) { return nextRun(from, e, this.rnd, this.tz); }
+
+  // Schedule: everyMinutes (>= MIN_PERIOD_MIN) or everyHours (default 12); jitterMin defaults to 30 or a quarter of
+  // the interval, whichever is less. watch: {selector?, textRegex?, kind, label}.
+  set(tenant, { profile, url, everyHours, everyMinutes, jitterMin, quietHours = null, check, watch = null, enabled = true }) {
+    url = httpUrl(url);
     if (!fs.existsSync(this.profileDir(tenant, profile))) throw new Error(`no profile ${profile}: open it once with session_open({profile}) and log in first`);
-    if (jitterMin * 2 > everyHours * 60) throw new Error('jitter_min must be at most half of every_hours');
+    if (everyHours != null && everyMinutes != null) throw new Error('give every_hours or every_minutes, not both');
+    if (everyMinutes != null && !(Number.isInteger(everyMinutes) && everyMinutes >= MIN_PERIOD_MIN)) throw new Error(`every_minutes must be a whole number of at least ${MIN_PERIOD_MIN}`);
+    if (everyMinutes == null) everyHours ??= 12;
+    const period = everyMinutes ?? everyHours * 60;
+    jitterMin ??= Math.min(30, Math.floor(period / 4));
+    if (jitterMin * 2 > period) throw new Error(`jitter_min must be at most half of the interval (${period} min)`);
+    if (quietHours) parseQuiet(quietHours);
     if (!check || !(check.text || check.selector || check.url_not_contains)) throw new Error('logged_in_check needs text, selector or url_not_contains');
+    if (watch) {
+      if (!watch.selector && !watch.textRegex) throw new Error('watch needs selector or text_regex');
+      if (watch.textRegex) { try { new RegExp(watch.textRegex); } catch { throw new Error('watch.text_regex is not a valid regular expression'); } }
+      if (watch.kind !== 'count' && watch.kind !== 'text') throw new Error('watch.kind must be count or text');
+      if (!watch.label) throw new Error('watch needs a label');
+    }
     const key = `${tenant}/${profile}`;
     const old = this.store.entries.get(key);
-    const rescheduled = !old || !old.enabled || old.everyHours !== everyHours || old.jitterMin !== jitterMin;
+    const rescheduled = !old || !old.enabled || periodMin(old) !== period || old.jitterMin !== jitterMin || (old.quietHours || null) !== (quietHours || null);
     // Updated in place: a visit running right now records its result on this same entry.
     const e = old || { tenant, profile, nextAt: null, history: [], lastSkip: null, created: this.now() };
+    const w = watch && Object.fromEntries(['selector', 'textRegex', 'kind', 'label'].filter((k) => watch[k]).map((k) => [k, watch[k]]));
+    // Watching something else starts from a new baseline; a new label alone keeps it.
+    const sameWatch = w && e.watch && ['selector', 'textRegex', 'kind'].every((k) => (w[k] || null) === (e.watch[k] || null));
+    if (!sameWatch) delete e.watchState;
+    delete e.everyHours; delete e.everyMinutes;
     Object.assign(e, {
-      url, everyHours, jitterMin, enabled,
+      url, ...(everyMinutes != null ? { everyMinutes } : { everyHours }), jitterMin, quietHours: quietHours || null, enabled,
       check: Object.fromEntries(['text', 'selector', 'url_not_contains'].filter((k) => check[k]).map((k) => [k, check[k]])),
+      watch: w || null,
     });
-    if (enabled && (rescheduled || !e.nextAt)) e.nextAt = nextRun(this.now(), e, this.rnd);
+    if (enabled && (rescheduled || !e.nextAt)) e.nextAt = this.nextRun(this.now(), e);
     this.store.entries.set(key, e);
     this.store.save();
     return this.view(e);
@@ -187,9 +292,14 @@ export class Keepalive {
   view(e) {
     const iso = (t) => (t ? new Date(t).toISOString() : null);
     return {
-      profile: e.profile, url: e.url, every_hours: e.everyHours, jitter_min: e.jitterMin, logged_in_check: e.check, enabled: e.enabled,
-      next_run: e.enabled ? iso(e.nextAt) : null, running: this.current?.key === `${e.tenant}/${e.profile}`,
-      last: e.history.slice(-HISTORY).reverse().map((r) => ({ at: iso(r.at), status: r.status, duration_ms: r.durationMs, ...(r.reason ? { reason: r.reason } : {}) })),
+      profile: e.profile, url: e.url, ...(e.everyMinutes != null ? { every_minutes: e.everyMinutes } : { every_hours: e.everyHours }), jitter_min: e.jitterMin,
+      ...(e.quietHours ? { quiet_hours: e.quietHours, tz: this.tz } : {}), logged_in_check: e.check,
+      ...(e.watch ? { watch: {
+        ...(e.watch.selector ? { selector: e.watch.selector } : {}), ...(e.watch.textRegex ? { text_regex: e.watch.textRegex } : {}), kind: e.watch.kind, label: e.watch.label,
+        value: e.watchState ? e.watchState.value : null, ...(e.watchState ? { read_at: iso(e.watchState.at), changed_at: iso(e.watchState.changedAt) } : { baseline: 'not read yet' }),
+      } } : {}),
+      enabled: e.enabled, next_run: e.enabled ? iso(e.nextAt) : null, running: this.current?.key === `${e.tenant}/${e.profile}`,
+      last: e.history.slice(-HISTORY).reverse().map((r) => ({ at: iso(r.at), status: r.status, duration_ms: r.durationMs, ...(r.reason ? { reason: r.reason } : {}), ...(r.watch ? { watch: r.watch } : {}) })),
       ...(e.lastSkip ? { last_skip: { at: iso(e.lastSkip.at), reason: e.lastSkip.reason } } : {}),
     };
   }
@@ -206,7 +316,7 @@ export class Keepalive {
     const m = this.manager;
     // An agent has the profile open (or it is still closing): the profile is in use anyway; the next visit comes a
     // full period later.
-    if (m.profilesInUse.has(key)) return this.skip(due, 'profile in use', nextRun(now, due, this.rnd));
+    if (m.profilesInUse.has(key)) return this.skip(due, 'profile in use', this.nextRun(now, due));
     // Leave agents a free slot (where there is more than one): a visit is background work.
     const room = (used, max) => used < max - (max > 1 ? 1 : 0);
     if (!room(m.used, this.cfg.maxSessions) || !room(m.tenantUse.get(due.tenant) || 0, this.cfg.maxSessionsPerTenant)) {
@@ -232,6 +342,24 @@ export class Keepalive {
     return { skipped: reason };
   }
 
+  // A visit's watched value against the stored one. The first value is the baseline (no event); after that a count
+  // that went up or a text that differs is an event. A count that went down is kept silently, so the next rise is
+  // measured from there. Returns what happened, for the history.
+  recordWatch(e, watch, { value, error }, url) {
+    // keepalive_set changed what is watched while this visit ran: the value belongs to the old watch.
+    if (!e.watch || ['selector', 'textRegex', 'kind'].some((k) => (e.watch[k] || null) !== (watch[k] || null))) return null;
+    if (error) return error;
+    const at = this.now(), prev = e.watchState;
+    if (!prev) { e.watchState = { value, at, changedAt: null }; return 'baseline'; }
+    if (value === prev.value) { prev.at = at; return 'unchanged'; }
+    const changed = watchChanged(watch.kind, prev.value, value);
+    e.watchState = { value, at, changedAt: changed ? at : prev.changedAt };
+    if (!changed) return 'lower';
+    const ev = { tenant: e.tenant, profile: e.profile, label: e.watch.label, old: prev.value, new: value, url };
+    Promise.resolve().then(() => this.onWatch(ev)).catch(() => {});
+    return 'changed';
+  }
+
   engineFor(meta) {
     if (meta?.engine) return meta.engine;
     if (meta?.family === 'firefox') return 'camoufox';
@@ -244,9 +372,10 @@ export class Keepalive {
     const m = this.manager;
     const owner = `keepalive:${e.tenant}`;
     const key = `${e.tenant}/${e.profile}`;
-    const { url, check } = { url: e.url, check: { ...e.check } }; // this visit's configuration
-    let status = 'error', reason = null, s = null, phase = 'open';
+    const { url, check, watch } = { url: e.url, check: { ...e.check }, watch: e.watch && { ...e.watch } }; // this visit's configuration
+    let status = 'error', reason = null, s = null, phase = 'open', watched = null;
     try {
+      try { httpUrl(url); } catch { reason = 'url is not http(s)'; throw new Error(reason); }
       const meta = readProfileMeta(this.profileDir(e.tenant, e.profile));
       // Same mode as normal use, so the fingerprint stays consistent: never open a headful profile headless.
       if (this.cfg.headless && meta?.headless !== true) { reason = 'profile is used headful; keepalive will not open it headless (run the service headful)'; throw new Error(reason); }
@@ -275,7 +404,14 @@ export class Keepalive {
         phase = 'check';
         if (await this.wall(ss.page)) return { status: 'bot_check', reason: 'bot check page' };
         const c = await evaluateCheck(ss.page, check);
-        return c.ok ? { status: 'ok' } : { status: 'logged_out', reason: c.reason };
+        if (!c.ok) return { status: 'logged_out', reason: c.reason };
+        if (watch) {
+          phase = 'watch';
+          watched = await extractWatch(ss.page, watch).then((value) => ({ value }), (err) => ({
+            error: /^(watch timeout|no number in the watched text)$/.test(err?.message || '') ? err.message : 'watch failed',
+          }));
+        }
+        return { status: 'ok' };
       });
       ({ status, reason = null } = r);
     } catch {
@@ -286,17 +422,18 @@ export class Keepalive {
     }
     if (this.store.entries.get(key) !== e) return { status }; // removed (or removed and re-added) meanwhile
     if (status === 'aborted') {
-      this.skip(e, this.stopped ? 'service stopped' : 'taken over by an agent', e.nextAt <= this.now() && !this.stopped ? nextRun(this.now(), e, this.rnd) : e.nextAt);
+      this.skip(e, this.stopped ? 'service stopped' : 'taken over by an agent', e.nextAt <= this.now() && !this.stopped ? this.nextRun(this.now(), e) : e.nextAt);
       return { status };
     }
-    e.history.push({ at: t0, status, durationMs: this.now() - t0, ...(reason ? { reason } : {}) });
+    const w = status === 'ok' && watched ? this.recordWatch(e, watch, watched, url) : null;
+    e.history.push({ at: t0, status, durationMs: this.now() - t0, ...(reason ? { reason } : {}), ...(w ? { watch: w } : {}) });
     if (e.history.length > HISTORY) e.history.splice(0, e.history.length - HISTORY);
-    e.nextAt = nextRun(this.now(), e, this.rnd);
+    e.nextAt = this.nextRun(this.now(), e);
     // The human has to hear about it even if the result can't be saved right now.
     if (status === 'logged_out' || status === 'bot_check') {
       Promise.resolve().then(() => this.emit({ tenant: e.tenant, profile: e.profile, url, kind: status, reason })).catch(() => {});
     }
     this.persist();
-    return { status, reason };
+    return { status, reason, ...(w ? { watch: w } : {}) };
   }
 }

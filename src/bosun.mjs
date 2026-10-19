@@ -20,7 +20,7 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {} } = {}
   const events = manager.events = new EventBus();
   let keepalive;
   try {
-    keepalive = manager.keepalive = new Keepalive({ cfg, manager, wall, emit: (e) => events.needsHuman(e), ...kaOpts });
+    keepalive = manager.keepalive = new Keepalive({ cfg, manager, wall, emit: (e) => events.needsHuman(e), onWatch: (e) => events.watchChanged(e), ...kaOpts });
   } catch (e) { await live?.close(); throw e; }
   if (cfg.keepalive) keepalive.start();
   const ws = cfg.ws ? await startWsServer({ cfg, manager }) : null;

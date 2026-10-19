@@ -4,8 +4,11 @@ import { z } from 'zod';
 import { countNodes, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
 import { TENANT_RE } from './auth.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
-import { urlKey } from './sessions.mjs';
+import { urlKey, httpUrl } from './sessions.mjs';
+
+export { httpUrl };
 import { MANIFEST, mcplConnection } from './events.mjs';
+import { MIN_PERIOD_MIN } from './keepalive.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
@@ -56,13 +59,6 @@ async function botLoop(s) {
 const ok = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1) }] });
 async function pageInfo(p) { return { url: p.url(), title: await p.title().catch(() => '') }; }
 
-// Agent navigation is limited to the web. file:, javascript:, data:, chrome:, about:, view-source: … are refused.
-export function httpUrl(raw) {
-  let u;
-  try { u = new URL(raw); } catch { throw new Error('invalid URL'); }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`only http:// and https:// URLs are allowed (got ${u.protocol})`);
-  return u.href;
-}
 
 // Playwright errors carry a call log that can quote page markup; keep only the headline.
 const cleanError = (e) => String(e?.message || e).split('\nCall log:')[0].replace(/\x1b\[[0-9;]*m/g, '').slice(0, 500);
@@ -80,7 +76,7 @@ const target = { ref: str(20).optional().describe('element ref from read (e.g. "
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
 
 export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 } }) {
-  const server = new McpServer({ name: 'bosun', version: '0.4.0' }, { capabilities: { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.5.0' }, { capabilities: { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -235,12 +231,25 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
   // Keepalive: per tenant (like profiles, shared by the tenant's connections).
   const keepalive = manager.keepalive;
   if (keepalive) {
-    tool('keepalive_set', 'Keep a persistent profile logged in without a model: every every_hours (± jitter_min) the service opens the profile, loads url, moves the mouse and scrolls for 20–60 s (no clicks, typing or navigation), then checks logged_in_check. Logged out or a bot check -> a bosun:needs-human event; no retries before the next visit. Only helps sites with sliding sessions.',
-      { profile: z.string().regex(TENANT_RE), url: z.string().max(4096).url(), every_hours: z.number().int().min(1).max(720).optional(), jitter_min: z.number().int().min(0).max(720).optional(),
+    tool('keepalive_set', 'Keep a persistent profile logged in without a model: every every_hours or every_minutes (± jitter_min; ×4 during quiet_hours) the service opens the profile, loads url, moves the mouse and scrolls for 20–60 s (no clicks, typing or navigation), then checks logged_in_check. Logged out or a bot check -> a bosun:needs-human event; no retries before the next visit. Optional watch: read one value on the page (e.g. a "43 neue Nachrichten" counter) and send a bosun:watch-changed event when it changes (count up, or text differs); the first visit only records it. Only helps sites with sliding sessions.',
+      { profile: z.string().regex(TENANT_RE), url: z.string().max(4096).url().describe('http(s) only'),
+        every_hours: z.number().int().min(1).max(720).optional().describe('interval (default 12)'),
+        every_minutes: z.number().int().min(MIN_PERIOD_MIN).max(43200).optional().describe(`interval in minutes, at least ${MIN_PERIOD_MIN} (instead of every_hours)`),
+        jitter_min: z.number().int().min(0).max(720).optional().describe('random shift of each visit, ± minutes (default 30, at most a quarter of a shorter interval)'),
+        quiet_hours: z.string().max(20).optional().describe(`local hours (time zone ${cfg.tz || 'Europe/Vienna'}) when the interval is ×4, e.g. "22-08"`),
         logged_in_check: z.object({ text: str(1000).optional(), selector: str(2000).optional(), url_not_contains: str(1000).optional() }).describe('what proves it is still logged in; every given condition must hold'),
+        watch: z.object({
+          selector: str(2000).optional().describe("element whose textContent is read (default: the page's visible text)"),
+          text_regex: str(500).optional().describe('picks the value: first capture group, else the whole match, e.g. "(\\d+) neue Nachrichten"'),
+          kind: z.enum(['count', 'text']).describe('count: a number, event when it goes up (no match = 0); text: at most 200 chars, event when it differs'),
+          label: str(100).describe('name for the value in events, e.g. "willhaben messages"'),
+        }).optional().describe('a value to read after the logged-in check; only the value is stored'),
         enabled: z.boolean().optional() },
-      async (a) => ok(keepalive.set(tenant, { profile: a.profile, url: httpUrl(a.url), everyHours: a.every_hours ?? 12, jitterMin: a.jitter_min ?? 30, check: a.logged_in_check, enabled: a.enabled ?? true })));
-    tool('keepalive_list', 'Keepalive schedules of your profiles with the next run and the last results (ok, logged_out, bot_check, error).', {}, async () => ok(keepalive.list(tenant)));
+      async (a) => ok(keepalive.set(tenant, {
+        profile: a.profile, url: a.url, everyHours: a.every_hours, everyMinutes: a.every_minutes, jitterMin: a.jitter_min, quietHours: a.quiet_hours || null,
+        check: a.logged_in_check, watch: a.watch ? { selector: a.watch.selector, textRegex: a.watch.text_regex, kind: a.watch.kind, label: a.watch.label } : null, enabled: a.enabled ?? true,
+      })));
+    tool('keepalive_list', 'Keepalive schedules of your profiles with the next run, the watched value and the last results (ok, logged_out, bot_check, error).', {}, async () => ok(keepalive.list(tenant)));
     tool('keepalive_remove', 'Stop keeping a profile alive.', { profile: z.string().regex(TENANT_RE) }, async (a) => ok(keepalive.remove(tenant, a.profile)));
   }
 

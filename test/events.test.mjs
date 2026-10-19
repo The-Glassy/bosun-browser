@@ -3,7 +3,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 import { startBosun, connect, until, sleep, TOKEN_B } from './helpers.mjs';
-import { FEATURE_SET, NEEDS_HUMAN } from '../src/events.mjs';
+import { FEATURE_SET, NEEDS_HUMAN, WATCH_SET, WATCH_CHANGED } from '../src/events.mjs';
 
 let svc;
 before(async () => { svc = await startBosun({ KEEPALIVE: '0' }); });
@@ -22,11 +22,14 @@ async function host({ token, capabilities = MCPL, accept = true } = {}) {
   return c;
 }
 
-test('the manifest declares bosun.handoff with pushEvents; mcpl/manifest returns it', async () => {
+test('the manifest declares bosun.handoff and bosun.watch with pushEvents; mcpl/manifest returns it', async () => {
   const c = await host();
   const m = c.getServerCapabilities().experimental.mcpl;
   assert.equal(m.pushEvents, true);
+  assert.deepEqual(Object.keys(m.featureSets), [FEATURE_SET, WATCH_SET]);
   assert.deepEqual(m.featureSets[FEATURE_SET].uses, ['pushEvents']);
+  assert.deepEqual(m.featureSets[WATCH_SET].uses, ['pushEvents']);
+  assert.ok(m.featureSets[WATCH_SET].tagOntology.tags[WATCH_CHANGED]);
   assert.deepEqual(await c.request({ method: 'mcpl/manifest' }, z.any()), m);
   await c.close();
 });
@@ -134,4 +137,30 @@ test('a connection attaching while a delivery is failing still gets the event', 
   await p;
   await until(() => got.length === 1);
   assert.equal(bus.pending.size, 0);
+});
+
+test('watch-changed goes out under bosun.watch only: a host that enabled just bosun.handoff gets it once it grants bosun.watch', async () => {
+  svc.events.pending.clear();
+  const c = await host();
+  const receipt = await c.grant({ enabled: [FEATURE_SET], effectiveCapabilities: ['pushEvents'] });
+  assert.deepEqual(receipt, { accepted: true, unavailableFeatures: [], notes: [] }); // not asked for, so not degraded
+  const change = { tenant: 'alice', profile: 'wh', label: 'willhaben messages', old: 43, new: 45, url: 'https://www.willhaben.at/iad/myprofile/chat' };
+  assert.equal(await svc.events.watchChanged(change), false);
+  assert.equal(await svc.events.needsHuman(event()), true); // the handoff set still works
+  await until(() => c.pushes.length === 1);
+  assert.equal(c.pushes[0].featureSet, FEATURE_SET);
+  // Asking for bosun.watch without pushEvents: reported as unavailable.
+  assert.deepEqual((await c.grant({ enabled: [WATCH_SET], effectiveCapabilities: ['tools'] })).unavailableFeatures,
+    [{ featureSet: WATCH_SET, missingCapabilities: ['pushEvents'], effect: 'disabled' }]);
+  // The new grant offers the queued event again.
+  await c.grant({ enabled: ['bosun.*'], effectiveCapabilities: ['pushEvents'] }); // a pattern works too
+  await until(() => c.pushes.length === 2);
+  const p = c.pushes[1];
+  assert.equal(p.featureSet, WATCH_SET);
+  assert.match(p.eventId, /^bosun:[0-9a-f-]{36}$/);
+  assert.deepEqual(p.tags, [WATCH_CHANGED, 'bosun:source=keepalive', 'bosun:profile=wh']);
+  assert.deepEqual(p.origin, { server: 'bosun', source: 'keepalive', profile: 'wh', label: 'willhaben messages', old: 43, new: 45, url: change.url });
+  assert.match(p.payload.content[0].text, /watch "willhaben messages" on profile "wh" changed: 43 -> 45/);
+  assert.equal(svc.events.pending.get('alice'), undefined);
+  await c.close();
 });
