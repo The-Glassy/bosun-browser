@@ -523,7 +523,7 @@ test('the bot-wall check: Meet\'s refusal page (on Meet, as a heading, invisible
 test('joining with a signed-in profile: no name field (the account name is used), "Join now"; unknown profiles are refused', async () => {
   await withService(async (svc) => {
     const c = await connect(svc);
-    const s = await c.open({ profile: 'google' }); // where the human signed in to Google earlier
+    const s = await c.open({ profile: 'google', engine: 'chromium' }); // where the human signed in to Google earlier
     await c.call('session_close', { session: s });
     const { code, url } = fake.newRoom();
     fake.set(code, { signedIn: true, open: true, searchBox: true });
@@ -536,6 +536,11 @@ test('joining with a signed-in profile: no name field (the account name is used)
     await until(async () => (await status(c, id)).state === 'recording', 15_000);
     await c.call('meeting_leave', { meeting_id: id });
     assert.match((await c.call('meeting_join', { url: fake.newRoom().url, profile: 'nobody' })).text, /no profile nobody: open it with session_open/);
+    if (process.env.ENGINE === 'camoufox') { // a Firefox profile can't host a meeting
+      const f = await c.open({ profile: 'firefox' });
+      await c.call('session_close', { session: f });
+      assert.match((await c.call('meeting_join', { url: fake.newRoom().url, profile: 'firefox' })).text, /Firefox \(camoufox\) profile; meetings need a Chromium profile/);
+    }
     await c.close();
   });
 });
