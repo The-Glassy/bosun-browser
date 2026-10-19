@@ -76,7 +76,7 @@ const target = { ref: str(20).optional().describe('element ref from read (e.g. "
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
 
 export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 } }) {
-  const server = new McpServer({ name: 'bosun', version: '0.5.0' }, { capabilities: { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.6.0' }, { capabilities: { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -251,6 +251,33 @@ export function buildServer({ manager, owner, tenant, cfg, conn = { inflight: 0 
       })));
     tool('keepalive_list', 'Keepalive schedules of your profiles with the next run, the watched value and the last results (ok, logged_out, bot_check, error).', {}, async () => ok(keepalive.list(tenant)));
     tool('keepalive_remove', 'Stop keeping a profile alive.', { profile: z.string().regex(TENANT_RE) }, async (a) => ok(keepalive.remove(tenant, a.profile)));
+  }
+
+  // Meetings (PoC): per tenant, like keepalive. A meeting runs in a session of its own and outlives this connection.
+  const meetings = manager.meetings;
+  if (meetings) {
+    const mid = { meeting_id: z.string().max(20) };
+    tool('meeting_join', 'Join a Google Meet as an unauthenticated guest notetaker (mic and camera off), ask to be let in and wait (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or it is alone for 2 min; then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting.',
+      { url: z.string().max(2048).url().describe('https://meet.google.com/abc-defg-hij'), name: str(60).optional().describe('display name (default "Glassy (notetaker)")'),
+        announce_text: str(1000).optional(), max_wait_admit_min: z.number().int().min(1).max(60).optional(),
+        profile: z.string().regex(TENANT_RE).optional().describe('join with a persistent profile instead of a fresh guest browser'),
+        engine: z.enum(ENGINE_NAMES).optional().describe('chromium (default) or patchright; camoufox is not supported for meetings'),
+        leave_on_optout: z.boolean().optional() },
+      async (a) => ok(await meetings.join(tenant, {
+        url: a.url, name: a.name || 'Glassy (notetaker)', announceText: a.announce_text, maxWaitAdmitMin: a.max_wait_admit_min ?? 10,
+        profile: a.profile, engine: a.engine, leaveOnOptOut: a.leave_on_optout ?? true,
+      })));
+    tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), participants if visible, recorded seconds; without meeting_id all your meetings.',
+      { meeting_id: z.string().max(20).optional() }, async (a) => ok(meetings.status(tenant, a.meeting_id)));
+    tool('meeting_chat_read', 'Chat messages of a meeting seen so far (others\' messages; since = last seq you have).', { ...mid, since: z.number().int().min(0).optional() },
+      async (a) => ok(meetings.chatRead(tenant, a.meeting_id, a.since ?? 0)));
+    tool('meeting_chat_send', 'Post a message in the meeting chat.', { ...mid, text: z.string().min(1).max(1000) },
+      async (a) => ok(await meetings.chatSend(tenant, a.meeting_id, a.text)));
+    tool('meeting_stop_recording', 'Stop recording (delete=true, default: also delete the file). The meeting goes on unrecorded.', { ...mid, delete: z.boolean().optional() },
+      async (a) => ok(await meetings.stopRecordingTool(tenant, a.meeting_id, a.delete ?? true)));
+    tool('meeting_leave', 'Leave the meeting; the recording is finished and kept (bosun:meeting-ended).', mid, async (a) => ok(await meetings.leave(tenant, a.meeting_id)));
+    tool('meeting_recording_delete', `Delete a meeting's recording (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
+      async (a) => ok(await meetings.deleteRecording(tenant, a.meeting_id)));
   }
 
   tool('sessions', 'List your open sessions.', {}, async () => ok(manager.list(owner).map((s) => (

@@ -7,8 +7,9 @@ import { startWsServer } from './wsserver.mjs';
 import { buildServer, wall } from './tools.mjs';
 import { Keepalive } from './keepalive.mjs';
 import { EventBus } from './events.mjs';
+import { Meetings } from './meetings/index.mjs';
 
-export async function startService(cfg, { engines, keepalive: kaOpts = {} } = {}) {
+export async function startService(cfg, { engines, keepalive: kaOpts = {}, meetings: mOpts = {} } = {}) {
   let live = null;
   if (cfg.live) {
     live = createLiveView({ port: cfg.live.port, host: cfg.live.host, baseUrl: cfg.live.baseUrl, ttlMs: cfg.handoffTtlMs });
@@ -21,6 +22,7 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {} } = {}
   let keepalive;
   try {
     keepalive = manager.keepalive = new Keepalive({ cfg, manager, wall, emit: (e) => events.needsHuman(e), onWatch: (e) => events.watchChanged(e), ...kaOpts });
+    manager.meetings = new Meetings({ cfg, manager, bus: events, ...mOpts });
   } catch (e) { await live?.close(); throw e; }
   if (cfg.keepalive) keepalive.start();
   const ws = cfg.ws ? await startWsServer({ cfg, manager }) : null;
@@ -29,11 +31,11 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {} } = {}
   const shutdown = () => (closing ??= (async () => {
     // Stop admission first, then tear down handoffs and sessions (each close is deadline-bounded).
     manager.closing = true;
-    await keepalive.stop().catch(() => {});
+    await Promise.allSettled([keepalive.stop(), manager.meetings.stop()]);
     await Promise.allSettled([ws?.close(), live?.close()]);
     await manager.closeAll();
   })());
-  return { cfg, live, manager, ws, keepalive, events, shutdown };
+  return { cfg, live, manager, ws, keepalive, events, meetings: manager.meetings, shutdown };
 }
 
 export async function main(env = process.env) {

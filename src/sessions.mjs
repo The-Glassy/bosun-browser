@@ -109,7 +109,8 @@ export class SessionManager {
     for (const s of this.sessions.values()) if (s.browser === browser) this.dispose(s, 'browser-crashed');
   }
 
-  async open({ owner, tenant, profile, locale, timezone, engine, preempt = true }) {
+  // media: {args, env} for a meeting's own browser process (see engines.mjs).
+  async open({ owner, tenant, profile, locale, timezone, engine, preempt = true, media = null }) {
     if (this.closing) throw new Error('service is shutting down');
     const def = this.engines.get(engine || this.cfg.engine);
     if (this.goneOwners.has(owner)) throw new Error('connection closed');
@@ -125,13 +126,13 @@ export class SessionManager {
       else { this.ownerOpens.delete(owner); this.goneOwners.delete(owner); }
     };
     try {
-      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt });
+      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media });
     } finally {
       untrack();
     }
   }
 
-  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt }) {
+  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media }) {
     // The profile was just closed (by session_close, a dropped connection, idle or crash) and its browser is still
     // shutting down; or a background keepalive holds it. Wait for it rather than refusing.
     if (profileKey && this.profilesInUse.has(profileKey)) {
@@ -167,7 +168,7 @@ export class SessionManager {
         }
         try {
           ({ ctx, browser = null, dir = null, tmpDir = null } = await this.engines.open(def.name, {
-            cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', shared: (d, bt) => this.getBrowser(d, bt),
+            cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', shared: (d, bt) => this.getBrowser(d, bt), media,
           }));
         } catch (e) {
           ({ dir = null, tmpDir = null } = e);

@@ -1,6 +1,7 @@
 // MCPL push events (spec §6 feature sets, §9 push/event, §16 tags) for things that need the agent's attention while
 // no tool call is running: a kept-alive profile that is logged out or stuck at a bot check (feature set
-// bosun.handoff), and a watched value that changed on a keepalive visit (feature set bosun.watch).
+// bosun.handoff), a watched value that changed on a keepalive visit (feature set bosun.watch), and what happens in a
+// meeting Bosun attends: chat messages, an opt-out, the end with the recording (feature set bosun.meeting).
 // A connection receives push/event only if its client asked for MCPL at initialize (capabilities.experimental.mcpl)
 // and the host's featureSets/update Request granted pushEvents with the event's feature set enabled. Events for a
 // tenant with no such connection wait (bounded) for the next one.
@@ -12,6 +13,8 @@ export const FEATURE_SET = 'bosun.handoff';
 export const NEEDS_HUMAN = 'bosun:needs-human';
 export const WATCH_SET = 'bosun.watch';
 export const WATCH_CHANGED = 'bosun:watch-changed';
+export const MEETING_SET = 'bosun.meeting';
+export const MEETING_TAGS = { chat: 'bosun:meeting-chat', optout: 'bosun:meeting-optout', ended: 'bosun:meeting-ended' };
 export const MANIFEST = {
   version: '0.5',
   pushEvents: true,
@@ -30,6 +33,18 @@ export const MANIFEST = {
       tagOntology: {
         tags: { [WATCH_CHANGED]: { desc: 'a watched value on a kept-alive profile changed' } },
         keyed: { 'bosun:source': { values: ['keepalive'] }, 'bosun:profile': { open: true } },
+      },
+    },
+    [MEETING_SET]: {
+      description: 'Push events from a meeting Bosun attends as a notetaker (meeting_join): every chat message, a participant opting out of the recording (recording stopped and deleted), and the end of the meeting with a reference to the audio recording.',
+      uses: ['pushEvents'],
+      tagOntology: {
+        tags: {
+          [MEETING_TAGS.chat]: { desc: 'a chat message in the meeting (origin: meeting_id, sender, text)' },
+          [MEETING_TAGS.optout]: { desc: 'someone asked not to be recorded; the recording was stopped and deleted' },
+          [MEETING_TAGS.ended]: { desc: 'Bosun left the meeting; origin carries duration and the recording (if any)' },
+        },
+        keyed: { 'bosun:meeting': { open: true }, 'bosun:platform': { values: ['meet'] } },
       },
     },
   },
@@ -60,6 +75,25 @@ export function watchEvent({ profile, label, old, new: now, url }) {
     tags: [WATCH_CHANGED, 'bosun:source=keepalive', `bosun:profile=${profile}`],
     origin: { server: 'bosun', source: 'keepalive', profile, label, old, new: now, url },
     payload: { content: [{ type: 'text', text: `Bosun watch "${label}" on profile "${profile}" changed: ${show(old)} -> ${show(now)} (${url}).` }] },
+  };
+}
+
+// Meeting events -> push/event params. kind: chat | optout | ended; data goes into origin.
+export function meetingEvent(kind, { meeting_id, platform, ...data }) {
+  const text = kind === 'chat' ? `Meeting ${meeting_id} chat — ${data.sender || 'someone'}: ${data.text}`
+    : kind === 'optout' ? `Meeting ${meeting_id}: ${data.sender || 'someone'} asked not to be recorded ("${data.text}"). The recording was stopped and deleted${data.left ? ' and Bosun left the meeting' : ''}.`
+    : `Meeting ${meeting_id} ended for Bosun (${data.reason}) after ${data.duration_s} s.${data.recording ? ` Recording: ${data.recording.bytes} bytes, ${data.recording.path}.` : ' No recording.'}`;
+  const content = [{ type: 'text', text }];
+  if (kind === 'ended' && data.recording) {
+    content.push({ type: 'resource_link', uri: data.recording.uri, name: `${meeting_id}.ogg`, mimeType: 'audio/ogg', size: data.recording.bytes });
+  }
+  return {
+    featureSet: MEETING_SET,
+    eventId: `bosun:${crypto.randomUUID()}`,
+    timestamp: new Date().toISOString(),
+    tags: [MEETING_TAGS[kind], `bosun:meeting=${meeting_id}`, `bosun:platform=${platform}`],
+    origin: { server: 'bosun', source: 'meeting', meeting_id, platform, ...data },
+    payload: { content },
   };
 }
 
@@ -119,6 +153,12 @@ export class EventBus extends EventEmitter {
   needsHuman(e) {
     this.emit('needs-human', e);
     return this.publish(e.tenant, needsHumanEvent(e));
+  }
+
+  // From the meeting manager: kind chat | optout | ended, e = {tenant, meeting_id, platform, ...}.
+  meeting(kind, { tenant, ...e }) {
+    this.emit(`meeting-${kind}`, { tenant, ...e });
+    return this.publish(tenant, meetingEvent(kind, e));
   }
 
   // From a keepalive visit's watch: e = {tenant, profile, label, old, new, url}.

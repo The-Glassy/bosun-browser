@@ -33,7 +33,8 @@ const defaultImporter = (spec) => import(spec);
 const hostOs = () => ({ darwin: 'macos', win32: 'windows' })[process.platform] || 'linux';
 
 // Each engine: { name, family, cdp, shared, tracker, load(), check(bt, cfg), open(bt, {cfg, dir, locale, timezone,
-// shared}) -> {ctx, browser?} }. shared: ephemeral sessions are contexts of one shared browser (manager.getBrowser);
+// shared, media}) -> {ctx, browser?} }. media ({args, env}, meetings only, Chromium family): extra browser flags and the
+// environment of a browser process of its own (its audio server). shared: ephemeral sessions are contexts of one shared browser (manager.getBrowser);
 // every other session is a persistent context in a directory Bosun owns (a profile or a temp dir), so its browser
 // processes can be found by that directory. tracker: how the password tracker gets into Bosun's evaluation world
 // ('init' script, or 'navigate': evaluate after every frame navigation). check: throws if the browser binary is absent.
@@ -46,9 +47,9 @@ function definitions(importer) {
       // Headless runs use Playwright's separate headless shell, whose path the API doesn't expose: checked at launch.
       check: (bt, cfg) => { if (!cfg.headless) exists(bt.executablePath()); },
       launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS }),
-      async open(bt, { cfg, dir, locale, timezone, shared }) {
+      async open(bt, { cfg, dir, locale, timezone, shared, media }) {
         const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone };
-        if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, args: CHROMIUM_ARGS, ...o }) };
+        if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, args: [...CHROMIUM_ARGS, ...(media?.args || [])], ...(media?.env ? { env: media.env } : {}), ...o }) };
         const browser = await shared();
         return { ctx: await browser.newContext(o), browser };
       },
@@ -59,9 +60,10 @@ function definitions(importer) {
       check: (bt) => exists(bt.executablePath()),
       // Recommended patchright setup: persistent context, no custom UA/headers, no automation-flag args, the
       // browser's own window size (viewport: null).
-      async open(bt, { cfg, dir, locale, timezone }) {
+      async open(bt, { cfg, dir, locale, timezone, media }) {
         const ctx = await bt.launchPersistentContext(dir, {
-          channel: 'chromium', headless: cfg.headless, viewport: null, args: ['--window-size=1366,900'], locale, timezoneId: timezone,
+          channel: 'chromium', headless: cfg.headless, viewport: null, args: ['--window-size=1366,900', ...(media?.args || [])], locale, timezoneId: timezone,
+          ...(media?.env ? { env: media.env } : {}),
         });
         return { ctx };
       },
@@ -109,17 +111,18 @@ export function createEngines({ importer = defaultImporter, overrides = {} } = {
       try { await get(name).check?.(bt, cfg); } catch (e) { throw explain(name, e); }
     },
     // Opens a context. Ephemeral sessions of non-shared engines get a private temp profile (tmpDir, removed on close).
-    async open(name, { cfg, profileDir, locale, timezone, shared }) {
+    async open(name, { cfg, profileDir, locale, timezone, shared, media }) {
       const def = get(name);
+      if (media && def.family !== 'chromium') throw new EngineUnavailableError(`meetings need a Chromium engine (chromium or patchright), not ${name}`);
       const bt = await load(name);
       let dir = profileDir, tmpDir = null;
-      if (!dir && !def.shared) {
+      if (!dir && (!def.shared || media)) { // media: a browser process of its own
         tmpDir = dir = path.join(cfg.dataDir, 'tmp', `${name}-${crypto.randomBytes(6).toString('hex')}`);
         fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       }
       // The caller owns dir/tmpDir from here on, also on failure: a launch that timed out may have left processes.
       try {
-        const r = await def.open(bt, { cfg, dir, locale, timezone, shared: () => shared(def, bt) });
+        const r = await def.open(bt, { cfg, dir, locale, timezone, shared: () => shared(def, bt), media });
         return { ...r, dir: r.browser ? null : dir, tmpDir };
       } catch (e) {
         throw Object.assign(explain(name, e), { dir, tmpDir });

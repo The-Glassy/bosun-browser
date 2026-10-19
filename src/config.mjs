@@ -29,6 +29,8 @@ export function loadConfig(env = process.env) {
     camoufoxOs: env.CAMOUFOX_OS || null, // null: the host's OS
     keepalive: env.KEEPALIVE !== '0', // run scheduled keepalive visits (configured with keepalive_set)
     tz: env.TZ || 'Europe/Vienna', // local time for keepalive quiet_hours
+    recordingRetentionDays: int(env, 'RECORDING_RETENTION_DAYS', 30, 1, 3650), // meeting recordings are deleted after this
+    meetingOwner: (env.MEETING_OWNER || '').trim().slice(0, 60) || null, // named in the meeting announcement ("X's AI notetaker")
     tokens: parseTokens(env),
     ws: null,
     live: null,
