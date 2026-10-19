@@ -15,11 +15,15 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - MCP server over **stdio** (Claude Code, Codex, …) or **WebSocket** (shared service).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
-  `keepalive_set` / `keepalive_list` / `keepalive_remove`.
+  `keepalive_set` / `keepalive_list` / `keepalive_remove`, `meeting_join` / `meeting_status` / `meeting_chat_read` /
+  `meeting_chat_send` / `meeting_stop_recording` / `meeting_leave` / `meeting_recording_delete`.
 - **Keepalive** for persistent profiles: scheduled visits keep sliding login sessions alive without a model, and a
   logged-out profile raises an MCPL `bosun:needs-human` push event. A visit can also **watch** one value (say, a
   "43 neue Nachrichten" counter) and push `bosun:watch-changed` when it goes up. See
   [Keeping logins alive](#keeping-logins-alive) and [Watching a value](#watching-a-value).
+- **Meetings (PoC):** joins a Google Meet as a guest notetaker, announces itself in the chat, records the audio to a
+  file and leaves; a "please don't record" in the chat stops and deletes the recording. Transcription happens later,
+  from the file. See [Meetings (PoC)](#meetings-poc).
 - Sessions are **ephemeral** (wiped on close) or use a named **persistent profile** of the tenant (stays logged in;
   no RAM while idle). A session belongs to the connection that opened it: other connections can't see, use or close
   it, and it is closed when that connection goes away or after `IDLE_TIMEOUT_SEC` without use.
@@ -83,6 +87,8 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `MAX_PAGES_PER_SESSION` | 5 | popups beyond this are closed |
 | `KEEPALIVE` | `1` | `0` = don't run scheduled keepalive visits (schedules are kept) |
 | `TZ` | `Europe/Vienna` | IANA time zone for keepalive `quiet_hours` |
+| `RECORDING_RETENTION_DAYS` | 30 | meeting recordings are deleted this many days after they were written |
+| `MEETING_OWNER` | – | name in the meeting announcement ("Hi, I'm Glassy, `<owner>`'s AI notetaker"); unset: "an AI notetaker" |
 | `MAX_DOM_NODES` | 60000 | `read` (a11y, whole page) refuses larger pages; pass `selector` |
 | `SAVE_SHOTS` / `SHOTS_PER_SESSION` | – / 20 | `1` = also keep screenshots on disk (0600, deleted when the session closes) |
 
@@ -243,6 +249,95 @@ Limits: a watch sees only what that one page shows (the visible text, or a selec
 Between visits nothing is watched, so with `every_minutes: 30` a new message is reported about 15 minutes after it
 arrived on average and up to about 40 minutes after (longer in quiet hours). Several changes between two visits make one event, carrying the latest value.
 
+## Meetings (PoC)
+
+Bosun can attend a **Google Meet** as a notetaker: it joins as an **unauthenticated guest**, records the meeting's
+audio and leaves. Nothing is transcribed live: the agent gets the recording when the meeting ends and transcribes it
+afterwards with whatever it likes. Zoom and Teams are not supported yet; the Meet-specific parts live in
+`src/meetings/platforms/meet.mjs` behind a small platform interface, so another platform is one more file.
+
+```jsonc
+meeting_join({ "url": "https://meet.google.com/abc-defg-hij" })   // name, announce_text, max_wait_admit_min (10),
+                                                                   // profile, engine, leave_on_optout (true)
+//  -> { "meeting_id": "m1a2b3c4d5e6", "state": "waiting", ... }   once the join request is out
+meeting_status({ "meeting_id": "m1a2b3c4d5e6" })   // joining | waiting | admitted | recording | ended, participants, recording_seconds
+meeting_chat_read({ "meeting_id": "…", "since": 0 })      meeting_chat_send({ "meeting_id": "…", "text": "…" })
+meeting_stop_recording({ "meeting_id": "…", "delete": true })   meeting_leave({ "meeting_id": "…" })
+meeting_recording_delete({ "meeting_id": "…" })
+```
+
+**How a meeting runs:**
+
+1. A fresh browser of its own (or `profile`; Chromium or patchright only, camoufox is refused). Media permission
+   prompts are accepted (`--use-fake-ui-for-media-stream`), but no fake devices are used: the microphone is a silent
+   audio source and there is no camera.
+2. In the lobby, the microphone and camera are switched off and the guest name is filled in (default
+   `Glassy (notetaker)`). Then **Ask to join** / **Teilnahme anfragen**, and Bosun waits up to `max_wait_admit_min`.
+   "You can't join this call", a denied request or no admission in time ends it with a clear error.
+3. Once admitted, Bosun opens the chat and **posts the announcement first**. Only then does recording start. The
+   default text is in English and German: *"Hi, I'm Glassy, an AI notetaker. I'm recording audio for notes. If you'd
+   rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the
+   recording."* With `MEETING_OWNER` set it says whose notetaker it is.
+4. While in the call:
+   - Every chat message from someone else is pushed to the agent as `bosun:meeting-chat`, with `meeting_id`,
+     `sender` and `text`. `meeting_chat_read` returns them too.
+   - Bosun leaves by itself when the meeting ends, when it is removed, or after **2 minutes alone**.
+   - The agent can leave with `meeting_leave`.
+   - On leaving, `bosun:meeting-ended` carries `meeting_id`, `reason`, `duration_s`, `bytes` and the `recording`:
+     path, a `file://` URI and size. The payload also has it as an MCP `resource_link`.
+
+The meeting runs in a session of its own, so it outlives the agent's connection. It counts against `MAX_SESSIONS`.
+Events use the MCPL feature set **`bosun.meeting`** (tags `bosun:meeting-chat`, `bosun:meeting-optout`,
+`bosun:meeting-ended`); host recipes that list `enabledFeatureSets` need to add it (or `bosun.*`).
+
+**Consent.** Recording starts only after the announcement. No slash commands are needed: a plain-language request
+not to be recorded is enough, in English, German, Ukrainian, Russian or Slovak (`please don't record`, `stop
+recording`, `bitte nicht aufnehmen`, `не записуй`, `не записывай`, `nenahrávaj`, …).
+- **What happens:** Bosun **stops the recording and deletes the file at once**, posts "Recording stopped and
+  deleted. / Aufnahme gestoppt und gelöscht." in the chat, sends `bosun:meeting-optout` and leaves. With
+  `leave_on_optout: false` it stays but never records again in that meeting.
+- **The matcher is conservative.** "don't stop recording", "keep recording" or "record the next steps" do not
+  trigger it.
+- **Because it can miss phrasings,** every chat message also reaches the agent, which can call
+  `meeting_stop_recording` itself.
+
+**Recordings:** `BROWSER_DATA/recordings/<tenant>/<meeting_id>.ogg`, mode 0600, Ogg/Opus 16 kHz mono 24 kbps (about
+11 MB per hour). They are deleted after `RECORDING_RETENTION_DAYS` (default 30), or with `meeting_recording_delete`.
+Chat text is kept only in memory, for the last 50 meetings.
+
+**Audio setup (Linux).** Each meeting gets a private PulseAudio server: its own `XDG_RUNTIME_DIR`, socket and
+config, with two null sinks:
+- **`bosun_out`:** the browser plays the meeting into it, and ffmpeg records its monitor.
+- **`bosun_mic`:** its silent monitor is the browser's microphone.
+
+Meetings never hear each other or the host's sound card. The image needs:
+
+```sh
+apt-get install -y pulseaudio pulseaudio-utils ffmpeg
+```
+
+Each meeting starts its own `pulseaudio` process, so PipeWire alone (`pipewire-pulse`) isn't enough. Both can be
+installed side by side: the private servers don't touch the system one.
+
+Meetings need a **headful** browser (headless Chromium plays no audio), so run the service under Xvfb without
+`HEADLESS=1`. On macOS or without these packages, `meeting_join` refuses with the reason.
+`docker/meeting-test.Dockerfile` builds an image that runs the audio test:
+`docker run --rm --init -v "$PWD":/app -w /app bosun-meeting-test xvfb-run -a node --test test/meeting-audio.test.mjs`.
+
+**Limits — what this can't do (yet):**
+
+- **Guests need a host.** Someone in the meeting has to admit the bot. Meetings that don't allow guests, or that
+  only admit people from the organisation, can't be joined.
+- **Google reviews bot-like guests.** Join requests from automated browsers can land in a review queue, be refused
+  outright ("You can't join this call") or need several tries. Datacenter IPs make this much more likely; a
+  residential connection works best.
+- **Meet's markup changes without notice.** Labels and texts are matched in English and German; the chat sender
+  name is a best-effort guess. A change on Google's side breaks the join or the chat watch until
+  `platforms/meet.mjs` is updated. This PoC has been tested against a local Meet stand-in, not against live Meet.
+- **One mixed audio track.** There is no speaker separation and no live transcript.
+- **Consent is the operator's responsibility.** The announcement and the opt-out are a courtesy, not a legal basis.
+  Check what applies where the participants are; some places require everyone's explicit consent before recording.
+
 ## Security notes
 
 - One service is one trust domain per **tenant** (token): a tenant's connections share its persistent profiles;
@@ -259,7 +354,7 @@ arrived on average and up to about 40 minutes after (longer in quiet hours). Sev
 
 ## Roadmap
 
-M1 tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
+M1 meetings beyond the PoC (Zoom, Teams, speaker separation), tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
 references, watching pages outside keepalive visits · M3 macros.
 
 ## License

@@ -3,7 +3,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 import { startBosun, connect, until, sleep, TOKEN_B } from './helpers.mjs';
-import { FEATURE_SET, NEEDS_HUMAN, WATCH_SET, WATCH_CHANGED } from '../src/events.mjs';
+import { FEATURE_SET, NEEDS_HUMAN, WATCH_SET, WATCH_CHANGED, MEETING_SET, MEETING_TAGS } from '../src/events.mjs';
 
 let svc;
 before(async () => { svc = await startBosun({ KEEPALIVE: '0' }); });
@@ -26,7 +26,8 @@ test('the manifest declares bosun.handoff and bosun.watch with pushEvents; mcpl/
   const c = await host();
   const m = c.getServerCapabilities().experimental.mcpl;
   assert.equal(m.pushEvents, true);
-  assert.deepEqual(Object.keys(m.featureSets), [FEATURE_SET, WATCH_SET]);
+  assert.deepEqual(Object.keys(m.featureSets), [FEATURE_SET, WATCH_SET, MEETING_SET]);
+  assert.deepEqual(Object.keys(m.featureSets[MEETING_SET].tagOntology.tags), Object.values(MEETING_TAGS));
   assert.deepEqual(m.featureSets[FEATURE_SET].uses, ['pushEvents']);
   assert.deepEqual(m.featureSets[WATCH_SET].uses, ['pushEvents']);
   assert.ok(m.featureSets[WATCH_SET].tagOntology.tags[WATCH_CHANGED]);
@@ -162,5 +163,27 @@ test('watch-changed goes out under bosun.watch only: a host that enabled just bo
   assert.deepEqual(p.origin, { server: 'bosun', source: 'keepalive', profile: 'wh', label: 'willhaben messages', old: 43, new: 45, url: change.url });
   assert.match(p.payload.content[0].text, /watch "willhaben messages" on profile "wh" changed: 43 -> 45/);
   assert.equal(svc.events.pending.get('alice'), undefined);
+  await c.close();
+});
+
+test('meeting events go out under bosun.meeting: chat, opt-out, and the end with a resource_link to the recording', async () => {
+  svc.events.pending.clear();
+  const c = await host();
+  await c.grant({ enabled: [MEETING_SET], effectiveCapabilities: ['pushEvents'] });
+  const base = { tenant: 'alice', meeting_id: 'm0123456789ab', platform: 'meet' };
+  await svc.events.meeting('chat', { ...base, sender: 'Alex Example', text: 'Hello' });
+  await svc.events.meeting('optout', { ...base, sender: 'Alex Example', text: 'please do not record', left: true });
+  const recording = { path: '/data/recordings/alice/m0123456789ab.ogg', uri: 'file:///data/recordings/alice/m0123456789ab.ogg', bytes: 4096, mime_type: 'audio/ogg', seconds: 60 };
+  await svc.events.meeting('ended', { ...base, reason: 'left', duration_s: 61, recording, bytes: 4096 });
+  await until(() => c.pushes.length === 3);
+  const [chat, optout, ended] = c.pushes;
+  for (const p of c.pushes) assert.equal(p.featureSet, MEETING_SET);
+  assert.deepEqual(chat.tags, [MEETING_TAGS.chat, 'bosun:meeting=m0123456789ab', 'bosun:platform=meet']);
+  assert.deepEqual(chat.origin, { server: 'bosun', source: 'meeting', meeting_id: 'm0123456789ab', platform: 'meet', sender: 'Alex Example', text: 'Hello' });
+  assert.equal(optout.tags[0], MEETING_TAGS.optout);
+  assert.match(optout.payload.content[0].text, /stopped and deleted and Bosun left/);
+  assert.equal(ended.tags[0], MEETING_TAGS.ended);
+  assert.deepEqual(ended.origin.recording, recording);
+  assert.deepEqual(ended.payload.content[1], { type: 'resource_link', uri: recording.uri, name: 'm0123456789ab.ogg', mimeType: 'audio/ogg', size: 4096 });
   await c.close();
 });

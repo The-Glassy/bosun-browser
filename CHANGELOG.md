@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.0 — meetings (PoC)
+
+### Added
+
+- **Meetings, Google Meet (PoC)**, seven tools:
+  - `meeting_join`, `meeting_status`, `meeting_chat_read`, `meeting_chat_send`, `meeting_stop_recording`,
+    `meeting_leave`, `meeting_recording_delete`.
+- **Joining:** as an unauthenticated guest, in a browser of its own.
+  - Mic and camera are off and the name is filled in before "Ask to join".
+  - It waits up to `max_wait_admit_min` for admission. A denied request, "You can't join this call" or no admission
+    in time ends it with a clear error.
+  - Chromium and patchright only; camoufox is refused.
+- **Once in:** Bosun opens the chat and posts an English/German announcement (`MEETING_OWNER` names whose notetaker
+  it is). **Only then** does it record the meeting's audio:
+  - Ogg/Opus, 16 kHz mono 24 kbps, in `BROWSER_DATA/recordings/<tenant>/<id>.ogg`, mode 0600.
+  - Each meeting has a private PulseAudio server (own runtime dir and socket): a null sink as the browser's output
+    and a silent one as its microphone.
+  - The audio is captured by ffmpeg.
+- **Chat:**
+  - A MutationObserver queues chat messages and every message from others becomes a `bosun:meeting-chat` event;
+    `meeting_chat_read` returns them too.
+  - **Opt-out in natural language:** a conservative matcher for English, German, Ukrainian, Russian and Slovak.
+    It stops and deletes the recording at once, confirms in the chat, sends `bosun:meeting-optout` and leaves (or
+    stays unrecorded).
+- **Leaving:** Bosun leaves by itself when the meeting ends, when it is removed or after 2 minutes alone.
+  `bosun:meeting-ended` carries the duration, reason and the recording (path, `file://` URI, bytes, as an MCP
+  `resource_link`).
+- **MCPL feature set `bosun.meeting`.**
+- **`RECORDING_RETENTION_DAYS`** (default 30): older recordings are deleted at startup and hourly.
+- **Platform interface** (`src/meetings/platforms/meet.mjs`): Zoom and Teams can be added later.
+- **`docker/meeting-test.Dockerfile`:** a Linux image (Playwright + pulseaudio + ffmpeg + Xvfb) for the audio
+  pipeline test.
+
 ## 0.5.0 — watch values on keepalive visits
 
 ### Added
