@@ -15,8 +15,8 @@ let fake;
 before(async () => { fake = await startFakeMeet(); });
 after(async () => { await fake.close(); });
 
-async function withService(fn, { env = {}, meetings = {} } = {}) {
-  const audio = fakeAudio();
+async function withService(fn, { env = {}, meetings = {}, audioOpts = {} } = {}) {
+  const audio = fakeAudio(audioOpts);
   const svc = await startBosun({ KEEPALIVE: '0', ...env }, { meetings: { audio, platformFor: (u) => (u.startsWith(fake.base) ? meet : null), pollMs: 200, ...meetings } });
   const ev = { chat: [], optout: [], ended: [] };
   for (const k of Object.keys(ev)) svc.events.on(`meeting-${k}`, (e) => ev[k].push(e));
@@ -270,4 +270,145 @@ test('config: RECORDING_RETENTION_DAYS and MEETING_OWNER; the announcement names
   assert.match(en, /^Hi, I'm Glassy, Alex's AI notetaker\./);
   assert.match(de, /KI-Notizassistent von Alex/);
   assert.match(de, /bitte nicht aufnehmen/);
+});
+
+test('own messages are recognized by what Bosun just sent, not by name: a participant called "You" or "Glassy (notetaker)" can still opt out', async () => {
+  for (const name of ['You', 'Glassy (notetaker)']) {
+    await withService(async (svc, ev) => {
+      const c = await connect(svc);
+      const { code, url } = fake.newRoom();
+      fake.open(code);
+      const id = (await c.call('meeting_join', { url })).json().meeting_id;
+      await until(async () => (await status(c, id)).state === 'recording', 15_000);
+      fake.say(code, name, "Please don't record");
+      await until(() => ev.optout.length === 1, 5000);
+      assert.equal(ev.chat[0].sender, name);
+      // Repeating the bot's own announcement is forwarded as chat, but is not an objection.
+      await c.close();
+    });
+  }
+  await withService(async (svc, ev) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    fake.open(code);
+    const id = (await c.call('meeting_join', { url })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    fake.say(code, 'Alex Example', announcement('Glassy (notetaker)', null)[0]);
+    await until(() => ev.chat.length === 1, 5000);
+    await sleep(500);
+    assert.equal(ev.optout.length, 0);
+    assert.equal((await status(c, id)).state, 'recording');
+    await c.close();
+  });
+});
+
+test('a chat message rendered empty first and filled in later still counts (opt-out included)', async () => {
+  await withService(async (svc, ev) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    fake.open(code);
+    const id = (await c.call('meeting_join', { url })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    fake.say(code, 'Alex Example', 'stop recording please', { lateMs: 700 });
+    await until(() => ev.optout.length === 1, 6000);
+    assert.equal(ev.optout[0].text, 'stop recording please');
+    await c.close();
+  });
+});
+
+test('microphone and camera must be verifiably off, or Bosun does not join', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    for (const mode of ['none', 'stuck']) {
+      const { code, url } = fake.newRoom();
+      fake.toggles(code, mode);
+      const r = await c.call('meeting_join', { url });
+      assert.equal(r.isError, true, mode);
+      assert.match(r.text, /could not make sure the microphone is off/, mode);
+      assert.equal(fake.room(code).guest, null, `${mode}: never asked to join`);
+    }
+    await until(() => svc.manager.used === 0, 10_000);
+    await c.close();
+  });
+});
+
+test('meeting state comes from the page, not from what participants control: names and chat lines', async () => {
+  await withService(async (svc, ev) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    fake.open(code);
+    fake.setOthers(code, ['The call has ended', 'You have been removed']);
+    const id = (await c.call('meeting_join', { url })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    fake.say(code, 'Alex Example', 'The call has ended');
+    await sleep(1000);
+    assert.equal((await status(c, id)).state, 'recording');
+    fake.end(code); // the real banner, with the same words already in the chat
+    await until(() => ev.ended.length === 1, 10_000);
+    assert.equal(ev.ended[0].reason, 'meeting-ended');
+    await c.close();
+  });
+});
+
+test('meeting_stop_recording before recording has started: it never starts', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    const id = (await c.call('meeting_join', { url })).json().meeting_id;
+    assert.equal((await status(c, id)).state, 'waiting');
+    assert.deepEqual((await c.call('meeting_stop_recording', { meeting_id: id })).json(), { stopped: false, deleted: false, recording_disabled: true, state: 'waiting' });
+    fake.admit(code);
+    await until(async () => fake.room(code).chat.length === 2, 15_000); // announced
+    await sleep(800);
+    assert.equal((await status(c, id)).state, 'admitted');
+    assert.equal(audio.recorders.length, 0);
+    await c.call('meeting_leave', { meeting_id: id });
+    await until(() => ev.ended.length === 1);
+    assert.equal(ev.ended[0].recording, null);
+    await c.close();
+  });
+});
+
+test('an objection during a graceful stop kills the recorder and deletes the file at once', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    fake.open(code);
+    const id = (await c.call('meeting_join', { url, leave_on_optout: false })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    const file = (await status(c, id)).recording.path;
+    const keep = c.call('meeting_stop_recording', { meeting_id: id, delete: false }); // takes 5 s to finish cleanly
+    await sleep(300);
+    fake.say(code, 'Alex Example', 'Nenahrávajte ma, prosím');
+    await until(() => ev.optout.length === 1, 4000);
+    assert.equal(audio.recorders[0].killed, true);
+    assert.equal(fs.existsSync(file), false);
+    await keep;
+    assert.equal(fs.existsSync(file), false);
+    assert.equal((await status(c, id)).recording, 'deleted');
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  }, { audioOpts: { stopMs: 5000 } });
+});
+
+test('leaving while the meeting is still setting up releases its audio server and browser; capacity is checked before anything starts', async () => {
+  await withService(async (svc, ev, audio) => {
+    const { url } = fake.newRoom();
+    const p = svc.meetings.join('alice', { url });
+    await until(() => svc.meetings.active.size === 1);
+    const [m] = svc.meetings.active.values();
+    await svc.meetings.leave('alice', m.id); // the audio server is still starting
+    await p.catch(() => {});
+    await until(() => audio.stats.closed === audio.stats.opened && svc.manager.used === 0, 10_000);
+    assert.equal(audio.stats.opened, 1);
+    // MAX_SESSIONS is 4 here: four meetings setting up hold the four slots; a fifth starts nothing.
+    const joins = Array.from({ length: 4 }, () => svc.meetings.join('alice', { url: fake.newRoom().url }).catch((e) => e));
+    await until(() => svc.meetings.active.size === 4);
+    await assert.rejects(svc.meetings.join('alice', { url: fake.newRoom().url }), /session limit/);
+    await sleep(100);
+    assert.equal(audio.stats.opened, 5);
+    for (const x of [...svc.meetings.active.values()]) await svc.meetings.leave('alice', x.id);
+    await Promise.all(joins);
+    await until(() => audio.stats.closed === audio.stats.opened && svc.manager.used === 0, 15_000);
+  }, { audioOpts: { openMs: 1500 } });
 });

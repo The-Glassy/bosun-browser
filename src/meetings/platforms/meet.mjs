@@ -20,8 +20,10 @@ const TEXT = {
   ended: /the call has ended|call ended|meeting (?:has )?ended|you left the meeting|you left the call|der anruf wurde beendet|(?:besprechung|meeting) (?:wurde )?beendet|sie haben (?:das meeting|den anruf) verlassen/i,
 };
 const LABEL = {
-  micOff: /^(?:turn off microphone|mikrofon (?:deaktivieren|ausschalten))/i,
+  micOff: /^(?:turn off microphone|mikrofon (?:deaktivieren|ausschalten))/i, // the button that turns it off: it is on
+  micOn: /^(?:turn on microphone|mikrofon (?:aktivieren|einschalten))/i, // it is off
   camOff: /^(?:turn off camera|kamera (?:deaktivieren|ausschalten))/i,
+  camOn: /^(?:turn on camera|kamera (?:aktivieren|einschalten))/i,
   join: /^(?:ask to join|teilnahme anfragen|teilnehmen anfragen|join now|jetzt teilnehmen|beitreten)$/i,
   chat: /^(?:chat with everyone|chat mit allen|open chat|chat öffnen|chat)$/i,
   chatInput: /send a message|nachricht senden|nachricht an alle/i,
@@ -29,13 +31,23 @@ const LABEL = {
 };
 const NAME_INPUT = 'input[aria-label="Your name"], input[aria-label="Ihr Name"], input[aria-label="Dein Name"], input[placeholder="Your name"], input[placeholder="Ihr Name"]';
 
-// Visible page text without the chat (a participant typing "the call has ended" must not end the meeting).
+// Visible page text outside anything participants control: chat messages, participant tiles and lists (names), and
+// form fields are skipped structurally, so a name or a chat line reading "The call has ended" neither ends the
+// meeting nor hides the real banner.
+const PARTICIPANT_CONTROLLED = '[data-message-id], [data-sender-name], [data-participant-id], [role="list"], [role="listitem"], textarea, input, [contenteditable="true"]';
 function pageText(page) {
-  return page.evaluate(() => {
-    let t = document.body?.innerText || '';
-    for (const m of document.querySelectorAll('[data-message-id]')) { const x = m.innerText; if (x) t = t.split(x).join(' '); }
-    return t.slice(0, 20000);
-  });
+  return page.evaluate((skip) => {
+    const out = [];
+    const walk = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+    const vis = new Map();
+    for (let n = walk.nextNode(); n && out.length < 2000; n = walk.nextNode()) {
+      const el = n.parentElement;
+      if (!el || !n.nodeValue.trim() || el.closest(skip) || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(el.tagName)) continue;
+      if (!vis.has(el)) vis.set(el, el.checkVisibility ? el.checkVisibility() : !!el.offsetParent);
+      if (vis.get(el)) out.push(n.nodeValue.trim());
+    }
+    return out.join('\n').slice(0, 20000);
+  }, PARTICIPANT_CONTROLLED);
 }
 const visible = (l) => l.first().isVisible().catch(() => false);
 const button = (page, name) => page.getByRole('button', { name });
@@ -60,10 +72,17 @@ export const meet = {
       if (Date.now() > end) throw new Error('no Meet lobby found (not a Meet page, or Meet changed)');
       await page.waitForTimeout(500);
     }
-    // Microphone and camera off before joining (with no camera device Meet may show them off already).
-    for (const label of [LABEL.micOff, LABEL.camOff]) {
-      const b = button(page, label);
-      if (await visible(b)) await b.first().click({ timeout: 5000 }).catch(() => {});
+    // Microphone and camera off before joining, verified: each control must end up showing its "turn on" label.
+    // If that can't be confirmed (control missing, click failed, Meet changed) the join is refused rather than risked.
+    for (const [what, onLabel, offLabel] of [['microphone', LABEL.micOff, LABEL.micOn], ['camera', LABEL.camOff, LABEL.camOn]]) {
+      const until = Date.now() + 10_000;
+      for (;;) {
+        if (await visible(button(page, offLabel))) break;
+        const on = button(page, onLabel);
+        if (await visible(on)) await on.first().click({ timeout: 3000 }).catch(() => {});
+        if (Date.now() > until) throw new Error(`could not make sure the ${what} is off before joining (Meet changed?); not joining`);
+        await page.waitForTimeout(300);
+      }
     }
     const input = page.locator(NAME_INPUT);
     if (await visible(input)) await input.first().fill(name, { timeout: 5000 });
@@ -104,7 +123,7 @@ export const meet = {
     await page.evaluate((key) => {
       if (window[key]) return;
       const q = [];
-      const seen = new Set();
+      const seen = new Map(); // id -> text queued last; a message rendered empty first, or changed, is queued again
       const sender = (el) => {
         const named = el.closest('[data-sender-name]');
         if (named) return named.getAttribute('data-sender-name');
@@ -119,9 +138,11 @@ export const meet = {
       const scan = () => {
         for (const el of document.querySelectorAll('[data-message-id]')) {
           const id = el.getAttribute('data-message-id');
-          if (!id || seen.has(id)) continue;
-          seen.add(id);
-          q.push({ id, sender: sender(el), text: (el.innerText || '').trim().slice(0, 2000) });
+          const text = (el.innerText || '').trim().slice(0, 2000);
+          if (!id || !text || seen.get(id) === text) continue;
+          seen.set(id, text);
+          if (seen.size > 2000) seen.delete(seen.keys().next().value);
+          q.push({ id, sender: sender(el), text });
           if (q.length > 500) q.shift();
         }
       };

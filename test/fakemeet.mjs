@@ -28,21 +28,27 @@ document.querySelector('[aria-label="Chat with everyone"]').onclick = () => { $(
 document.querySelector('[aria-label="Leave call"]').onclick = () => post('leave', {});
 const box = document.querySelector('textarea');
 box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); const t = box.value.trim(); box.value = ''; if (t) post('chat', { text: t }); } });
+const TOGGLES = '__TOGGLES__'; // 'none': no mic/camera buttons, 'stuck': the mic button does nothing
+$('mic').hidden = $('cam').hidden = TOGGLES === 'none';
+if (TOGGLES === 'stuck') $('mic').onclick = null;
 async function poll() {
   const s = await (await fetch('/api/state?code=' + code)).json();
   for (const id of ['lobby', 'waiting', 'denied', 'call', 'over']) $(id).hidden = s.view !== id;
   if (s.view === 'over') $('overText').textContent = s.over;
   if (s.view === 'call') {
     const want = s.participants.join();
-    if ($('tiles').dataset.p !== want) { $('tiles').dataset.p = want; $('tiles').innerHTML = s.participants.map((p) => '<div class="tile" data-participant-id="' + p + '"></div>').join(''); }
+    if ($('tiles').dataset.p !== want) {
+      $('tiles').dataset.p = want;
+      $('tiles').replaceChildren(...s.participants.map((p) => { const t = document.createElement('div'); t.className = 'tile'; t.dataset.participantId = p; t.textContent = p; return t; }));
+    }
     for (const m of s.chat) {
-      if (shown.has(m.id)) continue;
+      if (shown.has(m.id)) { const d = document.querySelector('[data-message-id="' + m.id + '"]'); if (d.textContent !== m.text) d.textContent = m.text; continue; }
       shown.add(m.id);
       const g = document.createElement('div');
       g.dataset.senderName = m.self ? 'You' : m.sender;
       const d = document.createElement('div');
       d.dataset.messageId = m.id;
-      d.textContent = m.text;
+      d.textContent = m.text; // may be empty at first and filled in by a later poll (lateMs)
       g.append(d);
       $('msgs').append(g);
     }
@@ -63,11 +69,15 @@ export async function startFakeMeet({ tone = false } = {}) {
   const srv = http.createServer(async (req, res) => {
     const u = new URL(req.url, 'http://x');
     const json = (o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
-    if (/^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(u.pathname)) { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(APP); }
+    if (/^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(u.pathname)) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      return res.end(APP.replace('__TOGGLES__', room(u.pathname.slice(1)).toggles || 'ok'));
+    }
     if (u.pathname === '/api/state') {
       const r = room(u.searchParams.get('code'));
       const view = r.over ? 'over' : r.phase === 'waiting' ? 'waiting' : r.phase === 'denied' ? 'denied' : r.phase === 'admitted' ? 'call' : 'lobby';
-      return json({ view, over: r.over, participants: ['self', ...r.others], chat: r.chat, tone: r.tone });
+      const chat = r.chat.map((m) => (m.fillAt && Date.now() < m.fillAt ? { ...m, text: '' } : m));
+      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone });
     }
     if (req.method === 'POST') {
       const b = await body(req);
@@ -89,7 +99,9 @@ export async function startFakeMeet({ tone = false } = {}) {
     admit: (c) => { room(c).phase = 'admitted'; room(c).log.push(['admit', Date.now()]); },
     open: (c) => { room(c).open = true; },
     deny: (c) => { room(c).phase = 'denied'; },
-    say: (c, sender, text) => { const r = room(c); r.chat.push({ id: `c${++r.seq}`, sender, text }); },
+    // lateMs: the message shows up empty first and gets its text that much later (incremental rendering).
+    say: (c, sender, text, { lateMs = 0 } = {}) => { const r = room(c); r.chat.push({ id: `c${++r.seq}`, sender, text, ...(lateMs ? { fillAt: Date.now() + lateMs } : {}) }); },
+    toggles: (c, mode) => { room(c).toggles = mode; }, // 'none': no mic/camera buttons, 'stuck': the mic button does nothing
     setOthers: (c, others) => { room(c).others = others; },
     end: (c) => { room(c).over = 'The call has ended'; },
     remove: (c) => { room(c).over = 'You’ve been removed from the meeting'; },
@@ -99,13 +111,19 @@ export async function startFakeMeet({ tone = false } = {}) {
 
 // Fake audio backend for hosts without PulseAudio: no audio server, the browser is muted, and the "recorder" writes a
 // growing Ogg-looking file until stopped.
-export function fakeAudio() {
+// openMs: the audio server takes that long to start; stopMs: a graceful stop takes that long (a kill is immediate).
+export function fakeAudio({ openMs = 0, stopMs = 0 } = {}) {
   const recorders = [];
+  const stats = { opened: 0, closed: 0 };
   return {
     recorders,
+    stats,
     unsupported: async () => null,
     needsHeadful: false,
     async open() {
+      stats.opened++;
+      if (openMs) await new Promise((r) => setTimeout(r, openMs));
+      let closed = false;
       return {
         browserEnv: undefined,
         args: ['--mute-audio'],
@@ -116,13 +134,14 @@ export function fakeAudio() {
           const exited = new Promise((r) => { done = r; });
           const t = setInterval(() => fs.appendFileSync(file, Buffer.alloc(200, 1)), 100);
           const rec = { file, startedAt: Date.now(), exited, killed: false, error: () => null };
-          const end = async (killed) => { clearInterval(t); rec.killed = killed; rec.ended = Date.now(); done({}); };
-          rec.stop = () => end(false);
+          let stopping = null;
+          const end = async (killed) => { clearInterval(t); rec.killed = rec.killed || killed; rec.ended = Date.now(); done({}); };
+          rec.stop = () => (stopping ??= (async () => { if (stopMs) await Promise.race([new Promise((r) => setTimeout(r, stopMs)), exited]); await end(false); })());
           rec.kill = () => end(true);
           recorders.push(rec);
           return rec;
         },
-        close: async () => {},
+        close: async () => { if (!closed) { closed = true; stats.closed++; } },
       };
     },
   };

@@ -48,14 +48,17 @@ export async function startPulse({ tmpRoot = os.tmpdir() } = {}) {
   proc.stderr.on('data', (d) => { if (err.length < 4000) err += d; });
   let exited = false;
   proc.on('exit', () => { exited = true; });
-  const close = async () => {
+  proc.on('error', (e) => { exited = true; err += `\n${e.code || e.message}`; }); // spawn failure: no 'exit' follows
+  let closing = null;
+  const close = () => (closing ??= (async () => {
     if (!exited) {
-      proc.kill('SIGTERM');
+      try { proc.kill('SIGTERM'); } catch {}
       for (let i = 0; i < 30 && !exited; i++) await sleep(100);
-      if (!exited) proc.kill('SIGKILL');
+      if (!exited) { try { proc.kill('SIGKILL'); } catch {} }
+      for (let i = 0; i < 20 && !exited; i++) await sleep(100);
     }
     fs.rmSync(dir, { recursive: true, force: true });
-  };
+  })());
   const pactl = (...args) => run('pactl', ['-s', `unix:${sock}`, ...args], { env });
   try {
     for (let i = 0; ; i++) {
@@ -91,12 +94,21 @@ export function startRecorder(pulse, file) {
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
   let err = '';
   proc.stderr.on('data', (d) => { if (err.length < 4000) err += d; });
-  const exited = new Promise((r) => proc.on('exit', (code, sig) => r({ code, sig })));
-  proc.on('error', () => {});
+  // Settles on exit, or on a spawn failure (which emits 'error' and no 'exit').
+  const exited = new Promise((r) => {
+    proc.on('exit', (code, sig) => r({ code, sig }));
+    proc.on('error', (e) => { err += `\n${e.code || e.message}`; r({ error: e }); });
+  });
+  // Every wait is bounded: a recorder that ignores even SIGKILL can't hold up the meeting's cleanup.
   const end = async (sig, waitMs) => {
-    if (proc.exitCode === null && proc.signalCode === null) proc.kill(sig);
-    const r = await Promise.race([exited, sleep(waitMs).then(() => null)]);
-    if (!r) { proc.kill('SIGKILL'); await exited; }
+    const alive = () => proc.exitCode === null && proc.signalCode === null && proc.pid !== undefined;
+    if (alive()) { try { proc.kill(sig); } catch {} }
+    let r = await Promise.race([exited, sleep(waitMs).then(() => null)]);
+    if (!r) {
+      try { proc.kill('SIGKILL'); } catch {}
+      r = await Promise.race([exited, sleep(2000).then(() => null)]);
+    }
+    return r;
   };
   return {
     file,

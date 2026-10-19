@@ -131,8 +131,11 @@ wrap.addEventListener('touchmove',(e)=>{e.preventDefault();if(!g||ended)return;
 },{passive:false});
 const tend=(e,cancel)=>{e.preventDefault();if(!g)return;if(e.touches.length){const a=avg(e.touches);g.x=g.ox=a.x;g.y=g.oy=a.y;restAt(g,a,performance.now());return}
  clearTimeout(g.lp);const G=g;g=null;if(ended)return;
- // A fine shift still below FINE when the finger lifts is applied before the release.
- const c=G.rc;if(c&&c.n===WARM&&!cancel&&mode==='pad'&&G.maxN===1&&G.moved>=SLOP&&Math.hypot(c.ex-c.x,c.ey-c.y)>=0.3){const k=vw/(stage.clientWidth||1);moveTo(cx+(c.ex-c.x)*0.9*k,cy+(c.ey-c.y)*0.9*k)}
+ // On release the cursor settles where the finger rested: what is left of a fine shift, or (when the finger lifts before
+ // the centre was known) the mean of the reports so far rather than the last noisy one.
+ const c=G.rc;if(c&&c.n&&!cancel&&mode==='pad'&&G.maxN===1&&G.moved>=SLOP){
+  const fx=c.n===WARM?c.ex-c.x:c.sx/c.n-G.x,fy=c.n===WARM?c.ey-c.y:c.sy/c.n-G.y;
+  if(Math.hypot(fx,fy)>=0.3){const k=vw/(stage.clientWidth||1);moveTo(cx+fx*0.9*k,cy+fy*0.9*k)}}
  if(G.drag){flushMove();send({type:'up',x:r1(cx),y:r1(cy)});cur.classList.remove('down');return}
  if(cancel||G.maxN!==1||G.moved>=SLOP||performance.now()-G.t0>=HOLD)return;
  if(mode==='pad'){flushMove();send({type:'click',x:r1(cx),y:r1(cy)});return}

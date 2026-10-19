@@ -73,11 +73,20 @@ const VETO = [
   rx('(?:nezastavuj|nezastavujte|neprestávaj|neprestávajte|nevypínaj|nevypínajte|nemaž)'),
 ];
 
+// A message is judged per clause: sentences, and the parts around "but"-like contrasts, so "Bob said keep recording,
+// but I do not consent to being recorded" is an opt-out while "don't stop recording" is not.
+const CONTRAST = /\s(?:but|however|though|aber|jedoch|sondern|doch|але|проте|но|однако|ale|avšak)\s/u;
+export function clauses(text) {
+  return String(text).slice(0, 4000).split(/[.!?;\n\u3002]+/u)
+    .flatMap((sentence) => normalize(sentence).split(CONTRAST))
+    .map((c) => c.trim()).filter(Boolean);
+}
+
 // -> {lang, rule} for an opt-out request, else null.
 export function matchOptOut(text) {
-  const t = normalize(text);
-  if (!t || t.length > 1000) return null;
-  if (VETO.some((v) => v.test(t))) return null;
-  for (let i = 0; i < RULES.length; i++) if (RULES[i][1].test(t)) return { lang: RULES[i][0], rule: i };
+  for (const c of clauses(text)) {
+    if (VETO.some((v) => v.test(c))) continue;
+    for (let i = 0; i < RULES.length; i++) if (RULES[i][1].test(c)) return { lang: RULES[i][0], rule: i };
+  }
   return null;
 }

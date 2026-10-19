@@ -24,6 +24,7 @@ const JOIN_REPLY_MS = 60_000; // meeting_join answers once the join request is o
 const MAX_CHAT = 500; // kept per meeting
 const MEDIA_ARGS = ['--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'];
 const SELF_SENDERS = /^(?:you|du|sie|ich|me|myself)$/i; // how a chat UI labels our own messages
+const MAX_STARTING = 50; // meetings still setting up, across tenants
 
 // state: joining -> waiting -> admitted -> recording -> ended (recording -> admitted when it is stopped early).
 const NEXT = {
@@ -51,8 +52,9 @@ export const CONFIRM_DELETED = 'Recording stopped and deleted. / Aufnahme gestop
 
 const sleep = (ms, signal) => new Promise((r) => {
   if (signal?.aborted) return r();
-  const t = setTimeout(r, ms);
-  signal?.addEventListener('abort', () => { clearTimeout(t); r(); }, { once: true });
+  const onAbort = () => { clearTimeout(t); r(); };
+  const t = setTimeout(() => { signal?.removeEventListener('abort', onAbort); r(); }, ms);
+  signal?.addEventListener('abort', onAbort, { once: true });
 });
 const deferred = () => { let resolve; const p = new Promise((r) => { resolve = r; }); return { p, resolve }; };
 
@@ -118,13 +120,19 @@ export class Meetings {
     const why = await this.audio.unsupported();
     if (why) throw new Error(why);
     if (this.audio.needsHeadful && this.cfg.headless) throw new Error('meetings need a headful browser (headless Chromium plays no audio): run the service without HEADLESS=1, under Xvfb');
+    // Capacity first, synchronously: a meeting still setting up (audio server, browser launch) has no session yet but
+    // will need one, so it counts. No audio server starts for a meeting that could not get a session.
+    const starting = [...this.active.values()].filter((x) => !x.session && !x.finishing);
+    if (this.manager.used + starting.length >= this.cfg.maxSessions || starting.length >= MAX_STARTING) throw new Error(`session limit ${this.cfg.maxSessions} reached; close one`);
+    const tUse = (this.manager.tenantUse.get(tenant) || 0) + starting.filter((x) => x.tenant === tenant).length;
+    if (tUse >= this.cfg.maxSessionsPerTenant) throw new Error(`session limit ${this.cfg.maxSessionsPerTenant} for this tenant reached; close one`);
     const id = `m${crypto.randomBytes(6).toString('hex')}`;
     const m = {
       id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, leaveOnOptOut,
       announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner),
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
-      createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, recMs: 0, file: null, deleted: false,
-      chat: [], chatSeq: 0, sent: new Set(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
+      createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, stopping: null, recMs: 0, file: null, deleted: false,
+      noRecord: false, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], sentAll: new Set(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
       ac: new AbortController(), joined: deferred(), finishing: null,
     };
     this.active.set(id, m);
@@ -142,13 +150,16 @@ export class Meetings {
   async run(m) {
     const { platform } = m;
     const signal = m.ac.signal;
-    m.rig = await this.audio.open();
-    if (signal.aborted) return;
-    m.session = await this.manager.open({
+    // finish() may run while these are being acquired and miss them: whatever arrives after it is released here.
+    const rig = await this.audio.open();
+    m.rig = rig;
+    if (m.finishing) { await rig.close().catch(() => {}); return; }
+    const session = await this.manager.open({
       owner: m.owner, tenant: m.tenant, profile: m.profile || undefined, engine: m.engine,
-      media: { args: [...MEDIA_ARGS, ...(m.rig.args || [])], env: m.rig.browserEnv },
-    });
-    if (signal.aborted) return;
+      media: { args: [...MEDIA_ARGS, ...(rig.args || [])], env: rig.browserEnv },
+    }).catch(async (e) => { await rig.close().catch(() => {}); throw e; });
+    m.session = session;
+    if (m.finishing) { await this.manager.dispose(session, 'meeting-ended').catch(() => {}); await rig.close().catch(() => {}); return; }
     await m.session.ctx.grantPermissions(['microphone', 'camera'], { origin: new URL(m.url).origin }).catch(() => {});
     await this.page(m, (p) => p.goto(m.url, { waitUntil: 'domcontentloaded', timeout: 45_000 })).catch((e) => {
       throw new Error(`could not load the meeting page: ${String(e?.message || e).split('\n')[0].slice(0, 200)}`);
@@ -178,11 +189,11 @@ export class Meetings {
       m.participants = await platform.participants(p);
       await platform.openChat(p);
       await platform.watchChat(p, m.chatKey);
-      for (const t of m.announce) { m.sent.add(t.trim()); await platform.sendChat(p, t); }
+      for (const t of m.announce) await this.say(m, p, t);
     });
     await this.pollChat(m); // an objection that arrived meanwhile counts before anything is recorded
     if (m.state === 'ended' || signal.aborted) return;
-    if (!m.optedOut) this.startRecording(m);
+    if (!m.optedOut && !m.noRecord) this.startRecording(m);
     while (!signal.aborted && m.state !== 'ended') {
       await sleep(this.pollMs, signal);
       if (signal.aborted || m.state === 'ended') return;
@@ -218,9 +229,23 @@ export class Meetings {
     } else m.aloneSince = null;
   }
 
+  // Posts in the chat and remembers it, so the copy that shows up in the chat panel is recognized as ours.
+  async say(m, page, text) {
+    m.sentAll.add(text.trim());
+    m.pendingOwn.push(text.trim());
+    if (m.pendingOwn.length > 50) m.pendingOwn.shift();
+    await m.platform.sendChat(page, text);
+  }
+
+  // Ours only if we just sent exactly this text AND the chat shows it as from us; each sent message matches once.
+  // A participant named "You" or after the bot, or repeating something the bot said, is not taken for the bot.
   own(m, msg) {
-    const sender = (msg.sender || '').trim();
-    return SELF_SENDERS.test(sender) || sender === m.name || m.sent.has((msg.text || '').trim());
+    const sender = (msg.sender || '').trim(), text = (msg.text || '').trim();
+    if (!(SELF_SENDERS.test(sender) || sender === m.name)) return false;
+    const i = m.pendingOwn.indexOf(text);
+    if (i < 0) return false;
+    m.pendingOwn.splice(i, 1);
+    return true;
   }
 
   async pollChat(m) {
@@ -230,12 +255,17 @@ export class Meetings {
       msgs = [];
     }
     for (const msg of msgs) {
-      if (this.own(m, msg) || !msg.text) continue;
-      const entry = { seq: ++m.chatSeq, at: new Date(this.now()).toISOString(), sender: msg.sender || null, text: msg.text };
+      if (!msg.text || m.chatTexts.get(msg.id) === msg.text) continue;
+      const edited = m.chatTexts.has(msg.id); // the panel filled in or changed a message after it first appeared
+      m.chatTexts.set(msg.id, msg.text);
+      if (m.chatTexts.size > 2 * MAX_CHAT) m.chatTexts.delete(m.chatTexts.keys().next().value);
+      if (!edited && this.own(m, msg)) { m.chatTexts.set(msg.id, msg.text); continue; }
+      const entry = { seq: ++m.chatSeq, at: new Date(this.now()).toISOString(), sender: msg.sender || null, text: msg.text, ...(edited ? { edited: true } : {}) };
       m.chat.push(entry);
       if (m.chat.length > MAX_CHAT) m.chat.shift();
-      this.emit(m, 'chat', { sender: entry.sender, text: entry.text });
-      if (!m.optedOut && !m.deleted && matchOptOut(msg.text)) await this.optOut(m, entry);
+      this.emit(m, 'chat', { sender: entry.sender, text: entry.text, ...(edited ? { edited: true } : {}) });
+      // The bot's own wording (the announcement quotes "please don't record") never counts as an objection.
+      if (!m.optedOut && !m.sentAll.has(msg.text.trim()) && matchOptOut(msg.text)) await this.optOut(m, entry);
       if (m.state === 'ended') return;
     }
   }
@@ -244,19 +274,23 @@ export class Meetings {
   async optOut(m, msg) {
     m.optedOut = { sender: msg.sender, text: msg.text, at: msg.at };
     await this.stopRecording(m, { del: true });
-    m.sent.add(CONFIRM_DELETED);
-    await this.page(m, (p) => m.platform.sendChat(p, CONFIRM_DELETED)).catch(() => {});
+    m.noRecord = true;
+    await this.page(m, (p) => this.say(m, p, CONFIRM_DELETED)).catch(() => {});
     this.emit(m, 'optout', { sender: msg.sender, text: msg.text, left: m.leaveOnOptOut });
     if (m.leaveOnOptOut) await this.finish(m, 'opted-out');
   }
 
+  // A graceful stop still in progress (m.stopping) is escalated to a kill when a deletion comes in meanwhile.
   async stopRecording(m, { del = true } = {}) {
-    const rec = m.rec;
-    if (rec) {
+    const rec = m.rec || m.stopping;
+    if (m.rec) {
       m.rec = null;
       m.recMs += this.now() - rec.startedAt;
       if (m.state === 'recording') transition(m, 'admitted');
-      await (del ? rec.kill() : rec.stop());
+    }
+    if (rec) {
+      m.stopping = rec;
+      try { await (del ? rec.kill() : rec.stop()); } finally { if (m.stopping === rec) m.stopping = null; }
     }
     let bytes = null;
     if (del && m.file) {
@@ -279,7 +313,8 @@ export class Meetings {
       m.ac.abort();
       m.joined.resolve();
       const rec = m.rec;
-      if (rec) { m.rec = null; m.recMs += this.now() - rec.startedAt; await rec.stop().catch(() => {}); }
+      if (rec) { m.rec = null; m.recMs += this.now() - rec.startedAt; m.stopping = rec; await rec.stop().catch(() => {}); }
+      else if (m.stopping) await m.stopping.stop().catch(() => {});
       if (m.session && !m.session.disposed) {
         if (wasIn && reason !== 'meeting-ended' && reason !== 'removed') {
           await Promise.race([this.page(m, (p) => m.platform.leave(p)).catch(() => {}), sleep(5000)]);
@@ -329,16 +364,17 @@ export class Meetings {
   async chatSend(tenant, id, text) {
     const m = this.get(tenant, id);
     if (m.state !== 'admitted' && m.state !== 'recording') throw new Error(`meeting ${id} is ${m.state}; chat is available once admitted`);
-    m.sent.add(text.trim());
-    await this.page(m, (p) => m.platform.sendChat(p, text));
+    await this.page(m, (p) => this.say(m, p, text));
     return { sent: true };
   }
 
+  // Also before recording has started: the meeting then never records.
   async stopRecordingTool(tenant, id, del = true) {
     const m = this.get(tenant, id);
-    if (!m.rec && !(del && m.file)) return { stopped: false, deleted: false, state: m.state };
+    m.noRecord = true;
+    if (!m.rec && !m.stopping && !(del && m.file)) return { stopped: false, deleted: false, recording_disabled: true, state: m.state };
     const r = await this.stopRecording(m, { del });
-    return { ...r, state: m.state };
+    return { ...r, recording_disabled: true, state: m.state };
   }
 
   async leave(tenant, id) {
@@ -352,7 +388,7 @@ export class Meetings {
     if (!ID_RE.test(String(id))) throw new Error(`no meeting ${id}`);
     const m = this.active.get(id) || this.ended.get(id);
     if (m && m.tenant !== tenant) throw new Error(`no meeting ${id}`);
-    if (m?.rec) return { ...(await this.stopRecording(m, { del: true })), meeting_id: id };
+    if (m && (m.rec || m.stopping)) { m.noRecord = true; return { ...(await this.stopRecording(m, { del: true })), meeting_id: id }; }
     const f = this.file(tenant, id);
     const existed = fs.existsSync(f);
     fs.rmSync(f, { force: true });

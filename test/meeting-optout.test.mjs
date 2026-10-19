@@ -42,9 +42,17 @@ for (const lang of Object.keys(YES)) {
   });
 }
 
+test('clauses: a veto only cancels its own clause; long messages are still read', () => {
+  assert.ok(matchOptOut("Bob said keep recording, but I do not consent to being recorded."));
+  assert.ok(matchOptOut('Ich weiß, du sollst nicht aufhören. Aber bitte nicht aufnehmen!'));
+  assert.ok(matchOptOut(`Please don't record. ${'Some context about why. '.repeat(80)}`));
+  assert.equal(matchOptOut("Please keep recording, but don't stop the recording."), null);
+  assert.equal(matchOptOut("Don't stop recording. We need it."), null);
+});
+
 test('normalize: case, apostrophes, punctuation, whitespace', () => {
   assert.equal(normalize('  Don’t   RECORD!!! '), "don't record");
   assert.equal(normalize('Bitte, nicht aufnehmen.'), 'bitte nicht aufnehmen');
-  assert.equal(matchOptOut('x'.repeat(2000)), null);
+  assert.equal(matchOptOut('x'.repeat(5000)), null);
   assert.equal(matchOptOut(''), null);
 });

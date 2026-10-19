@@ -206,6 +206,8 @@ test('a deliberate fine correction after resting still moves the cursor (also wh
       const before = (await log(page)).moves.at(-1);
       await rest(180 + shift, 300, 250); // a little to the right, held briefly, then lifted
       await ev('touchEnd', []);
+      // The correction may reach a slow engine (camoufox) well after the release: wait for it, don't sample once.
+      await until(async () => (await log(page)).moves.at(-1)[0] - before[0] >= shift * 2, 8000).catch(() => {});
       await settled(page);
       const L = await log(page);
       const after = L.moves.at(-1);
