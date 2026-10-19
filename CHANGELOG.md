@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.5.0 — watch values on keepalive visits
+
+### Added
+
+- **Watch** (`keepalive_set` → `watch: {selector?, text_regex?, kind: "count"|"text", label}`): after the
+  logged-in check a visit reads one value from the page — the selector's textContent or the visible text, narrowed
+  by `text_regex` (run in the page, 5 s limit). The first read is a baseline; afterwards a count that went up or a
+  text that differs raises one MCPL push event (`bosun:watch-changed`; origin `{profile, label, old, new, url}`).
+  Only the value is stored (a number, or ≤200 characters), with when it was read and last changed; `keepalive_list`
+  shows it, and each result in `last` says `baseline` / `unchanged` / `changed` / `lower` or why the read failed.
+  - "No match" (0 / null) is only a selector or regex that matched nothing. An invalid selector or a closed page is
+    a failed read that keeps the baseline. A takeover mid-read aborts the visit.
+  - A new `selector` / `text_regex` / `kind` / `url` starts a new baseline. A configuration generation keeps a visit
+    still running for the old one from recording.
+- **MCPL feature set `bosun.watch`** for those events, next to `bosun.handoff`. A host recipe that lists
+  `enabledFeatureSets` must add `bosun.watch` (or `bosun.*`); one without the list gets both. A new
+  `featureSets/update` Request now offers queued events again. Feature sets the host didn't ask for are no longer
+  reported as unavailable. `enabled` / `disabled` also accept `*` and `prefix.*`.
+- **`every_minutes`** (at least 30) as an alternative to `every_hours`. `jitter_min` defaults to 30 or a quarter of
+  a shorter interval.
+- **`quiet_hours`** (`"22-08"`, local time in `TZ`, default `Europe/Vienna`): the interval runs four times slower
+  during the window (an interval that straddles its edge is stretched only for the part inside). Wall-clock edges.
+  Time is integrated between quiet edges and DST changes, so skipped and repeated hours count as they really pass. Jitter and "skip
+  while an agent has the profile open" are unchanged.
+
+### Fixed
+
+- **Trackpad cursor shook while the finger rested.** A finger held still on a phone reports ±1–2 px of sensor
+  noise. Scaled to the page, that was ±10 px, and it was sent as a stream of mouse moves. A finger that stays within
+  3 px for 120 ms now counts as resting. Its centre is averaged, and the cursor settles there, so an idle cursor
+  sends nothing. A deliberate fine shift (≥1 px of averaged movement) still moves it, also while dragging, and
+  what is left of it is applied before the release. The jitter on server-side interpolated paths during real movement is unchanged. The tap/hold threshold
+  now measures distance from where the finger went down, not the noisy path length.
+- **URLs are http(s) only at every entry point:** besides the tool layer, the keepalive core refuses a non-web URL
+  in `set()`, and a visit refuses one found in a hand-edited `keepalive.json` before opening the profile.
+
 ## 0.4.0 — keepalive
 
 ### Added

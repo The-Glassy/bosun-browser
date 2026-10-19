@@ -17,11 +17,14 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
   `keepalive_set` / `keepalive_list` / `keepalive_remove`.
 - **Keepalive** for persistent profiles: scheduled visits keep sliding login sessions alive without a model, and a
-  logged-out profile raises an MCPL `bosun:needs-human` push event. See [Keeping logins alive](#keeping-logins-alive).
+  logged-out profile raises an MCPL `bosun:needs-human` push event. A visit can also **watch** one value (say, a
+  "43 neue Nachrichten" counter) and push `bosun:watch-changed` when it goes up. See
+  [Keeping logins alive](#keeping-logins-alive) and [Watching a value](#watching-a-value).
 - Sessions are **ephemeral** (wiped on close) or use a named **persistent profile** of the tenant (stays logged in;
   no RAM while idle). A session belongs to the connection that opened it: other connections can't see, use or close
   it, and it is closed when that connection goes away or after `IDLE_TIMEOUT_SEC` without use.
-- `navigate` accepts only `http://` and `https://` URLs.
+- `navigate` and `keepalive_set` accept only `http://` and `https://` URLs (no `file:`, `data:`, `javascript:`,
+  `about:`, `chrome:`, `view-source:`, `blob:`, `ftp:` …).
 - **Bot-wall detection** after navigation/click (Cloudflare challenge pages, CAPTCHA iframes, "access denied" texts).
   A bot check that keeps reloading itself (IP reputation) is reported as such: `bot check keeps reloading (likely IP
   reputation); try engine chromium + request_human, or another network`.
@@ -79,6 +82,7 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `IDLE_TIMEOUT_SEC` | 900 | close sessions unused this long (`0` = never; a session in handoff is never idle) |
 | `MAX_PAGES_PER_SESSION` | 5 | popups beyond this are closed |
 | `KEEPALIVE` | `1` | `0` = don't run scheduled keepalive visits (schedules are kept) |
+| `TZ` | `Europe/Vienna` | IANA time zone for keepalive `quiet_hours` |
 | `MAX_DOM_NODES` | 60000 | `read` (a11y, whole page) refuses larger pages; pass `selector` |
 | `SAVE_SHOTS` / `SHOTS_PER_SESSION` | – / 20 | `1` = also keep screenshots on disk (0600, deleted when the session closes) |
 
@@ -151,19 +155,26 @@ keepalive_list()     // schedule, next run, last results: ok | logged_out | bot_
 keepalive_remove({ "profile": "shop" })
 ```
 
-Each visit, at `every_hours` ± `jitter_min` (first one a period after `keepalive_set`):
+The interval is `every_hours` (default 12) or `every_minutes` (at least 30), each visit shifted by up to
+± `jitter_min` (default 30, or a quarter of a shorter interval). `quiet_hours` (`"22-08"`, `"22:30-07:00"`, local
+time in `TZ`, default `Europe/Vienna`) makes the interval **four times longer** while it lasts, so a 30-minute
+watch visits about every two hours at night. An interval that starts before a quiet window is stretched only for
+its part inside it. Quiet hours follow the wall clock, and on DST nights the time is counted as it really passes. Calling `keepalive_set` again replaces the whole configuration of that profile.
+
+Each visit, at the interval ± `jitter_min` (first one an interval after `keepalive_set`):
 
 - opens the profile with the **engine and mode it was last used with** (recorded in the profile; a profile used
   headful is never opened headless, so the fingerprint stays the same);
 - loads `url`, then for 20–60 s moves the mouse along human-looking paths (the live view's trackpad interpolation),
   scrolls 1–3 times and sometimes rests over a link. It **never clicks, types or navigates**;
 - checks `logged_in_check` (every given condition must hold: `text` visible, `selector` visible, URL doesn't
-  contain `url_not_contains`), closes the profile and records the result (time, status, duration; last 10 kept).
+  contain `url_not_contains`), reads the [watched value](#watching-a-value) if there is one, closes the profile and
+  records the result (time, status, duration; last 10 kept).
 
 Visits run one at a time, a few minutes apart, and never take the last free session slot from agents. A profile an
 agent has open is skipped (it's in use anyway); an agent opening a profile during a visit takes it over at once.
 Schedules and results live in `BROWSER_DATA/keepalive.json` (mode 0600) and survive restarts. Nothing from the
-page is stored or logged beyond the check result.
+page is stored or logged beyond the check result and the watched value.
 
 When a visit finds the profile **logged out** or stuck at a **bot check**, Bosun pushes an MCPL event to the
 tenant's agent (feature set `bosun.handoff`, tags `bosun:needs-human`, `bosun:source=keepalive`,
@@ -183,6 +194,55 @@ next one. There is no retry loop: the next attempt is the next scheduled visit.
 - The visit runs from Bosun's IP with Bosun's browser; if the site ties the session to a different network or
   device, keeping it alive here doesn't help.
 
+### Watching a value
+
+A visit can read one value from the page after the logged-in check and tell the agent when it changes. For
+willhaben's message counter in the header:
+
+```jsonc
+keepalive_set({ "profile": "willhaben", "url": "https://www.willhaben.at/iad/myprofile/chat",
+                "every_minutes": 30, "quiet_hours": "22-08",
+                "logged_in_check": { "url_not_contains": "/login" },
+                "watch": { "text_regex": "(\\d+) neue Nachrichten", "kind": "count", "label": "willhaben messages" } })
+```
+
+- **What is read:** the `selector`'s `textContent` if given, else the page's visible text. `text_regex` picks the
+  value (its first capture group, else the whole match). The regex runs in the page with a 5 s limit, so a
+  pathological pattern can't stall the service.
+  - `kind: "count"`: the first whole number in the text. Thousands separators inside it are ignored, but the
+    regex has to capture them: use `([\d.]+)` rather than `(\d+)` if the site writes "1.234". No match counts
+    as **0**, since many badges disappear when nothing is new.
+  - `kind: "text"`: the text with whitespace collapsed, at most 200 characters. No match is `null`.
+- **When it is reported:** the first successful read is the **baseline** and raises no event. After that, a count
+  that **went up** or a text that **differs** raises one `bosun:watch-changed` event. A count that went down (you
+  read the messages) is stored silently, and the next rise is measured from there.
+  - Nothing is read when the visit isn't logged in.
+  - A read that fails is recorded as `watch timeout`, `no number in the watched text` or `watch failed` (say, a
+    selector that isn't valid) and leaves the stored value alone. Only a selector or regex that matches nothing
+    counts as "no match". An agent taking the profile over mid-read aborts the visit, and nothing is recorded.
+  - Changing `selector`, `text_regex`, `kind` or the `url` starts a new baseline; a new `label` doesn't. A visit
+    still running for the old configuration records nothing.
+- **What is stored:** only the value (a number, or at most 200 characters), when it was read and when it last
+  changed, shown under `watch` in `keepalive_list`, plus `baseline` / `unchanged` / `changed` / `lower` per visit
+  in `last`. Nothing else from the page.
+
+The event uses its own MCPL feature set **`bosun.watch`**: tags `bosun:watch-changed`, `bosun:source=keepalive`,
+`bosun:profile=<name>`; origin `{profile, label, old, new, url}`; text e.g. `Bosun watch "willhaben messages" on
+profile "willhaben" changed: 43 -> 45 (https://…)`. Delivery and queueing work as for `bosun:needs-human`.
+
+**Host recipe change:** a recipe without `enabledFeatureSets` for Bosun gets both feature sets. One that lists
+`"bosun.handoff"` must add `"bosun.watch"`, or use `"bosun.*"`, otherwise watch events are not delivered (they wait
+in the queue, up to 20 per tenant, until a connection grants the set):
+
+```jsonc
+"mcpServers": { "bosun": { "url": "wss://bosun.example/mcp", "transport": "websocket",
+                           "enabledFeatureSets": ["bosun.handoff", "bosun.watch"] } }
+```
+
+Limits: a watch sees only what that one page shows (the visible text, or a selector's text, at visit time).
+Between visits nothing is watched, so with `every_minutes: 30` a new message is reported about 15 minutes after it
+arrived on average and up to about 40 minutes after (longer in quiet hours). Several changes between two visits make one event, carrying the latest value.
+
 ## Security notes
 
 - One service is one trust domain per **tenant** (token): a tenant's connections share its persistent profiles;
@@ -200,7 +260,7 @@ next one. There is no retry loop: the next attempt is the next scheduled visit.
 ## Roadmap
 
 M1 tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
-references, watch · M3 macros.
+references, watching pages outside keepalive visits · M3 macros.
 
 ## License
 

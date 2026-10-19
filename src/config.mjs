@@ -28,11 +28,13 @@ export function loadConfig(env = process.env) {
     engine: env.ENGINE || 'chromium',
     camoufoxOs: env.CAMOUFOX_OS || null, // null: the host's OS
     keepalive: env.KEEPALIVE !== '0', // run scheduled keepalive visits (configured with keepalive_set)
+    tz: env.TZ || 'Europe/Vienna', // local time for keepalive quiet_hours
     tokens: parseTokens(env),
     ws: null,
     live: null,
   };
   if (!ENGINE_NAMES.includes(cfg.engine)) throw new Error(`ENGINE must be one of ${ENGINE_NAMES.join(', ')} (got "${cfg.engine}")`);
+  try { new Intl.DateTimeFormat('en', { timeZone: cfg.tz }); } catch { throw new Error(`TZ must be an IANA time zone such as Europe/Vienna (got "${cfg.tz}")`); }
   if (cfg.camoufoxOs && !['macos', 'windows', 'linux'].includes(cfg.camoufoxOs)) throw new Error('CAMOUFOX_OS must be macos, windows or linux');
   cfg.maxSessionsPerTenant = int(env, 'MAX_SESSIONS_PER_TENANT', cfg.maxSessions, 1, cfg.maxSessions);
 

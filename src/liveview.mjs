@@ -98,24 +98,41 @@ c.addEventListener('pointerup',mup);c.addEventListener('pointercancel',mup);
 c.addEventListener('wheel',(e)=>{e.preventDefault();const q=at(e.clientX,e.clientY);wheel(q.x,q.y,e.deltaX,e.deltaY)},{passive:false});
 // Touch. Tap mode: tap = click there, drag = scroll. Trackpad mode: drag moves the cursor (relative, accelerated),
 // tap = click at the cursor, two fingers = scroll, hold then drag = press, move, release.
-const SLOP=8,HOLD=450;let g=null;
+// A finger resting on the glass still reports tiny movements. Once it has stayed within REST px for REST_MS it counts
+// as resting: its centre is the mean of the first WARM reports, later reports are averaged (EMA), so noise cancels
+// out and the cursor stays put with nothing sent, while a deliberate fine shift of FINE px or more from the centre
+// still moves it (and what is left of it is applied on release).
+const SLOP=8,HOLD=450,REST=3,REST_MS=120,FINE=1,EMA=0.25,WARM=8;let g=null;
+const restAt=(G,a,now)=>{G.rx=a.x;G.ry=a.y;G.rt=now;G.rc=null};
 const avg=(ts)=>{let X=0,Y=0;for(const q of ts){X+=q.clientX;Y+=q.clientY}return{x:X/ts.length,y:Y/ts.length}};
 wrap.addEventListener('touchstart',(e)=>{e.preventDefault();if(ended)return;const a=avg(e.touches),now=performance.now();
  if(!g)g={t0:now,t:now,x:a.x,y:a.y,moved:0,maxN:0,drag:false,lp:0};
- g.x=a.x;g.y=a.y;g.t=now;g.maxN=Math.max(g.maxN,e.touches.length);clearTimeout(g.lp);
+ g.x=g.ox=a.x;g.y=g.oy=a.y;g.t=now;restAt(g,a,now);g.maxN=Math.max(g.maxN,e.touches.length);clearTimeout(g.lp);
  if(mode==='pad'&&g.maxN===1)g.lp=setTimeout(()=>{if(g&&!g.drag&&g.moved<SLOP){g.drag=true;flushMove();send({type:'down',x:r1(cx),y:r1(cy)});cur.classList.add('down')}},HOLD);
 },{passive:false});
 wrap.addEventListener('touchmove',(e)=>{e.preventDefault();if(!g||ended)return;
- const a=avg(e.touches),now=performance.now(),dx=a.x-g.x,dy=a.y-g.y,dt=Math.max(1,now-g.t),k=vw/(stage.clientWidth||1);
- g.x=a.x;g.y=a.y;g.t=now;g.moved+=Math.hypot(dx,dy);
+ let a=avg(e.touches);const now=performance.now();
+ if(Math.hypot(a.x-g.rx,a.y-g.ry)>=REST)restAt(g,a,now);
+ else if(now-g.rt>=REST_MS){
+  const c=g.rc||(g.rc={n:0,sx:0,sy:0});
+  if(c.n<WARM){c.n++;c.sx+=a.x;c.sy+=a.y;if(c.n<WARM)return;
+   // Centre known: settle the cursor there (the last reports before resting were noisy too).
+   c.x=c.ex=c.sx/WARM;c.y=c.ey=c.sy/WARM;if(Math.hypot(c.x-g.x,c.y-g.y)<0.5)return;a={x:c.x,y:c.y}}
+  else{c.ex+=(a.x-c.ex)*EMA;c.ey+=(a.y-c.ey)*EMA;
+   if(Math.hypot(c.ex-c.x,c.ey-c.y)<FINE)return;
+   a={x:g.x+c.ex-c.x,y:g.y+c.ey-c.y};c.x=c.ex;c.y=c.ey}}
+ const dx=a.x-g.x,dy=a.y-g.y,dt=Math.max(1,now-g.t),k=vw/(stage.clientWidth||1);
+ g.x=a.x;g.y=a.y;g.t=now;g.moved=Math.max(g.moved,Math.hypot(a.x-g.ox,a.y-g.oy));
  if(g.moved<SLOP)return;
  clearTimeout(g.lp);
  if(e.touches.length>1||mode!=='pad'){if(g.drag)return;const q=mode==='pad'?{x:cx,y:cy}:at(a.x,a.y);wheel(q.x,q.y,-dx*k,-dy*k);return}
  const gain=Math.min(3.2,0.9+1.1*Math.hypot(dx,dy)/dt);
  moveTo(cx+dx*gain*k,cy+dy*gain*k);
 },{passive:false});
-const tend=(e,cancel)=>{e.preventDefault();if(!g)return;if(e.touches.length){const a=avg(e.touches);g.x=a.x;g.y=a.y;return}
+const tend=(e,cancel)=>{e.preventDefault();if(!g)return;if(e.touches.length){const a=avg(e.touches);g.x=g.ox=a.x;g.y=g.oy=a.y;restAt(g,a,performance.now());return}
  clearTimeout(g.lp);const G=g;g=null;if(ended)return;
+ // A fine shift still below FINE when the finger lifts is applied before the release.
+ const c=G.rc;if(c&&c.n===WARM&&!cancel&&mode==='pad'&&G.maxN===1&&G.moved>=SLOP&&Math.hypot(c.ex-c.x,c.ey-c.y)>=0.3){const k=vw/(stage.clientWidth||1);moveTo(cx+(c.ex-c.x)*0.9*k,cy+(c.ey-c.y)*0.9*k)}
  if(G.drag){flushMove();send({type:'up',x:r1(cx),y:r1(cy)});cur.classList.remove('down');return}
  if(cancel||G.maxN!==1||G.moved>=SLOP||performance.now()-G.t0>=HOLD)return;
  if(mode==='pad'){flushMove();send({type:'click',x:r1(cx),y:r1(cy)});return}

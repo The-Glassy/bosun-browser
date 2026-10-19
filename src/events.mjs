@@ -1,7 +1,8 @@
 // MCPL push events (spec §6 feature sets, §9 push/event, §16 tags) for things that need the agent's attention while
-// no tool call is running — today: a kept-alive profile that is logged out or stuck at a bot check.
+// no tool call is running: a kept-alive profile that is logged out or stuck at a bot check (feature set
+// bosun.handoff), and a watched value that changed on a keepalive visit (feature set bosun.watch).
 // A connection receives push/event only if its client asked for MCPL at initialize (capabilities.experimental.mcpl)
-// and the host's featureSets/update Request granted pushEvents with feature set bosun.handoff enabled. Events for a
+// and the host's featureSets/update Request granted pushEvents with the event's feature set enabled. Events for a
 // tenant with no such connection wait (bounded) for the next one.
 import crypto from 'crypto';
 import { EventEmitter } from 'events';
@@ -9,6 +10,8 @@ import { z } from 'zod';
 
 export const FEATURE_SET = 'bosun.handoff';
 export const NEEDS_HUMAN = 'bosun:needs-human';
+export const WATCH_SET = 'bosun.watch';
+export const WATCH_CHANGED = 'bosun:watch-changed';
 export const MANIFEST = {
   version: '0.5',
   pushEvents: true,
@@ -21,13 +24,21 @@ export const MANIFEST = {
         keyed: { 'bosun:source': { values: ['keepalive'] }, 'bosun:reason': { values: ['logged-out', 'bot-check'] }, 'bosun:profile': { open: true } },
       },
     },
+    [WATCH_SET]: {
+      description: 'Push events when a value watched on a keepalive visit changed (a counter went up, a text differs), e.g. new messages; origin carries profile, label, old, new and url.',
+      uses: ['pushEvents'],
+      tagOntology: {
+        tags: { [WATCH_CHANGED]: { desc: 'a watched value on a kept-alive profile changed' } },
+        keyed: { 'bosun:source': { values: ['keepalive'] }, 'bosun:profile': { open: true } },
+      },
+    },
   },
 };
 const MAX_PENDING = 20; // per tenant
 const PUSH_TIMEOUT_MS = 15_000;
 
 // needs-human from a keepalive visit -> push/event params.
-export function pushEvent({ profile, url, reason, kind }) {
+export function needsHumanEvent({ profile, url, reason, kind }) {
   const what = kind === 'bot_check' ? 'is stuck at a bot check' : `is logged out (${reason})`;
   return {
     featureSet: FEATURE_SET,
@@ -36,6 +47,19 @@ export function pushEvent({ profile, url, reason, kind }) {
     tags: [NEEDS_HUMAN, 'bosun:source=keepalive', `bosun:reason=${kind === 'bot_check' ? 'bot-check' : 'logged-out'}`, `bosun:profile=${profile}`],
     origin: { server: 'bosun', source: 'keepalive', profile, url, reason: kind === 'bot_check' ? 'bot check' : reason },
     payload: { content: [{ type: 'text', text: `Bosun keepalive: profile "${profile}" ${what} at ${url}. Open a session with this profile, navigate there and call request_human so your human can log in again.` }] },
+  };
+}
+
+// A watched value changed on a keepalive visit -> push/event params. old/new are the extracted values only.
+export function watchEvent({ profile, label, old, new: now, url }) {
+  const show = (v) => (v === null ? 'nothing' : JSON.stringify(v));
+  return {
+    featureSet: WATCH_SET,
+    eventId: `bosun:${crypto.randomUUID()}`,
+    timestamp: new Date().toISOString(),
+    tags: [WATCH_CHANGED, 'bosun:source=keepalive', `bosun:profile=${profile}`],
+    origin: { server: 'bosun', source: 'keepalive', profile, label, old, new: now, url },
+    payload: { content: [{ type: 'text', text: `Bosun watch "${label}" on profile "${profile}" changed: ${show(old)} -> ${show(now)} (${url}).` }] },
   };
 }
 
@@ -94,7 +118,13 @@ export class EventBus extends EventEmitter {
   // From the keepalive scheduler: e = {tenant, profile, url, reason, kind}.
   needsHuman(e) {
     this.emit('needs-human', e);
-    return this.publish(e.tenant, pushEvent(e));
+    return this.publish(e.tenant, needsHumanEvent(e));
+  }
+
+  // From a keepalive visit's watch: e = {tenant, profile, label, old, new, url}.
+  watchChanged(e) {
+    this.emit('watch-changed', e);
+    return this.publish(e.tenant, watchEvent(e));
   }
 }
 
@@ -104,14 +134,16 @@ const grants = (patterns, cap) => patterns.some((p) => p === cap || p === '*' ||
 const overlaps = (a, b) => grants([a], b) || grants([b], a);
 
 // MCPL on one MCP connection: the manifest is advertised statically (plain MCP clients ignore experimental); the
-// grant comes from featureSets/update. Attaches the connection to the bus once push is allowed.
+// grant comes from featureSets/update. Attaches the connection to the bus once push is allowed for some feature set;
+// each event is only offered for its own feature set.
 export function mcplConnection(server, { bus, tenant }) {
   let grant = null; // {caps: string[], enabled: Set<string>} after a featureSets/update Request
   let detach = null;
   const wantsMcpl = () => !!server.getClientCapabilities()?.experimental?.mcpl;
-  const pushAllowed = () => !!grant && wantsMcpl() && grants(grant.caps, 'pushEvents') && grant.enabled.has(FEATURE_SET);
+  const allowed = (set) => !!grant && wantsMcpl() && grants(grant.caps, 'pushEvents') && grant.enabled.has(set);
+  const pushAllowed = () => Object.keys(MANIFEST.featureSets).some(allowed);
   const sink = async (params) => {
-    if (!pushAllowed()) return false;
+    if (!allowed(params.featureSet)) return false;
     const r = await server.request({ method: 'push/event', params }, z.object({ accepted: z.boolean() }).passthrough(), { timeout: PUSH_TIMEOUT_MS });
     return r.accepted === true || r.reason === 'duplicate';
   };
@@ -119,25 +151,28 @@ export function mcplConnection(server, { bus, tenant }) {
     const caps = Array.isArray(p?.effectiveCapabilities) ? p.effectiveCapabilities.filter((c) => typeof c === 'string') : [];
     const denied = Array.isArray(p?.deniedCapabilities) ? p.deniedCapabilities : [];
     if (caps.some((c) => denied.some((d) => typeof d === 'string' && overlaps(c, d)))) { grant = { caps: [], enabled: new Set() }; return false; } // malformed: fail closed
-    const selected = Array.isArray(p?.enabled) ? p.enabled : null;
-    const disabled = Array.isArray(p?.disabled) ? p.disabled : [];
-    const enabled = new Set(Object.entries(MANIFEST.featureSets)
-      .filter(([n, d]) => (selected === null || selected.includes(n) || selected.includes('*')) && !disabled.includes(n) && d.uses.every((u) => grants(caps, u)))
-      .map(([n]) => n));
+    // Hosts resolve their recipe's patterns and send names; '*' and 'bosun.*' are accepted too.
+    const names = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : null);
+    const selected = names(p?.enabled), disabled = names(p?.disabled) || [];
+    const wanted = Object.keys(MANIFEST.featureSets).filter((n) => (selected === null || grants(selected, n)) && !grants(disabled, n));
+    const enabled = new Set(wanted.filter((n) => MANIFEST.featureSets[n].uses.every((u) => grants(caps, u))));
     if (form === 'notification') { // a notification can narrow the grant, never widen it
       if (!grant) return true;
       grant = { caps: grant.caps.filter((c) => grants(caps, c)), enabled: new Set([...grant.enabled].filter((n) => enabled.has(n))) };
-    } else grant = { caps, enabled };
+    } else grant = { caps, enabled, wanted };
     return true;
   };
-  const update = () => {
-    if (pushAllowed() && !detach) detach = bus.attach(tenant, sink);
+  // A new grant (Request) re-attaches with a fresh sink: events refused under the old grant (say, a feature set that
+  // was not enabled yet) are offered again.
+  const update = (regrant = false) => {
+    if (pushAllowed() && (!detach || regrant)) { detach?.(); detach = bus.attach(tenant, (p) => sink(p)); }
     else if (!pushAllowed() && detach) { detach(); detach = null; }
   };
   server.setRequestHandler(z.object({ method: z.literal('featureSets/update'), params: z.any().optional() }), async (req) => {
     if (!apply(req.params, 'request')) { update(); throw Object.assign(new Error('effectiveCapabilities and deniedCapabilities overlap; nothing is granted'), { code: -32602 }); }
-    update();
-    const unavailableFeatures = Object.keys(MANIFEST.featureSets).filter((n) => !grant.enabled.has(n))
+    update(true);
+    // Feature sets the host asked for but did not grant the capabilities of (ones it left out are simply off).
+    const unavailableFeatures = grant.wanted.filter((n) => !grant.enabled.has(n))
       .map((featureSet) => ({ featureSet, missingCapabilities: MANIFEST.featureSets[featureSet].uses.filter((u) => !grants(grant.caps, u)), effect: 'disabled' }));
     return { accepted: true, unavailableFeatures, notes: [], ...(unavailableFeatures.length ? { mode: 'degraded' } : {}) };
   });

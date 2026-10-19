@@ -153,6 +153,75 @@ test('trackpad (default on touch): drag = many mouse moves between two points, t
   }
 });
 
+test('an idle trackpad cursor sends nothing: no input for 5 s, and a finger resting on the glass (sensor noise) for 5 s', async () => {
+  const c = await connect(svc);
+  const { page, link } = await handoff(c, '/pointer');
+  const { ctx, vp } = await openViewer(link);
+  try {
+    assert.equal(await vp.evaluate(() => document.body.dataset.mode), 'pad');
+    const cdp = await vp.context().newCDPSession(vp);
+    const ev = (type, pts) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: pts.map(([x, y], id) => ({ x, y, id })) });
+    const cursor = () => vp.evaluate(() => { const r = document.getElementById('cur').getBoundingClientRect(); return [r.left, r.top]; });
+    await resetLog(page);
+    await sleep(5000);
+    assert.equal((await log(page)).moves.length, 0);
+    // Drag, then keep the finger down and still: it reports ±1 px of noise every 16 ms.
+    await ev('touchStart', [[100, 300]]);
+    for (let i = 1; i <= 12; i++) { await ev('touchMove', [[100 + 8 * i, 300 + 4 * i]]); await sleep(16); }
+    await settled(page);
+    const before = await cursor();
+    await resetLog(page);
+    const t0 = Date.now();
+    for (let i = 0; Date.now() - t0 < 5000; i++) { await ev('touchMove', [[196 + [1, -1, 0.5, -0.5][i % 4], 348 + [0.7, -0.7, -0.3, 0.3][i % 4]]]); await sleep(16); }
+    assert.deepEqual((await log(page)).moves, []);
+    assert.deepEqual(await cursor(), before); // the overlay did not shake either
+    // Then a real move is still followed right away.
+    for (let i = 1; i <= 6; i++) { await ev('touchMove', [[196 + 6 * i, 348]]); await sleep(16); }
+    await ev('touchEnd', []);
+    await until(async () => (await log(page)).moves.length > 0);
+    assert.deepEqual((await log(page)).buttons, []);
+  } finally {
+    await ctx.close();
+    await c.close();
+  }
+});
+
+test('a deliberate fine correction after resting still moves the cursor (also while dragging, before the release)', async () => {
+  const c = await connect(svc);
+  const { page, link } = await handoff(c, '/pointer');
+  const { ctx, vp } = await openViewer(link);
+  try {
+    const cdp = await vp.context().newCDPSession(vp);
+    const ev = (type, pts) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: pts.map(([x, y], id) => ({ x, y, id })) });
+    const N = [[1, 0.7], [-1, -0.7], [0.5, -0.3], [-0.5, 0.3]];
+    const rest = async (x, y, ms) => { const t0 = Date.now(); for (let i = 0; Date.now() - t0 < ms; i++) { await ev('touchMove', [[x + N[i % 4][0], y + N[i % 4][1]]]); await sleep(16); } };
+    // 2 px (with the noise it leaves the 3 px rest radius) and 1.5 px (it stays inside: the averaged path).
+    for (const [drag, shift] of [[false, 2], [true, 2], [false, 1.5], [true, 1.5]]) {
+      await resetLog(page);
+      await ev('touchStart', [[100, 300]]);
+      if (drag) await sleep(600); // hold: press
+      for (let i = 1; i <= 10; i++) { await ev('touchMove', [[100 + 8 * i, 300]]); await sleep(16); }
+      await rest(180, 300, 400);
+      await settled(page);
+      const before = (await log(page)).moves.at(-1);
+      await rest(180 + shift, 300, 250); // a little to the right, held briefly, then lifted
+      await ev('touchEnd', []);
+      await settled(page);
+      const L = await log(page);
+      const after = L.moves.at(-1);
+      assert.ok(after[0] - before[0] >= shift * 2, `drag=${drag} shift=${shift}: ${JSON.stringify([before, after])}`); // ~shift x 0.9 x 3.3
+      assert.ok(Math.abs(after[1] - before[1]) <= 2);
+      if (drag) {
+        assert.deepEqual(L.buttons, ['down', 'up']);
+        assert.equal(after[2], 1); // the correction happened with the button still down
+      }
+    }
+  } finally {
+    await ctx.close();
+    await c.close();
+  }
+});
+
 test('tap mode clicks where tapped; a desktop mouse hovers (real mouse moves) and clicks', async () => {
   const c = await connect(svc);
   const { page, link } = await handoff(c, '/pointer');
