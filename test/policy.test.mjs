@@ -257,6 +257,13 @@ test('bridge: a server that never completes the handshake times out; stdin EOF b
     const eof = bridge({ BOSUN_URL: url, BOSUN_TOKEN: TOKEN_E });
     eof.p.stdin.end();
     assert.equal(await eof.exited, 0);
+    // Input piling up before the handshake is bounded.
+    const flood = bridge({ BOSUN_URL: url, BOSUN_TOKEN: TOKEN_E });
+    const rec = `${JSON.stringify({ jsonrpc: '2.0', method: 'x', params: { pad: 'y'.repeat(512 * 1024) } })}\n`;
+    flood.p.stdin.on('error', () => {});
+    for (let i = 0; i < 20; i++) flood.p.stdin.write(rec);
+    assert.equal(await flood.exited, 1);
+    assert.match(flood.stderr(), /more than 8 MiB of input before the connection opened/);
     const t0 = Date.now();
     const hung = bridge({ BOSUN_URL: url, BOSUN_TOKEN: TOKEN_E });
     assert.equal(await hung.exited, 1);

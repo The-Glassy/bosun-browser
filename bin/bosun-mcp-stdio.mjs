@@ -7,6 +7,7 @@ import WebSocket from 'ws';
 
 const MAX_LINE = 1024 * 1024; // bytes; Bosun's maxPayload: a longer message would get the connection closed
 const HANDSHAKE_MS = 15_000;
+const MAX_PENDING = 8 * 1024 * 1024; // bytes read before the socket opens, or sent and not yet flushed
 
 const die = (code, msg) => { process.stderr.write(`bosun-mcp-stdio: ${msg}\n`); process.exit(code); };
 const warn = (msg) => process.stderr.write(`bosun-mcp-stdio: ${msg}\n`);
@@ -50,6 +51,7 @@ function run(env = process.env) {
   const ws = new WebSocket(target.url, { headers: { authorization: `Bearer ${target.token}` }, handshakeTimeout: HANDSHAKE_MS, maxPayload: 64 * 1024 * 1024 });
   let stdinEnded = false;
   const queue = []; // lines read before the socket opened
+  let queued = 0, paused = false;
 
   ws.on('unexpected-response', (_req, res) => {
     const code = res.statusCode;
@@ -71,7 +73,17 @@ function run(env = process.env) {
   });
 
   // stdin -> server: one frame per non-empty line. Only parseable JSON is forwarded.
-  const send = (line) => (ws.readyState === WebSocket.OPEN ? ws.send(line) : queue.push(line));
+  // Before open: queued up to MAX_PENDING. After: stdin pauses while the socket has MAX_PENDING unflushed.
+  const send = (line) => {
+    if (ws.readyState !== WebSocket.OPEN) {
+      queued += Buffer.byteLength(line);
+      if (queued > MAX_PENDING) die(1, 'more than 8 MiB of input before the connection opened');
+      queue.push(line);
+      return;
+    }
+    ws.send(line, () => { if (paused && ws.bufferedAmount < MAX_PENDING / 2) { paused = false; process.stdin.resume(); } });
+    if (!paused && ws.bufferedAmount > MAX_PENDING) { paused = true; process.stdin.pause(); }
+  };
   process.stdin.on('data', lineReader((line) => {
     if (!line.trim()) return;
     try { JSON.parse(line); } catch { warn('dropped a line that is not JSON'); return; }
@@ -83,7 +95,8 @@ function run(env = process.env) {
     setTimeout(() => { ws.terminate(); process.exit(0); }, 2000).unref();
   });
   ws.on('open', () => {
-    for (const line of queue.splice(0)) ws.send(line);
+    for (const line of queue.splice(0)) send(line);
+    queued = 0;
     if (stdinEnded) ws.close(1000);
   });
 }
