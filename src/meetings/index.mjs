@@ -184,7 +184,8 @@ export class Meetings {
     if (first === 'denied') return this.finish(m, 'denied', 'the request to join was denied');
     if (first === 'refused') return this.finish(m, 'refused_by_google', REFUSED_BY_GOOGLE);
     if (first === 'ended') return this.finish(m, 'meeting-ended', 'the meeting has ended');
-    if (first === 'waiting') {
+    if (first === 'waiting' || first === 'asked') {
+      m.knocked = first === 'waiting'; // the waiting room was seen: the request reached the meeting
       transition(m, 'waiting');
       m.joined.resolve();
       const until = this.now() + m.maxWaitMs;
@@ -193,8 +194,10 @@ export class Meetings {
         if (signal.aborted || m.state === 'ended') return;
         const s = await this.page(m, (p) => platform.state(p));
         if (s === 'admitted') break;
-        // After knocking, "can't join" means the request was turned down (by the host, or by Google's review).
-        if (s === 'denied' || s === 'refused') return this.finish(m, 'denied', 'the request to join was denied');
+        if (s === 'waiting') m.knocked = true;
+        if (s === 'denied') return this.finish(m, 'denied', 'the request to join was denied');
+        // "Can't join" after the waiting room: the request was turned down. Without one: Google turned the guest away.
+        if (s === 'refused') return m.knocked ? this.finish(m, 'denied', 'the request to join was denied') : this.finish(m, 'refused_by_google', REFUSED_BY_GOOGLE);
         if (s === 'ended' || s === 'removed') return this.finish(m, 'meeting-ended', 'the meeting has ended');
         if (this.now() > until) return this.finish(m, 'not-admitted', `not admitted within ${Math.round(m.maxWaitMs / 60_000)} min`);
       }

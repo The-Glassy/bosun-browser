@@ -5,7 +5,7 @@
 //   name, matches(url), locale
 //   joinUrl(url)          the URL to load: forces Meet's English UI (hl=en)
 //   lobby(page, {name})   mic and camera off, guest name filled in (if asked), join clicked
-//                         -> 'waiting' | 'admitted' | 'denied' | 'refused' | 'ended'
+//                         -> 'waiting' (knock seen) | 'asked' (no waiting room seen yet) | 'admitted' | 'denied' | 'refused' | 'ended'
 //   state(page)           'lobby' | 'waiting' | 'admitted' | 'denied' | 'refused' | 'removed' | 'ended' | 'unknown'
 //   openChat(page), sendChat(page, text)
 //   watchChat(page, key)  install a MutationObserver that queues new chat messages; drainChat(page, key) -> [{id, sender, text}]
@@ -55,15 +55,24 @@ const LABEL = {
   leave: any('^leave call$', '^anruf verlassen$', '^leave meeting$', '^besprechung verlassen$', '^opustiť hovor$', '^вийти з дзвінка$', '^покинуть звонок$'),
 };
 const NAME_LABELS = ['Your name', 'Ihr Name', 'Dein Name', 'Vaše meno', 'Ваше ім’я', "Ваше ім'я", 'Ваше имя'];
-// The guest-name field: by its label or placeholder in any of the languages, else the only text box on the page.
+// The lobby asking a guest for a name ("What's your name?" / "Wie heißen Sie?" ...).
+const NAME_PROMPT = any("what's your name", 'wie heißen sie', 'wie heißt du', 'ako sa voláte', 'як вас звати', 'как вас зовут');
+// The guest-name field: by its label or placeholder in any of the languages; else, only while the page asks for a
+// name, the one plain text input there is (never a search box, chat box or textarea). null: no name step (signed in).
 async function nameInput(page) {
   for (const n of NAME_LABELS) {
     const l = page.locator(`input[aria-label="${n}"], input[placeholder="${n}"]`);
     if (await visible(l)) return l.first();
   }
-  const boxes = page.getByRole('textbox');
+  if (!NAME_PROMPT.test(await pageText(page).catch(() => ''))) return null;
+  const boxes = page.locator('input:not([type]), input[type="text"]');
   const shown = [];
-  for (let i = 0, c = Math.min(await boxes.count().catch(() => 0), 5); i < c; i++) if (await boxes.nth(i).isVisible().catch(() => false)) shown.push(boxes.nth(i));
+  for (let i = 0, c = Math.min(await boxes.count().catch(() => 0), 5); i < c; i++) {
+    const b = boxes.nth(i);
+    if (!(await b.isVisible().catch(() => false))) continue;
+    const label = await b.evaluate((e) => `${e.getAttribute('aria-label') || ''} ${e.getAttribute('placeholder') || ''} ${e.getAttribute('role') || ''}`).catch(() => '');
+    if (!/search|suche|chat|message|nachricht|hľadať|пошук|поиск|searchbox/i.test(label)) shown.push(b);
+  }
   return shown.length === 1 ? shown[0] : null;
 }
 
@@ -89,8 +98,21 @@ const visible = (l) => l.first().isVisible().catch(() => false);
 const button = (page, name) => page.getByRole('button', { name });
 const disabled = (l) => l.first().evaluate((b) => b.disabled || b.getAttribute('aria-disabled') === 'true').catch(() => false);
 
-// Whether a page text is Google's "You can't join this video call" page (also used by the bot-wall check).
+// Whether a page text is Google's "You can't join this video call" page.
 export const meetCantJoin = (text) => TEXT.cantJoin.test(norm(text));
+// For the bot-wall check: Google's refusal page on Meet itself (meetHost), shown as a page heading, with no visible
+// challenge frame (Meet embeds an invisible reCAPTCHA there; a visible one is a real challenge).
+export async function meetRefusalPage(page, { meetHost = 'meet.google.com' } = {}) {
+  try { if (new URL(page.url()).hostname !== meetHost) return false; } catch { return false; }
+  const headings = await page.locator('h1, h2, [role="heading"]').allInnerTexts().catch(() => []);
+  if (!headings.some(meetCantJoin)) return false;
+  const challenge = await page.locator('iframe').evaluateAll((fs) => fs.some((f) => {
+    if (!/recaptcha|hcaptcha|challenges\.cloudflare|turnstile/.test(f.src)) return false;
+    const r = f.getBoundingClientRect();
+    return r.width >= 60 && r.height >= 60 && f.checkVisibility?.() !== false;
+  })).catch(() => false);
+  return !challenge;
+}
 
 export const meet = {
   name: 'meet',
@@ -109,19 +131,20 @@ export const meet = {
     return u.href;
   },
 
-  // Microphone or camera verified off: its control shows "turn on", or the device doesn't exist (Meet says it wasn't
-  // found, or its control is disabled). If it is on, it is switched off and checked again. Throws if neither can be
-  // established: joining with a live microphone or camera is not risked.
+  // Microphone or camera verified off: its control shows "turn on" (enabled or not), or Meet says that device wasn't
+  // found while no control shows it on. A control showing it on is clicked (if enabled) and checked again; a disabled
+  // one is waited out, never taken as "off". Throws if "off" can't be established: joining with a live microphone or
+  // camera is not risked.
   async ensureOff(page, what, { onLabel, offLabel, missing }, timeoutMs = 10_000) {
     const until = Date.now() + timeoutMs;
     for (;;) {
       if (await visible(button(page, offLabel))) return 'off';
-      if (TEXT[missing].test(await pageText(page).catch(() => ''))) return 'no device';
+      const st = await this.state(page); // the lobby may give way to a denial, refusal or end at any time
+      if (st === 'denied' || st === 'refused' || st === 'ended') return st;
       const on = button(page, onLabel);
-      if (await visible(on)) {
-        if (await disabled(on)) return 'no device';
-        await on.first().click({ timeout: 3000 }).catch(() => {});
-      }
+      const live = await visible(on);
+      if (!live && TEXT[missing].test(await pageText(page).catch(() => ''))) return 'no device';
+      if (live && !(await disabled(on))) await on.first().click({ timeout: 3000 }).catch(() => {});
       if (Date.now() > until) throw new Error(`could not make sure the ${what} is off before joining (Meet changed?); not joining`);
       await page.waitForTimeout(300);
     }
@@ -138,8 +161,10 @@ export const meet = {
       if (Date.now() > end) throw new Error(`no "Ask to join" button found on the Meet page (not a Meet lobby, or Meet changed); page ${s}`);
       await page.waitForTimeout(500);
     }
-    await this.ensureOff(page, 'microphone', { onLabel: LABEL.micOff, offLabel: LABEL.micOn, missing: 'noMic' });
-    await this.ensureOff(page, 'camera', { onLabel: LABEL.camOff, offLabel: LABEL.camOn, missing: 'noCamera' });
+    for (const [what, onLabel, offLabel, missing] of [['microphone', LABEL.micOff, LABEL.micOn, 'noMic'], ['camera', LABEL.camOff, LABEL.camOn, 'noCamera']]) {
+      const r = await this.ensureOff(page, what, { onLabel, offLabel, missing });
+      if (r === 'denied' || r === 'refused' || r === 'ended') return r;
+    }
     // Signed in to Google: no name field, Meet uses the account's name.
     input = await nameInput(page);
     if (input) await input.fill(name, { timeout: 5000 });
@@ -150,10 +175,9 @@ export const meet = {
     for (let i = 0; i < 10; i++) {
       await page.waitForTimeout(500);
       const s = await this.state(page);
-      if (s === 'admitted' || s === 'denied' || s === 'refused' || s === 'ended') return s;
-      if (s === 'waiting') return 'waiting';
+      if (s === 'admitted' || s === 'denied' || s === 'refused' || s === 'ended' || s === 'waiting') return s;
     }
-    return 'waiting';
+    return 'asked'; // the request went out, but no waiting room was seen (yet)
   },
 
   async state(page) {

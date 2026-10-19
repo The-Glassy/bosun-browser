@@ -9,19 +9,20 @@ import { urlKey, httpUrl } from './sessions.mjs';
 export { httpUrl };
 import { MANIFEST, mcplConnection } from './events.mjs';
 import { MIN_PERIOD_MIN } from './keepalive.mjs';
-import { meetCantJoin } from './meetings/platforms/meet.mjs';
+import { meetRefusalPage } from './meetings/platforms/meet.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
 
 // Heuristic bot-wall detection after navigation/click.
 export const MEET_REFUSED = "Google Meet refused this guest (\"You can't join this video call\"), not a captcha: use a profile signed in to Google, or a residential IP";
-export async function wall(p) {
+// opts.meetHost: tests only (a local Meet stand-in).
+export async function wall(p, { meetHost } = {}) {
   try {
     const title = (await p.title()).toLowerCase();
     if (/just a moment|nur einen moment|attention required|verify you are human|robot/.test(title)) return 'bot check page';
-    // Meet's refusal page embeds reCAPTCHA frames but is a refusal; solving nothing gets past it.
-    if (meetCantJoin((await p.locator('body').innerText({ timeout: 2000 }).catch(() => '')).slice(0, 5000))) return MEET_REFUSED;
+    // Meet's refusal page embeds an invisible reCAPTCHA but is a refusal: there is nothing to solve.
+    if (await meetRefusalPage(p, meetHost ? { meetHost } : {})) return MEET_REFUSED;
     const f = p.frames().map((f) => f.url()).join(' ');
     if (/recaptcha|hcaptcha|challenges\.cloudflare\.com|turnstile|captcha-delivery|geo\.captcha/.test(f)) return 'captcha';
     const t = (await p.locator('body').innerText({ timeout: 2000 }).catch(() => '')).slice(0, 3000).toLowerCase();

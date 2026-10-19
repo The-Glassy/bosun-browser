@@ -319,7 +319,9 @@ test('a chat message rendered empty first and filled in later still counts (opt-
 test('microphone and camera must be verifiably off, or Bosun does not join', async () => {
   await withService(async (svc) => {
     const c = await connect(svc);
-    for (const mode of ['none', 'stuck']) {
+    // No control at all; a control that won't switch; one showing "on" but disabled; a stale "not found" banner next
+    // to a control that still shows the microphone on.
+    for (const mode of ['none', 'stuck', 'disabledOn', 'staleBanner']) {
       const { code, url } = fake.newRoom();
       fake.toggles(code, mode);
       const r = await c.call('meeting_join', { url });
@@ -482,12 +484,38 @@ test('Google refusing the guest ("You can\'t join this video call", EN and DE) e
     assert.deepEqual(ev.ended.map((e) => e.reason), ['refused_by_google', 'refused_by_google']);
     assert.equal(audio.recorders.length, 0);
     await until(() => svc.manager.used === 0, 10_000);
-    // The same page reached by an agent's navigate: reported as a refusal, not as a captcha (it embeds reCAPTCHA frames).
-    const { code, url } = fake.newRoom();
-    fake.set(code, { lang: 'de', phase: 'refused' });
+    // Refused only after a while, with no waiting room in between: still Google, not the host.
+    const late = fake.newRoom();
+    fake.set(late.code, { refuse: true, refuseAfterMs: 7000 });
+    const lid = (await c.call('meeting_join', { url: late.url })).json().meeting_id;
+    await until(() => ev.ended.some((e) => e.meeting_id === lid), 20_000);
+    assert.equal(ev.ended.find((e) => e.meeting_id === lid).reason, 'refused_by_google');
+    assert.match((await status(c, lid)).error, /signed in to a Google account/);
+    await c.close();
+  });
+});
+
+test('the bot-wall check: Meet\'s refusal page (on Meet, as a heading, invisible reCAPTCHA) is a refusal; anything else with a challenge stays a captcha', async () => {
+  const { wall, MEET_REFUSED } = await import('../src/tools.mjs');
+  await withService(async (svc) => {
+    const c = await connect(svc);
     const s = await c.open();
-    const nav = (await c.call('navigate', { session: s, url })).json();
-    assert.match(nav.blocked, /Google Meet refused this guest .*not a captcha/);
+    const page = svc.manager.sessions.get(s).page;
+    const show = async (opts) => {
+      const { code, url } = fake.newRoom();
+      fake.set(code, { phase: 'refused', ...opts });
+      await page.goto(url);
+      await until(async () => (await page.locator('#refused').isVisible()), 5000);
+    };
+    const meetHost = new URL(fake.base).hostname;
+    await show({ lang: 'de' });
+    assert.equal(await wall(page, { meetHost }), MEET_REFUSED);
+    assert.equal(await wall(page), 'captcha'); // not on Meet: the reCAPTCHA frame counts as usual
+    assert.match((await c.call('navigate', { session: s, url: page.url() })).json().blocked, /captcha/);
+    await show({ bigChallenge: true }); // a visible challenge on the refusal page: a captcha after all
+    assert.equal(await wall(page, { meetHost }), 'captcha');
+    await page.setContent('<h1>Help</h1><p>If you see "You can’t join this video call", try again.</p><iframe src="https://example.com/recaptcha/api2/anchor"></iframe>');
+    assert.equal(await wall(page, { meetHost }), 'captcha'); // quoted in text, not Meet's heading (and setContent keeps the URL)
     await c.close();
   });
 });
@@ -498,11 +526,11 @@ test('joining with a signed-in profile: no name field (the account name is used)
     const s = await c.open({ profile: 'google' }); // where the human signed in to Google earlier
     await c.call('session_close', { session: s });
     const { code, url } = fake.newRoom();
-    fake.set(code, { signedIn: true, open: true });
+    fake.set(code, { signedIn: true, open: true, searchBox: true });
     const r = await c.call('meeting_join', { url, profile: 'google' });
     assert.equal(r.isError, false, r.text);
     const id = r.json().meeting_id;
-    assert.deepEqual(fake.room(code).guest, { name: null, mic: false, cam: false });
+    assert.deepEqual(fake.room(code).guest, { name: null, mic: false, cam: false, search: '' }); // the search box is left alone
     const session = [...svc.manager.sessions.values()].find((x) => x.owner === `meeting:${id}`);
     assert.equal(session.profile, 'google');
     await until(async () => (await status(c, id)).state === 'recording', 15_000);

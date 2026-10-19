@@ -11,13 +11,18 @@ From a live run on a Linux server (datacenter IP, de-AT locale).
   - The meeting browser now asks for English (`hl=en`, Accept-Language `en-US`).
   - Lobby, waiting, denial, end, removal, device and chat texts are matched in English, German, Slovak, Ukrainian and
     Russian.
-  - The guest name field is found by label, placeholder, or as the page's only text box.
+  - The guest name field is found by label or placeholder. While the page asks for a name, the only plain text
+    input also counts; search and chat boxes never do.
 - **A missing camera or microphone blocked the join.** Meet showed "Kamera nicht gefunden" and no toggle. A device
-  that Meet reports as not found, or whose control is disabled, now counts as off; it is never clicked. A device
-  that is present must still be verifiably switched off.
+  that Meet reports as not found, while no control shows it on, now counts as off and is never clicked. A device
+  that is present must still be verifiably switched off. A disabled control that shows "on" is never taken as off.
 - **Google's refusal page was taken for a captcha.** It embeds reCAPTCHA frames. "You can't join this video call"
   shown right after asking, before anyone could admit the guest, now ends the meeting with reason
-  `refused_by_google` and a hint (signed-in profile or residential IP). The bot-wall check reports it as a refusal.
+  `refused_by_google` and a hint (signed-in profile or residential IP).
+  - "Before anyone could admit" means no waiting room was seen, however late the refusal comes.
+  - The bot-wall check reports it as a refusal only on Meet itself, with the refusal as the page heading and no
+    visible challenge frame.
+  - Anywhere else, a reCAPTCHA frame still counts as a captcha.
 
 ### Added
 

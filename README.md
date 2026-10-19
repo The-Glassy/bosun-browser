@@ -275,15 +275,15 @@ meeting_recording_delete({ "meeting_id": "…" })
      still win, every text and label is also recognized in German, Slovak, Ukrainian and Russian.
 2. **Lobby:**
    - Microphone and camera must be **verifiably off** before joining. Bosun switches a device off and checks it,
-     unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden", or a disabled
-     control); then it already counts as off. If neither can be confirmed, Bosun does not join.
+     unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden") and no control shows
+     it on; then it already counts as off. If neither can be confirmed, Bosun does not join.
    - A guest types its name (default `Glassy (notetaker)`); a signed-in profile has no name field and joins under
      the account's name.
    - Then **Ask to join** / **Teilnahme erbitten** / **Join now**, and Bosun waits up to `max_wait_admit_min`.
 3. **Not getting in:**
    - A denied request or no admission in time ends the meeting with a clear error.
    - **Google turning the guest away** ("You can't join this video call" / "Sie können nicht an diesem Videoanruf
-     teilnehmen" right after asking, before anyone could admit it) ends with reason `refused_by_google`.
+     teilnehmen" after asking, with no waiting room seen) ends with reason `refused_by_google`.
    - That refusal comes with a hint: join with a signed-in profile, or from a residential IP. It is not a captcha,
      and `navigate` reports it as a refusal too.
 4. Once admitted, Bosun opens the chat and **posts the announcement first**. Only then does recording start. The
