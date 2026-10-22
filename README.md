@@ -476,9 +476,11 @@ Entries are separated by `;` (or newlines), hosts within an entry by `,`. A host
 ### How it is enforced
 
 A tenant that is named gets **its own forward proxy inside the service** (`src/proxy.mjs`, on loopback, with a
-random password of its own), and its browser contexts are launched with that proxy as their only way out
+random password of its own) **and a browser of its own**, launched with that proxy as its only way out
 (`--proxy-bypass-list=<-loopback>`, so not even loopback is exempt; QUIC off and WebRTC's non-proxied UDP off, so
-nothing can go around it; Chromium does not fall back to a direct connection when a proxy refuses). Every
+nothing can go around it; Chromium does not fall back to a direct connection when a proxy refuses). Those flags
+belong to that browser alone — tenants without an allowlist share a browser launched exactly the way upstream
+launches it, so one tenant's allowlist never changes another tenant's networking. Every
 connection the browser wants — a navigation, each hop of a redirect, a subresource, XHR, a WebSocket from the page
 **or from a worker**, a service-worker fetch, a prefetch — arrives at the proxy as a request or a `CONNECT` and is
 checked against the allowlist before a byte leaves the host:
@@ -498,7 +500,8 @@ checked against the allowlist before a byte leaves the host:
 - `navigate` and `keepalive_set` also check the allowlist up front, so the agent gets a clear refusal instead of a
   403 page, and `navigate`'s tool description names the hosts it may reach.
 
-A tenant that is not named is unrestricted: no proxy, nothing intercepted, exactly upstream behaviour.
+A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a browser with upstream's own flags
+— exactly upstream behaviour, whatever another tenant's allowlist says.
 
 ### What it does not do
 

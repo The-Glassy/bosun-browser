@@ -8,14 +8,12 @@ import crypto from 'crypto';
 
 export const ENGINE_NAMES = ['chromium', 'patchright', 'camoufox'];
 export const CHROMIUM_ARGS = ['--disable-blink-features=AutomationControlled'];
-// Extra flags while any tenant is proxied (fork): QUIC would not go through an HTTP proxy, and WebRTC must not open
-// UDP of its own. Chromium does not fall back to a direct connection when a configured proxy refuses or fails.
+// Extra flags for a browser that serves a proxied tenant (fork): QUIC would not go through an HTTP proxy, and
+// WebRTC must not open UDP of its own. Chromium does not fall back to a direct connection when a configured proxy
+// refuses or fails. They are Chromium flags, and they are added only where a proxy is in play: a browser serving
+// tenants without an allowlist is launched exactly the way upstream launches it.
 export const PROXY_ARGS = ['--disable-quic', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'];
-// A tenant with a host allowlist reaches the network only through its proxy (src/proxy.mjs). Chromium needs the
-// browser itself to be launched with a proxy before a context may set its own, and "per-context" is Playwright's
-// placeholder for exactly that; contexts without one still go direct.
-const proxied = (cfg) => !!cfg.tenantAllow?.size;
-const chromiumArgs = (cfg, extra = []) => [...CHROMIUM_ARGS, ...(proxied(cfg) ? PROXY_ARGS : []), ...extra];
+const chromiumArgs = (proxy, extra = []) => [...CHROMIUM_ARGS, ...(proxy ? PROXY_ARGS : []), ...extra];
 
 const INSTALL = {
   chromium: 'npx playwright install chromium',
@@ -71,7 +69,7 @@ const hostOs = () => ({ darwin: 'macos', win32: 'windows' })[process.platform] |
 
 // Each engine: { name, family, cdp, shared, tracker, load(), check(bt, cfg), open(bt, {cfg, dir, locale, timezone,
 // shared, media}) -> {ctx, browser?} }. media ({args, env}, meetings only, Chromium family): extra browser flags and the
-// environment of a browser process of its own (its audio server). shared: ephemeral sessions are contexts of one shared browser (manager.getBrowser);
+// environment of a browser process of its own (its audio server). shared: ephemeral sessions are contexts of a shared browser (manager.getBrowser: one per proxied tenant, one for the rest);
 // every other session is a persistent context in a directory Bosun owns (a profile or a temp dir), so its browser
 // processes can be found by that directory. tracker: how the password tracker gets into Bosun's evaluation world
 // ('init' script, or 'navigate': evaluate after every frame navigation). check: throws if the browser binary is absent.
@@ -83,10 +81,11 @@ function definitions(importer) {
       async load() { return (await importer('playwright')).chromium; },
       // Headless runs use Playwright's separate headless shell, whose path the API doesn't expose: checked at launch.
       async check(bt, cfg) { if (!cfg.headless) exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
-      launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: chromiumArgs(cfg), chromiumSandbox: cfg.chromiumSandbox, ...(proxied(cfg) ? { proxy: { server: 'per-context' } } : {}) }),
+      // proxy: the tenant's forward proxy, or null. A browser launched with one serves only that tenant.
+      launchShared: (bt, cfg, proxy = null) => bt.launch({ headless: cfg.headless, args: chromiumArgs(proxy), chromiumSandbox: cfg.chromiumSandbox, ...(proxy ? { proxy } : {}) }),
       async open(bt, { cfg, dir, locale, timezone, shared, media, proxy }) {
         const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}) };
-        if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, chromiumSandbox: cfg.chromiumSandbox, args: chromiumArgs(cfg, media?.args || []), ...(media?.env ? { env: media.env } : {}), ...o }) };
+        if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, chromiumSandbox: cfg.chromiumSandbox, args: chromiumArgs(proxy, media?.args || []), ...(media?.env ? { env: media.env } : {}), ...o }) };
         const browser = await shared();
         return { ctx: await browser.newContext(o), browser };
       },
@@ -100,7 +99,7 @@ function definitions(importer) {
       async open(bt, { cfg, dir, locale, timezone, media, proxy }) {
         const ctx = await bt.launchPersistentContext(dir, {
           channel: 'chromium', headless: cfg.headless, viewport: null, locale, timezoneId: timezone,
-          args: ['--window-size=1366,900', ...(proxied(cfg) ? PROXY_ARGS : []), ...(media?.args || [])],
+          args: ['--window-size=1366,900', ...(proxy ? PROXY_ARGS : []), ...(media?.args || [])],
           chromiumSandbox: cfg.chromiumSandbox, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}),
           ...(media?.env ? { env: media.env } : {}),
         });
@@ -117,6 +116,8 @@ function definitions(importer) {
       // Fingerprint (window, screen, fonts, UA) comes from Camoufox (viewport: null keeps Playwright out of it); the
       // OS matches the host unless CAMOUFOX_OS says otherwise, so fonts and rendering stay consistent with the claimed
       // platform. humanize stays off: with Playwright 1.64 its cursor patch makes actionability checks hang.
+      // A proxied tenant's Firefox gets the proxy, but not PROXY_ARGS: those are Chromium flags (camoufox is off
+      // by default in this fork, see README > Chromium sandbox / FEATURES_ENGINES).
       async open({ launchOptions, firefox }, { cfg, dir, locale, timezone, proxy }) {
         const opts = await launchOptions({ headless: cfg.headless, os: cfg.camoufoxOs || hostOs(), locale, humanize: false });
         return { ctx: await firefox.launchPersistentContext(dir, { ...opts, viewport: null, timezoneId: timezone, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}) }) };

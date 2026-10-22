@@ -90,18 +90,22 @@ test('CHROMIUM_SANDBOX defaults to on and is a 0/1 switch', () => {
 
 test('the engine launches Chromium with its sandbox, and refuses downloads by default', async () => {
   const real = createEngines().get('chromium');
-  const launchedWith = async (cfg) => { let o; await real.launchShared({ launch: async (x) => { o = x; return { on() {} }; } }, cfg); return o; };
+  const launchedWith = async (cfg, proxy) => { let o; await real.launchShared({ launch: async (x) => { o = x; return { on() {} }; } }, cfg, proxy); return o; };
   assert.equal((await launchedWith(loadConfig({}))).chromiumSandbox, true);
   assert.equal((await launchedWith(loadConfig({ CHROMIUM_SANDBOX: '0' }))).chromiumSandbox, false);
-  // No tenant is proxied here: the launch stays as upstream has it.
-  const plain = await launchedWith(loadConfig({}));
-  assert.equal(plain.proxy, undefined);
-  assert.deepEqual(plain.args, CHROMIUM_ARGS);
-  // With a tenant allowlist the browser is launched so that a context can have its own proxy, and so that nothing
-  // can go around it: no QUIC, and WebRTC may not open UDP of its own.
-  const withAllow = await launchedWith(loadConfig({ BROWSER_TOKEN: 'x'.repeat(24), BROWSER_TENANT_ALLOW: 'default=example.org' }));
-  assert.deepEqual(withAllow.proxy, { server: 'per-context' });
-  assert.deepEqual(withAllow.args, [...CHROMIUM_ARGS, ...PROXY_ARGS]);
+  const tenantProxy = { server: 'http://127.0.0.1:1', username: 'bosun', password: 'p', bypass: '<-loopback>' };
+  // The browser of tenants that are not proxied is launched exactly as upstream launches it — including when some
+  // *other* tenant has an allowlist, which is why the flags come from the proxy and not from the configuration.
+  for (const cfg of [loadConfig({}), loadConfig({ BROWSER_TOKEN: 'x'.repeat(24), BROWSER_TENANT_ALLOW: 'default=example.org' })]) {
+    const plain = await launchedWith(cfg);
+    assert.equal(plain.proxy, undefined);
+    assert.deepEqual(plain.args, CHROMIUM_ARGS);
+  }
+  // A browser launched for a proxied tenant gets that proxy, and the flags that keep traffic inside it: no QUIC,
+  // and WebRTC may not open UDP of its own.
+  const proxied = await launchedWith(loadConfig({}), tenantProxy);
+  assert.deepEqual(proxied.proxy, tenantProxy);
+  assert.deepEqual(proxied.args, [...CHROMIUM_ARGS, ...PROXY_ARGS]);
   assert.ok(PROXY_ARGS.includes('--disable-quic'));
   assert.ok(PROXY_ARGS.includes('--force-webrtc-ip-handling-policy=disable_non_proxied_udp'));
   let ctxOpts;

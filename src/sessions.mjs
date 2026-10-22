@@ -83,7 +83,7 @@ export class SessionManager {
     this.closed = new Map(); // recently closed id -> {owner, reason}, so the owner learns why (bounded)
     this.closeDeadlineMs = CLOSE_DEADLINE_MS;
     this.stuck = new Set(); // per-session browsers that survived SIGKILL; their slots stay reserved
-    this.browserP = null;
+    this.browsers = new Map(); // '' = the shared browser of unproxied tenants, else the proxied tenant's own
     this.launches = 0;
     this.closing = false;
     this.dlBytes = 0; // bytes of downloads currently kept across all sessions (DOWNLOADS_TOTAL_MAX_MB)
@@ -97,20 +97,24 @@ export class SessionManager {
     }
   }
 
-  // The shared browser of the shared engine (chromium): launched once, relaunched after it goes away.
-  getBrowser(def, bt) {
-    if (!this.browserP) {
+  // Shared browsers of the shared engine (chromium), launched once each and relaunched after one goes away.
+  // A tenant with a host allowlist gets a browser of its own, launched with that tenant's proxy and with the flags
+  // that keep traffic inside it; tenants without one share a browser launched exactly the way upstream does, so
+  // one tenant's allowlist cannot change another tenant's networking.
+  getBrowser(def, bt, proxy = null, key = '') {
+    if (!this.browsers.has(key)) {
       this.launches++;
-      const p = this.browserP = def.launchShared(bt, this.cfg).then((b) => {
-        b.on('disconnected', () => this.onBrowserGone(b, p));
+      const p = def.launchShared(bt, this.cfg, proxy).then((b) => {
+        b.on('disconnected', () => this.onBrowserGone(b, key, p));
         return b;
-      }, (e) => { if (this.browserP === p) this.browserP = null; throw e; });
+      }, (e) => { if (this.browsers.get(key) === p) this.browsers.delete(key); throw e; });
+      this.browsers.set(key, p);
     }
-    return this.browserP;
+    return this.browsers.get(key);
   }
 
-  onBrowserGone(browser, p) {
-    if (this.browserP === p) this.browserP = null; // next open relaunches
+  onBrowserGone(browser, key, p) {
+    if (this.browsers.get(key) === p) this.browsers.delete(key); // next open relaunches
     for (const s of this.sessions.values()) if (s.browser === browser) this.dispose(s, 'browser-crashed');
   }
 
@@ -184,7 +188,8 @@ export class SessionManager {
         }
         try {
           ({ ctx, browser = null, dir = null, tmpDir = null } = await this.engines.open(def.name, {
-            cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', shared: (d, bt) => this.getBrowser(d, bt), media, proxy,
+            cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', media, proxy,
+            shared: (d, bt) => this.getBrowser(d, bt, proxy, proxy ? tenant : ''),
           }));
         } catch (e) {
           ({ dir = null, tmpDir = null } = e);
@@ -470,9 +475,12 @@ export class SessionManager {
     // Includes disposals that started earlier (explicit close, disconnect) and are still closing.
     await Promise.race([Promise.allSettled([...this.disposals]), sleep(CLOSE_DEADLINE_MS + 1000)]);
     for (const x of [...this.stuck]) { this.stuck.delete(x); await this.reclaim(x); }
-    const bp = this.browserP;
-    this.browserP = null;
-    if (bp) await Promise.race([bp.then((b) => b.close(), () => {}), sleep(CLOSE_DEADLINE_MS)]).catch(() => {});
+    const browsers = [...this.browsers.values()];
+    this.browsers.clear();
+    await Promise.race([
+      Promise.allSettled(browsers.map((bp) => bp.then((b) => b.close(), () => {}))),
+      sleep(CLOSE_DEADLINE_MS),
+    ]).catch(() => {});
     const proxies = [...this.proxies.values()];
     this.proxies.clear();
     await Promise.allSettled(proxies.map((p) => p.then((x) => x.close(), () => {})));
