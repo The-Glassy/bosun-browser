@@ -28,24 +28,85 @@ export function httpUrl(raw) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms).unref?.());
 
 const MAX_BLOCKED_LOGGED = 50; // distinct denied targets logged per session
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+const MAX_HOPS = 10; // redirects followed for one request
 
-// Fork: aborts every HTTP(S) request to a host the tenant's allowlist doesn't cover — subresources, XHR, iframes
-// and the requests a redirect or the page's own JavaScript starts, not just what the agent navigates to. Logged
-// once per origin+path, never with the query. Requests of other schemes (data:, blob:, about:) are left alone.
-// Not covered: requests made by a service worker, and WebSocket connections (see docs/FORK-SECURITY-REVIEW.md).
-export async function installAllowlist(ctx, { tenant, allow, blocked = new Set(), log = console.error }) {
+// After a redirect chain the browser never saw, the document keeps the URL the agent asked for, so relative URLs in
+// it would resolve against that. A <base href> points them at where the document really came from. Bytes are carried
+// through latin1, which round-trips any encoding, and the tag is ASCII, so the body is not re-encoded.
+async function rebased(req, res, finalUrl) {
+  const headers = res.headers();
+  if (req.resourceType() !== 'document' || !/^text\/html\b/i.test(headers['content-type'] || '')) return { response: res };
+  let body;
+  try { body = (await res.body()).toString('latin1'); } catch { return { response: res }; }
+  if (/<base[\s>]/i.test(body)) return { response: res }; // the document sets its own base
+  const tag = `<base href="${finalUrl.replace(/[&"<>]/g, (c) => ({ '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' })[c])}">`;
+  const head = /<head[^>]*>/i.exec(body);
+  const at = head ? head.index + head[0].length : 0;
+  const out = { ...headers };
+  delete out['content-encoding']; // the body below is decoded
+  delete out['content-length'];
+  return { status: res.status(), headers: out, body: Buffer.from(body.slice(0, at) + tag + body.slice(at), 'latin1') };
+}
+
+// Fork: the tenant's host allowlist, on everything the browser would send.
+//
+// HTTP(S): Playwright follows redirects inside route.continue() without calling the handler again (its network
+// manager continues a paused hop whose request has a redirectedFrom), so an allowed host could redirect the browser
+// anywhere. The chain is therefore walked here, hop by hop, with route.fetch(maxRedirects: 0): every hop is checked
+// before it is sent and only the final response reaches the browser. Requests of other schemes (data:, blob:,
+// about:) are passed through.
+// WebSockets never reach an HTTP route; they go through Playwright's WebSocket routing with the same host rules.
+// Denied requests are aborted and logged once per origin+path, never with the query.
+// Known gaps (docs/FORK-SECURITY-REVIEW.md): a WebSocket opened inside a dedicated Worker is not routed by
+// Playwright, and responses are proxied, so a streaming response (server-sent events) does not reach the page.
+export async function installAllowlist(ctx, { tenant, allow, blocked = new Set(), log = console.error, onRedirect = () => {} }) {
+  const deny = (url) => {
+    const at = blockedTarget(url);
+    if (blocked.has(at) || blocked.size >= MAX_BLOCKED_LOGGED) return;
+    blocked.add(at);
+    log(`bosun: tenant ${tenant}: blocked request to ${at} (host allowlist)`);
+    if (blocked.size === MAX_BLOCKED_LOGGED) log(`bosun: tenant ${tenant}: further blocked requests of this session are not logged`);
+  };
+
   await ctx.route('**/*', async (route) => {
-    const url = route.request().url();
+    const req = route.request();
+    const first = req.url();
     try {
-      if (!/^https?:/i.test(url) || allowsUrl(allow, url)) return await route.continue();
-      const at = blockedTarget(url);
-      if (!blocked.has(at) && blocked.size < MAX_BLOCKED_LOGGED) {
-        blocked.add(at);
-        log(`bosun: tenant ${tenant}: blocked request to ${at} (host allowlist)`);
-        if (blocked.size === MAX_BLOCKED_LOGGED) log(`bosun: tenant ${tenant}: further blocked requests of this session are not logged`);
+      if (!/^https?:/i.test(first)) return await route.continue();
+      if (!allowsUrl(allow, first)) { deny(first); return await route.abort('blockedbyclient'); }
+      let url = first, method = req.method(), postData = req.postDataBuffer() ?? undefined;
+      for (let hop = 0; ; hop++) {
+        const res = await route.fetch({ url, method, ...(postData === undefined ? {} : { postData }), maxRedirects: 0 });
+        const location = res.headers().location;
+        if (!REDIRECT_STATUS.has(res.status()) || !location) { // the end of the chain (a 3xx without Location included)
+          if (url !== first) onRedirect(first, url);
+          return await route.fulfill(url === first ? { response: res } : await rebased(req, res, url));
+        }
+        if (hop >= MAX_HOPS) {
+          log(`bosun: tenant ${tenant}: more than ${MAX_HOPS} redirects from ${blockedTarget(first)}`);
+          return await route.abort('failed');
+        }
+        let next;
+        try { next = new URL(location, url).href; } catch { return await route.abort('failed'); }
+        if (!allowsUrl(allow, next)) { deny(next); return await route.abort('blockedbyclient'); } // not sent
+        // 301/302/303 turn an unsafe method into GET without a body; 307/308 keep both.
+        if (!(res.status() === 307 || res.status() === 308) && method !== 'GET' && method !== 'HEAD') { method = 'GET'; postData = undefined; }
+        url = next;
       }
-      await route.abort('blockedbyclient');
-    } catch { /* the page or the context went away while the request was handled */ }
+    } catch {
+      try { await route.abort('failed'); } catch { /* the page or the context went away */ }
+    }
+  });
+
+  await ctx.routeWebSocket('**/*', (ws) => {
+    try {
+      if (allowsUrl(allow, ws.url())) return void ws.connectToServer();
+      deny(ws.url());
+      ws.close({ code: 1008, reason: 'host allowlist' });
+    } catch {
+      try { ws.close({ code: 1011 }); } catch { /* already gone */ }
+    }
   });
 }
 
@@ -107,6 +168,7 @@ export class SessionManager {
     this.browserP = null;
     this.launches = 0;
     this.closing = false;
+    this.dlBytes = 0; // bytes of downloads currently kept across all sessions (DOWNLOADS_TOTAL_MAX_MB)
     fs.mkdirSync(path.join(cfg.dataDir, 'profiles'), { recursive: true });
     // Temp profiles of ephemeral per-browser sessions: anything left here is from a process that was killed.
     fs.rmSync(path.join(cfg.dataDir, 'tmp'), { recursive: true, force: true });
@@ -205,6 +267,11 @@ export class SessionManager {
           ({ dir = null, tmpDir = null } = e);
           throw e;
         }
+        // Fork: the tenant's host allowlist, before the first page exists, so nothing can be requested unrouted
+        // (and so Playwright's WebSocket routing reaches every page of this context). A failure here fails the open.
+        const allow = allowFor(this.cfg, tenant);
+        const redirects = { last: null }; // the last redirect chain the browser didn't see (navigate reports it)
+        if (allow) await installAllowlist(ctx, { tenant, allow, onRedirect: (from, to) => { redirects.last = { from, to }; } });
         if (def.tracker === 'init') await ctx.addInitScript(passwordTracker);
         const page = ctx.pages()[0] || await ctx.newPage();
         if (def.tracker === 'navigate') {
@@ -214,13 +281,11 @@ export class SessionManager {
         if (this.closing) throw new Error('service is shutting down');
         if (this.goneOwners.has(owner)) throw new Error('connection closed'); // owner left while we were launching
         if (profileDir) recordProfileUse(profileDir, { engine: def.name, headless: this.cfg.headless });
-        // Fork: the tenant's host allowlist, before anything can navigate. A failure here fails the open.
-        const allow = allowFor(this.cfg, tenant);
-        if (allow) await installAllowlist(ctx, { tenant, allow });
         const s = {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
           navs: [], ctxErrors: [], wallSeen: null, // recent main-frame navigations {t, at: origin+path}, "context destroyed" failures, last bot check seen (bot-check loops)
+          redirects, dlBytes: 0,
         };
         this.sessions.set(s.id, s);
         page.on('framenavigated', (f) => {
@@ -228,6 +293,12 @@ export class SessionManager {
           s.navs.push({ t: Date.now(), at: urlKey(f.url()) });
           if (s.navs.length > 100) s.navs.shift();
         });
+        // Downloads are refused by the context unless DOWNLOADS=1; when they are allowed, they get a disk budget.
+        if (this.cfg.downloads) {
+          const budget = (p) => p.on('download', (d) => { this.onDownload(s, d).catch(() => {}); });
+          budget(page);
+          ctx.on('page', budget);
+        }
         page.on('close', () => this.dispose(s, 'page-closed'));
         page.on('crash', () => this.dispose(s, 'page-crashed'));
         ctx.on('close', () => this.dispose(s, 'context-closed'));
@@ -360,6 +431,25 @@ export class SessionManager {
     }
   }
 
+  // A download that would push this session, or the service, past its disk budget is cancelled; one that was already
+  // written when we learn its size is deleted again. Logged without the URL's query.
+  async onDownload(s, d) {
+    const perSession = this.cfg.downloadMaxMb * 1024 * 1024, total = this.cfg.downloadTotalMaxMb * 1024 * 1024;
+    const note = (what) => console.error(`bosun: tenant ${s.tenant}: ${what} ${blockedTarget(d.url())} (download budget)`);
+    if (s.dlBytes >= perSession || this.dlBytes >= total) {
+      await d.cancel().catch(() => {});
+      return note('refused download of');
+    }
+    let size;
+    try { size = (await fs.promises.stat(await d.path())).size; } catch { return; } // cancelled, failed or already gone
+    if (s.dlBytes + size > perSession || this.dlBytes + size > total) {
+      await d.delete().catch(() => {});
+      return note('deleted over-budget download of');
+    }
+    s.dlBytes += size;
+    this.dlBytes += size;
+  }
+
   async saveShot(s, buf) {
     if (!this.cfg.saveShots || policyOf(this.cfg, s.tenant) === 'ephemeral') return null; // ephemeral: nothing on disk
     if (s.disposed) throw new Error(`session ${s.id} was closed (${s.closeReason})`);
@@ -384,6 +474,7 @@ export class SessionManager {
     s.closeReason = reason;
     this.sessions.delete(s.id);
     this.closed.set(s.id, { owner: s.owner, reason });
+    this.dlBytes = Math.max(0, this.dlBytes - (s.dlBytes || 0)); // the context takes its downloads with it
     if (this.closed.size > 200) this.closed.delete(this.closed.keys().next().value);
     if (s.handoff) s.handoff.cancel();
     const profileKey = s.profile ? `${s.tenant}/${s.profile}` : null;

@@ -43,6 +43,11 @@ export function loadConfig(env = process.env) {
     tokens: parseTokens(env),
     // Fork: features that are off unless this deployment asks for them.
     features: { meetings: flag(env, 'FEATURES_MEETINGS', false) },
+    // Chromium's own sandbox. On by default: a renderer that runs untrusted web content must not sit directly on the
+    // service user. 0 is an explicit, logged choice (see README > Chromium sandbox).
+    chromiumSandbox: flag(env, 'CHROMIUM_SANDBOX', true),
+    // Downloads a page starts. Off by default: nothing a page fetches is written to disk.
+    downloads: flag(env, 'DOWNLOADS', false),
     engines: null, // engines a session may choose
     tenantAllow: null, // tenant -> host patterns (fork: per-tenant navigation allowlist)
     policies: null,
@@ -57,6 +62,9 @@ export function loadConfig(env = process.env) {
   for (const e of wanted) if (!ENGINE_NAMES.includes(e)) throw new Error(`FEATURES_ENGINES must be a comma list of ${ENGINE_NAMES.join(', ')} (got "${e}")`);
   cfg.engines = ENGINE_NAMES.filter((e) => e === cfg.engine || wanted.includes(e));
   cfg.tenantAllow = parseTenantAllow(env, cfg.tokens);
+  // Disk budget for downloads (only when DOWNLOADS=1): per session, and across all sessions.
+  cfg.downloadMaxMb = int(env, 'DOWNLOADS_MAX_MB', 100, 1, 1_000_000);
+  cfg.downloadTotalMaxMb = int(env, 'DOWNLOADS_TOTAL_MAX_MB', Math.max(500, cfg.downloadMaxMb), cfg.downloadMaxMb, 10_000_000);
   cfg.maxSessionsPerTenant = int(env, 'MAX_SESSIONS_PER_TENANT', cfg.maxSessions, 1, cfg.maxSessions);
   cfg.policies = parsePolicies(env, cfg.tokens);
   // Session cap of each tenant with policy "ephemeral".

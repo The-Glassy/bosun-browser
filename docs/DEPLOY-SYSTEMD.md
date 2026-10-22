@@ -8,10 +8,11 @@ Example files: [`deploy/bosun.service`](../deploy/bosun.service) and
 meant to be replaced; nothing in this repository knows your hostnames or tokens, and nothing here should learn
 them.
 
-Threat model behind these choices: the browser runs untrusted web content as the service user, so the service user
-must own nothing else and reach nothing else. See [FORK-SECURITY-REVIEW.md](FORK-SECURITY-REVIEW.md) — in particular
-H1 (where the browser may go), M1 (the live-view link is a bearer token) and M4 (child processes inherit the
-service's environment, tokens included).
+Threat model behind these choices: the browser runs untrusted web content, so it keeps **Chromium's own sandbox**
+(§3a — this needs host configuration, and the service refuses to start without it), and the user it runs as must
+own nothing else and reach nothing else. See [FORK-SECURITY-REVIEW.md](FORK-SECURITY-REVIEW.md) — in particular H1
+(where the browser may go), H3 (the sandbox), M1 (the live-view link is a bearer token), M4 (child processes inherit
+the service's environment, tokens included) and M5 (downloads on disk).
 
 ## 1. User, directories, packages
 
@@ -54,7 +55,9 @@ sudo editor /etc/bosun/bosun.env
 - One token per consumer, so revoking one does not disturb the others. Rotation = edit the file,
   `systemctl restart bosun`.
 - The browser, `ffmpeg` and `pulseaudio` children inherit this environment, so anything able to read
-  `/proc/<pid>/environ` as the `bosun` user can read the tokens. That is why `bosun` runs nothing else.
+  `/proc/<pid>/environ` as the `bosun` user can read the tokens — every tenant's token, since `BROWSER_TOKENS` is
+  one variable. That is why `bosun` runs nothing else, why the browser keeps its sandbox (§3a), and why hard
+  tenant isolation means one service per tenant.
 
 ## 3. The unit
 
@@ -84,10 +87,62 @@ What the unit does, and why:
 | `ProtectSystem=strict` + `ReadWritePaths=/var/lib/bosun` | the only writable path is the data volume |
 | `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes` | no access to other users' data, private `/tmp` |
 | `RestrictAddressFamilies=… AF_NETLINK` | Chromium needs netlink for network-change notifications |
-| no `SystemCallFilter`, no `RestrictNamespaces` | Chromium's own sandbox needs `clone()`/`unshare()`; filtering them breaks the launch or silently disables the sandbox |
+| no `SystemCallFilter`, no `RestrictNamespaces`, no `PrivateUsers` | Chromium's **own** sandbox needs `clone()`/`unshare()` and user namespaces; filtering them makes the browser fail to start (§3a) |
 
 Bosun locates leftover browser processes with `ps` and kills them by their profile directory
 (`src/sessions.mjs`), so do not hide its own children from it (no `PrivatePIDs=yes`).
+
+These directives bound what the service **user** may do. They are not a renderer sandbox: that is §3a, and without
+it a page that breaks the renderer is already inside everything the unit allows.
+
+## 3a. Chromium's sandbox (the service will not start without it)
+
+`CHROMIUM_SANDBOX` defaults to `1`, and startup starts the browser once to prove the sandbox works. If it cannot,
+the service exits with the list below instead of running unprotected. Pick **one** of the three:
+
+**1. Allow unprivileged user namespaces (simplest; Ubuntu 23.10+ restricts them via AppArmor).**
+
+```sh
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-apparmor-userns.conf
+sudo sysctl --system
+sysctl kernel.apparmor_restrict_unprivileged_userns    # expect 0
+```
+
+**2. Or grant `userns` to the browser binary with an AppArmor profile** (keeps the restriction for everything else).
+Create `/etc/apparmor.d/bosun-chromium`:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bosun-chromium /var/lib/bosun/pw-browsers/**/{chrome,chrome-headless-shell,headless_shell} flags=(unconfined) {
+  userns,
+  include if exists <local/bosun-chromium>
+}
+```
+
+then `sudo apparmor_parser -r /etc/apparmor.d/bosun-chromium`. Re-run it after a Playwright update changes the
+browser path.
+
+**3. Or use Chromium's setuid helper** (if your policy keeps user namespaces restricted):
+
+```sh
+sudo chown root:root /var/lib/bosun/pw-browsers/chromium-*/chrome-linux64/chrome_sandbox
+sudo chmod 4755 /var/lib/bosun/pw-browsers/chromium-*/chrome-linux64/chrome_sandbox
+```
+
+and add `Environment=CHROME_DEVEL_SANDBOX=/var/lib/bosun/pw-browsers/chromium-<build>/chrome-linux64/chrome_sandbox`
+to the unit. A setuid binary cannot gain privileges under `NoNewPrivileges=yes`, so this option also means
+**removing `NoNewPrivileges=yes` from the unit** — a worse trade than options 1 and 2, so use it only if you must.
+
+Verify what actually runs, not the setting:
+
+```sh
+ps -eo args | grep -- --type=renderer | grep -c -- --no-sandbox   # expect 0
+```
+
+A container or CI box that allows none of the three can only run with `CHROMIUM_SANDBOX=0`, which the service
+prints a warning about at every start. Do not do that on a host that also holds persistent profiles.
 
 ## 4. Network: loopback plus `tailscale serve`
 
@@ -125,20 +180,33 @@ FEATURES_ENGINES=chromium
 
 - `BROWSER_TENANT_ALLOW` is per tenant: entries separated by `;`, hosts within an entry by `,`. Patterns are
   `host` (any port), `*.host` (subdomains only — add the apex separately), `host:port`, `[::1]:port`, or `*`.
-  It is enforced on `navigate`, on `keepalive_set`, and on every HTTP(S) request any frame of that tenant's
-  sessions makes, so a page cannot steer the browser somewhere else; denied requests are aborted and logged
+  It is enforced on `navigate`, on `keepalive_set`, on every HTTP(S) request any frame of that tenant's sessions
+  makes — **including each redirect hop before it is sent** — and on WebSocket connections (`ws:`/`wss:`, same
+  rules, default ports 80/443). Denied requests are aborted and logged
   (`bosun: tenant <t>: blocked request to <scheme>://<host>/<path> (host allowlist)`) without the query. A tenant
-  that is not named may reach any host.
+  that is not named may reach any host, and nothing is intercepted for it.
 - A denied navigation the *page* started leaves the tab on the browser's error page; the agent can navigate again.
+- An allowlisted tenant's responses are fetched by the service and handed to the browser, which has four
+  consequences worth knowing before you enable it for a tenant: **streaming** responses (server-sent events) do not
+  reach the page; the tab keeps the pre-redirect URL (`navigate` reports `redirected_to`, HTML gets a
+  `<base href>`); Chromium's **Local Network Access** checks stop such a page from opening a WebSocket to a
+  loopback or private address; and response bodies pass through the service's memory. See README ›
+  [Per-tenant host allowlist](../README.md#per-tenant-host-allowlist).
 - Remember the hosts a login actually needs: an identity provider, a CDN that serves the page's scripts, the
   CAPTCHA vendor. A handoff can only reach what the tenant may reach.
 - `FEATURES_MEETINGS=0` (the default here) means the meeting tools are not listed and their handlers are not wired:
   no recordings directory, no PulseAudio server, no `ffmpeg`. Turning it on adds a recording consent surface — read
   README › Meetings first.
 - `FEATURES_ENGINES=chromium` (the default here) means a session cannot ask for the anti-detect engines. Enable
-  them deliberately (`FEATURES_ENGINES=chromium,patchright`) and install them first; `patchright` is also the
-  engine whose credential masking a page cannot see (review finding H2), so prefer it for handoffs on sites you do
-  not control.
+  them deliberately (`FEATURES_ENGINES=chromium,patchright`) and install them first. `patchright` runs Bosun's
+  masking helpers in an isolated world, which stops a page from switching masking off — but not from copying what
+  the human typed somewhere masking does not look (review finding H2). No engine makes an untrusted page safe to
+  type a credential into.
+- `DOWNLOADS=0` (the default here) means the browser context refuses downloads, so a page cannot write files at
+  all. With `DOWNLOADS=1`, `DOWNLOADS_MAX_MB` (per session) and `DOWNLOADS_TOTAL_MAX_MB` (service-wide) bound what
+  is kept; one download may still use its own size transiently before it is measured, and Playwright keeps download
+  files under `/tmp` — which is RAM-backed on most systems and, with `PrivateTmp=yes`, private to this unit. Give
+  the volume a quota, or keep downloads off.
 
 ## 6. Operating it
 
@@ -152,6 +220,10 @@ FEATURES_ENGINES=chromium
 - Restart behaviour: `Restart=on-failure` with a 45 s stop timeout. Bosun closes sessions and handoffs on SIGTERM
   within its own bounded deadlines; a browser that survives SIGKILL keeps its session slot and says so in the log.
 - Health check: `systemctl is-active bosun` plus one `tools/list` call over the WebSocket with a real token.
+- After every upgrade, re-check the sandbox: the journal must carry no `CHROMIUM_SANDBOX=0` warning, and
+  `ps -eo args | grep -- --type=renderer | grep -c -- --no-sandbox` must print `0` while a session is open. A
+  Playwright update moves the browser path, which an AppArmor profile (§3a option 2) or `CHROME_DEVEL_SANDBOX`
+  (option 3) has to follow.
 
 ## 7. Checklist before you call it done
 
@@ -161,6 +233,8 @@ FEATURES_ENGINES=chromium
 - [ ] `LIVE_BASE_URL` matches the `tailscale serve` address; a link opens on a phone in the tailnet.
 - [ ] Every tenant that should be restricted appears in `BROWSER_TENANT_ALLOW`; a `navigate` to another host is
       refused, and the refusal shows up in the journal without the query.
-- [ ] `FEATURES_MEETINGS=0`, `FEATURES_ENGINES` lists only what is installed.
+- [ ] `FEATURES_MEETINGS=0`, `FEATURES_ENGINES` lists only what is installed, `DOWNLOADS=0` (or a quota on the
+      volume).
+- [ ] The service started without a `CHROMIUM_SANDBOX=0` warning, and no renderer process shows `--no-sandbox`.
 - [ ] Egress to private ranges is blocked for the service.
 - [ ] `ALLOW_NO_TOKEN` is unset.

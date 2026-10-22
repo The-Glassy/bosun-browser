@@ -8,16 +8,23 @@ handoff, URL handling on `navigate`, WebSocket origin checks, resource caps, dep
 page-controlled code where Bosun or the agent can be affected by it, and any call home / telemetry.
 
 **Method.** Read of `src/**`, `bin/**`, `package.json` / `package-lock.json` and the docs; `grep` for outbound
-network use; two live probes against headless Chromium (below, under H2). Not done: fuzzing, a review of the
-Playwright/Chromium/`ws`/`zod` dependencies themselves, no test against a real hostile site, no review of
-`src/meetings/**` beyond the parts that touch the service's security properties (meetings are off in this fork).
+network use; live probes against headless Chromium (below, under H2, H3 and M5). A second, independent review round
+then attacked this fork's own changes and found three of the conclusions below wrong: it demonstrated that ordinary
+HTTP redirects and WebSockets walked straight past the first version of the host allowlist, that Chromium was
+running with `--no-sandbox` all along, and that engine choice is a much weaker credential boundary than H2 first
+claimed. Those are corrected here (H1, H2, H3) and the code now enforces what the text promises. Not done: fuzzing,
+a review of the Playwright/Chromium/`ws`/`zod` dependencies themselves, no test against a real hostile site, no
+review of `src/meetings/**` beyond the parts that touch the service's security properties (meetings are off in this
+fork).
 
 **Verdict.** Nothing found that makes the service unsafe to run for our use (UI checks and human-finished logins on
-hosts we control) **provided** two things hold: the service cannot reach anything it has no business reaching
-(network egress policy plus the per-tenant host allowlist this fork adds), and a handoff where the human types real
-credentials happens on a host we trust (H2). Both HIGH findings are deployment-level, not code defects: upstream
-states the egress requirement in `README.md:412-414` but ships no in-process control for it, and documents the
-page-world limitation in `docs/ENGINES.md:101-105` without spelling out that it is defeatable.
+hosts we control) **provided** three things hold: the service cannot reach anything it has no business reaching
+(network egress policy plus the per-tenant host allowlist this fork adds), a handoff where the human types real
+credentials happens on a page we trust — on any engine (H2) — and the browser keeps its own sandbox (H3). None of
+the HIGH findings is a code defect in the service's own logic: upstream states the egress requirement in
+`README.md` › Security notes but ships no in-process control for it, leaves Playwright's default `--no-sandbox` in
+place, and documents the page-world limitation in `docs/ENGINES.md:101-105` without spelling out that it is
+defeatable.
 
 Severity: **HIGH** = can expose credentials or reach systems outside the intended blast radius. **MEDIUM** = narrows
 an important guarantee or depends entirely on the deployment to be safe. **LOW** = hardening, bounded impact.
@@ -25,12 +32,14 @@ an important guarantee or depends entirely on the deployment to be safe. **LOW**
 
 | # | Severity | Finding | Status in this fork |
 |---|---|---|---|
-| H1 | HIGH | `navigate` and page requests may go to any host (SSRF; cloud metadata, private LAN) | mitigated: per-tenant host allowlist (`BROWSER_TENANT_ALLOW`) |
-| H2 | HIGH | A page can defeat credential masking and the post-handoff clearing on engine `chromium` | documented; mitigate with `ENGINE=patchright` and by handing off only on allowlisted hosts |
+| H1 | HIGH | `navigate` and page requests may go to any host (SSRF; cloud metadata, private LAN) | mitigated: per-tenant host allowlist (`BROWSER_TENANT_ALLOW`), enforced per redirect hop and on WebSockets |
+| H2 | HIGH | A page can defeat credential masking and the post-handoff clearing on engine `chromium` | documented; engine choice stops only the helper tampering — the page must be trusted either way |
+| H3 | HIGH | Chromium runs with `--no-sandbox`: a renderer compromise lands on the service user | fixed: `chromiumSandbox: true`, `CHROMIUM_SANDBOX=0` to opt out loudly, startup preflight |
 | M1 | MEDIUM | The live-view link is a bearer token for the whole handoff, retakeable after 5 s of viewer silence | accepted: live view on loopback behind a private-network proxy |
 | M2 | MEDIUM | Masking covers the page dump, not the URL and title returned with it | documented |
 | M3 | MEDIUM | One shared Chromium browser process serves every tenant; the global session cap is shared | accepted for one team; one process per tenant for hard isolation |
 | M4 | MEDIUM | Service secrets are inherited by every browser child process | deploy guidance: own user, own `EnvironmentFile` |
+| M5 | MEDIUM | A page's downloads are written to disk with no budget at all | fixed: `DOWNLOADS=0` by default, per-session and service-wide byte budgets |
 | L1 | LOW | Legacy `?token=` query parameter still accepted | deploy guidance: header only |
 | L2 | LOW | No rate limiting, lockout or log on failed authentication | accepted |
 | L3 | LOW | `ALLOW_NO_TOKEN=1` gives any local process a full-policy tenant | deploy guidance: never set |
@@ -40,7 +49,7 @@ an important guarantee or depends entirely on the deployment to be safe. **LOW**
 | I1 | INFO | No telemetry and no call home | verified |
 | I2 | INFO | Token handling and tenant namespacing are sound | verified |
 | I3 | INFO | WebSocket origin checks, live-view CSP and input validation are in place | verified |
-| I4 | INFO | Resource caps are broad; two gaps noted | verified |
+| I4 | INFO | Resource caps are broad; gaps noted (downloads: M5) | verified |
 | I5 | INFO | Dependencies are exactly pinned, no install scripts | verified |
 | I6 | INFO | No tool runs agent- or page-supplied code in the service process | verified |
 
@@ -61,13 +70,50 @@ position, exfiltration of what it reads via a following request.
 Upstream's position (`README.md:412-414`) is that the deployment must block private ranges on egress; the
 `http(s)`-only check explicitly does not replace that boundary.
 
-**In this fork:** `BROWSER_TENANT_ALLOW` gives a tenant a host allowlist that is enforced on `navigate`,
-`keepalive_set` and — via Playwright route interception on the session's browser context — on every HTTP(S) request
-any frame of the session makes, including redirects. Denied requests are aborted (`blockedbyclient`) and logged
-without the URL's query. A tenant with no allowlist keeps upstream behaviour. See `README.md` ›
-[Per-tenant host allowlist] and `docs/DEPLOY-SYSTEMD.md`. Known gaps of the mechanism (also noted there): requests
-made by a service worker, and WebSocket connections, are not route-intercepted — the egress policy remains the real
-boundary.
+**In this fork:** `BROWSER_TENANT_ALLOW` gives a tenant a host allowlist, enforced on `navigate`, on
+`keepalive_set`, and — via Playwright route interception on the session's browser context — on every HTTP(S)
+request any frame of the session makes. Denied requests are aborted (`blockedbyclient`) and logged without the
+URL's query. A tenant with no allowlist keeps upstream behaviour. See `README.md` ›
+[Per-tenant host allowlist](../README.md#per-tenant-host-allowlist) and `docs/DEPLOY-SYSTEMD.md`.
+
+The first version of that enforcement had two holes, both demonstrated by the second review round and both now
+closed:
+
+- **Redirects.** `route.continue()` hands the request to the browser, and Playwright's network manager silently
+  continues every *redirect hop* of that request without calling the route handler again (its `_onRequest` has
+  `if (redirectedFrom || …) Fetch.continueRequest(…)`, so a hop never becomes a Route). An allowed host answering
+  `301/302/303/307/308` therefore moved the browser to any host it liked, document or subresource, with no denial
+  logged. The handler now walks the chain itself — `route.fetch({ maxRedirects: 0 })` per hop, each `Location`
+  checked against the allowlist *before* that hop is sent, and only the final response handed to the browser
+  (`src/sessions.mjs`, `installAllowlist`).
+- **WebSockets.** They are not HTTP requests and never reach an HTTP route, so a page could open one anywhere. The
+  context now also routes WebSockets (`ctx.routeWebSocket`), matching `ws:`/`wss:` with the same host and port
+  rules (default ports 80/443); a denied connection is closed with 1008 before it reaches a server and is logged
+  as `ws://host/path`.
+
+What this costs, for tenants that have an allowlist (all of it in `README.md` › Per-tenant host allowlist too):
+
+- Responses are fetched by the service and fulfilled into the browser, so a **streaming** response (server-sent
+  events, a long-poll that never ends) does not reach the page; it fails when the fetch times out.
+- A fulfilled response has no remote address, so Chromium's **Local Network Access** checks treat the document as
+  public: a page may then not open a WebSocket to a *loopback or private* address even when the allowlist allows
+  it (public hosts are unaffected). `test/allowlist-redirects.test.mjs` therefore runs its WebSocket cases with
+  that Chromium check off, so that the allowlist is the only thing deciding.
+- After a redirect the tab keeps the URL the agent asked for; `navigate` reports the real one as `redirected_to`,
+  and an HTML document gets a `<base href>` so its relative URLs still resolve against where it came from.
+- Because the browser only ever sees the request it made, a document that came from **another allowed origin** is
+  served under the origin that was asked for, so it runs with that origin's cookies and storage. Two hosts inside
+  one allowlist are not isolated from each other across a redirect. Keep an allowlist to the hosts the tenant
+  really needs, and prefer exact hosts over `*.`; a wildcard means every host under it can speak for every other
+  across a redirect. Pinned down in `test/allowlist-redirects.test.mjs`.
+- Response bodies pass through the service's heap, one per in-flight request. Compressed responses are handed over
+  intact (regression-tested with gzip and multibyte text).
+
+Residual, with evidence: a WebSocket opened **inside a dedicated Worker** is not routed by Playwright (probed:
+the page-side override does not reach worker scopes, the connection reached the test server). Service-worker
+`fetch` *is* covered on the pinned Playwright/Chromium (probed: blocked and logged), but that is Playwright's
+behaviour, not a guarantee. WebRTC was not tested. Hostnames are matched as names, with no address pinning, so
+network-level egress policy stays necessary — as upstream says.
 
 ## H2 — HIGH: on engine `chromium`, the page can defeat credential masking and the post-handoff clearing
 
@@ -98,15 +144,68 @@ credential in the form for the agent to read. (a) also applies to `screenshot`, 
 page-controlled, so a field whose accessible name looks like a password stays masked; the leak is the field whose
 name does not.
 
-`docs/ENGINES.md:101-105` and `README.md:143-146` state that the helpers run in the page's world on plain Chromium
-and that a page can *detect* them; that they can be neutralized is not stated. `patchright` and `camoufox` run the
-scans in an isolated world (upstream's own test asserts this and skips it for `chromium`:
+`docs/ENGINES.md:101-105` and `README.md` › Handoff state that the helpers run in the page's world on plain
+Chromium and that a page can *detect* them; that they can be neutralized is not stated. `patchright` and `camoufox`
+run the scans in an isolated world (upstream's own test asserts this and skips it for `chromium`:
 `test/handoff.test.mjs:326`).
 
-**In this fork:** not fixed in code — fixing it upstream-compatibly means moving the scans off the page world for
-`chromium` too, which is upstream's design decision, not ours. Operationally: hand off only on hosts in the tenant's
-allowlist (H1), and use `ENGINE=patchright` for a session where a human will type credentials on a site we do not
-control.
+**How far another engine helps — corrected.** An earlier version of this review recommended `ENGINE=patchright`
+for credentials on sites "we do not control". That is too strong a promise, and the second review round showed
+why. An isolated world only stops a page from *replacing Bosun's own objects*; it shares the page's DOM, and
+masking works on fields — their current value, and the values Bosun has seen in them. A page that simply moves what
+the human typed somewhere else defeats masking on every engine, with no tampering at all:
+
+```
+# page: <input type=password> and a button that copies the value into a <p> and clears the input
+MIRROR VALUES []                                 # nothing is in a credential field any more
+MIRROR READ  … submit | Mirror-probe-secret …    # the MCP read returns it as ordinary page text
+```
+
+That is reproduced as a standing test (`test/masking-limits.test.mjs`), together with the case that *is* masked, so
+the two documents and the behaviour cannot drift apart. Screenshots have the same shape: the mask covers the
+inputs, not a copy of their contents elsewhere on the page. Upstream says as much for the page's own doing
+(`README.md` › Handoff: "secrets the page itself echoes as normal text" are not protected); the mistake was ours,
+in presenting an engine switch as a boundary.
+
+**In this fork:** the helper-tampering hole is not fixed in code — fixing it upstream-compatibly means moving the
+scans off the page world for `chromium` too, which is upstream's design decision, not ours. What holds instead:
+`ENGINE=patchright` stops that one technique (an isolated world), the host allowlist (H1) keeps a handoff on hosts
+the tenant may reach at all, and **the page where a human types a credential has to be one we trust, whatever the
+engine**. If that is not true for some flow, the credential does not belong in this browser.
+
+## H3 — HIGH: Chromium runs without its own sandbox
+
+Neither Chromium launch path passes `chromiumSandbox` (`src/engines.mjs:49-55` upstream), and the pinned Playwright
+adds `--no-sandbox` unless that option is explicitly `true`. Probed on a real session of the service: both the
+browser process and the renderer carried `--no-sandbox`.
+
+```
+# ps -eo args, while a session was open
+… chrome-headless-shell … --no-sandbox --disable-blink-features=AutomationControlled --user-data-dir=/…
+… chrome-headless-shell --type=renderer --headless=old --no-sandbox --disable-dev-shm-usage …
+```
+
+So the process that parses untrusted HTML, CSS, images and JavaScript has nothing between it and the service user:
+one renderer bug, and the attacker is reading `profiles/<tenant>/…` (every tenant's cookies), the tokens in the
+service's environment (M4) and whatever else that user can reach. The systemd hardening in a deployment is a
+different boundary — it limits what the *user* may do, not what a compromised renderer may do inside it — and the
+first version of this review discussed "escaping the browser sandbox" without noticing there was none. That was a
+review defect; the launch behaviour itself is upstream's.
+
+**In this fork:** both Chromium-family engines launch with `chromiumSandbox: true` (`src/engines.mjs`), which is
+also what `CHROMIUM_SANDBOX` defaults to. Because the sandbox needs host configuration, startup runs a preflight on
+Linux — it starts the browser the way sessions will and closes it again — and **refuses to start** with the three
+things an operator can do about it (unprivileged user namespaces, an AppArmor profile that grants `userns`, or the
+setuid helper) rather than falling back. Running unsandboxed stays possible, but only as `CHROMIUM_SANDBOX=0`,
+which is printed as a warning at every start. `docs/DEPLOY-SYSTEMD.md` carries the exact commands, including that
+the setuid-helper route needs `NoNewPrivileges` **off** in the unit. Tests: `test/features.test.mjs` ("with the
+sandbox on, the service either runs sandboxed or refuses to start" — it asserts there is no `--no-sandbox` on any
+renderer when the sandbox works, and the instructive refusal when it cannot).
+
+Note for this repository's CI and for containers: unprivileged user namespaces are often unavailable there (on the
+machine this fork was built on, `kernel.apparmor_restrict_unprivileged_userns=1` and Playwright's `chrome_sandbox`
+is not setuid), which is exactly when the service now refuses to start. The test suite sets `CHROMIUM_SANDBOX=0`
+deliberately and says so.
 
 ## M1 — MEDIUM: the live-view link is a bearer token for the whole handoff
 
@@ -154,8 +253,29 @@ Playwright launches the browser with the service's environment by default, and t
 explicitly (`{ ...process.env, … }`, `src/meetings/audio.mjs:38`). `BROWSER_TOKEN` / `BROWSER_TOKENS` are therefore
 readable in `/proc/<browser pid>/environ` by any process running as the same user, and by anything that escapes the
 browser sandbox. Mitigation is deployment-side: a dedicated unprivileged user that runs nothing else, tokens in a
-root-owned `0640` `EnvironmentFile` outside the repo (`docs/DEPLOY-SYSTEMD.md`), and separate tokens per tenant so
-one leak is one tenant.
+root-owned `0640` `EnvironmentFile` outside the repo (`docs/DEPLOY-SYSTEMD.md`), and Chromium's own sandbox between
+the page and that environment (H3). Separate tokens per tenant do **not** contain this one: `BROWSER_TOKENS` holds
+every tenant's token in a single variable, which every child process inherits whole. They help with rotation, not
+with containment; one service process per tenant is what contains it.
+
+## M5 — MEDIUM: a page's downloads are written to disk with no budget
+
+Playwright contexts accept downloads unless told otherwise, and upstream never says otherwise: no
+`acceptDownloads`, no cancellation, no byte or count cap. Probed by the second review round on a real session — a
+click on an attachment link saved 65 536 bytes without anyone asking — and the resource-cap inventory in the first
+version of this review missed it entirely (I4 listed screenshots, DOM size and meeting recordings, not downloads).
+
+A page can therefore write as much as it likes, as often as it likes, for as long as the session lives.
+`MAX_SESSIONS`, `MemoryMax` and `PrivateTmp` do not bound disk: files land in Playwright's artifacts directory
+(under `/tmp`, which is commonly a tmpfs, so it is RAM) and live until the context closes.
+
+**In this fork:** downloads are off by default (`DOWNLOADS=0` → `acceptDownloads: false`, so a download is refused
+by the context and nothing is written). With `DOWNLOADS=1`, each session keeps at most `DOWNLOADS_MAX_MB` (default
+100) and the service at most `DOWNLOADS_TOTAL_MAX_MB` (default 500) of downloaded bytes: a download that would pass
+either budget is cancelled before it is written, or deleted again if its size was only known afterwards, and the
+refusal is logged without the URL's query. Closing a session releases its share, since the context takes its files
+with it. Tests: `test/downloads.test.mjs`. What this does *not* bound: a single download transiently uses its own
+size on disk before it can be measured — so give the volume a real quota if you turn downloads on.
 
 ## L1 — LOW: the legacy `?token=` query parameter is still accepted
 
@@ -243,9 +363,10 @@ Per connection: 1 MiB frames, 64 open requests, 8 MiB send buffer, `MAX_INFLIGHT
 (`src/sessions.mjs:194`), `MAX_DOM_NODES` before a whole-page `read`, screenshot clipping and a per-session
 screenshot ring (`src/tools.mjs:206-222`, `src/sessions.mjs:335`). Live view: 16 KiB frames, 64 queued inputs,
 frame drops then disconnect for a slow viewer, drain deadline (`src/liveview.mjs:174-183`). The stdio bridge bounds
-line length and pending bytes (`bin/bosun-mcp-stdio.mjs:8-10`). Gaps: a meeting recording has no size cap, only
-`RECORDING_RETENTION_DAYS` and the sweeper (`src/meetings/index.mjs:68-82`) — it grows at ~11 MB/h while the meeting
-lasts; and nothing bounds how often an agent may open and close sessions (no rate limit, L2).
+line length and pending bytes (`bin/bosun-mcp-stdio.mjs:8-10`). Gaps: **downloads had no budget at all** (M5 — the
+first version of this inventory missed them); a meeting recording has no size cap, only `RECORDING_RETENTION_DAYS`
+and the sweeper (`src/meetings/index.mjs:68-82`) — it grows at ~11 MB/h while the meeting lasts; and nothing bounds
+how often an agent may open and close sessions (no rate limit, L2).
 
 ## I5 — INFO: dependencies are exactly pinned, no install scripts
 
@@ -268,18 +389,35 @@ own directory.
 
 ## What this fork changed in response
 
-1. **H1** — `BROWSER_TENANT_ALLOW=<tenant>=<host>,<host>;…`: a per-tenant host allowlist enforced on `navigate`,
-   `keepalive_set` and on every HTTP(S) request any frame of the session makes (Playwright route interception);
-   denied requests are aborted and logged without the query. A tenant without an allowlist keeps upstream
-   behaviour.
-2. **L4 / consent surface** — `FEATURES_MEETINGS=0` by default: the meeting tools are not listed and their handlers
+1. **H1** — `BROWSER_TENANT_ALLOW=<tenant>=<host>,<host>;…`: a per-tenant host allowlist enforced on `navigate`, on
+   `keepalive_set`, on every HTTP(S) request any frame of the session makes **including each redirect hop before it
+   is sent**, and on WebSocket connections (`ws:`/`wss:`, same host and port rules). Denied requests are aborted
+   and logged without the query. A tenant without an allowlist keeps upstream behaviour.
+2. **H3** — `chromiumSandbox: true` for both Chromium engines, `CHROMIUM_SANDBOX` on by default, a startup
+   preflight that refuses to run when the sandbox cannot be set up, and a warning at every start if it is switched
+   off.
+3. **M5** — `DOWNLOADS=0` by default; with downloads on, `DOWNLOADS_MAX_MB` per session and
+   `DOWNLOADS_TOTAL_MAX_MB` across the service, enforced by cancelling or deleting what goes past them.
+4. **L4 / consent surface** — `FEATURES_MEETINGS=0` by default: the meeting tools are not listed and their handlers
    are not wired; no recordings directory, no audio server, no PulseAudio socket.
-3. **H2 / anti-detect surface** — `FEATURES_ENGINES=chromium` by default: a session can only pick `chromium` (plus
+5. **anti-detect surface** — `FEATURES_ENGINES=chromium` by default: a session can only pick `chromium` (plus
    whatever `ENGINE` is set to), so `patchright` and `camoufox` have to be enabled deliberately.
-4. **M1 / M4 / L1 / L3** — `docs/DEPLOY-SYSTEMD.md`: own unprivileged user, Xvfb, `TasksMax`, both listeners on
+6. **M1 / M4 / L1 / L3** — `docs/DEPLOY-SYSTEMD.md`: own unprivileged user, Xvfb, `TasksMax`, both listeners on
    loopback, live view published over a private network only, secrets in a root-owned `EnvironmentFile` outside the
-   repository, bearer header only, `ALLOW_NO_TOKEN` never set.
+   repository, bearer header only, `ALLOW_NO_TOKEN` never set, and what the Chromium sandbox needs from the host.
 
-Residual risk after those changes, in order: H2 on a host we do not control; the service-worker and WebSocket gaps
-in route interception (so an egress policy is still required); M1 for as long as a handoff link is live; M2 on a
-login form that submits with GET; M3 while several tenants share one process.
+Residual risk after those changes, in order:
+
+- **H2**, and more generally: a page that handles a credential can hand it to the agent, on any engine. Only trust
+  decides this.
+- The allowlist's remaining channels: a WebSocket opened inside a **dedicated Worker** (not routed by Playwright),
+  **WebRTC** (not tested), and name-based matching with no address pinning. Network egress policy stays part of the
+  deployment.
+- What proxying costs an allowlisted tenant: **streaming responses** (server-sent events) do not reach the page,
+  Chromium's **Local Network Access** checks see a fulfilled document as public (so no WebSocket from such a page
+  to a loopback or private address), the tab keeps the pre-redirect URL (`navigate` reports `redirected_to`, HTML
+  gets a `<base href>`), and response bodies pass through the service's heap.
+- **M1** for as long as a handoff link is live; **M2** on a login form that submits with GET; **M3** while several
+  tenants share one process; **M5**'s transient single-download size if downloads are enabled.
+- **H3** on a host where the operator chooses `CHROMIUM_SANDBOX=0`: then M4's inherited tokens and every tenant's
+  profile are one renderer bug away, and only the systemd user boundary is left.

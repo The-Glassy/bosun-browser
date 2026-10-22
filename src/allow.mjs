@@ -1,10 +1,12 @@
 // Per-tenant navigation host allowlist (fork addition). A tenant that has one may only reach the hosts it names:
-// enforced when the agent navigates, when a keepalive schedule is set, and on every HTTP(S) request any frame of
-// the tenant's sessions makes (see SessionManager: Playwright route interception), so a page cannot steer the
-// browser somewhere else. A tenant without an allowlist is unrestricted (upstream behaviour).
+// enforced when the agent navigates, when a keepalive schedule is set, on every HTTP(S) request any frame of the
+// tenant's sessions makes (including each hop of a redirect chain, before it is sent) and on the WebSockets a page
+// opens — see installAllowlist in sessions.mjs. So a page cannot steer the browser somewhere else. A tenant without
+// an allowlist is unrestricted (upstream behaviour).
 import { TENANT_RE } from './auth.mjs';
 
-const DEFAULT_PORT = { 'http:': 80, 'https:': 443 };
+// ws/wss are checked with the same rules: a WebSocket is a destination the page chooses just like any request.
+const DEFAULT_PORT = { 'http:': 80, 'https:': 443, 'ws:': 80, 'wss:': 443 };
 
 // One pattern: "*" (any host), "example.org" (that host, any port), "*.example.org" (any subdomain, any port),
 // "example.org:8443" / "127.0.0.1:4848" / "[::1]:4848" (that host on that port only).
@@ -39,12 +41,12 @@ export function parseHostPattern(raw) {
 
 const matchesHost = (p, host) => (p.wild ? host.endsWith(`.${p.host}`) : host === p.host);
 
-// Does one of the patterns allow this http(s) URL? Anything unparseable, or not http(s), is not allowed here
-// (callers only ask about http(s) URLs; `navigate` refuses other schemes already).
+// Does one of the patterns allow this http(s) or ws(s) URL? Anything unparseable, or of another scheme, is not
+// allowed here (callers only ask about those schemes; `navigate` refuses the rest already).
 export function allowsUrl(patterns, raw) {
   let u;
   try { u = new URL(raw); } catch { return false; }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  if (!Object.hasOwn(DEFAULT_PORT, u.protocol)) return false;
   const host = u.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
   const port = Number(u.port || DEFAULT_PORT[u.protocol]);
   return patterns.some((p) => p.any || (matchesHost(p, host) && (p.port === null || p.port === port)));

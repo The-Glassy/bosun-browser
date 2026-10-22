@@ -5,8 +5,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
 import path from 'path';
+import { execFileSync, spawn } from 'child_process';
 import { loadConfig } from '../src/config.mjs';
-import { startBosun, startPageServer, connect } from './helpers.mjs';
+import { createEngines } from '../src/engines.mjs';
+import { startBosun, startPageServer, connect, tmpDir } from './helpers.mjs';
+
+const SERVER = new URL('../src/server.mjs', import.meta.url).pathname;
 
 const MEETING_TOOLS = ['meeting_join', 'meeting_status', 'meeting_chat_read', 'meeting_chat_send', 'meeting_stop_recording', 'meeting_leave', 'meeting_recording_delete'];
 
@@ -66,4 +70,92 @@ test('FEATURES_MEETINGS=1 wires the meeting tools again', async () => {
     for (const t of MEETING_TOOLS) assert.ok(names.includes(t), t);
     await c.close();
   } finally { await svc.stop(); }
+});
+
+// --- Chromium's own sandbox (CHROMIUM_SANDBOX, on by default) ---
+
+// The real chromium definition with a stand-in browser type, so the launch options can be inspected without a
+// browser (and a sandbox failure can be simulated on a host where the sandbox works).
+const withFakeChromium = (launch) => {
+  const real = createEngines().get('chromium');
+  return createEngines({ overrides: { chromium: { ...real, load: async () => ({ launch, executablePath: () => '/unused' }) } } });
+};
+
+test('CHROMIUM_SANDBOX defaults to on and is a 0/1 switch', () => {
+  assert.equal(loadConfig({}).chromiumSandbox, true);
+  assert.equal(loadConfig({ CHROMIUM_SANDBOX: '1' }).chromiumSandbox, true);
+  assert.equal(loadConfig({ CHROMIUM_SANDBOX: '0' }).chromiumSandbox, false);
+  assert.throws(() => loadConfig({ CHROMIUM_SANDBOX: 'off' }), /CHROMIUM_SANDBOX must be 0 or 1/);
+});
+
+test('the engine launches Chromium with its sandbox, and refuses downloads by default', async () => {
+  const real = createEngines().get('chromium');
+  const launchedWith = async (cfg) => { let o; await real.launchShared({ launch: async (x) => { o = x; return { on() {} }; } }, cfg); return o; };
+  assert.equal((await launchedWith(loadConfig({}))).chromiumSandbox, true);
+  assert.equal((await launchedWith(loadConfig({ CHROMIUM_SANDBOX: '0' }))).chromiumSandbox, false);
+  let ctxOpts;
+  await real.open({}, { cfg: loadConfig({}), dir: null, locale: 'de-AT', timezone: 'Europe/Vienna', shared: async () => ({ newContext: async (o) => { ctxOpts = o; return {}; } }) });
+  assert.equal(ctxOpts.acceptDownloads, false);
+  await real.open({}, { cfg: loadConfig({ DOWNLOADS: '1' }), dir: null, locale: 'de-AT', timezone: 'Europe/Vienna', shared: async () => ({ newContext: async (o) => { ctxOpts = o; return {}; } }) });
+  assert.equal(ctxOpts.acceptDownloads, true);
+});
+
+test('a sandbox that cannot start stops the service with what the operator has to do', async () => {
+  const sandboxFails = withFakeChromium(async () => { throw new Error("Chromium sandboxing failed!\nTo avoid the sandboxing issue, do either of the following:"); });
+  await assert.rejects(sandboxFails.check('chromium', loadConfig({ HEADLESS: '1' })), (e) => {
+    assert.match(e.message, /engine chromium: Chromium could not start with its own sandbox/);
+    assert.match(e.message, /apparmor_restrict_unprivileged_userns=0/);
+    assert.match(e.message, /CHROME_DEVEL_SANDBOX/);
+    assert.match(e.message, /CHROMIUM_SANDBOX=0/); // the only way out, and it is explicit
+    return true;
+  });
+  // With the sandbox switched off there is no preflight launch at all.
+  let launched = false;
+  const off = withFakeChromium(async () => { launched = true; return { close: async () => {} }; });
+  await off.check('chromium', loadConfig({ HEADLESS: '1', CHROMIUM_SANDBOX: '0' }));
+  assert.equal(launched, false);
+  // With it on, the preflight launches once (sandboxed) and closes again.
+  let opts = null, closed = false;
+  const on = withFakeChromium(async (o) => { opts = o; return { close: async () => { closed = true; } }; });
+  await on.check('chromium', loadConfig({ HEADLESS: '1' }));
+  assert.equal(opts.chromiumSandbox, true);
+  assert.equal(closed, true);
+});
+
+test('with the sandbox on, the service either runs sandboxed or refuses to start', async () => {
+  // This host may not allow unprivileged user namespaces (containers often do not), which is exactly the case that
+  // must fail loudly rather than fall back.
+  let svc = null;
+  try {
+    svc = await startBosun({ CHROMIUM_SANDBOX: '1' });
+  } catch (e) {
+    assert.match(e.message, /Chromium could not start with its own sandbox/);
+    assert.match(e.message, /CHROMIUM_SANDBOX=0/);
+    return;
+  }
+  try {
+    const c = await connect(svc);
+    await c.open(); // a real session on the shared browser
+    const renderers = execFileSync('ps', ['-eo', 'args'], { encoding: 'utf8', maxBuffer: 64 << 20 })
+      .split('\n').filter((l) => l.includes('--type=renderer') && l.includes('chrome'));
+    assert.ok(renderers.length, 'no renderer process found');
+    for (const r of renderers) assert.ok(!r.includes('--no-sandbox'), r.slice(0, 200));
+    await c.close();
+  } finally { await svc.stop(); }
+});
+
+test('CHROMIUM_SANDBOX=0 is said out loud at every start', async () => {
+  const err = await new Promise((resolve) => {
+    const p = spawn(process.execPath, [SERVER], {
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH || '', BROWSER_DATA: tmpDir(), HEADLESS: '1', WS_PORT: '0', BROWSER_TOKEN: 'x'.repeat(24), CHROMIUM_SANDBOX: '0' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let out = '';
+    const done = () => { clearTimeout(t); resolve(out); };
+    p.stderr.on('data', (d) => { out += d; if (/MCP over WebSocket/.test(out)) p.kill('SIGTERM'); });
+    p.on('exit', done);
+    const t = setTimeout(() => p.kill('SIGKILL'), 30000);
+  });
+  assert.match(err, /WARNING — CHROMIUM_SANDBOX=0: the browser runs without its own sandbox/);
+  assert.match(err, /MCP over WebSocket/);
 });

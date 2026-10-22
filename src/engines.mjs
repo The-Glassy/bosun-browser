@@ -7,7 +7,7 @@ import path from 'path';
 import crypto from 'crypto';
 
 export const ENGINE_NAMES = ['chromium', 'patchright', 'camoufox'];
-const CHROMIUM_ARGS = ['--disable-blink-features=AutomationControlled'];
+export const CHROMIUM_ARGS = ['--disable-blink-features=AutomationControlled'];
 
 const INSTALL = {
   chromium: 'npx playwright install chromium',
@@ -17,14 +17,43 @@ const INSTALL = {
 
 export class EngineUnavailableError extends Error {}
 
+// What an operator has to do when Chromium refuses to start with its sandbox (CHROMIUM_SANDBOX=1, the default).
+// Ubuntu 23.10+ restricts unprivileged user namespaces through AppArmor, which is what Chromium's namespace sandbox
+// needs; the alternative is its setuid helper.
+export const SANDBOX_HELP = [
+  'Chromium could not start with its own sandbox. One of these has to be true on this host:',
+  '  1. unprivileged user namespaces are allowed:',
+  "     echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-apparmor-userns.conf && sudo sysctl --system",
+  '  2. or an AppArmor profile grants "userns" to the browser binary (see docs/DEPLOY-SYSTEMD.md),',
+  '  3. or the setuid helper next to the browser is root-owned and mode 4755, with CHROME_DEVEL_SANDBOX pointing at',
+  '     it and NoNewPrivileges unset in the unit (see docs/DEPLOY-SYSTEMD.md).',
+  'Running the browser unsandboxed is a deliberate choice: set CHROMIUM_SANDBOX=0 (logged at every start).',
+].join('\n');
+
+// Startup preflight for the Chromium family: start the browser the way sessions will and close it again, so a host
+// where the sandbox cannot work is refused at startup instead of at the first session (explain() turns the failure
+// into SANDBOX_HELP). Never falls back silently.
+async function sandboxPreflight(bt, cfg) {
+  if (!cfg.chromiumSandbox || process.platform !== 'linux') return;
+  let b = null;
+  try {
+    b = await bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: true, timeout: 60_000 });
+  } finally {
+    await b?.close().catch(() => {});
+  }
+}
+
 const missingModule = (e) => e?.code === 'ERR_MODULE_NOT_FOUND' || e?.code === 'MODULE_NOT_FOUND';
 const missingBinary = (e) => e?.binary || ['CamoufoxNotInstalled', 'FileNotFoundError'].includes(e?.constructor?.name) ||
   /Executable doesn't exist|camoufox fetch/i.test(String(e?.message || e));
+// Chromium refusing to start because its sandbox cannot be set up on this host.
+const sandboxFailure = (e) => /Chromium sandboxing failed|Failed to move to new namespace|chrome[-_]sandbox|SUID sandbox|setuid sandbox/i.test(String(e?.message || e));
 
-// Rethrow launch failures caused by a missing install as a clear, actionable error.
+// Rethrow launch failures caused by a missing install, or by an unusable sandbox, as a clear, actionable error.
 function explain(name, e) {
   if (missingModule(e)) return new EngineUnavailableError(`engine ${name} is not installed — run: ${INSTALL[name]}`);
   if (missingBinary(e)) return new EngineUnavailableError(`engine ${name}: browser binary missing — run: ${INSTALL[name]}`);
+  if (sandboxFailure(e)) return new EngineUnavailableError(`engine ${name}: ${SANDBOX_HELP}`);
   return e;
 }
 
@@ -45,11 +74,11 @@ function definitions(importer) {
       name: 'chromium', family: 'chromium', cdp: true, shared: true, tracker: 'init',
       async load() { return (await importer('playwright')).chromium; },
       // Headless runs use Playwright's separate headless shell, whose path the API doesn't expose: checked at launch.
-      check: (bt, cfg) => { if (!cfg.headless) exists(bt.executablePath()); },
-      launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS }),
+      async check(bt, cfg) { if (!cfg.headless) exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
+      launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: cfg.chromiumSandbox }),
       async open(bt, { cfg, dir, locale, timezone, shared, media }) {
-        const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone };
-        if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, args: [...CHROMIUM_ARGS, ...(media?.args || [])], ...(media?.env ? { env: media.env } : {}), ...o }) };
+        const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: cfg.downloads };
+        if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, chromiumSandbox: cfg.chromiumSandbox, args: [...CHROMIUM_ARGS, ...(media?.args || [])], ...(media?.env ? { env: media.env } : {}), ...o }) };
         const browser = await shared();
         return { ctx: await browser.newContext(o), browser };
       },
@@ -57,12 +86,13 @@ function definitions(importer) {
     patchright: {
       name: 'patchright', family: 'chromium', cdp: true, shared: false, tracker: 'navigate',
       async load() { return (await importer('patchright')).chromium; },
-      check: (bt) => exists(bt.executablePath()),
+      async check(bt, cfg) { exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
       // Recommended patchright setup: persistent context, no custom UA/headers, no automation-flag args, the
       // browser's own window size (viewport: null).
       async open(bt, { cfg, dir, locale, timezone, media }) {
         const ctx = await bt.launchPersistentContext(dir, {
           channel: 'chromium', headless: cfg.headless, viewport: null, args: ['--window-size=1366,900', ...(media?.args || [])], locale, timezoneId: timezone,
+          chromiumSandbox: cfg.chromiumSandbox, acceptDownloads: cfg.downloads,
           ...(media?.env ? { env: media.env } : {}),
         });
         return { ctx };
@@ -80,7 +110,7 @@ function definitions(importer) {
       // platform. humanize stays off: with Playwright 1.64 its cursor patch makes actionability checks hang.
       async open({ launchOptions, firefox }, { cfg, dir, locale, timezone }) {
         const opts = await launchOptions({ headless: cfg.headless, os: cfg.camoufoxOs || hostOs(), locale, humanize: false });
-        return { ctx: await firefox.launchPersistentContext(dir, { ...opts, viewport: null, timezoneId: timezone }) };
+        return { ctx: await firefox.launchPersistentContext(dir, { ...opts, viewport: null, timezoneId: timezone, acceptDownloads: cfg.downloads }) };
       },
     },
   };

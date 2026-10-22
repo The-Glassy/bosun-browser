@@ -42,6 +42,10 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
 
 export async function main(env = process.env) {
   const cfg = loadConfig(env);
+  // Never silent: an unsandboxed browser is said out loud at every start.
+  if (!cfg.chromiumSandbox && cfg.engine !== 'camoufox') {
+    console.error('bosun: WARNING — CHROMIUM_SANDBOX=0: the browser runs without its own sandbox, so a renderer that is compromised by a page lands directly on this user');
+  }
   const svc = await startService(cfg);
   const exit = (code) => {
     const force = setTimeout(() => process.exit(1), 20_000);

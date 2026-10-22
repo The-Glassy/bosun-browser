@@ -142,7 +142,9 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       const r = await s.page.goto(url, { waitUntil: a.wait || 'domcontentloaded', timeout: 45000 });
       await s.page.waitForTimeout(1200);
       const w = noteWall(s, await wall(s.page));
-      return ok({ status: r?.status(), ...(await pageInfo(s.page)), ...(w ? { blocked: w, hint: 'call request_human to let a person solve it' } : {}) });
+      // A redirect chain the host allowlist walked is followed by the service, so the tab keeps the URL asked for.
+      const red = s.redirects?.last?.from === url ? s.redirects.last.to : null;
+      return ok({ status: r?.status(), ...(await pageInfo(s.page)), ...(red ? { redirected_to: red } : {}), ...(w ? { blocked: w, hint: 'call request_human to let a person solve it' } : {}) });
     });
   });
 

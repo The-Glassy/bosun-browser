@@ -82,6 +82,10 @@ export async function startBosun(env = {}, opts = {}) {
     // The suites below exercise the upstream feature surface; this fork's defaults (meetings off, chromium only)
     // are asserted in features.test.mjs, which passes them explicitly.
     FEATURES_MEETINGS: '1', FEATURES_ENGINES: 'chromium,patchright,camoufox',
+    // Chromium's sandbox needs host configuration (user namespaces or the setuid helper, see
+    // docs/DEPLOY-SYSTEMD.md) that a CI container usually does not have; features.test.mjs asserts that the
+    // default (sandbox on) either works or refuses to start.
+    CHROMIUM_SANDBOX: '0',
     ...(process.env.ENGINE ? { ENGINE: process.env.ENGINE } : {}), ...env,
   });
   const svc = await startService(cfg, opts);

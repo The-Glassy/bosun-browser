@@ -7,8 +7,9 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 > and [CHANGELOG.md](CHANGELOG.md).
 
 > **This is a fork.** It adds a [per-tenant host allowlist](#per-tenant-host-allowlist)
-> (`BROWSER_TENANT_ALLOW`), turns two things off by default — meetings (`FEATURES_MEETINGS=0`) and every engine but
-> `chromium` (`FEATURES_ENGINES=chromium`) — and ships a Linux deployment guide
+> (`BROWSER_TENANT_ALLOW`), runs Chromium **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), and
+> turns three things off by default: meetings (`FEATURES_MEETINGS=0`), every engine but `chromium`
+> (`FEATURES_ENGINES=chromium`) and downloads (`DOWNLOADS=0`). It also ships a Linux deployment guide
 > ([docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md)). What was reviewed before adopting it, and what is still risky,
 > is written down in [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md). Nothing else was removed, so
 > upstream merges stay easy: the switches are configuration, not deletions.
@@ -84,6 +85,9 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
 | `FEATURES_MEETINGS` | `0` | `1` = list and wire the meeting tools (this fork: off) |
 | `FEATURES_ENGINES` | `chromium` | engines a session may ask for, comma list; `ENGINE` is always included |
+| `CHROMIUM_SANDBOX` | `1` | `0` = run Chromium without its own sandbox (logged at every start); see [Chromium sandbox](#chromium-sandbox) |
+| `DOWNLOADS` | `0` | `1` = let pages download files (with the budget below); `0` = the context refuses them |
+| `DOWNLOADS_MAX_MB` / `DOWNLOADS_TOTAL_MAX_MB` | 100 / 500 | downloaded bytes a session, and the whole service, may keep |
 | `WS_HOST` / `WS_PORT` | `127.0.0.1` / – | WebSocket MCP listener (stdio when `WS_PORT` is unset) |
 | `WS_ALLOWED_ORIGINS` | – | comma list of browser Origins allowed to connect (non-browser clients send none) |
 | `ALLOW_NO_TOKEN` | – | `1` = no auth, loopback only |
@@ -156,8 +160,10 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
   output. The handoff ends only after the human's last input has reached the page.
 - A password field that is revealed with a show-password toggle stays masked: an event-driven tracker remembers every
   input that ever was `type=password` (incl. shadow roots), and Bosun also notes them when a handoff starts and every
-  500 ms during it. On `chromium` Bosun's helpers run in the page's own JavaScript world, so a page can detect them;
-  on `patchright` and `camoufox` they run in an isolated world (details in [docs/ENGINES.md](docs/ENGINES.md)).
+  500 ms during it. On `chromium` Bosun's helpers run in the page's own JavaScript world, so a page can detect them
+  — and replace them, which switches masking off for fields that aren't sensitive by markup (probed, see
+  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md) finding H2); on `patchright` and `camoufox` they run
+  in an isolated world, which stops that and nothing else (details in [docs/ENGINES.md](docs/ENGINES.md)).
 - Not protected: text the human types into ordinary fields, secrets the page itself echoes as normal text, custom
   widgets that aren't `<input>`/`<textarea>` (e.g. per-digit OTP boxes built from `div`s), closed shadow roots.
   Those are visible to the agent after Done. Ask the human to finish the login (submit it) before pressing Done.
@@ -422,6 +428,32 @@ on stderr. The opening handshake times out after 15 s. Exit codes: `0` stdin end
 `2` bad configuration (missing variable, a non-ws URL, credentials in the URL), `3` token refused. The bridge needs
 only Node and the `ws` package.
 
+## Chromium sandbox
+
+The browser parses untrusted web content, so it runs with **Chromium's own sandbox** (`chromiumSandbox: true`,
+which is what `CHROMIUM_SANDBOX=1`, the default, means). Playwright's default is `--no-sandbox`; this fork does not
+use it.
+
+The sandbox needs something from the host, and startup checks it: Bosun starts the browser once, closes it again,
+and **refuses to run** if that fails, printing what to do. On Linux, one of these has to be true:
+
+1. unprivileged user namespaces are allowed —
+   `echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-apparmor-userns.conf && sudo sysctl --system`
+   (Ubuntu 23.10+ restricts them through AppArmor), or
+2. an AppArmor profile grants `userns` to the browser binary, or
+3. Chromium's setuid helper next to the browser is root-owned and mode 4755, with `CHROME_DEVEL_SANDBOX` pointing at
+   it — and then the service must **not** run with `NoNewPrivileges`.
+
+[docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md) has the commands for each. A container or CI box usually allows
+none of them; there, `CHROMIUM_SANDBOX=0` is the explicit way out, and the service says so on every start:
+
+```
+bosun: WARNING — CHROMIUM_SANDBOX=0: the browser runs without its own sandbox, …
+```
+
+Check what is actually running, not just the setting: `ps -eo args | grep -- --type=renderer` must show no
+`--no-sandbox`.
+
 ## Per-tenant host allowlist
 
 Keep a tenant to the hosts it has business with — so a page that says "now open this other URL" gets nowhere, and
@@ -444,16 +476,39 @@ Enforcement, for a tenant that is named:
 
 - `navigate` refuses a URL outside the list, naming the host (never the rest of the URL), and `keepalive_set`
   refuses such a schedule.
-- Every HTTP(S) request any frame of the tenant's sessions makes is checked by Playwright route interception —
-  subresources, XHR, iframes, redirects and navigations the page starts itself. Denied requests are aborted and
-  logged as `bosun: tenant <t>: blocked request to <scheme>://<host>/<path> (host allowlist)`, without the query.
-  A navigation the page started and that was denied leaves the tab on the browser's error page; the agent can
-  navigate again.
+- Every HTTP(S) request any frame of the tenant's sessions makes is checked — subresources, XHR, iframes, popups,
+  prefetches, service-worker fetches and navigations the page starts itself.
+- **Every redirect hop is checked before it is sent.** Playwright follows redirects without consulting a route
+  handler again, so Bosun walks the chain itself (`route.fetch` with `maxRedirects: 0`) and only hands the final
+  response to the browser. An allowed host answering `302 Location: https://elsewhere/` gets nowhere.
+- **WebSockets** are checked with the same host and port rules (`ws:` defaults to port 80, `wss:` to 443). A denied
+  connection is closed with code 1008 before it reaches any server.
+- Denied requests are logged as `bosun: tenant <t>: blocked request to <scheme>://<host>/<path> (host allowlist)`,
+  without the query, once per target and session. A denied navigation the page started leaves the tab on the
+  browser's error page; the agent can navigate again.
 - `navigate`'s tool description names the allowed hosts, so the agent doesn't have to discover them by trial.
 
-A tenant that is not named is unrestricted. Not covered by the interception: requests a **service worker** makes and
-**WebSocket** connections — so the network boundary still belongs to the firewall (see
-[Security notes](#security-notes) and [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md)).
+A tenant that is not named is unrestricted, and nothing is intercepted for it at all.
+
+What an allowlist costs the tenant that has one — because responses are fetched by the service and handed to the
+browser:
+
+- A **streaming** response (server-sent events, an endless long-poll) never reaches the page; it fails when the
+  fetch times out. Plain requests, forms, cookies, redirects and downloads are unaffected.
+- After a redirect the tab keeps the URL the agent asked for. `navigate` reports the real one as `redirected_to`,
+  and an HTML document gets a `<base href>` so its relative URLs still resolve correctly.
+- Chromium treats a response the service fulfilled as coming from no address, so its **Local Network Access**
+  checks stop such a page from opening a WebSocket to a *loopback or private* address even when the allowlist
+  allows it. Pages and WebSocket servers on public hosts are unaffected.
+- A redirect **to another allowed origin** is served under the origin that was asked for, so that content runs with
+  the first origin's cookies and storage. List the hosts a tenant really needs, and prefer exact hosts over `*.`.
+- Response bodies pass through the service's memory, one per in-flight request (compressed responses are handed
+  over intact).
+
+Still not covered: a WebSocket opened inside a **dedicated Worker** (Playwright's WebSocket routing does not reach
+worker scopes) and **WebRTC**. Hosts are matched by name, with no address pinning. The network boundary therefore
+still belongs to the firewall — see [Security notes](#security-notes) and
+[docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md).
 
 ## Security notes
 
@@ -470,8 +525,16 @@ A tenant that is not named is unrestricted. Not covered by the interception: req
 - No rate limiting yet beyond the connection, in-flight and session caps.
 - A named tenant can be kept to a list of hosts (see [Per-tenant host allowlist](#per-tenant-host-allowlist)). That
   narrows what the agent and the page can ask for; it does not replace the egress boundary above.
-- Credential masking around a handoff runs in the page's own JavaScript world on `chromium`, where a hostile page
-  can neutralize it; `patchright` runs it in an isolated world. Details and a probe:
+- The browser runs with its own sandbox (see [Chromium sandbox](#chromium-sandbox)). Upstream's default, and this
+  fork's with `CHROMIUM_SANDBOX=0`, is `--no-sandbox`: then a renderer compromise is directly on the service user,
+  which is where the profiles and the service's environment (tokens included) are.
+- Downloads are off by default (`DOWNLOADS=0`), and bounded by a disk budget when enabled, so a page cannot fill
+  the volume.
+- Credential masking around a handoff covers credential **fields** — their value, and values Bosun saw in them. A
+  page that copies what the human typed into ordinary text, or into something it reads later, is not masked on
+  **any** engine, and on `chromium` a page can also neutralize the masking helpers outright (they run in its own
+  JavaScript world; `patchright` uses an isolated one, which stops that technique and nothing more). Treat the page
+  where a credential is typed as trusted, or don't type it there. Details, probes and the standing test:
   [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md) (finding H2).
 
 ## Roadmap
