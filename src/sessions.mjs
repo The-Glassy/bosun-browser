@@ -434,6 +434,8 @@ export class SessionManager {
       } catch {
         if (!reclaimed && !s.dir) s.release(); // shared-browser context: nothing per session left to wait for
       }
+      // Files this session put into its pages: the browser that could still read them is gone.
+      await this.uploads?.sessionClosed(s.id, (id) => this.sessions.has(id)).catch(() => {});
     })();
     this.disposals.add(s.disposing);
     if (profileKey) this.closingProfiles.set(profileKey, s.disposing);

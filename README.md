@@ -21,7 +21,8 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - MCP server over **stdio** (Claude Code, Codex, …) or **WebSocket** (shared service).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
-  `keepalive_set` / `keepalive_list` / `keepalive_remove`, and (unless `FEATURES_MEETINGS=0`) `meeting_join` /
+  `keepalive_set` / `keepalive_list` / `keepalive_remove`, `upload_create` / `upload` (unless `FEATURES_UPLOADS=0`),
+  and (unless `FEATURES_MEETINGS=0`) `meeting_join` /
   `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
   `meeting_leave` / `meeting_recording_delete`.
 - **Keepalive** for persistent profiles: scheduled visits keep sliding login sessions alive without a model, and a
@@ -31,6 +32,9 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - **Meetings (PoC):** joins a Google Meet (as a guest or signed in) or a Zoom meeting (signed in, in Zoom's web
   client) as a notetaker, announces itself in the chat, records the audio to a file and leaves; a "please don't record" in the chat stops and deletes the recording. Transcription happens later,
   from the file. See [Meetings (PoC)](#meetings-poc).
+- **File uploads** into pages: the agent sends the file with one `curl -T` to a one-time URL on the MCP port
+  (streamed to disk, up to 300 MB), then `upload` puts it into a file input, answers the file chooser a button
+  opens, or drops it on a drop zone. See [Uploading files](#uploading-files).
 - Sessions are **ephemeral** (wiped on close) or use a named **persistent profile** of the tenant (stays logged in;
   no RAM while idle). A session belongs to the connection that opened it: other connections can't see, use or close
   it, and it is closed when that connection goes away or after `IDLE_TIMEOUT_SEC` without use.
@@ -82,6 +86,11 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
 | `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist, enforced by a per-tenant forward proxy: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
 | `FEATURES_MEETINGS` | `1` | `0` = the meeting tools are not listed and their handlers not wired |
+| `FEATURES_UPLOADS` | `1` | `0` = no upload tools and no PUT endpoint |
+| `UPLOAD_MAX_BYTES` | 314572800 (300 MB) | largest file one upload may carry |
+| `UPLOAD_TENANT_QUOTA_BYTES` | 1073741824 (1 GB) | uploaded bytes one tenant may hold at a time (at least `UPLOAD_MAX_BYTES`) |
+| `UPLOAD_TTL_SEC` / `UPLOAD_URL_TTL_SEC` | 3600 / 900 | an uploaded file is deleted this long after it arrived; an upload URL is valid this long |
+| `UPLOAD_BASE_URL` | – (the `Host` the client connected with, `http://`) | where tenants reach the MCP port, for the PUT URL; set it behind TLS or another name |
 | `FEATURES_ENGINES` | all three | engines a session may ask for, comma list (e.g. `chromium`); `ENGINE` is always included |
 | `CHROMIUM_SANDBOX` | `1` | `0` = run Chromium without its own sandbox (logged at every start); see [Chromium sandbox](#chromium-sandbox) |
 | `DOWNLOADS` | `0` | `1` = let pages download files (with the budget below); `0` = the context refuses them |
@@ -125,6 +134,58 @@ fallback to another engine. A persistent profile remembers its engine family (Ch
 other. patchright and camoufox-js are `optionalDependencies`; their browsers are separate downloads.
 
 Chromium spawns many threads: under systemd give the unit a generous `TasksMax` (e.g. 2000).
+
+## Uploading files
+
+Two calls and a `curl` between them:
+
+```text
+upload_create { filename: "report.pdf", size_bytes: 48213 }
+  -> { file_id: "f3a…", put_url: "http://127.0.0.1:8002/upload/f3a…?t=…",
+       curl: "curl -sS --fail-with-body -T 'report.pdf' 'http://127.0.0.1:8002/upload/f3a…?t=…'", valid_min: 15 }
+$ curl -sS --fail-with-body -T report.pdf 'http://127.0.0.1:8002/upload/f3a…?t=…'
+  -> {"file_id":"f3a…","filename":"report.pdf","size":48213}
+upload { session, selector: "input[type=file]", file_id: "f3a…" }      # or ref / role+name / text
+  -> { method: "input", input_files: ["report.pdf"], url, title }
+click { session, role: "button", name: "Send" }
+```
+
+- **Where the bytes go.** The PUT goes to the same host and port as MCP (the URL is built from the `Host` the MCP
+  client connected with, or `UPLOAD_BASE_URL`), so whatever reaches MCP reaches it. The body is streamed straight to
+  `BROWSER_DATA/uploads/<tenant>/<file_id>/<filename>` (0600): never held in memory, never base64. The browser
+  reads the file from there itself; no bytes cross the MCP connection.
+- **The URL works once,** for `UPLOAD_URL_TTL_SEC` (15 min), and only for the tenant that asked for it. Its secret
+  is the credential; an `Authorization: Bearer` header is optional, and refused if it is another tenant's token.
+  `size_bytes` is optional; when given, the PUT must carry exactly that many bytes.
+- **Small files** (up to 1 MB): `upload_create { filename, content_base64 }` stores the file at once, no PUT.
+- **Limits.** `UPLOAD_MAX_BYTES` per file (300 MB) and `UPLOAD_TENANT_QUOTA_BYTES` per tenant (1 GB) are checked
+  against `Content-Length` before any byte is read, and again while the body streams: past either, the answer is
+  `413` and nothing stays on disk.
+- **Files never cross tenants.** A `file_id` of another tenant answers like one that never existed.
+- **Deletion.** A file is deleted when the session that used it closes (the last one, if several did),
+  `UPLOAD_TTL_SEC` (1 h) after it arrived, or when the service starts. Submit the form within the hour.
+- **Read-only tokens** (policy `ephemeral`) can't upload: the tools are refused, and so is a PUT with such a token.
+
+How `upload` puts the files in:
+
+1. The element is an `<input type=file>`, hidden or not, or the `<label>` of one: the input gets the files
+   directly. Several files (`files: [id, id]`) only when it has `multiple`.
+2. Anything else (an "Upload" button, a link) is clicked, and the file chooser it opens is answered.
+3. If no chooser opens within 5 s, the files are **dropped** on the element: `dragenter`, `dragover`, `drop` with
+   the files in a `DataTransfer`. `accepted` says whether something on the page took the drop.
+
+`method: input | chooser | drop` forces one of them.
+
+Drag-and-drop is best effort:
+- The events are synthetic (`isTrusted` is false). A drop zone that checks for real user events ignores them.
+- On `camoufox`, Firefox hides files dropped from outside the page's own scripts, so Bosun dispatches the drop
+  from a script element in the page. A page whose Content-Security-Policy refuses inline scripts gets no files;
+  `note` says so. Use `chromium` for that page.
+- An element inside a shadow root may not be found by the camoufox drop script; drop on its host, or use another
+  engine.
+
+Prefer the page's file input or its "Upload" button where there is one: both are as good as a person picking a
+file.
 
 ## Handoff
 
@@ -442,7 +503,8 @@ With policy `ephemeral` the server enforces, not just hides:
   the connection and close when it closes (or after `IDLE_TIMEOUT_SEC`).
 - Nothing is written to `BROWSER_DATA`: screenshots are returned but never saved, even with `SAVE_SHOTS=1`. Ephemeral
   sessions use temporary browser profiles that are deleted on close; Playwright keeps downloads in its own temporary
-  directory and deletes them with the session. There is no upload tool.
+  directory and deletes them with the session. `upload_create` and `upload` are refused, and so is an upload PUT
+  that carries this token.
 - No MCPL push events.
 
 A policy only narrows what the token can do; the tenant is still separate from yours, so it never sees your profiles
@@ -460,7 +522,7 @@ stdin/stdout and the WebSocket, one message per frame.
   "env": { "BOSUN_URL": "ws://127.0.0.1:7360", "BOSUN_TOKEN": "<swarm token>" } } } }
 ```
 
-Records are split on LF only (CRLF is accepted); a record that is not JSON or is over 1 MiB is dropped with a line
+Records are split on LF only (CRLF is accepted); a record that is not JSON or is over 2 MiB is dropped with a line
 on stderr. The opening handshake times out after 15 s. Exit codes: `0` stdin ended, `1` connection failed or lost,
 `2` bad configuration (missing variable, a non-ws URL, credentials in the URL), `3` token refused. The bridge needs
 only Node and the `ws` package.
@@ -580,6 +642,9 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
   which is where the profiles and the service's environment (tokens included) are.
 - Downloads are off by default (`DOWNLOADS=0`), and bounded by a disk budget when enabled, so a page cannot fill
   the volume.
+- Uploads are written to `BROWSER_DATA/uploads` (on the data volume, not a RAM-backed `/tmp`) under a per-file cap
+  and a per-tenant quota, and deleted after use, after an hour and at every start. Once a file is in a page, the page
+  can send it anywhere it can reach: upload only what you would hand that site.
 - Credential masking around a handoff covers credential **fields** — their value, and values Bosun saw in them. A
   page that copies what the human typed into ordinary text, or into something it reads later, is not masked on
   **any** engine, and on `chromium` a page can also neutralize the masking helpers outright (they run in its own
