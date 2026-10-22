@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.8.0 — security hardening: Chromium sandbox, host allowlist, download budget
+
+From an external security review of 0.7.0 ([docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md)) and the
+hardening contributed with it.
+
+### Changed — read before upgrading
+
+- **Chromium runs with its own sandbox** (`CHROMIUM_SANDBOX=1`, the default). 0.7.0 ran it with Playwright's
+  `--no-sandbox`, so a compromised renderer landed directly on the service user. On Linux, **startup now launches the
+  browser once and refuses to start** if the sandbox cannot be set up, printing what the host needs: unprivileged
+  user namespaces, an AppArmor profile that grants `userns`, or the setuid helper (see README › Chromium sandbox and
+  docs/DEPLOY-SYSTEMD.md). `CHROMIUM_SANDBOX=0` runs unsandboxed and says so at every start.
+- **Downloads are refused by default** (`DOWNLOADS=0` → `acceptDownloads: false`). No tool used them, and a page
+  could write unbounded files into Playwright's temp directory (often RAM-backed). `DOWNLOADS=1` turns them on, with
+  `DOWNLOADS_MAX_MB` per session (100) and `DOWNLOADS_TOTAL_MAX_MB` service-wide (500): a download past either
+  budget is cancelled, or deleted if it finished first.
+
+### Added
+
+- **Per-tenant host allowlist**, `BROWSER_TENANT_ALLOW='ops=*.example.org,127.0.0.1:4848; swarm=*.example.org'`.
+  - A named tenant gets its own forward proxy inside the service (loopback, a password of its own), and each of
+    its sessions runs in a browser of its own launched with it (a temporary profile, removed with the session), so
+    every connection is checked before it leaves: navigations, each redirect hop,
+    subresources, page and worker WebSockets, service workers, prefetches.
+  - The proxy resolves DNS itself and connects to the address it checked. A name that resolves into a private range
+    is refused unless the allowlist names that address.
+  - QUIC is off and WebRTC is limited to the proxy: Chromium flags, the `webrtc.ip_handling_policy` profile
+    preference (full Chromium — headful, patchright — ignores the flag), and Firefox preferences for camoufox (which
+    also needs `network.proxy.allow_hijacking_localhost` to send loopback through the proxy).
+  - `navigate` and `keepalive_set` refuse hosts outside the list up front. `navigate` reports a refused redirect as
+    `refused: "host allowlist"`, or, for an `https` hop refused at `CONNECT`, with an error naming host and port.
+  - Denials are logged as host and port, never a path or query.
+  - A tenant without an allowlist gets no proxy and the same shared browser as before.
+- **Feature switches**: `FEATURES_MEETINGS=0` drops the meeting tools and their machinery; `FEATURES_ENGINES` limits
+  the engines a session may pick. Both default to everything on, as before.
+- `docs/DEPLOY-SYSTEMD.md` and `deploy/` (unit and env example): a hardened systemd deployment.
+- Tests for all of the above, including an engine matrix for the allowlist (`ENGINE=patchright|camoufox npm test`)
+  and a standing test of what credential masking does not cover.
+
+### Fixed
+
+- **camoufox: a WebSocket opened in a worker could end the service.** Playwright's Firefox driver hits an internal
+  assertion on that WebSocket's events, which surfaced as an unhandled rejection, and Node exits on those, taking every
+  tenant's sessions and handoffs with it. A rejection from inside the browser driver is now logged
+  (`bosun: browser driver error, ignored: …`) and the service keeps serving; any other unhandled rejection still ends
+  the process.
+
+### Documented
+
+- On `chromium` a page can neutralize the credential-masking helpers (they run in its JavaScript world), and on any
+  engine a page can copy what the human typed into ordinary text. The page where a credential is typed must be
+  trusted (review finding H2).
+
 ## 0.7.0 — read-only tokens for subagents
 
 ### Added

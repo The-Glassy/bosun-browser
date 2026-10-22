@@ -46,6 +46,14 @@ const PAGES = {
     addEventListener('mousedown', () => { L.buttons.push('down'); out(); }); addEventListener('mouseup', () => { L.buttons.push('up'); out(); });
     document.addEventListener('reset-log', reset); reset();</script>`,
   '/popups': `<title>Popups</title><script>for (let i = 0; i < 10; i++) window.open('/second?' + i)</script>`,
+  // Requests the page itself makes to ?to=<url> (host allowlist). no-cors: resolves when the request went out,
+  // rejects when it was aborted, whatever the other server replies.
+  '/fetch': `<title>Fetch</title><p id="out">pending</p>
+    <script>const to = new URL(location.href).searchParams.get('to');
+    const say = (t) => { document.getElementById('out').textContent = t; };
+    fetch(to, { mode: 'no-cors' }).then(() => say('fetch ok'), () => say('fetch blocked'));</script>`,
+  '/go': `<title>Go</title><p id="out">staying</p>
+    <script>location.href = new URL(location.href).searchParams.get('to');</script>`,
 };
 
 export async function startPageServer() {
@@ -69,8 +77,15 @@ export function tmpDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'bosun-t
 export async function startBosun(env = {}, opts = {}) {
   const dataDir = tmpDir();
   const cfg = loadConfig({
-    HEADLESS: '1', BROWSER_DATA: dataDir, WS_PORT: '0', LIVE_PORT: '0', BROWSER_TOKENS: `alice:${TOKEN},bob:${TOKEN_B}`,
-    MAX_SESSIONS: '4', ...(process.env.ENGINE ? { ENGINE: process.env.ENGINE } : {}), ...env,
+    // TEST_HEADFUL=1 (under Xvfb on Linux) runs the full browser instead of Chromium's headless shell, as a headful
+    // deployment does: some browser behaviour (WebRTC policy) differs between the two.
+    HEADLESS: process.env.TEST_HEADFUL === '1' ? '0' : '1', BROWSER_DATA: dataDir, WS_PORT: '0', LIVE_PORT: '0', BROWSER_TOKENS: `alice:${TOKEN},bob:${TOKEN_B}`,
+    MAX_SESSIONS: '4',
+    // Chromium's sandbox needs host configuration (user namespaces or the setuid helper, see
+    // docs/DEPLOY-SYSTEMD.md) that a CI container usually does not have; features.test.mjs asserts that the
+    // default (sandbox on) either works or refuses to start.
+    CHROMIUM_SANDBOX: '0',
+    ...(process.env.ENGINE ? { ENGINE: process.env.ENGINE } : {}), ...env,
   });
   const svc = await startService(cfg, opts);
   return {
