@@ -20,19 +20,19 @@ hardening contributed with it.
 ### Added
 
 - **Per-tenant host allowlist**, `BROWSER_TENANT_ALLOW='ops=*.example.org,127.0.0.1:4848; swarm=*.example.org'`.
-  - A named tenant gets its own forward proxy inside the service (loopback, a password of its own) and a browser of
-    its own launched with it, so every connection is checked before it leaves: navigations, each redirect hop,
+  - A named tenant gets its own forward proxy inside the service (loopback, a password of its own), and each of
+    its sessions runs in a browser of its own launched with it (a temporary profile, removed with the session), so
+    every connection is checked before it leaves: navigations, each redirect hop,
     subresources, page and worker WebSockets, service workers, prefetches.
   - The proxy resolves DNS itself and connects to the address it checked. A name that resolves into a private range
     is refused unless the allowlist names that address.
   - QUIC is off and WebRTC is limited to the proxy: Chromium flags, the `webrtc.ip_handling_policy` profile
-    preference for persistent profiles (which ignore the flag), and Firefox preferences for camoufox (which also
-    needs `network.proxy.allow_hijacking_localhost` to send loopback through the proxy).
+    preference (full Chromium — headful, patchright — ignores the flag), and Firefox preferences for camoufox (which
+    also needs `network.proxy.allow_hijacking_localhost` to send loopback through the proxy).
   - `navigate` and `keepalive_set` refuse hosts outside the list up front. `navigate` reports a refused redirect as
     `refused: "host allowlist"`, or, for an `https` hop refused at `CONNECT`, with an error naming host and port.
   - Denials are logged as host and port, never a path or query.
-  - A tenant without an allowlist gets no proxy and the same browser as before.
-  - A tenant's own browser is closed when its last session ends.
+  - A tenant without an allowlist gets no proxy and the same shared browser as before.
 - **Feature switches**: `FEATURES_MEETINGS=0` drops the meeting tools and their machinery; `FEATURES_ENGINES` limits
   the engines a session may pick. Both default to everything on, as before.
 - `docs/DEPLOY-SYSTEMD.md` and `deploy/` (unit and env example): a hardened systemd deployment.

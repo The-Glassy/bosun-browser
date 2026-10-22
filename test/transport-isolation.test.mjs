@@ -54,7 +54,7 @@ async function gatherIce(token, open = {}) {
       pc.close();
       return seen;
     }, stunPort);
-    return { datagrams: udp.datagrams, candidates, browser: session.browser, allowlisted: !!svc.manager.allowList(token === TOKEN ? 'alice' : 'bob') };
+    return { datagrams: udp.datagrams, candidates, browser: session.browser, tmpDir: session.tmpDir, allowlisted: !!svc.manager.allowList(token === TOKEN ? 'alice' : 'bob') };
   } finally { await c.close(); }
 }
 
@@ -72,12 +72,12 @@ test('a tenant without an allowlist keeps its transports while another tenant is
   assert.equal(alice.allowlisted, true);
   assert.equal(alice.datagrams, 0, `a proxied tenant's browser sent UDP: ${JSON.stringify(alice.candidates)}`);
 
-  // They ran in different browsers, which is what makes the two sets of flags possible at all.
-  // On engines with one browser process per session (patchright, camoufox) there is no shared browser to compare.
-  if (!bob.browser) return;
-  assert.ok(alice.browser && alice.browser !== bob.browser, 'both tenants shared one browser');
-  // alice's own browser went away with her last session; the shared one of unproxied tenants stays up.
-  await until(() => [...svc.manager.browsers.keys()].join() === '', 10000);
+  // alice ran in a browser process of her own (a temp profile, gone with the session), which is what makes her flags
+  // and profile preferences possible at all; bob's session, on chromium, is a context of the shared browser.
+  assert.equal(alice.browser, null);
+  assert.ok(alice.tmpDir);
+  await until(() => !fs.existsSync(alice.tmpDir), 15000);
+  if (bob.browser) assert.equal(svc.manager.browserP !== null, true);
 });
 
 // A persistent Chromium profile (profiles, patchright, meetings) ignores --force-webrtc-ip-handling-policy: only the

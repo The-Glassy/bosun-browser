@@ -83,8 +83,7 @@ export class SessionManager {
     this.closed = new Map(); // recently closed id -> {owner, reason}, so the owner learns why (bounded)
     this.closeDeadlineMs = CLOSE_DEADLINE_MS;
     this.stuck = new Set(); // per-session browsers that survived SIGKILL; their slots stay reserved
-    this.browsers = new Map(); // '' = the shared browser of unproxied tenants, else the proxied tenant's own
-    this.browserHolds = new Map(); // browser key -> sessions and opens using that shared browser
+    this.browserP = null;
     this.launches = 0;
     this.closing = false;
     this.dlBytes = 0; // bytes of downloads currently kept across all sessions (DOWNLOADS_TOTAL_MAX_MB)
@@ -98,40 +97,22 @@ export class SessionManager {
     }
   }
 
-  // Shared browsers of the shared engine (chromium), launched once each and relaunched after one goes away.
-  // A tenant with a host allowlist gets a browser of its own, launched with that tenant's proxy and with the flags
-  // that keep traffic inside it; tenants without one share a browser launched exactly the way upstream does, so
-  // one tenant's allowlist cannot change another tenant's networking.
-  getBrowser(def, bt, proxy = null, key = '') {
-    if (!this.browsers.has(key)) {
+  // The shared browser of the shared engine (chromium): launched once, relaunched after it goes away. Only tenants
+  // without a host allowlist use it, so it is launched exactly as 0.7.0 launched it; a proxied tenant's sessions
+  // each get a browser of their own (engines.mjs open).
+  getBrowser(def, bt) {
+    if (!this.browserP) {
       this.launches++;
-      const p = def.launchShared(bt, this.cfg, proxy).then((b) => {
-        b.on('disconnected', () => this.onBrowserGone(b, key, p));
+      const p = this.browserP = def.launchShared(bt, this.cfg).then((b) => {
+        b.on('disconnected', () => this.onBrowserGone(b, p));
         return b;
-      }, (e) => { if (this.browsers.get(key) === p) this.browsers.delete(key); throw e; });
-      this.browsers.set(key, p);
+      }, (e) => { if (this.browserP === p) this.browserP = null; throw e; });
     }
-    return this.browsers.get(key);
+    return this.browserP;
   }
 
-  // A session (or an open in progress) uses the shared browser under key. A proxied tenant's own browser is closed
-  // when nothing holds it any more, so an idle allowlisted tenant costs no browser process; the next open launches
-  // it again. The browser of unproxied tenants stays up, as upstream keeps it.
-  holdBrowser(key) { this.browserHolds.set(key, (this.browserHolds.get(key) || 0) + 1); }
-
-  async releaseBrowser(key) {
-    const n = (this.browserHolds.get(key) || 0) - 1;
-    if (n > 0) { this.browserHolds.set(key, n); return; }
-    this.browserHolds.delete(key);
-    if (key === '' || this.closing) return; // closeAll() takes care of the rest
-    const bp = this.browsers.get(key);
-    if (!bp) return;
-    this.browsers.delete(key); // a later open launches a fresh one
-    await Promise.race([bp.then((b) => b.close(), () => {}), sleep(this.closeDeadlineMs)]).catch(() => {});
-  }
-
-  onBrowserGone(browser, key, p) {
-    if (this.browsers.get(key) === p) this.browsers.delete(key); // next open relaunches
+  onBrowserGone(browser, p) {
+    if (this.browserP === p) this.browserP = null; // next open relaunches
     for (const s of this.sessions.values()) if (s.browser === browser) this.dispose(s, 'browser-crashed');
   }
 
@@ -191,7 +172,7 @@ export class SessionManager {
     };
 
     const p = (async () => {
-      let ctx = null, browser = null, dir = null, tmpDir = null, profileDir = null, claimed = false, browserKey = null;
+      let ctx = null, browser = null, dir = null, tmpDir = null, profileDir = null, claimed = false;
       try {
         // A tenant with a host allowlist only reaches the network through its own forward proxy, which is what its
         // browser contexts are launched with. A failure here fails the open rather than opening a session that is
@@ -206,11 +187,7 @@ export class SessionManager {
         try {
           ({ ctx, browser = null, dir = null, tmpDir = null } = await this.engines.open(def.name, {
             cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', media, proxy,
-            shared: (d, bt) => {
-              browserKey = proxy ? tenant : '';
-              this.holdBrowser(browserKey);
-              return this.getBrowser(d, bt, proxy, browserKey);
-            },
+            shared: (d, bt) => this.getBrowser(d, bt),
           }));
         } catch (e) {
           ({ dir = null, tmpDir = null } = e);
@@ -229,7 +206,7 @@ export class SessionManager {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
           navs: [], ctxErrors: [], wallSeen: null, // recent main-frame navigations {t, at: origin+path}, "context destroyed" failures, last bot check seen (bot-check loops)
-          dlBytes: 0, browserKey,
+          dlBytes: 0,
         };
         this.sessions.set(s.id, s);
         page.on('framenavigated', (f) => {
@@ -250,7 +227,6 @@ export class SessionManager {
         return s;
       } catch (e) {
         if (ctx) await Promise.race([ctx.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
-        if (browserKey !== null) await this.releaseBrowser(browserKey);
         if (await this.reclaim({ dir, tmpDir, release, what: `failed open (${def.name})` })) {
           if (claimed) unclaimProfile(profileDir);
         }
@@ -452,7 +428,6 @@ export class SessionManager {
       let reclaimed = false;
       try {
         await Promise.race([s.ctx.close().catch(() => {}), sleep(this.closeDeadlineMs)]);
-        if (s.browserKey !== null && s.browserKey !== undefined) await this.releaseBrowser(s.browserKey);
         await Promise.allSettled([...s.writes]); // a screenshot being written must not outlive the directory removal
         await fs.promises.rm(path.join(this.cfg.dataDir, 'shots', s.tenant, s.id), { recursive: true, force: true }).catch(() => {});
         reclaimed = await this.reclaim({ dir: s.dir, tmpDir: s.tmpDir, release: s.release, what: `session ${s.id} (${s.engine})` });
@@ -506,12 +481,9 @@ export class SessionManager {
     // Includes disposals that started earlier (explicit close, disconnect) and are still closing.
     await Promise.race([Promise.allSettled([...this.disposals]), sleep(CLOSE_DEADLINE_MS + 1000)]);
     for (const x of [...this.stuck]) { this.stuck.delete(x); await this.reclaim(x); }
-    const browsers = [...this.browsers.values()];
-    this.browsers.clear();
-    await Promise.race([
-      Promise.allSettled(browsers.map((bp) => bp.then((b) => b.close(), () => {}))),
-      sleep(CLOSE_DEADLINE_MS),
-    ]).catch(() => {});
+    const bp = this.browserP;
+    this.browserP = null;
+    if (bp) await Promise.race([bp.then((b) => b.close(), () => {}), sleep(CLOSE_DEADLINE_MS)]).catch(() => {});
     const proxies = [...this.proxies.values()];
     this.proxies.clear();
     await Promise.allSettled(proxies.map((p) => p.then((x) => x.close(), () => {})));

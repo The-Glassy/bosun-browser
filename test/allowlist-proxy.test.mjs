@@ -8,6 +8,7 @@
 // that address too (DNS rebinding).
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
 import http from 'http';
 import zlib from 'zlib';
 import { WebSocketServer } from 'ws';
@@ -370,22 +371,18 @@ test('a redirect to https outside the allowlist is refused at CONNECT, and navig
   } finally { await c.close(); }
 });
 
-test('a proxied tenant\'s own browser is closed after its last session, and relaunched by the next open', async () => {
+test('a proxied tenant\'s sessions run in browsers of their own, which go with the session', async () => {
   const c = await connect(svc, TOKEN);
   try {
     const a = await c.open();
     const b = await c.open();
-    const browser = svc.manager.sessions.get(a).browser;
-    if (!browser) return; // engines without a shared browser (patchright, camoufox) run one process per session anyway
-    assert.ok(svc.manager.browsers.has('alice'));
+    const [sa, sb] = [svc.manager.sessions.get(a), svc.manager.sessions.get(b)];
+    assert.equal(sa.browser, null); // never the shared browser
+    assert.ok(sa.tmpDir && sb.tmpDir && sa.tmpDir !== sb.tmpDir);
+    assert.equal((await c.call('navigate', { session: a, url: `${base}/` })).json().title, 'Allowed');
     await c.call('session_close', { session: a });
-    assert.ok(svc.manager.browsers.has('alice'), 'closed while another session still used it');
-    assert.equal(browser.isConnected(), true);
-    await c.call('session_close', { session: b });
-    await until(() => !svc.manager.browsers.has('alice') && !browser.isConnected(), 10000);
-    const again = await c.open();
-    assert.equal((await c.call('navigate', { session: again, url: `${base}/` })).json().title, 'Allowed');
-    assert.notEqual(svc.manager.sessions.get(again).browser, browser);
+    await until(() => !fs.existsSync(sa.tmpDir), 15000); // its browser is gone, and its profile with it
+    assert.equal((await c.call('navigate', { session: b, url: `${base}/` })).json().title, 'Allowed');
   } finally { await c.close(); }
 });
 

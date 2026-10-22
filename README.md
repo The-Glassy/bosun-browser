@@ -473,15 +473,16 @@ Entries are separated by `;` (or newlines), hosts within an entry by `,`. A host
 ### How it is enforced
 
 A tenant that is named gets **its own forward proxy inside the service** (`src/proxy.mjs`, on loopback, with a
-random password of its own) **and a browser of its own**, launched with that proxy as its only way out
+random password of its own), and **each of its sessions runs in a browser of its own** (a temporary profile,
+removed with the session), launched with that proxy as its only way out
 (`--proxy-bypass-list=<-loopback>`, so not even loopback is exempt; QUIC off and WebRTC's non-proxied UDP off, so
-nothing can go around it; Chromium does not fall back to a direct connection when a proxy refuses). A persistent
-Chromium profile (profiles, `patchright`, meetings) ignores the WebRTC flag, so the profile also gets the
-`webrtc.ip_handling_policy` preference before every proxied launch (and loses it again on an unproxied one).
+nothing can go around it; Chromium does not fall back to a direct connection when a proxy refuses). Full Chromium
+(headful, `patchright`) ignores the WebRTC flag, so the browser's profile also gets the `webrtc.ip_handling_policy`
+preference before every proxied launch (a persistent profile loses it again on an unproxied launch, if Bosun set
+it).
 `camoufox` gets the same as Firefox preferences: loopback through the proxy too
-(`network.proxy.allow_hijacking_localhost`), WebRTC through the proxy only, no HTTP/3, no DNS prefetching. The
-tenant's own browser is closed when its last session ends and relaunched by the next one. Those settings
-belong to that browser alone — tenants without an allowlist share a browser launched exactly the way upstream
+(`network.proxy.allow_hijacking_localhost`), WebRTC through the proxy only, no HTTP/3, no DNS prefetching. Those
+settings belong to that browser alone — tenants without an allowlist share a browser launched exactly the way upstream
 launches it, so one tenant's allowlist never changes another tenant's networking. Every
 connection the browser wants — a navigation, each hop of a redirect, a subresource, XHR, a WebSocket from the page
 **or from a worker**, a service-worker fetch, a prefetch — arrives at the proxy as a request or a `CONNECT` and is

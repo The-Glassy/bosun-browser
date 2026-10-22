@@ -114,7 +114,8 @@ const hostOs = () => ({ darwin: 'macos', win32: 'windows' })[process.platform] |
 
 // Each engine: { name, family, cdp, shared, tracker, load(), check(bt, cfg), open(bt, {cfg, dir, locale, timezone,
 // shared, media}) -> {ctx, browser?} }. media ({args, env}, meetings only, Chromium family): extra browser flags and the
-// environment of a browser process of its own (its audio server). shared: ephemeral sessions are contexts of a shared browser (manager.getBrowser: one per proxied tenant, one for the rest);
+// environment of a browser process of its own (its audio server). proxy: the tenant's forward proxy (host allowlist),
+// or null. shared: ephemeral sessions of tenants without a proxy are contexts of one shared browser (manager.getBrowser);
 // every other session is a persistent context in a directory Bosun owns (a profile or a temp dir), so its browser
 // processes can be found by that directory. tracker: how the password tracker gets into Bosun's evaluation world
 // ('init' script, or 'navigate': evaluate after every frame navigation). check: throws if the browser binary is absent.
@@ -126,8 +127,7 @@ function definitions(importer) {
       async load() { return (await importer('playwright')).chromium; },
       // Headless runs use Playwright's separate headless shell, whose path the API doesn't expose: checked at launch.
       async check(bt, cfg) { if (!cfg.headless) exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
-      // proxy: the tenant's forward proxy, or null. A browser launched with one serves only that tenant.
-      launchShared: (bt, cfg, proxy = null) => bt.launch({ headless: cfg.headless, args: chromiumArgs(proxy), chromiumSandbox: cfg.chromiumSandbox, ...(proxy ? { proxy } : {}) }),
+      launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: cfg.chromiumSandbox }),
       async open(bt, { cfg, dir, locale, timezone, shared, media, proxy }) {
         const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}) };
         if (dir) applyWebrtcPolicy(dir, !!proxy);
@@ -197,13 +197,15 @@ export function createEngines({ importer = defaultImporter, overrides = {} } = {
       const bt = await load(name);
       try { await get(name).check?.(bt, cfg); } catch (e) { throw explain(name, e); }
     },
-    // Opens a context. Ephemeral sessions of non-shared engines get a private temp profile (tmpDir, removed on close).
+    // Opens a context. Ephemeral sessions of non-shared engines, of meetings and of proxied tenants get a private temp
+    // profile (tmpDir, removed on close): a proxied tenant's browser needs its own launch flags and profile
+    // preferences (applyWebrtcPolicy: full Chromium ignores the WebRTC flag), so it never shares a browser.
     async open(name, { cfg, profileDir, locale, timezone, shared, media, proxy = null }) {
       const def = get(name);
       if (media && def.family !== 'chromium') throw new EngineUnavailableError(`meetings need a Chromium engine (chromium or patchright), not ${name}`);
       const bt = await load(name);
       let dir = profileDir, tmpDir = null;
-      if (!dir && (!def.shared || media)) { // media: a browser process of its own
+      if (!dir && (!def.shared || media || proxy)) { // media, proxy: a browser process of its own
         tmpDir = dir = path.join(cfg.dataDir, 'tmp', `${name}-${crypto.randomBytes(6).toString('hex')}`);
         fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       }

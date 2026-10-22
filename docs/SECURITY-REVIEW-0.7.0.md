@@ -40,7 +40,7 @@ an important guarantee or depends entirely on the deployment to be safe. **LOW**
 | H3 | HIGH | Chromium runs with `--no-sandbox`: a renderer compromise lands on the service user | fixed: `chromiumSandbox: true`, `CHROMIUM_SANDBOX=0` to opt out loudly, startup preflight |
 | M1 | MEDIUM | The live-view link is a bearer token for the whole handoff, retakeable after 5 s of viewer silence | accepted: live view on loopback behind a private-network proxy |
 | M2 | MEDIUM | Masking covers the page dump, not the URL and title returned with it | documented |
-| M3 | MEDIUM | One shared Chromium browser process serves every tenant; the global session cap is shared | narrowed: a tenant with an allowlist gets its own browser process; the rest still share one, caps still global |
+| M3 | MEDIUM | One shared Chromium browser process serves every tenant; the global session cap is shared | narrowed: each session of a tenant with an allowlist gets its own browser process; the rest still share one, caps still global |
 | M4 | MEDIUM | Service secrets are inherited by every browser child process | deploy guidance: own user, own `EnvironmentFile` |
 | M5 | MEDIUM | A page's downloads are written to disk with no budget at all | fixed: `DOWNLOADS=0` by default, per-session and service-wide byte budgets |
 | L1 | LOW | Legacy `?token=` query parameter still accepted | deploy guidance: header only |
@@ -74,8 +74,8 @@ position, exfiltration of what it reads via a following request.
 `http(s)`-only check explicitly does not replace that boundary.
 
 **In 0.8.0:** `BROWSER_TENANT_ALLOW` gives a tenant a host allowlist, and the tenant's browser reaches the
-network **only through a forward proxy the service runs for that tenant** (`src/proxy.mjs`). That tenant also gets
-a **browser instance of its own**, launched with that proxy (`--proxy-bypass-list=<-loopback>`, QUIC off, WebRTC's
+network **only through a forward proxy the service runs for that tenant** (`src/proxy.mjs`). Each of that tenant's
+sessions also gets a **browser instance of its own**, launched with that proxy (`--proxy-bypass-list=<-loopback>`, QUIC off, WebRTC's
 non-proxied UDP off, and Chromium does not fall back to a direct connection when a proxy refuses). Those are
 browser-wide flags, so they stay in that browser: tenants without an allowlist share a browser launched the way
 0.7.0 launches it, and configuring one tenant's allowlist does not change another tenant's transports
@@ -257,9 +257,9 @@ others (keepalive leaves one slot free for agents, `src/keepalive.mjs:346-349`, 
 The README says hard isolation means one process and data dir per tenant (`README.md:410-411`). Accepted for one
 team; set `MAX_SESSIONS_PER_TENANT` below `MAX_SESSIONS` when more than one tenant shares a service.
 
-**In 0.8.0, partly narrowed as a side effect of H1:** a tenant with a host allowlist runs in a browser process
-of its own (it has to, because the flags that keep it inside its proxy are browser-wide), so such a tenant no
-longer shares a process with anyone. Tenants without an allowlist still share one browser, and the session caps are
+**In 0.8.0, partly narrowed as a side effect of H1:** each session of a tenant with a host allowlist runs in a
+browser process of its own (it has to, because the flags and profile preferences that keep it inside its proxy are
+browser-wide), so such a tenant no longer shares a process with anyone. Tenants without an allowlist still share one browser, and the session caps are
 still global.
 
 ## M4 — MEDIUM: service secrets are inherited by every child process
@@ -426,8 +426,9 @@ own directory.
    unless `network.proxy.allow_hijacking_localhost` is set), so a proxied Firefox now gets that preference, WebRTC
    through the proxy only, no HTTP/3 and no DNS prefetching. A persistent Chromium profile (profiles, `patchright`,
    meetings) ignores `--force-webrtc-ip-handling-policy`, so the profile also gets the `webrtc.ip_handling_policy`
-   preference before a proxied launch. A proxied tenant's own browser is closed with its last session. The
-   allowlist suites run on all three engines.
+   preference before a proxied launch — and so does full Chromium in general (headful), whose shared browser had no
+   profile to carry it: each session of a proxied tenant now runs in a browser of its own on a temporary profile.
+   The allowlist suites run on all three engines, and headful under Xvfb.
 
 Residual risk after those changes, in order:
 
@@ -438,9 +439,9 @@ Residual risk after those changes, in order:
   allowed can talk to each other under the browser's normal rules — reachability is not mutual trust. Network
   egress policy stays the outer boundary.
 - Plain `http://` is proxied as HTTP/1.1, so no h2c and no QUIC for proxied tenants; `https://` is end-to-end.
-  Every connection of a proxied tenant passes through one extra local hop, and each proxied tenant runs a browser
-  process of its own while it has sessions (that is what keeps its transport flags out of everybody else's browser,
-  and it costs the RAM of one more browser per such tenant).
+  Every connection of a proxied tenant passes through one extra local hop, and each session of a proxied tenant
+  runs a browser process of its own (that is what keeps its transport flags and profile preferences out of
+  everybody else's browser, and it costs the RAM of one browser per such session).
 - **M1** for as long as a handoff link is live; **M2** on a login form that submits with GET; **M3** while several
   tenants share one process (and one browser); **M5**'s transient single-download size if downloads are enabled.
 - **H3** on a host where the operator chooses `CHROMIUM_SANDBOX=0`: then M4's inherited tokens and every tenant's
