@@ -22,7 +22,8 @@ function launch(id, search) {
 // controls in the preview, "Cannot detect your camera"/"microphone"), recordedNotice (a "This meeting is being
 // recorded" dialog once in), bigChallenge (a visible reCAPTCHA in the preview), title (the meeting's topic shown in
 // the call), recipient (the chat starts addressed to this person; "Everyone" is in its menu unless hostOnly),
-// enterNewline (Enter adds a line break; the Send button sends), askPasscode (the preview asks for the passcode even
+// enterNewline (Enter adds a line break; the Send button sends), hideRecipient (no recipient control shown: messages
+// go to `recipient` anyway, marked "(Privately)"), askPasscode (the preview asks for the passcode even
 // though the link carried one).
 function webClient(id, r) {
   return `<!doctype html><meta charset="utf-8"><title>Zoom Meeting</title>
@@ -39,7 +40,7 @@ function webClient(id, r) {
 ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10"><p>We use cookies.</p>
   <button id="onetrust-accept-btn-handler">Accept Cookies</button></div>` : ''}
 <div id="waiting" hidden><h2>Please wait, the meeting host will let you in soon.</h2><button>Leave</button></div>
-<div id="notice" hidden><p id="noticeText"></p></div>
+<div id="notice" role="dialog" hidden><p id="noticeText"></p><button>OK</button></div>
 <div id="call" hidden>
   ${r.title ? `<div class="meeting-info-container__topic">${esc(r.title)}</div>` : ''}
   <div id="tiles"></div>
@@ -56,7 +57,7 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
   </footer>
   <aside id="panel" class="chat-container" hidden>
     <div id="msgs" class="chat-container__chat-list"></div>
-    <div class="chat-receiver-list"><button id="to" class="chat-receiver-list__receiver">${esc(r.recipient || 'Everyone')}</button>
+    <div class="chat-receiver-list"${r.hideRecipient ? ' hidden' : ''}><button id="to" class="chat-receiver-list__receiver">${esc(r.recipient || 'Everyone')}</button>
       <div role="menu" id="toMenu" hidden>${r.hostOnly ? '' : '<div role="menuitem" tabindex="0" id="toAll">Everyone</div>'}<div role="menuitem" tabindex="0">Host and co-hosts</div></div></div>
     <div id="box" class="tiptap ProseMirror" contenteditable="true" aria-label="Type message here ..."></div>
     <button id="send" aria-label="send">Send</button>
@@ -123,6 +124,7 @@ async function poll() {
       d.id = 'chat-message-content-' + m.id;
       d.textContent = m.text;
       item.append(d);
+      if (m.to && m.to !== 'Everyone') { const p = document.createElement('span'); p.textContent = '(Privately)'; item.append(p); }
       $('msgs').append(item);
     }
     if (R.tone && audio && !toned) { toned = true; const c = new AudioContext(); const o = c.createOscillator(); o.frequency.value = 440; o.connect(c.destination); o.start(); }

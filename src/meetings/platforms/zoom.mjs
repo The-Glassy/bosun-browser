@@ -8,7 +8,7 @@
 // and labels are also matched in German and Ukrainian (some Russian). These markers were written from Zoom's web
 // client as documented and seen in screenshots, and tested against a local stand-in (test/fakezoom.mjs), not yet
 // against live Zoom: a run against real Zoom that fails here is fixed here.
-import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, DIALOGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, DIALOGS, HEADINGS } from './common.mjs';
 
 const TEXT = {
   // The waiting room, or a meeting the host has not started yet (Zoom lets you in when it starts).
@@ -60,7 +60,10 @@ const NAME_FIELD = 'input#input-for-name, input[aria-label="Your Name" i], input
 const PASSCODE_FIELD = 'input#input-for-pwd, input[aria-label*="passcode" i], input[placeholder*="passcode" i], input[aria-label*="kenncode" i], input[placeholder*="kenncode" i]';
 // The chat's recipient ("To: Everyone" / a person / "Host and co-hosts") and its Send button.
 const CHAT_RECIPIENT = '[class*="receiver-list__receiver"], [class*="chat-receiver"] button, [class*="chat-to"] button, button[aria-label^="send to" i], button[aria-label^="chat with" i]';
-const EVERYONE = any('everyone', 'alle(?:n)?\\b', 'jeder', 'всі(?:х)?\\b', 'усі(?:х)?\\b', 'все(?:х|м)?\\b');
+// Zoom's own label for the public recipient, exactly (a participant named "Everyone Else" is not it).
+const EVERYONE = /^(?:to:?\s*)?(?:everyone|everyone in (?:the )?meeting|alle|alle im meeting|jeder|всі|усі|всім|усім|всі учасники|все|всем|все участники)$/i;
+// How Zoom marks a message that went to one person only.
+const PRIVATELY = any('\\(privately\\)', 'direct message', '\\(privat\\)', 'direktnachricht', 'приватно', 'особисто', 'лично');
 const SEND = any('^send$', '^send message$', '^senden$', '^nachricht senden$', '^надіслати$', '^отправить$');
 const CHAT_INPUT = '.chat-box__chat-textarea, textarea[class*="chat"], [contenteditable="true"][class*="chat"], .tiptap[contenteditable="true"], [contenteditable="true"][data-placeholder*="message" i], textarea[placeholder*="message" i]';
 // One chat message's text (innermost match wins), and the item it belongs to with the sender's name.
@@ -194,7 +197,7 @@ export const zoom = {
       if (live) { await live.click({ timeout: 3000 }).catch(() => {}); break; }
       if (await visible(button(page, LABEL.micOn))) break; // audio connected, muted
       const comp = await firstVisible(button(page, LABEL.joinAudio));
-      if (comp) { await comp.click({ timeout: 3000 }).catch(() => {}); continue; }
+      if (comp) await comp.click({ timeout: 3000 }).catch(() => {});
       else { const menu = await firstVisible(button(page, LABEL.audioMenu)); if (menu) await menu.click({ timeout: 3000 }).catch(() => {}); }
       if (Date.now() > until) throw new Error('could not join computer audio in Zoom (nothing would be heard or recorded); Zoom changed?');
       await page.waitForTimeout(500);
@@ -207,16 +210,17 @@ export const zoom = {
 
   // 'launch' (an app-launch page), 'lobby' (the web client's preview), 'waiting', 'admitted', 'removed', 'ended',
   // 'invalid', 'sign-in', 'captcha' or 'unknown'.
-  async state(page) {
+  // admitted: the manager knows Bosun got in. From then on only Zoom's dialogs (and, with the toolbar faded out,
+  // headings) can say the meeting ended or Bosun was removed: captions and the meeting title ("Waiting room
+  // redesign") are participants' words. Before that, the whole page counts.
+  async state(page, { admitted = false } = {}) {
     try { if (/\/(?:postattendee|wc\/leave)\b/.test(new URL(page.url()).pathname)) return 'ended'; } catch {}
-    // In the call (the toolbar's participants or chat button; not "Leave" alone, the waiting room has one too), only
-    // Zoom's dialogs can say the meeting ended or Bosun was removed: captions and the meeting title ("Waiting room
-    // redesign") are participants' words. Before that, the whole page counts.
+    // In the call: the toolbar's participants or chat button (not "Leave" alone: the waiting room has one too).
     const inCall = await firstVisible(button(page, LABEL.participants)) || await firstVisible(button(page, LABEL.chat));
-    const t = await pageText(page, inCall ? MODALS : null).catch(() => '');
+    const t = await pageText(page, inCall ? MODALS : admitted ? `${MODALS}, ${HEADINGS}` : null).catch(() => '');
     if (TEXT.removed.test(t)) return 'removed';
     if (TEXT.ended.test(t)) return 'ended';
-    if (inCall) return 'admitted';
+    if (inCall || admitted) return 'admitted';
     if (TEXT.invalid.test(t)) return 'invalid';
     if (TEXT.signIn.test(t)) return 'sign-in';
     if (await captchaShown(page)) return 'captcha';
@@ -240,32 +244,54 @@ export const zoom = {
   // to Everyone, or the message is not sent. Without a recipient control (chat to everyone only) it is sent.
   async toEveryone(page) {
     const r = await firstVisible(page.locator(CHAT_RECIPIENT));
-    if (!r || EVERYONE.test(norm(await r.innerText().catch(() => '')))) return;
+    if (!r || EVERYONE.test(norm(await r.innerText().catch(() => '')).trim())) return;
     await r.click({ timeout: 3000 }).catch(() => {});
     const opt = await firstVisible(page.getByRole('menuitem', { name: EVERYONE })) || await firstVisible(page.getByRole('option', { name: EVERYONE }))
       || await firstVisible(page.getByRole('menuitemradio', { name: EVERYONE }));
     if (opt) await opt.click({ timeout: 3000 }).catch(() => {});
     await page.waitForTimeout(200);
-    const now = norm(await r.innerText().catch(() => ''));
+    const now = norm(await r.innerText().catch(() => '')).trim();
     if (!EVERYONE.test(now)) throw new Error(`the Zoom chat can't be sent to everyone (recipient: ${now.slice(0, 60) || 'unknown'}); the host may allow chat with the host only`);
   },
 
-  // Enter sends unless the account set Enter to a new line: a message still in the box is sent with the Send button,
-  // and one that stays there is an error (the announcement must have gone out before recording).
+  // Enter sends unless the account set Enter to a new line: a message still in the box is sent with the Send button.
+  // Sent means it shows up in the chat, not marked private; otherwise this throws (the announcement must have gone
+  // out to everyone before recording starts).
   async sendChat(page, text) {
     await this.openChat(page);
     await this.toEveryone(page);
     const box = await chatBox(page);
+    const before = await this.posted(page, text);
     await box.fill(text, { timeout: 5000 });
     await box.press('Enter', { timeout: 5000 });
-    const left = async () => norm(await box.evaluate((e) => ('value' in e ? e.value : e.innerText)).catch(() => '')).trim();
+    const left = async () => norm(await box.evaluate((e) => ('value' in e ? e.value : e.innerText))).trim(); // a read error throws
     for (let i = 0; i < 8 && await left(); i++) await page.waitForTimeout(150);
-    if (!(await left())) return;
-    await box.fill(text, { timeout: 5000 }); // Enter may have added a line break
-    const send = await firstVisible(button(page, SEND));
-    if (send) await send.click({ timeout: 3000 }).catch(() => {});
-    for (let i = 0; i < 8 && await left(); i++) await page.waitForTimeout(150);
-    if (await left()) throw new Error('the Zoom chat message was not sent (still in the chat box)');
+    if (await left()) {
+      await box.fill(text, { timeout: 5000 }); // Enter may have added a line break
+      const send = await firstVisible(button(page, SEND));
+      if (send) await send.click({ timeout: 3000 }).catch(() => {});
+      for (let i = 0; i < 8 && await left(); i++) await page.waitForTimeout(150);
+      if (await left()) throw new Error('the Zoom chat message was not sent (still in the chat box)');
+    }
+    for (let i = 0; i < 40; i++) {
+      const now = await this.posted(page, text);
+      if (now.count > before.count) {
+        if (now.private) throw new Error('the Zoom chat message went to one person only, not to everyone');
+        return;
+      }
+      await page.waitForTimeout(250);
+    }
+    throw new Error('the Zoom chat message did not show up in the chat');
+  },
+
+  // How many chat messages read exactly `text`, and whether the last of them is marked as private.
+  async posted(page, text) {
+    return page.evaluate(({ MSG, ITEM, text }) => {
+      const all = [...document.querySelectorAll(MSG)];
+      const hits = all.filter((el) => !all.some((o) => o !== el && el.contains(o))).filter((el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() === text);
+      const last = hits.at(-1);
+      return { count: hits.length, label: last ? ((last.closest(ITEM) || last.parentElement)?.innerText || '').replace(last.innerText || '', ' ').slice(0, 300) : '' };
+    }, { MSG: CHAT_MESSAGE, ITEM: CHAT_ITEM, text: norm(text).trim() }).then((r) => ({ count: r.count, private: PRIVATELY.test(norm(r.label)) }));
   },
 
   // As meet.mjs: new chat messages are queued in the page under a random, non-enumerable key. Zoom groups consecutive

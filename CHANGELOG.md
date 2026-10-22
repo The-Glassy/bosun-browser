@@ -16,8 +16,8 @@
     toolbar counter, and leaving when the meeting ends, Bosun is removed, or it is alone for 2 minutes.
   - The announcement goes to everyone: the chat's recipient is switched to Everyone first. If the host allows chat
     with the host only, Bosun leaves without recording. A message still in the chat box after Enter (an account
-    set to "Enter adds a new line") is sent with the Send button, and one that stays there ends the meeting
-    before recording.
+    set to "Enter adds a new line") is sent with the Send button. The announcement has to show up in the chat, not
+    marked private; otherwise the meeting ends before recording.
   - New join outcomes with their own reason and hint: `invalid-meeting` (wrong ID or passcode, or a link without
     `?pwd=`), `sign-in-required`, `captcha`. Removal from the waiting room is `denied`. The link's `pwd` is an
     encrypted token: Bosun never types it into a passcode field.
@@ -44,7 +44,7 @@
   Bosun, between two chat reads, Bosun finished first and kept the recording. It now reads the chat once more and
   an objection still deletes the recording.
 - **Captions or a meeting title could end a meeting.** Once in the call, "the meeting has ended" or "you have been
-  removed" now only counts in the platform's own dialogs. Captions, the meeting title and the rest of the page are
+  removed" now only counts in the platform's own dialogs (and headings, once the call's controls are gone). Captions, the meeting title and the rest of the page are
   participants' words. Before the call, the whole page still counts.
 
 ### Documented

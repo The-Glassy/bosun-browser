@@ -210,7 +210,7 @@ export class Meetings {
       for (;;) {
         await sleep(this.pollMs, signal);
         if (signal.aborted || m.state === 'ended') return;
-        const s = await this.page(m, (p) => platform.state(p));
+        const s = await this.page(m, (p) => platform.state(p, { admitted: false }));
         if (s === 'admitted') break;
         if (s === 'waiting') m.knocked = true;
         // "Can't join" after the waiting room: the request was turned down. Without one: Google turned the guest away.
@@ -256,7 +256,7 @@ export class Meetings {
   }
 
   async tick(m) {
-    const s = await this.page(m, (p) => m.platform.state(p));
+    const s = await this.page(m, (p) => m.platform.state(p, { admitted: true }));
     if (s === 'ended' || s === 'removed') {
       // An objection already in the chat counts before the recording is kept: the page usually still holds it.
       await this.pollChat(m).catch(() => {});

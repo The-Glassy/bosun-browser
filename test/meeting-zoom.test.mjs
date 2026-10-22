@@ -274,3 +274,22 @@ test('Zoom asking for the passcode although the link has one: not typed in (pwd 
     await c.close();
   });
 });
+
+test('Zoom announcement to one person only: a recipient named "Everyone Else" is not Everyone, and a message marked private stops the meeting before recording', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    await zoomProfile(c);
+    for (const [opts, error] of [
+      [{ recipient: 'Everyone Else', hostOnly: true }, /can't be sent to everyone \(recipient: Everyone Else\)/],
+      [{ recipient: 'Guest Two', hideRecipient: true }, /went to one person only/],
+    ]) {
+      const { url } = fake.newRoom({ signedIn: true, open: true, ...opts });
+      const id = (await c.call('meeting_join', { url, profile: 'zoom' })).json().meeting_id;
+      await until(async () => (await status(c, id)).state === 'ended', 20_000);
+      assert.match((await status(c, id)).error, error);
+      await until(() => svc.manager.used === 0, 10_000); // the profile is free again
+    }
+    assert.equal(audio.recorders.length, 0);
+    await c.close();
+  });
+});

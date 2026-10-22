@@ -27,6 +27,8 @@ export function pageText(page, skip, roots = null) {
 // Where a site puts its own status messages over a running call (meeting ended, removed): dialogs only. Captions,
 // the meeting title and toasts are outside, so what participants say or name a meeting can't end it.
 export const DIALOGS = '[role="dialog"], [role="alertdialog"]';
+// With the call's toolbar hidden (it fades out) the end page may have replaced the call: headings count too.
+export const HEADINGS = 'h1, h2, h3, [role="heading"]';
 
 export const visible = (l) => l.first().isVisible().catch(() => false);
 export const button = (page, name) => page.getByRole('button', { name });

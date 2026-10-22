@@ -330,8 +330,8 @@ meeting_recording_delete({ "meeting_id": "…" })
      challenge before joining). Being removed from Zoom's waiting room counts as `denied`.
 4. Once admitted (Zoom: computer audio joined first, since without it nothing is heard, then microphone and
    camera checked off again), Bosun opens the chat and **posts the announcement first**. On Zoom the chat is set to
-   Everyone first. If Zoom allows chat with the host only, or the message stays unsent, Bosun leaves without
-   recording. Only then does recording start. The
+   Everyone first, and the announcement has to show up in the chat, not marked as private. If Zoom allows chat with
+   the host only, or the message doesn't show up, Bosun leaves without recording. Only then does recording start. The
    default text is in English and German: *"Hi, I'm Glassy, an AI notetaker. I'm recording audio for notes. If you'd
    rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the
    recording."* With `MEETING_OWNER` set it says whose notetaker it is.
@@ -410,6 +410,11 @@ Meetings need a **headful** browser (headless Chromium plays no audio), so run t
   built from how the real pages look. The signed-in Meet lobby (dialogs, "Getting ready...", "Join here too") and
   all of Zoom are new in 0.9.0 and have not had a live run yet. The Zoom chat watch depends most on Zoom's markup
   and is the part most likely to need a fix after the first live meeting.
+- **Zoom may connect computer audio with the microphone on.** Bosun mutes it as soon as the control appears. The
+  browser's microphone is a silent source, so only silence can go out in that moment, and the server has no camera.
+- **An objection in the last second before Zoom leaves the page can be missed.** Bosun reads the chat once more
+  when a meeting ends, but if Zoom has already navigated to its end page, messages it hadn't read yet are gone.
+  The recording is then kept; the agent can still delete it with `meeting_recording_delete`.
 - **One mixed audio track.** There is no speaker separation and no live transcript.
 - **Consent is the operator's responsibility.** The announcement and the opt-out are a courtesy, not a legal basis.
   Check what applies where the participants are; some places require everyone's explicit consent before recording.

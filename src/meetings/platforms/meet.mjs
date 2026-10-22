@@ -21,7 +21,7 @@
 // Ukrainian and Russian, so a UI that comes up in another of those languages works too. Markers are labels, roles
 // and texts a person sees; a run against real Meet that fails here is fixed here.
 
-import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, DIALOGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, DIALOGS, HEADINGS } from './common.mjs';
 
 const TEXT = {
   waiting: any("asking to be let in", "you'll join the call when someone lets you in", 'waiting for the host', 'please wait until a meeting host',
@@ -206,17 +206,17 @@ export const meet = {
     return pick(LABEL.switchHere);
   },
 
-  async state(page) {
-    // In the call (participant tiles or the in-call chat button; the lobby has neither), only Meet's dialogs can say
-    // it ended or Bosun was removed: captions and the meeting title are participants' words. Outside the call the
-    // whole page counts (Meet replaces the call with its end or refusal page).
+  // admitted: the manager knows Bosun got in. From then on only Meet's dialogs (and, with the call's controls gone,
+  // headings: Meet's end page) can say the call ended or Bosun was removed; captions and the meeting title are
+  // participants' words. Before that the whole page counts (lobby, refusal, waiting).
+  async state(page, { admitted = false } = {}) {
     const inCall = await firstVisible(page.locator('[data-participant-id]')) || await visible(button(page, LABEL.chat));
-    const t = await pageText(page, inCall ? DIALOGS : null).catch(() => '');
+    const t = await pageText(page, inCall ? DIALOGS : admitted ? `${DIALOGS}, ${HEADINGS}` : null).catch(() => '');
     if (TEXT.denied.test(t)) return 'denied';
     if (TEXT.cantJoin.test(t)) return 'refused';
     if (TEXT.removed.test(t)) return 'removed';
     if (TEXT.ended.test(t)) return 'ended';
-    if (inCall) return 'admitted';
+    if (inCall || admitted) return 'admitted';
     if (TEXT.waiting.test(t)) return 'waiting';
     if (await joinCandidate(page)) return 'lobby';
     return 'unknown';
