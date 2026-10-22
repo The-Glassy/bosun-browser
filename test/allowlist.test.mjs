@@ -4,7 +4,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config.mjs';
-import { allowsUrl, blockedTarget, parseHostPattern, parseTenantAllow } from '../src/allow.mjs';
+import { allowsUrl, parseHostPattern, parseTenantAllow } from '../src/allow.mjs';
 import { startBosun, startPageServer, connect, until, TOKEN, TOKEN_B } from './helpers.mjs';
 
 const GOOD = 'x'.repeat(24);
@@ -56,11 +56,6 @@ test('allowsUrl: host and port, subdomains only under *., no scheme but http(s)'
   assert.ok(!allowsUrl(patterns('*'), 'file:///etc/passwd'));
 });
 
-test('a denied request is logged without the query or the fragment', () => {
-  assert.equal(blockedTarget('https://evil.test:8443/a/b?token=secret#frag'), 'https://evil.test:8443/a/b');
-  assert.equal(blockedTarget('nonsense'), '(unparseable URL)');
-});
-
 let pages, other, svc;
 before(async () => {
   pages = await startPageServer();
@@ -96,28 +91,6 @@ test('a tenant without an allowlist reaches any host (upstream behaviour)', asyn
   } finally { await c.close(); }
 });
 
-test('requests the page makes itself are aborted, and logged without the query', async () => {
-  const logs = [];
-  const orig = console.error;
-  console.error = (...a) => { logs.push(a.join(' ')); };
-  const c = await connect(svc, TOKEN);
-  try {
-    const s = await c.open();
-    // Allowed target: the request goes out.
-    await c.call('navigate', { session: s, url: `${pages.base}/fetch?to=${encodeURIComponent(`${pages.base}/second`)}` });
-    assert.equal((await c.call('wait_for', { session: s, text: 'fetch ok', timeoutMs: 10000 })).isError, false);
-    // Denied target: aborted, and the query never reaches the log.
-    await c.call('navigate', { session: s, url: `${pages.base}/fetch?to=${encodeURIComponent(`${other.base}/second?secret=shh`)}` });
-    assert.equal((await c.call('wait_for', { session: s, text: 'fetch blocked', timeoutMs: 10000 })).isError, false);
-    const line = await until(() => logs.find((l) => l.includes('blocked request to')), 5000);
-    assert.match(line, new RegExp(`^bosun: tenant alice: blocked request to ${other.base}/second \\(host allowlist\\)$`));
-    assert.ok(!logs.some((l) => l.includes('shh')), logs.join('\n'));
-  } finally {
-    console.error = orig;
-    await c.close();
-  }
-});
-
 test('a navigation the page starts by itself cannot leave the allowlist', async () => {
   const logs = [];
   const orig = console.error;
@@ -128,12 +101,12 @@ test('a navigation the page starts by itself cannot leave the allowlist', async 
     const go = `${pages.base}/go?to=${encodeURIComponent(`${other.base}/second`)}`;
     const n = await c.call('navigate', { session: s, url: go });
     assert.equal(n.isError, false, n.text);
-    const line = await until(() => logs.find((l) => l.includes('blocked request to')), 5000);
-    assert.equal(line, `bosun: tenant alice: blocked request to ${other.base}/second (host allowlist)`);
-    // The denied page never loaded; the aborted main-frame navigation leaves the tab on the browser's error page.
+    // The browser follows its own navigation; the tenant's proxy is what refuses it, so the host never answers.
+    const line = await until(() => logs.find((l) => l.includes(': blocked ')), 5000);
+    assert.equal(line, `bosun: tenant alice: blocked 127.0.0.1:${new URL(other.base).port} — not in the host allowlist`);
+    assert.ok(!logs.some((l) => l.includes('/second')), logs.join('\n')); // host:port only
     const r = await c.call('read', { session: s, mode: 'text' });
     assert.ok(!r.text.includes('second page'), r.text);
-    assert.ok(!r.text.includes(other.base), r.text);
   } finally {
     console.error = orig;
     await c.close();

@@ -142,9 +142,10 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       const r = await s.page.goto(url, { waitUntil: a.wait || 'domcontentloaded', timeout: 45000 });
       await s.page.waitForTimeout(1200);
       const w = noteWall(s, await wall(s.page));
-      // A redirect chain the host allowlist walked is followed by the service, so the tab keeps the URL asked for.
-      const red = s.redirects?.last?.from === url ? s.redirects.last.to : null;
-      return ok({ status: r?.status(), ...(await pageInfo(s.page)), ...(red ? { redirected_to: red } : {}), ...(w ? { blocked: w, hint: 'call request_human to let a person solve it' } : {}) });
+      const info = await pageInfo(s.page);
+      // The browser follows redirects itself; one that left the allowlist got the tenant proxy's refusal instead.
+      const refused = r?.status() === 403 && !manager.isAllowed(tenant, info.url);
+      return ok({ status: r?.status(), ...info, ...(refused ? { refused: 'host allowlist' } : {}), ...(w ? { blocked: w, hint: 'call request_human to let a person solve it' } : {}) });
     });
   });
 

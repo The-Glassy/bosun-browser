@@ -7,7 +7,8 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 > and [CHANGELOG.md](CHANGELOG.md).
 
 > **This is a fork.** It adds a [per-tenant host allowlist](#per-tenant-host-allowlist)
-> (`BROWSER_TENANT_ALLOW`), runs Chromium **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), and
+> (`BROWSER_TENANT_ALLOW`), enforced by a forward proxy inside the service that is the browser's only way out, runs
+> Chromium **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), and
 > turns three things off by default: meetings (`FEATURES_MEETINGS=0`), every engine but `chromium`
 > (`FEATURES_ENGINES=chromium`) and downloads (`DOWNLOADS=0`). It also ships a Linux deployment guide
 > ([docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md)). What was reviewed before adopting it, and what is still risky,
@@ -82,7 +83,7 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `BROWSER_TOKENS` | – | more tenants: `alice:<token>,bob:<token>` |
 | `BROWSER_TOKEN_POLICIES` | – (all `full`) | per-tenant policy: `swarm=ephemeral` (see [Read-only tokens for subagents](#read-only-tokens-for-subagents)) |
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
-| `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
+| `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist, enforced by a per-tenant forward proxy: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
 | `FEATURES_MEETINGS` | `0` | `1` = list and wire the meeting tools (this fork: off) |
 | `FEATURES_ENGINES` | `chromium` | engines a session may ask for, comma list; `ENGINE` is always included |
 | `CHROMIUM_SANDBOX` | `1` | `0` = run Chromium without its own sandbox (logged at every start); see [Chromium sandbox](#chromium-sandbox) |
@@ -457,7 +458,7 @@ Check what is actually running, not just the setting: `ps -eo args | grep -- --t
 ## Per-tenant host allowlist
 
 Keep a tenant to the hosts it has business with — so a page that says "now open this other URL" gets nowhere, and
-neither does a redirect, an iframe or a `fetch` the page starts:
+neither does a redirect, an iframe, a `fetch`, a WebSocket or anything a worker starts:
 
 ```sh
 BROWSER_TENANT_ALLOW='ops=*.example.org,example.org,127.0.0.1:4848; swarm=*.example.org'
@@ -472,43 +473,44 @@ Entries are separated by `;` (or newlines), hosts within an entry by `,`. A host
 | `example.org:8443`, `127.0.0.1:4848`, `[::1]:4848` | that host on that port only |
 | `*` | every host (the escape hatch) |
 
-Enforcement, for a tenant that is named:
+### How it is enforced
 
-- `navigate` refuses a URL outside the list, naming the host (never the rest of the URL), and `keepalive_set`
-  refuses such a schedule.
-- Every HTTP(S) request any frame of the tenant's sessions makes is checked — subresources, XHR, iframes, popups,
-  prefetches, service-worker fetches and navigations the page starts itself.
-- **Every redirect hop is checked before it is sent.** Playwright follows redirects without consulting a route
-  handler again, so Bosun walks the chain itself (`route.fetch` with `maxRedirects: 0`) and only hands the final
-  response to the browser. An allowed host answering `302 Location: https://elsewhere/` gets nowhere.
-- **WebSockets** are checked with the same host and port rules (`ws:` defaults to port 80, `wss:` to 443). A denied
-  connection is closed with code 1008 before it reaches any server.
-- Denied requests are logged as `bosun: tenant <t>: blocked request to <scheme>://<host>/<path> (host allowlist)`,
-  without the query, once per target and session. A denied navigation the page started leaves the tab on the
-  browser's error page; the agent can navigate again.
-- `navigate`'s tool description names the allowed hosts, so the agent doesn't have to discover them by trial.
+A tenant that is named gets **its own forward proxy inside the service** (`src/proxy.mjs`, on loopback, with a
+random password of its own), and its browser contexts are launched with that proxy as their only way out
+(`--proxy-bypass-list=<-loopback>`, so not even loopback is exempt; QUIC off and WebRTC's non-proxied UDP off, so
+nothing can go around it; Chromium does not fall back to a direct connection when a proxy refuses). Every
+connection the browser wants — a navigation, each hop of a redirect, a subresource, XHR, a WebSocket from the page
+**or from a worker**, a service-worker fetch, a prefetch — arrives at the proxy as a request or a `CONNECT` and is
+checked against the allowlist before a byte leaves the host:
 
-A tenant that is not named is unrestricted, and nothing is intercepted for it at all.
+- A denied connection is never made. The browser gets `403` from the proxy, so a denied navigation leaves the tab
+  on that URL with the proxy's one-line reason and `navigate` reports `status: 403` and `refused: "host allowlist"`.
+- Denials are logged as `bosun: tenant <t>: blocked <host>:<port> — <reason>`: host and port, never a path or a
+  query. One line per target per tenant (a repeat is counted, not logged again).
+- **DNS is resolved by the proxy, once**, and the connection goes to that address, so the address a decision was
+  made about is the address that gets used — a name cannot change where it points between the check and the
+  connection. A name that resolves into loopback or a private range is only followed if the allowlist names that
+  address as well, so `127.0.0.1:4848` has to be in the list for a name that resolves there.
+- **Nothing is intercepted.** The proxy tunnels TLS (`CONNECT`) and streams plain HTTP; it never terminates TLS,
+  rewrites a response or buffers a body. The browser's own rules therefore all still hold: a redirect to another
+  allowed host loads **as that host**, with its own origin, storage and cookies, and the tab shows the URL it
+  really ended up on.
+- `navigate` and `keepalive_set` also check the allowlist up front, so the agent gets a clear refusal instead of a
+  403 page, and `navigate`'s tool description names the hosts it may reach.
 
-What an allowlist costs the tenant that has one — because responses are fetched by the service and handed to the
-browser:
+A tenant that is not named is unrestricted: no proxy, nothing intercepted, exactly upstream behaviour.
 
-- A **streaming** response (server-sent events, an endless long-poll) never reaches the page; it fails when the
-  fetch times out. Plain requests, forms, cookies, redirects and downloads are unaffected.
-- After a redirect the tab keeps the URL the agent asked for. `navigate` reports the real one as `redirected_to`,
-  and an HTML document gets a `<base href>` so its relative URLs still resolve correctly.
-- Chromium treats a response the service fulfilled as coming from no address, so its **Local Network Access**
-  checks stop such a page from opening a WebSocket to a *loopback or private* address even when the allowlist
-  allows it. Pages and WebSocket servers on public hosts are unaffected.
-- A redirect **to another allowed origin** is served under the origin that was asked for, so that content runs with
-  the first origin's cookies and storage. List the hosts a tenant really needs, and prefer exact hosts over `*.`.
-- Response bodies pass through the service's memory, one per in-flight request (compressed responses are handed
-  over intact).
+### What it does not do
 
-Still not covered: a WebSocket opened inside a **dedicated Worker** (Playwright's WebSocket routing does not reach
-worker scopes) and **WebRTC**. Hosts are matched by name, with no address pinning. The network boundary therefore
-still belongs to the firewall — see [Security notes](#security-notes) and
-[docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md).
+- The allowlist is host and port, and a `CONNECT` tunnel is not inspected, so an entry without a port allows a
+  tunnel to **any** port on that host. Prefer `host:port` entries.
+- It is not a URL filter: a path or a query is never looked at (and never logged).
+- Hosts you allow can talk to each other with the browser's normal rules; the allowlist decides reachability, not
+  mutual trust. Keep it to the hosts a tenant needs.
+- Plain `http://` goes through the proxy as HTTP/1.1 (no h2c, no QUIC); `https://` is end-to-end inside the tunnel.
+- A firewall is still the outer boundary: the proxy is a per-tenant rule inside the service, not a replacement for
+  network egress policy (see [Security notes](#security-notes) and
+  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md)).
 
 ## Security notes
 
@@ -523,8 +525,9 @@ still belongs to the firewall — see [Security notes](#security-notes) and
   finished — that revokes the link for good (no replay afterwards). A connected, responsive viewer can't be pushed
   out by a second one.
 - No rate limiting yet beyond the connection, in-flight and session caps.
-- A named tenant can be kept to a list of hosts (see [Per-tenant host allowlist](#per-tenant-host-allowlist)). That
-  narrows what the agent and the page can ask for; it does not replace the egress boundary above.
+- A named tenant can be kept to a list of hosts, enforced by a per-tenant forward proxy that is the browser's only
+  way out (see [Per-tenant host allowlist](#per-tenant-host-allowlist)). That narrows what the agent, the page, its
+  workers and its service workers can reach; it does not replace the egress boundary above.
 - The browser runs with its own sandbox (see [Chromium sandbox](#chromium-sandbox)). Upstream's default, and this
   fork's with `CHROMIUM_SANDBOX=0`, is `--no-sandbox`: then a renderer compromise is directly on the service user,
   which is where the profiles and the service's environment (tokens included) are.

@@ -8,11 +8,13 @@ handoff, URL handling on `navigate`, WebSocket origin checks, resource caps, dep
 page-controlled code where Bosun or the agent can be affected by it, and any call home / telemetry.
 
 **Method.** Read of `src/**`, `bin/**`, `package.json` / `package-lock.json` and the docs; `grep` for outbound
-network use; live probes against headless Chromium (below, under H2, H3 and M5). A second, independent review round
-then attacked this fork's own changes and found three of the conclusions below wrong: it demonstrated that ordinary
-HTTP redirects and WebSockets walked straight past the first version of the host allowlist, that Chromium was
-running with `--no-sandbox` all along, and that engine choice is a much weaker credential boundary than H2 first
-claimed. Those are corrected here (H1, H2, H3) and the code now enforces what the text promises. Not done: fuzzing,
+network use; live probes against headless Chromium (below, under H2, H3 and M5). Two further independent review
+rounds then attacked this fork's own changes, and between them corrected three of the conclusions below and two of
+the mechanisms: the first version of the host allowlist let ordinary HTTP redirects and WebSockets straight past,
+the second broke the browser's origin isolation while fixing that, Chromium had been running with `--no-sandbox`
+all along, and engine choice is a much weaker credential boundary than H2 first claimed. All of it is corrected
+here (H1 — including what the two failed mechanisms were — H2 and H3), and the enforcement now sits at the network
+layer, where it does not have to re-implement anything the browser already does. Not done: fuzzing,
 a review of the Playwright/Chromium/`ws`/`zod` dependencies themselves, no test against a real hostile site, no
 review of `src/meetings/**` beyond the parts that touch the service's security properties (meetings are off in this
 fork).
@@ -32,7 +34,7 @@ an important guarantee or depends entirely on the deployment to be safe. **LOW**
 
 | # | Severity | Finding | Status in this fork |
 |---|---|---|---|
-| H1 | HIGH | `navigate` and page requests may go to any host (SSRF; cloud metadata, private LAN) | mitigated: per-tenant host allowlist (`BROWSER_TENANT_ALLOW`), enforced per redirect hop and on WebSockets |
+| H1 | HIGH | `navigate` and page requests may go to any host (SSRF; cloud metadata, private LAN) | mitigated: per-tenant host allowlist (`BROWSER_TENANT_ALLOW`) enforced by a per-tenant forward proxy — every connection, including redirect hops, worker WebSockets and DNS |
 | H2 | HIGH | A page can defeat credential masking and the post-handoff clearing on engine `chromium` | documented; engine choice stops only the helper tampering — the page must be trusted either way |
 | H3 | HIGH | Chromium runs with `--no-sandbox`: a renderer compromise lands on the service user | fixed: `chromiumSandbox: true`, `CHROMIUM_SANDBOX=0` to opt out loudly, startup preflight |
 | M1 | MEDIUM | The live-view link is a bearer token for the whole handoff, retakeable after 5 s of viewer silence | accepted: live view on loopback behind a private-network proxy |
@@ -70,50 +72,54 @@ position, exfiltration of what it reads via a following request.
 Upstream's position (`README.md:412-414`) is that the deployment must block private ranges on egress; the
 `http(s)`-only check explicitly does not replace that boundary.
 
-**In this fork:** `BROWSER_TENANT_ALLOW` gives a tenant a host allowlist, enforced on `navigate`, on
-`keepalive_set`, and — via Playwright route interception on the session's browser context — on every HTTP(S)
-request any frame of the session makes. Denied requests are aborted (`blockedbyclient`) and logged without the
-URL's query. A tenant with no allowlist keeps upstream behaviour. See `README.md` ›
-[Per-tenant host allowlist](../README.md#per-tenant-host-allowlist) and `docs/DEPLOY-SYSTEMD.md`.
+**In this fork:** `BROWSER_TENANT_ALLOW` gives a tenant a host allowlist, and the tenant's browser reaches the
+network **only through a forward proxy the service runs for that tenant** (`src/proxy.mjs`): its contexts are
+launched with that proxy (`--proxy-bypass-list=<-loopback>`, QUIC off, WebRTC's non-proxied UDP off, and Chromium
+does not fall back to a direct connection when a proxy refuses). Every connection the browser wants arrives there
+as a request or a `CONNECT` and is checked before a byte leaves the host: navigations, **each hop of a redirect**,
+subresources, XHR, WebSockets from a page **and from a worker**, service-worker fetches, prefetches. The proxy
+resolves DNS itself, once, and connects to that address, so the address the decision was made about is the address
+that is used; a name that resolves into loopback or a private range is only followed if the allowlist names that
+address too (DNS rebinding). Denials are answered with `403` and logged as `host:port` and a reason — never a path
+or a query. `navigate` and `keepalive_set` check the list up front as well, so the agent gets a clear refusal. A
+tenant with no allowlist gets no proxy and keeps upstream behaviour. The proxy listens on loopback with a random
+password of its own, so another local process cannot use it as an open proxy into the tenant's hosts.
 
-The first version of that enforcement had two holes, both demonstrated by the second review round and both now
-closed:
+Nothing is intercepted: TLS is tunnelled, plain HTTP is streamed, no response is terminated, rewritten or
+buffered. That is the point of this layer — the browser keeps its own semantics, so a redirect to another allowed
+host loads **as that host** (its own origin, storage and cookies) and the tab shows where it really ended up.
 
-- **Redirects.** `route.continue()` hands the request to the browser, and Playwright's network manager silently
-  continues every *redirect hop* of that request without calling the route handler again (its `_onRequest` has
-  `if (redirectedFrom || …) Fetch.continueRequest(…)`, so a hop never becomes a Route). An allowed host answering
-  `301/302/303/307/308` therefore moved the browser to any host it liked, document or subresource, with no denial
-  logged. The handler now walks the chain itself — `route.fetch({ maxRedirects: 0 })` per hop, each `Location`
-  checked against the allowlist *before* that hop is sent, and only the final response handed to the browser
-  (`src/sessions.mjs`, `installAllowlist`).
-- **WebSockets.** They are not HTTP requests and never reach an HTTP route, so a page could open one anywhere. The
-  context now also routes WebSockets (`ctx.routeWebSocket`), matching `ws:`/`wss:` with the same host and port
-  rules (default ports 80/443); a denied connection is closed with 1008 before it reaches a server and is logged
-  as `ws://host/path`.
+### Two mechanisms that did not work, and why (worth not repeating)
 
-What this costs, for tenants that have an allowlist (all of it in `README.md` › Per-tenant host allowlist too):
+The first two attempts enforced this *inside* the page, with Playwright's request routing, and both were taken
+apart by review:
 
-- Responses are fetched by the service and fulfilled into the browser, so a **streaming** response (server-sent
-  events, a long-poll that never ends) does not reach the page; it fails when the fetch times out.
-- A fulfilled response has no remote address, so Chromium's **Local Network Access** checks treat the document as
-  public: a page may then not open a WebSocket to a *loopback or private* address even when the allowlist allows
-  it (public hosts are unaffected). `test/allowlist-redirects.test.mjs` therefore runs its WebSocket cases with
-  that Chromium check off, so that the allowlist is the only thing deciding.
-- After a redirect the tab keeps the URL the agent asked for; `navigate` reports the real one as `redirected_to`,
-  and an HTML document gets a `<base href>` so its relative URLs still resolve against where it came from.
-- Because the browser only ever sees the request it made, a document that came from **another allowed origin** is
-  served under the origin that was asked for, so it runs with that origin's cookies and storage. Two hosts inside
-  one allowlist are not isolated from each other across a redirect. Keep an allowlist to the hosts the tenant
-  really needs, and prefer exact hosts over `*.`; a wildcard means every host under it can speak for every other
-  across a redirect. Pinned down in `test/allowlist-redirects.test.mjs`.
-- Response bodies pass through the service's heap, one per in-flight request. Compressed responses are handed over
-  intact (regression-tested with gzip and multibyte text).
+1. **`route.continue()`** checks only the first request of a chain: Playwright's network manager continues every
+   redirect hop whose request has a `redirectedFrom` without consulting the handler again, so an allowed host could
+   move the browser anywhere with a `302`. Probed for all five redirect codes.
+2. **Walking the chain with `route.fetch({maxRedirects: 0})` and fulfilling the final response** closed that, and
+   broke something worse: a response fetched from another origin was fulfilled **under the URL that was asked
+   for**, so its scripts ran with the first origin's authority. The review's probe read origin A's `localStorage`
+   from a page that came from origin B (`stolen=A-only-probe-secret`), which is a storage-confidentiality
+   regression, not a trade-off — an allowlist grants reachability, never mutual trust between an app, its CDN and
+   its identity provider. The same mechanism also left every fetched response buffered in the service
+   (`APIRequestContext` keeps the bodies until disposal: 8 MiB retained after eight 1 MiB fetches) and still did
+   not cover a WebSocket opened inside a dedicated `Worker`, because Playwright's WebSocket routing lives in the
+   page.
 
-Residual, with evidence: a WebSocket opened **inside a dedicated Worker** is not routed by Playwright (probed:
-the page-side override does not reach worker scopes, the connection reached the test server). Service-worker
-`fetch` *is* covered on the pinned Playwright/Chromium (probed: blocked and logged), but that is Playwright's
-behaviour, not a guarantee. WebRTC was not tested. Hostnames are matched as names, with no address pinning, so
-network-level egress policy stays necessary — as upstream says.
+Both are reverted. The lesson is the layer, not the patch: an allowlist is a network rule, and anything that
+enforces it by answering *for* the network ends up re-implementing the browser's own guarantees badly.
+`test/allowlist-proxy.test.mjs` keeps the adversarial cases as regression tests — every redirect code, a page
+WebSocket, a **Blob-worker** WebSocket, a subresource redirect, a cross-origin redirect that must load as its own
+origin, and a name that resolves into loopback.
+
+What the proxy costs, and what it still does not do:
+
+- The allowlist is host and port, and a `CONNECT` tunnel is not inspected, so an entry without a port permits a
+  tunnel to any port on that host; prefer `host:port`. Paths and queries are never examined (nor logged).
+- Plain `http://` is proxied as HTTP/1.1 (no h2c, no QUIC); `https://` is end-to-end inside the tunnel.
+- Hosts that are allowed can still talk to each other under the browser's normal rules. Reachability is not trust.
+- The proxy is per tenant inside one service; network egress policy remains the outer boundary, as upstream says.
 
 ## H2 — HIGH: on engine `chromium`, the page can defeat credential masking and the post-handoff clearing
 
@@ -389,10 +395,12 @@ own directory.
 
 ## What this fork changed in response
 
-1. **H1** — `BROWSER_TENANT_ALLOW=<tenant>=<host>,<host>;…`: a per-tenant host allowlist enforced on `navigate`, on
-   `keepalive_set`, on every HTTP(S) request any frame of the session makes **including each redirect hop before it
-   is sent**, and on WebSocket connections (`ws:`/`wss:`, same host and port rules). Denied requests are aborted
-   and logged without the query. A tenant without an allowlist keeps upstream behaviour.
+1. **H1** — `BROWSER_TENANT_ALLOW=<tenant>=<host>,<host>;…`: a per-tenant host allowlist, enforced by a forward
+   proxy the service runs for that tenant and launches its browser contexts with, so it is the browser's only way
+   out. Checked there: navigations, every redirect hop, subresources, XHR, WebSockets from pages and from workers,
+   service-worker fetches, prefetches — before anything is sent, with DNS resolved by the proxy and pinned to the
+   address the decision was made about. Nothing is intercepted, so the browser's origins, cookies and CORS are
+   untouched. `navigate` and `keepalive_set` also refuse up front. A tenant without an allowlist gets no proxy.
 2. **H3** — `chromiumSandbox: true` for both Chromium engines, `CHROMIUM_SANDBOX` on by default, a startup
    preflight that refuses to run when the sandbox cannot be set up, and a warning at every start if it is switched
    off.
@@ -410,14 +418,17 @@ Residual risk after those changes, in order:
 
 - **H2**, and more generally: a page that handles a credential can hand it to the agent, on any engine. Only trust
   decides this.
-- The allowlist's remaining channels: a WebSocket opened inside a **dedicated Worker** (not routed by Playwright),
-  **WebRTC** (not tested), and name-based matching with no address pinning. Network egress policy stays part of the
-  deployment.
-- What proxying costs an allowlisted tenant: **streaming responses** (server-sent events) do not reach the page,
-  Chromium's **Local Network Access** checks see a fulfilled document as public (so no WebSocket from such a page
-  to a loopback or private address), the tab keeps the pre-redirect URL (`navigate` reports `redirected_to`, HTML
-  gets a `<base href>`), and response bodies pass through the service's heap.
+- What the allowlist is: host and port. A `CONNECT` tunnel is not inspected, so an entry without a port permits a
+  tunnel to any port on that host (prefer `host:port`); paths and queries are never examined; and hosts that are
+  allowed can talk to each other under the browser's normal rules — reachability is not mutual trust. Network
+  egress policy stays the outer boundary.
+- Plain `http://` is proxied as HTTP/1.1, so no h2c and no QUIC for proxied tenants; `https://` is end-to-end.
+  Every connection of a proxied tenant passes through one extra local hop.
 - **M1** for as long as a handoff link is live; **M2** on a login form that submits with GET; **M3** while several
-  tenants share one process; **M5**'s transient single-download size if downloads are enabled.
+  tenants share one process (and one browser); **M5**'s transient single-download size if downloads are enabled.
 - **H3** on a host where the operator chooses `CHROMIUM_SANDBOX=0`: then M4's inherited tokens and every tenant's
   profile are one renderer bug away, and only the systemd user boundary is left.
+- Verified by probe but worth re-checking after a Playwright or Chromium upgrade, because they are properties of
+  the browser rather than of this code: that a context without a proxy still goes direct, that
+  `--proxy-bypass-list=<-loopback>` keeps loopback inside the proxy, and that no traffic (QUIC, WebRTC, a worker's
+  WebSocket) finds a way around a configured proxy. `test/allowlist-proxy.test.mjs` is where those live.

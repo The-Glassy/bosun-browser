@@ -8,6 +8,14 @@ import crypto from 'crypto';
 
 export const ENGINE_NAMES = ['chromium', 'patchright', 'camoufox'];
 export const CHROMIUM_ARGS = ['--disable-blink-features=AutomationControlled'];
+// Extra flags while any tenant is proxied (fork): QUIC would not go through an HTTP proxy, and WebRTC must not open
+// UDP of its own. Chromium does not fall back to a direct connection when a configured proxy refuses or fails.
+export const PROXY_ARGS = ['--disable-quic', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'];
+// A tenant with a host allowlist reaches the network only through its proxy (src/proxy.mjs). Chromium needs the
+// browser itself to be launched with a proxy before a context may set its own, and "per-context" is Playwright's
+// placeholder for exactly that; contexts without one still go direct.
+const proxied = (cfg) => !!cfg.tenantAllow?.size;
+const chromiumArgs = (cfg, extra = []) => [...CHROMIUM_ARGS, ...(proxied(cfg) ? PROXY_ARGS : []), ...extra];
 
 const INSTALL = {
   chromium: 'npx playwright install chromium',
@@ -75,10 +83,10 @@ function definitions(importer) {
       async load() { return (await importer('playwright')).chromium; },
       // Headless runs use Playwright's separate headless shell, whose path the API doesn't expose: checked at launch.
       async check(bt, cfg) { if (!cfg.headless) exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
-      launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: cfg.chromiumSandbox }),
-      async open(bt, { cfg, dir, locale, timezone, shared, media }) {
-        const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: cfg.downloads };
-        if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, chromiumSandbox: cfg.chromiumSandbox, args: [...CHROMIUM_ARGS, ...(media?.args || [])], ...(media?.env ? { env: media.env } : {}), ...o }) };
+      launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: chromiumArgs(cfg), chromiumSandbox: cfg.chromiumSandbox, ...(proxied(cfg) ? { proxy: { server: 'per-context' } } : {}) }),
+      async open(bt, { cfg, dir, locale, timezone, shared, media, proxy }) {
+        const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}) };
+        if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, chromiumSandbox: cfg.chromiumSandbox, args: chromiumArgs(cfg, media?.args || []), ...(media?.env ? { env: media.env } : {}), ...o }) };
         const browser = await shared();
         return { ctx: await browser.newContext(o), browser };
       },
@@ -89,10 +97,11 @@ function definitions(importer) {
       async check(bt, cfg) { exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
       // Recommended patchright setup: persistent context, no custom UA/headers, no automation-flag args, the
       // browser's own window size (viewport: null).
-      async open(bt, { cfg, dir, locale, timezone, media }) {
+      async open(bt, { cfg, dir, locale, timezone, media, proxy }) {
         const ctx = await bt.launchPersistentContext(dir, {
-          channel: 'chromium', headless: cfg.headless, viewport: null, args: ['--window-size=1366,900', ...(media?.args || [])], locale, timezoneId: timezone,
-          chromiumSandbox: cfg.chromiumSandbox, acceptDownloads: cfg.downloads,
+          channel: 'chromium', headless: cfg.headless, viewport: null, locale, timezoneId: timezone,
+          args: ['--window-size=1366,900', ...(proxied(cfg) ? PROXY_ARGS : []), ...(media?.args || [])],
+          chromiumSandbox: cfg.chromiumSandbox, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}),
           ...(media?.env ? { env: media.env } : {}),
         });
         return { ctx };
@@ -108,9 +117,9 @@ function definitions(importer) {
       // Fingerprint (window, screen, fonts, UA) comes from Camoufox (viewport: null keeps Playwright out of it); the
       // OS matches the host unless CAMOUFOX_OS says otherwise, so fonts and rendering stay consistent with the claimed
       // platform. humanize stays off: with Playwright 1.64 its cursor patch makes actionability checks hang.
-      async open({ launchOptions, firefox }, { cfg, dir, locale, timezone }) {
+      async open({ launchOptions, firefox }, { cfg, dir, locale, timezone, proxy }) {
         const opts = await launchOptions({ headless: cfg.headless, os: cfg.camoufoxOs || hostOs(), locale, humanize: false });
-        return { ctx: await firefox.launchPersistentContext(dir, { ...opts, viewport: null, timezoneId: timezone, acceptDownloads: cfg.downloads }) };
+        return { ctx: await firefox.launchPersistentContext(dir, { ...opts, viewport: null, timezoneId: timezone, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}) }) };
       },
     },
   };
@@ -141,7 +150,7 @@ export function createEngines({ importer = defaultImporter, overrides = {} } = {
       try { await get(name).check?.(bt, cfg); } catch (e) { throw explain(name, e); }
     },
     // Opens a context. Ephemeral sessions of non-shared engines get a private temp profile (tmpDir, removed on close).
-    async open(name, { cfg, profileDir, locale, timezone, shared, media }) {
+    async open(name, { cfg, profileDir, locale, timezone, shared, media, proxy = null }) {
       const def = get(name);
       if (media && def.family !== 'chromium') throw new EngineUnavailableError(`meetings need a Chromium engine (chromium or patchright), not ${name}`);
       const bt = await load(name);
@@ -152,7 +161,7 @@ export function createEngines({ importer = defaultImporter, overrides = {} } = {
       }
       // The caller owns dir/tmpDir from here on, also on failure: a launch that timed out may have left processes.
       try {
-        const r = await def.open(bt, { cfg, dir, locale, timezone, shared: () => shared(def, bt), media });
+        const r = await def.open(bt, { cfg, dir, locale, timezone, shared: () => shared(def, bt), media, proxy });
         return { ...r, dir: r.browser ? null : dir, tmpDir };
       } catch (e) {
         throw Object.assign(explain(name, e), { dir, tmpDir });

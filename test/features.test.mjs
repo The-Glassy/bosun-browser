@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import { execFileSync, spawn } from 'child_process';
 import { loadConfig } from '../src/config.mjs';
-import { createEngines } from '../src/engines.mjs';
+import { CHROMIUM_ARGS, PROXY_ARGS, createEngines } from '../src/engines.mjs';
 import { startBosun, startPageServer, connect, tmpDir } from './helpers.mjs';
 
 const SERVER = new URL('../src/server.mjs', import.meta.url).pathname;
@@ -93,10 +93,27 @@ test('the engine launches Chromium with its sandbox, and refuses downloads by de
   const launchedWith = async (cfg) => { let o; await real.launchShared({ launch: async (x) => { o = x; return { on() {} }; } }, cfg); return o; };
   assert.equal((await launchedWith(loadConfig({}))).chromiumSandbox, true);
   assert.equal((await launchedWith(loadConfig({ CHROMIUM_SANDBOX: '0' }))).chromiumSandbox, false);
+  // No tenant is proxied here: the launch stays as upstream has it.
+  const plain = await launchedWith(loadConfig({}));
+  assert.equal(plain.proxy, undefined);
+  assert.deepEqual(plain.args, CHROMIUM_ARGS);
+  // With a tenant allowlist the browser is launched so that a context can have its own proxy, and so that nothing
+  // can go around it: no QUIC, and WebRTC may not open UDP of its own.
+  const withAllow = await launchedWith(loadConfig({ BROWSER_TOKEN: 'x'.repeat(24), BROWSER_TENANT_ALLOW: 'default=example.org' }));
+  assert.deepEqual(withAllow.proxy, { server: 'per-context' });
+  assert.deepEqual(withAllow.args, [...CHROMIUM_ARGS, ...PROXY_ARGS]);
+  assert.ok(PROXY_ARGS.includes('--disable-quic'));
+  assert.ok(PROXY_ARGS.includes('--force-webrtc-ip-handling-policy=disable_non_proxied_udp'));
   let ctxOpts;
-  await real.open({}, { cfg: loadConfig({}), dir: null, locale: 'de-AT', timezone: 'Europe/Vienna', shared: async () => ({ newContext: async (o) => { ctxOpts = o; return {}; } }) });
+  const shared = async () => ({ newContext: async (o) => { ctxOpts = o; return {}; } });
+  await real.open({}, { cfg: loadConfig({}), dir: null, locale: 'de-AT', timezone: 'Europe/Vienna', shared });
   assert.equal(ctxOpts.acceptDownloads, false);
-  await real.open({}, { cfg: loadConfig({ DOWNLOADS: '1' }), dir: null, locale: 'de-AT', timezone: 'Europe/Vienna', shared: async () => ({ newContext: async (o) => { ctxOpts = o; return {}; } }) });
+  assert.equal(ctxOpts.proxy, undefined);
+  // A context gets the tenant's proxy options, and <-loopback> so even loopback goes through them.
+  const proxy = { server: 'http://127.0.0.1:1', username: 'bosun', password: 'p', bypass: '<-loopback>' };
+  await real.open({}, { cfg: loadConfig({}), dir: null, locale: 'de-AT', timezone: 'Europe/Vienna', shared, proxy });
+  assert.deepEqual(ctxOpts.proxy, proxy);
+  await real.open({}, { cfg: loadConfig({ DOWNLOADS: '1' }), dir: null, locale: 'de-AT', timezone: 'Europe/Vienna', shared });
   assert.equal(ctxOpts.acceptDownloads, true);
 });
 

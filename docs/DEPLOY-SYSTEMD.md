@@ -180,20 +180,24 @@ FEATURES_ENGINES=chromium
 
 - `BROWSER_TENANT_ALLOW` is per tenant: entries separated by `;`, hosts within an entry by `,`. Patterns are
   `host` (any port), `*.host` (subdomains only — add the apex separately), `host:port`, `[::1]:port`, or `*`.
-  It is enforced on `navigate`, on `keepalive_set`, on every HTTP(S) request any frame of that tenant's sessions
-  makes — **including each redirect hop before it is sent** — and on WebSocket connections (`ws:`/`wss:`, same
-  rules, default ports 80/443). Denied requests are aborted and logged
-  (`bosun: tenant <t>: blocked request to <scheme>://<host>/<path> (host allowlist)`) without the query. A tenant
-  that is not named may reach any host, and nothing is intercepted for it.
-- A denied navigation the *page* started leaves the tab on the browser's error page; the agent can navigate again.
-- An allowlisted tenant's responses are fetched by the service and handed to the browser, which has four
-  consequences worth knowing before you enable it for a tenant: **streaming** responses (server-sent events) do not
-  reach the page; the tab keeps the pre-redirect URL (`navigate` reports `redirected_to`, HTML gets a
-  `<base href>`); Chromium's **Local Network Access** checks stop such a page from opening a WebSocket to a
-  loopback or private address; and response bodies pass through the service's memory. See README ›
-  [Per-tenant host allowlist](../README.md#per-tenant-host-allowlist).
+- A named tenant gets **its own forward proxy inside the service**, on loopback with a password of its own, and its
+  browser contexts are launched with that proxy as their only way out. Every connection — navigations, each
+  redirect hop, subresources, XHR, WebSockets from the page or from a worker, service-worker fetches, prefetches —
+  is checked there before anything is sent, and the proxy resolves DNS itself so a name cannot point somewhere else
+  between the check and the connection. Nothing is intercepted: TLS is tunnelled, so the browser's origins,
+  cookies and CORS stay exactly as the network says.
+- A denied connection is logged as `bosun: tenant <t>: blocked <host>:<port> — <reason>` (host and port only, one
+  line per target) and answered with `403`, so a denied navigation shows the proxy's reason and `navigate` reports
+  `refused: "host allowlist"`.
+- Name an address as an address: a name in the allowlist that resolves into loopback or a private range is refused
+  unless the allowlist also names that address (this is what DNS rebinding runs into). For a local service, list
+  `127.0.0.1:4848`, not only the name that points at it.
+- The allowlist is host and port, and a `CONNECT` tunnel is not inspected, so an entry without a port allows a
+  tunnel to any port on that host. Prefer `host:port`.
 - Remember the hosts a login actually needs: an identity provider, a CDN that serves the page's scripts, the
   CAPTCHA vendor. A handoff can only reach what the tenant may reach.
+- A tenant that is not named is unrestricted and gets no proxy at all.
+- This is a per-tenant rule inside the service, not a replacement for the egress policy in §4.
 - `FEATURES_MEETINGS=0` (the default here) means the meeting tools are not listed and their handlers are not wired:
   no recordings directory, no PulseAudio server, no `ffmpeg`. Turning it on adds a recording consent surface — read
   README › Meetings first.

@@ -1,8 +1,8 @@
-// Per-tenant navigation host allowlist (fork addition). A tenant that has one may only reach the hosts it names:
-// enforced when the agent navigates, when a keepalive schedule is set, on every HTTP(S) request any frame of the
-// tenant's sessions makes (including each hop of a redirect chain, before it is sent) and on the WebSockets a page
-// opens — see installAllowlist in sessions.mjs. So a page cannot steer the browser somewhere else. A tenant without
-// an allowlist is unrestricted (upstream behaviour).
+// Per-tenant navigation host allowlist (fork addition): which hosts a tenant may reach. The patterns are matched
+// here; they are enforced in src/proxy.mjs, the per-tenant forward proxy that is the only way out of that tenant's
+// browser (so every navigation, redirect hop, subresource, WebSocket and worker request is checked), and, for a
+// clearer error before anything is opened, on `navigate` and `keepalive_set`. A tenant without an allowlist is
+// unrestricted and gets no proxy (upstream behaviour).
 import { TENANT_RE } from './auth.mjs';
 
 // ws/wss are checked with the same rules: a WebSocket is a destination the page chooses just like any request.
