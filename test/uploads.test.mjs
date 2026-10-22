@@ -240,7 +240,8 @@ test('base64 shortcut: up to 1 MB, refused above and when it is not base64', asy
   assert.equal(ok.json().size, MB);
   const big = await c.call('upload_create', { filename: 'two.bin', content_base64: Buffer.alloc(MB + 3).toString('base64') });
   assert.equal(big.isError, true);
-  assert.equal((await c.call('upload_create', { filename: 'x.bin', content_base64: 'not base64!' })).isError, true);
+  for (const bad of ['not base64!', 'a==', '==', 'YQ=', 'YQ==YQ==']) assert.match((await c.call('upload_create', { filename: 'x.bin', content_base64: bad })).text, /not base64/, bad);
+  assert.equal((await c.call('upload_create', { filename: 'y.bin', content_base64: 'YQ' })).json().size, 1); // padding may be left out
   await c.close();
 });
 
@@ -349,6 +350,30 @@ test('caps: files a tenant holds (base64 and empty ones too), and PUTs streaming
   assert.equal((await put(urls[4], Buffer.from('x'))).status, 201);
   for (const f of [...svc.uploads.files.values()].filter((x) => x.tenant === 'bob')) await svc.uploads.remove(f);
   await c.close();
+});
+
+test('a file that cannot be deleted keeps its quota and slot until a retry succeeds; the service caps files in all', async () => {
+  const dir = tmpDir();
+  const up = new Uploads({ ...loadConfig({}), dataDir: dir });
+  const origError = console.error;
+  console.error = () => {};
+  try {
+    const f = await up.create('alice', { filename: 'stuck.txt', content: Buffer.from('12345') });
+    fs.chmodSync(path.join(dir, 'uploads', 'alice'), 0o500); // its directory can't be removed now
+    await up.remove(f);
+    assert.equal(up.used('alice'), 5);
+    assert.equal(up.count('alice'), 1);
+    fs.chmodSync(path.join(dir, 'uploads', 'alice'), 0o700);
+    up.sweep();
+    await until(() => up.count('alice') === 0);
+    assert.equal(up.used('alice'), 0);
+    for (let i = 0; i < 500; i++) await up.create(`t${i % 10}`, { filename: 'e', content: Buffer.alloc(0) });
+    await assert.rejects(up.create('t99', { filename: 'e', content: Buffer.alloc(0) }), /service holds 500 uploads/);
+  } finally {
+    console.error = origError;
+    await up.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('expiry: an unused PUT URL and an unused file expire; cleanup with the session and on start', async () => {

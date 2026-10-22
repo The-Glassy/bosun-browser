@@ -9,8 +9,7 @@
     line. The URL is valid for 15 min, works once, and only for the tenant that asked for it.
   - The PUT goes to the MCP port itself, built from the `Host` the MCP client connected with (or
     `UPLOAD_BASE_URL`), so whatever reaches MCP reaches it. The body streams straight to
-    `BROWSER_DATA/uploads/<tenant>/<file_id>/<filename>` (0600): not held in memory, not base64. `Expect:
-    100-continue` is answered after the checks.
+    `BROWSER_DATA/uploads/<tenant>/<file_id>/<filename>` (0600): not held in memory, not base64.
   - `upload_create { filename, content_base64 }` stores a file of up to 1 MB at once, no PUT needed.
   - `upload { session, ref | selector | role+name | text, file_id | files[] }` fills an `<input type=file>`
     (hidden ones too, or through its label), or clicks a button and answers the file chooser it opens, or drops the
@@ -18,7 +17,11 @@
     input or chooser allows `multiple`. The browser reads the files from disk itself.
   - Limits: `UPLOAD_MAX_BYTES` (300 MB per file) and `UPLOAD_TENANT_QUOTA_BYTES` (1 GB per tenant), checked
     against `Content-Length` and again while the body streams (`413`, nothing left on disk). `size_bytes`, when
-    given, must match exactly.
+    given, must match exactly. A tenant holds at most 50 uploads at a time and streams 4 at once (16 in all;
+    `429`, retry the same URL). `Expect: 100-continue` is answered only after these
+    checks, so a refused file is never sent.
+  - Instead of the URL's secret, `PUT /upload/<file_id>` with the tenant's own token in `Authorization: Bearer`
+    works too (once, like the URL).
   - Files are deleted when the session that used them closes, an hour after they arrived (`UPLOAD_TTL_SEC`), and
     all of them when the service starts.
   - Files never cross tenants: another tenant's `file_id` answers like one that never existed, and a PUT with

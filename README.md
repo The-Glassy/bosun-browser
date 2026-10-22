@@ -155,12 +155,14 @@ click { session, role: "button", name: "Send" }
   `BROWSER_DATA/uploads/<tenant>/<file_id>/<filename>` (0600): never held in memory, never base64. The browser
   reads the file from there itself; no bytes cross the MCP connection.
 - **The URL works once,** for `UPLOAD_URL_TTL_SEC` (15 min), and only for the tenant that asked for it. Its secret
-  is the credential; an `Authorization: Bearer` header is optional, and refused if it is another tenant's token.
+  (`?t=`) is the credential. Instead of it, `PUT /upload/<file_id>` with the tenant's own token in
+  `Authorization: Bearer` works too; another tenant's token is refused either way.
   `size_bytes` is optional; when given, the PUT must carry exactly that many bytes.
 - **Small files** (up to 1 MB): `upload_create { filename, content_base64 }` stores the file at once, no PUT.
 - **Limits.** `UPLOAD_MAX_BYTES` per file (300 MB) and `UPLOAD_TENANT_QUOTA_BYTES` per tenant (1 GB) are checked
   against `Content-Length` before any byte is read, and again while the body streams: past either, the answer is
-  `413` and nothing stays on disk.
+  `413` and nothing stays on disk. A tenant holds at most 50 uploads at a time (waiting, arriving or ready), and
+  streams at most 4 at once (16 across the service); past that a PUT gets `429` and its URL stays valid.
 - **Files never cross tenants.** A `file_id` of another tenant answers like one that never existed.
 - **Deletion.** A file is deleted when the session that used it closes (the last one, if several did),
   `UPLOAD_TTL_SEC` (1 h) after it arrived, or when the service starts. Submit the form within the hour.

@@ -345,8 +345,10 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       async (a) => {
         if (a.content_base64 !== undefined) {
           const b64 = a.content_base64.replace(/\s+/g, '');
-          if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64) || b64.length % 4 === 1) throw new Error('content_base64 is not base64');
           const content = Buffer.from(b64, 'base64');
+          // Only what decodes back to the same text: Node turns "a==" into zero bytes without a word.
+          const bare = (t) => t.replace(/=+$/, '');
+          if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64) || (b64.includes('=') && b64.length % 4) || bare(content.toString('base64')) !== bare(b64)) throw new Error('content_base64 is not base64');
           if (content.length > BASE64_MAX_BYTES) throw new Error(`content_base64 is for files up to 1 MB; use the PUT URL (omit content_base64) for larger files`);
           const f = await uploads.create(tenant, { filename: a.filename, content });
           return ok({ file_id: f.id, filename: f.name, size: f.size, next: `call upload with file_id ${f.id}` });

@@ -10,6 +10,7 @@ import { Transform } from 'stream';
 
 export const BASE64_MAX_BYTES = 1024 * 1024;
 const FILES_PER_TENANT = 50; // files a tenant holds at a time, in any state (waiting, arriving, ready)
+const FILES_TOTAL = 500; // and across the service
 const PUTS_PER_TENANT = 4; // PUTs streaming at once, per tenant
 const PUTS_TOTAL = 16; // and across the service
 const PUT_IDLE_MS = 60_000; // a PUT that sends nothing for this long is dropped
@@ -56,6 +57,7 @@ export class Uploads {
     const size = content ? content.length : sizeBytes;
     if (size !== null && size > this.cfg.uploadMaxBytes) throw new Error(`file is larger than the upload limit (${mb(this.cfg.uploadMaxBytes)}, UPLOAD_MAX_BYTES)`);
     if (size !== null && size > this.room(tenant)) throw new Error(`upload quota of this token is used up (${mb(this.used(tenant))} of ${mb(this.cfg.uploadQuotaBytes)} held; files are deleted when the session that used them closes, or after ${Math.round(this.cfg.uploadTtlMs / 60000)} min)`);
+    if (this.files.size >= FILES_TOTAL) throw new Error(`the service holds ${FILES_TOTAL} uploads already; try again later`);
     if (this.count(tenant) >= FILES_PER_TENANT) {
       throw new Error(`this token holds ${FILES_PER_TENANT} uploads already (waiting, arriving or ready); close the sessions that used them, or let them expire`);
     }
@@ -112,21 +114,27 @@ export class Uploads {
     }
   }
 
-  async remove(f) {
-    if (f.state === 'deleted') return;
-    const bytes = f.state === 'pending' ? 0 : f.size;
-    f.state = 'deleted';
-    f.secret = null;
-    f.abort?.();
-    this.addUse(f.tenant, -bytes);
-    // The slot (FILES_PER_TENANT) is released once the directory is gone.
-    await fs.promises.rm(f.dir, { recursive: true, force: true }).catch(() => {});
-    this.files.delete(f.id);
+  // The file is unusable at once; its bytes (quota) and its slot (file caps) are released only once the directory is
+  // gone. A removal that fails is retried by the sweep.
+  remove(f) {
+    if (f.state !== 'deleted') {
+      f.state = 'deleted';
+      f.secret = null;
+      f.abort?.();
+    }
+    f.removing ??= fs.promises.rm(f.dir, { recursive: true, force: true }).then(() => {
+      if (this.files.get(f.id) !== f) return;
+      this.files.delete(f.id);
+      this.addUse(f.tenant, -f.size);
+    }, (e) => {
+      console.error(`bosun: upload ${f.id} of tenant ${f.tenant} not deleted yet (${e.code || e.message}); retrying`);
+    }).finally(() => { f.removing = null; });
+    return f.removing;
   }
 
   sweep(now = Date.now()) {
     for (const f of [...this.files.values()]) {
-      if ((f.state === 'pending' && now > f.urlExpiresAt) || (f.state === 'ready' && now > f.expiresAt)) this.remove(f);
+      if (f.state === 'deleted' || (f.state === 'pending' && now > f.urlExpiresAt) || (f.state === 'ready' && now > f.expiresAt)) this.remove(f);
     }
   }
 
@@ -178,6 +186,7 @@ export class Uploads {
     };
     const counter = new Transform({
       transform: (chunk, _enc, cb) => {
+        if (f.state !== 'receiving') return cb(new Error('upload was cancelled')); // its bytes are being released
         if (over) return cb();
         received += chunk.length;
         if (f.expected !== null && received > f.expected) refuse(`more bytes than size_bytes (${f.expected})`);
