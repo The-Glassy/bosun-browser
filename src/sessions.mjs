@@ -7,6 +7,7 @@ import path from 'path';
 import { clearSensitive, installTracker, notePasswords, passwordTracker } from './redact.mjs';
 import { createEngines, claimProfile, unclaimProfile, recordProfileUse } from './engines.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, policyOf } from './auth.mjs';
+import { allowFor, allowsUrl, blockedTarget } from './allow.mjs';
 
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
 const CLOSE_DEADLINE_MS = 10_000; // default; manager.closeDeadlineMs
@@ -25,6 +26,28 @@ export function httpUrl(raw) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms).unref?.());
+
+const MAX_BLOCKED_LOGGED = 50; // distinct denied targets logged per session
+
+// Fork: aborts every HTTP(S) request to a host the tenant's allowlist doesn't cover — subresources, XHR, iframes
+// and the requests a redirect or the page's own JavaScript starts, not just what the agent navigates to. Logged
+// once per origin+path, never with the query. Requests of other schemes (data:, blob:, about:) are left alone.
+// Not covered: requests made by a service worker, and WebSocket connections (see docs/FORK-SECURITY-REVIEW.md).
+export async function installAllowlist(ctx, { tenant, allow, blocked = new Set(), log = console.error }) {
+  await ctx.route('**/*', async (route) => {
+    const url = route.request().url();
+    try {
+      if (!/^https?:/i.test(url) || allowsUrl(allow, url)) return await route.continue();
+      const at = blockedTarget(url);
+      if (!blocked.has(at) && blocked.size < MAX_BLOCKED_LOGGED) {
+        blocked.add(at);
+        log(`bosun: tenant ${tenant}: blocked request to ${at} (host allowlist)`);
+        if (blocked.size === MAX_BLOCKED_LOGGED) log(`bosun: tenant ${tenant}: further blocked requests of this session are not logged`);
+      }
+      await route.abort('blockedbyclient');
+    } catch { /* the page or the context went away while the request was handled */ }
+  });
+}
 
 // Browser processes started for a persistent context carry its directory on their command line
 // (--user-data-dir=… / -profile …), which is how they're found when a close hangs.
@@ -114,6 +137,8 @@ export class SessionManager {
   async open({ owner, tenant, profile, locale, timezone, engine, preempt = true, media = null }) {
     if (this.closing) throw new Error('service is shutting down');
     const def = this.engines.get(engine || this.cfg.engine);
+    // Only engines this deployment enabled (FEATURES_ENGINES, plus the default ENGINE).
+    if (!this.cfg.engines.includes(def.name)) throw new Error(`engine ${def.name} is not enabled on this service (FEATURES_ENGINES)`);
     if (this.goneOwners.has(owner)) throw new Error('connection closed');
     const ephemeral = policyOf(this.cfg, tenant) === 'ephemeral';
     if (ephemeral && (profile || media)) throw new Error(profile ? PROFILES_REFUSED : NOT_ALLOWED);
@@ -189,6 +214,9 @@ export class SessionManager {
         if (this.closing) throw new Error('service is shutting down');
         if (this.goneOwners.has(owner)) throw new Error('connection closed'); // owner left while we were launching
         if (profileDir) recordProfileUse(profileDir, { engine: def.name, headless: this.cfg.headless });
+        // Fork: the tenant's host allowlist, before anything can navigate. A failure here fails the open.
+        const allow = allowFor(this.cfg, tenant);
+        if (allow) await installAllowlist(ctx, { tenant, allow });
         const s = {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
@@ -229,6 +257,19 @@ export class SessionManager {
   }
 
   list(owner) { return [...this.sessions.values()].filter((s) => s.owner === owner); }
+
+  // Fork: the tenant's host allowlist, or null when it has none (then nothing is restricted).
+  allowList(tenant) { return allowFor(this.cfg, tenant); }
+
+  // Returns the URL, or throws because the tenant's allowlist doesn't cover its host. The message names host and
+  // port only, never the rest of the URL.
+  checkAllowed(tenant, url) {
+    const allow = this.allowList(tenant);
+    if (!allow || allowsUrl(allow, url)) return url;
+    let host = 'that URL';
+    try { host = new URL(url).host; } catch {}
+    throw new Error(`${host} is not in the host allowlist of this token (BROWSER_TENANT_ALLOW)`);
+  }
 
   // Every page action and observation goes through here: serialized per session, refused during a handoff, and
   // discarded if a handoff began while it ran.
