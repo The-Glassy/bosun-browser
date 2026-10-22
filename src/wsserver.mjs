@@ -77,6 +77,8 @@ export async function startWsServer({ cfg, manager }) {
   });
   // An upload may take longer than Node's 5-minute request limit; uploads.mjs bounds each PUT itself (idle, total).
   srv.requestTimeout = 0;
+  // Expect: 100-continue is answered by uploads.mjs once the size and credentials are checked, not by Node at once.
+  srv.on('checkContinue', (req, res) => srv.emit('request', req, res));
   srv.on('clientError', (_e, sock) => sock.destroy());
   srv.on('error', (e) => console.error(`bosun ws: ${e.message}`));
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD });

@@ -30,6 +30,11 @@ const PAGES = {
       i.onchange = async () => { const parts = []; for (const f of i.files) parts.push(f.name + '=' + (await f.text()).slice(0, 40)); document.getElementById('out').textContent = 'got ' + parts.join(','); };
       i.click(); };
     document.getElementById('pick').onclick = () => pick(true); document.getElementById('one').onclick = () => pick(false);</script>`,
+  // The button is disabled for 6 s, then opens the chooser a moment after the click.
+  '/slow': `<title>Slow</title><button id="pick" disabled>Upload</button><p id="out">none</p>
+    <script>setTimeout(() => { document.getElementById('pick').disabled = false; }, 6000);
+    document.getElementById('pick').onclick = () => setTimeout(() => { const i = document.createElement('input'); i.type = 'file';
+      i.onchange = () => { document.getElementById('out').textContent = 'got ' + i.files[0].name; }; i.click(); }, 300);</script>`,
   '/drop': `<title>Drop</title><div id="zone" style="width:300px;height:200px;border:1px dashed">Drop files here</div><div id="plain">not a zone</div><p id="out">none</p>
     <script>const z = document.getElementById('zone'); z.addEventListener('dragover', (e) => e.preventDefault());
     z.addEventListener('drop', async (e) => { e.preventDefault(); const parts = []; for (const f of e.dataTransfer.files) parts.push(f.name + '=' + (await f.text()).slice(0, 40)); document.getElementById('out').textContent = 'dropped ' + parts.join(','); });</script>`,
@@ -216,6 +221,18 @@ test('a drop zone without an input gets a synthetic drop; a plain element says i
   await c.close();
 });
 
+test('a chooser button that becomes clickable late, and opens its chooser after the click', async () => {
+  const c = await connect(svc, TOKEN);
+  const id = await c.open();
+  const f = (await c.call('upload_create', { filename: 'late.txt', content_base64: Buffer.from('late').toString('base64') })).json().file_id;
+  await c.call('navigate', { session: id, url: `${base}/slow` });
+  const r = await c.call('upload', { session: id, selector: '#pick', file_id: f });
+  assert.equal(r.isError, false, r.text);
+  assert.equal(r.json().method, 'chooser');
+  await until(async () => /got late\.txt/.test((await c.call('read', { session: id, mode: 'text', selector: '#out' })).text));
+  await c.close();
+});
+
 test('base64 shortcut: up to 1 MB, refused above and when it is not base64', async () => {
   const c = await connect(svc, TOKEN);
   const ok = await c.call('upload_create', { filename: 'one.bin', content_base64: Buffer.alloc(MB, 7).toString('base64') });
@@ -255,6 +272,16 @@ test('too big: over UPLOAD_MAX_BYTES or the tenant quota is refused, with or wit
     assert.equal(p5.status, 413);
     assert.match(p5.json.error, /quota/);
     assert.match((await c.call('upload_create', { filename: 'c', size_bytes: 800 })).text, /quota/);
+    // Expect: 100-continue with a Content-Length over the cap: 413 before any byte of the body is sent.
+    const u6 = (await c.call('upload_create', { filename: 'e' })).json();
+    const early = await new Promise((resolve) => {
+      let continued = false;
+      const req = http.request(u6.put_url, { method: 'PUT', headers: { 'content-length': '5000', expect: '100-continue' } }, (res) => { res.resume(); resolve({ status: res.statusCode, continued }); });
+      req.on('continue', () => { continued = true; req.end(Buffer.alloc(5000)); });
+      req.on('error', () => resolve({ status: 0, continued }));
+      req.flushHeaders();
+    });
+    assert.deepEqual(early, { status: 413, continued: false });
     await until(() => s2.uploads.used('alice') === 800);
     const dirs = fs.readdirSync(path.join(s2.dataDir, 'uploads', 'alice'));
     assert.deepEqual(dirs, [u4.file_id]); // refused uploads left nothing behind
@@ -279,6 +306,14 @@ test("files never cross tenants: another tenant's file_id and PUT header are ref
   assert.equal((await put(u.put_url, Buffer.from('x'), { authorization: `Bearer ${TOKEN_B}` })).status, 403);
   assert.equal((await put(u.put_url, Buffer.from('x'), { authorization: 'Bearer nope-nope-nope-nope' })).status, 403);
   assert.equal((await put(u.put_url, Buffer.from('x'), { authorization: `Bearer ${TOKEN}` })).status, 201); // own token: fine
+  // The tenant's own token instead of the URL's secret; nothing at all is 401.
+  const u3 = (await a.call('upload_create', { filename: 'h.txt' })).json();
+  const bare = u3.put_url.replace(/\?t=.*/, '');
+  assert.equal((await put(bare, Buffer.from('h'))).status, 401);
+  assert.equal((await put(bare, Buffer.from('h'), { authorization: `Bearer ${TOKEN_B}` })).status, 403);
+  const p3 = await put(bare, Buffer.from('h'), { authorization: `Bearer ${TOKEN}` });
+  assert.equal(p3.status, 201, p3.text);
+  assert.equal((await put(bare, Buffer.from('h'), { authorization: `Bearer ${TOKEN}` })).status, 404); // still once
   // A wrong secret, a malformed id.
   assert.equal((await put(u.put_url.replace(/t=.*/, 't=wrong'), Buffer.from('x'))).status, 404);
   assert.equal((await put(u.put_url.replace(/\/upload\/[^?]+/, '/upload/..%2f..%2fetc'), Buffer.from('x'))).status, 404);
@@ -290,6 +325,30 @@ test("files never cross tenants: another tenant's file_id and PUT header are ref
   const u2 = (await a.call('upload_create', { filename: 'y.txt' })).json();
   assert.equal((await put(u2.put_url, Buffer.from('y'), { authorization: `Bearer ${TOKEN_E}` })).status, 403);
   await Promise.all([a.close(), b.close(), e.close()]);
+});
+
+test('caps: files a tenant holds (base64 and empty ones too), and PUTs streaming at once', async () => {
+  const c = await connect(svc, TOKEN_B);
+  const made = [];
+  for (;;) {
+    const r = await c.call('upload_create', { filename: 'empty.txt', content_base64: '' });
+    if (r.isError) { assert.match(r.text, /holds 50 uploads/); break; }
+    made.push(r.json().file_id);
+    assert.ok(made.length <= 50);
+  }
+  assert.equal(made.length, 50);
+  for (const id of made) await svc.uploads.remove(svc.uploads.files.get(id));
+  // Four slow PUTs stream; the fifth is told to retry, and its URL still works afterwards.
+  const urls = [];
+  for (let i = 0; i < 5; i++) urls.push((await c.call('upload_create', { filename: `s${i}` })).json().put_url);
+  const reqs = urls.slice(0, 4).map((u) => { const r = http.request(u, { method: 'PUT', headers: { 'content-length': '10' } }); r.on('error', () => {}); r.write('12345'); return r; });
+  await until(() => svc.uploads.count('bob', 'receiving') === 4);
+  assert.equal((await put(urls[4], Buffer.from('x'))).status, 429);
+  for (const r of reqs) r.end('67890');
+  await until(() => svc.uploads.count('bob', 'ready') === 4);
+  assert.equal((await put(urls[4], Buffer.from('x'))).status, 201);
+  for (const f of [...svc.uploads.files.values()].filter((x) => x.tenant === 'bob')) await svc.uploads.remove(f);
+  await c.close();
 });
 
 test('expiry: an unused PUT URL and an unused file expire; cleanup with the session and on start', async () => {

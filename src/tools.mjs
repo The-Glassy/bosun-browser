@@ -118,9 +118,17 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
   }
   if (method === 'input') throw new Error('the element is not a file input (or a label of one); try method chooser or drop');
   if (method !== 'drop') {
-    const chooser = page.waitForEvent('filechooser', { timeout: method === 'chooser' ? 10000 : 5000 }).catch(() => null);
-    await l.click({ timeout: 15000 });
-    const fc = await chooser;
+    // Listening from before the click (which may wait for the button to become clickable) until a grace period
+    // after it: a page may open its chooser asynchronously.
+    let fc = null;
+    const onChooser = (c) => { fc ??= c; };
+    page.on('filechooser', onChooser);
+    try {
+      await l.click({ timeout: 15000 });
+      for (const end = Date.now() + (method === 'chooser' ? 10000 : 5000); !fc && Date.now() < end;) await sleep(100);
+    } finally {
+      page.off('filechooser', onChooser);
+    }
     if (fc) {
       if (many && !fc.isMultiple()) throw new Error(`the file chooser this opened takes one file; got ${paths.length}`);
       await fc.setFiles(paths, { timeout: 30000 });

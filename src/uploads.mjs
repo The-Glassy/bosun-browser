@@ -9,7 +9,9 @@ import { pipeline } from 'stream/promises';
 import { Transform } from 'stream';
 
 export const BASE64_MAX_BYTES = 1024 * 1024;
-const PENDING_PER_TENANT = 20; // upload_create calls not yet PUT
+const FILES_PER_TENANT = 50; // files a tenant holds at a time, in any state (waiting, arriving, ready)
+const PUTS_PER_TENANT = 4; // PUTs streaming at once, per tenant
+const PUTS_TOTAL = 16; // and across the service
 const PUT_IDLE_MS = 60_000; // a PUT that sends nothing for this long is dropped
 const PUT_MAX_MS = 60 * 60_000; // and none may take longer than an hour
 const ID_RE = /^f[0-9a-f]{16}$/;
@@ -40,6 +42,7 @@ export class Uploads {
   }
 
   used(tenant) { return this.usage.get(tenant) || 0; }
+  count(tenant, state = null) { let n = 0; for (const f of this.files.values()) if (f.tenant === tenant && (!state || f.state === state)) n++; return n; }
   addUse(tenant, n) { this.usage.set(tenant, Math.max(0, this.used(tenant) + n)); }
 
   // Room left for a file of this tenant: the per-file cap and the tenant's quota, whichever is smaller.
@@ -53,8 +56,8 @@ export class Uploads {
     const size = content ? content.length : sizeBytes;
     if (size !== null && size > this.cfg.uploadMaxBytes) throw new Error(`file is larger than the upload limit (${mb(this.cfg.uploadMaxBytes)}, UPLOAD_MAX_BYTES)`);
     if (size !== null && size > this.room(tenant)) throw new Error(`upload quota of this token is used up (${mb(this.used(tenant))} of ${mb(this.cfg.uploadQuotaBytes)} held; files are deleted when the session that used them closes, or after ${Math.round(this.cfg.uploadTtlMs / 60000)} min)`);
-    if (!content && [...this.files.values()].filter((f) => f.tenant === tenant && f.state === 'pending').length >= PENDING_PER_TENANT) {
-      throw new Error(`too many uploads waiting for their PUT (${PENDING_PER_TENANT}); send or let them expire first`);
+    if (this.count(tenant) >= FILES_PER_TENANT) {
+      throw new Error(`this token holds ${FILES_PER_TENANT} uploads already (waiting, arriving or ready); close the sessions that used them, or let them expire`);
     }
     const id = `f${crypto.randomBytes(8).toString('hex')}`;
     const dir = path.join(this.root, tenant, id);
@@ -114,10 +117,11 @@ export class Uploads {
     const bytes = f.state === 'pending' ? 0 : f.size;
     f.state = 'deleted';
     f.secret = null;
-    this.files.delete(f.id);
     f.abort?.();
     this.addUse(f.tenant, -bytes);
+    // The slot (FILES_PER_TENANT) is released once the directory is gone.
     await fs.promises.rm(f.dir, { recursive: true, force: true }).catch(() => {});
+    this.files.delete(f.id);
   }
 
   sweep(now = Date.now()) {
@@ -126,9 +130,9 @@ export class Uploads {
     }
   }
 
-  // PUT /upload/<id>?t=<secret>. Answers the request itself; returns true when the path was ours.
-  // authTenant(req): the tenant of an Authorization header, null without one, false for a token that doesn't
-  // authenticate. A header is optional (the secret is the credential); when sent, it must be this file's tenant.
+  // PUT /upload/<id>?t=<secret>, or PUT /upload/<id> with the tenant's token in Authorization. Answers the request
+  // itself; returns true when the path was ours. authTenant(req): the tenant of an Authorization header, null
+  // without one, false for a token that doesn't authenticate. With both, both must hold.
   async handle(req, res, { authTenant, policyOf }) {
     const u = new URL(req.url, 'http://x');
     const m = /^\/upload\/([^/]+)$/.exec(u.pathname);
@@ -141,10 +145,11 @@ export class Uploads {
     };
     if (req.method !== 'PUT') { reply(405, { error: 'PUT only' }); return true; }
     const f = ID_RE.test(m[1]) ? this.files.get(m[1]) : null;
-    const secret = u.searchParams.get('t') || '';
-    const okSecret = f?.secret && secret.length === f.secret.length && crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(f.secret));
-    if (!f || !okSecret || f.state !== 'pending' || Date.now() > f.urlExpiresAt) { reply(404, { error: 'no such upload URL (used, expired, or never issued); call upload_create again' }); return true; }
+    const secret = u.searchParams.get('t');
+    const okSecret = secret === null || (!!f?.secret && Buffer.byteLength(secret) === f.secret.length && crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(f.secret)));
     const hdr = authTenant(req);
+    if (secret === null && !hdr) { reply(401, { error: 'give the URL from upload_create (with ?t=), or your token in Authorization: Bearer' }); return true; }
+    if (!f || !okSecret || f.state !== 'pending' || Date.now() > f.urlExpiresAt) { reply(404, { error: 'no such upload URL (used, expired, or never issued); call upload_create again' }); return true; }
     if (hdr === false || (hdr !== null && hdr !== f.tenant)) { reply(403, { error: 'this token may not upload to that URL' }); return true; }
     if (policyOf(f.tenant) === 'ephemeral') { reply(403, { error: 'uploads are not allowed for this token' }); return true; }
     const len = req.headers['content-length'] !== undefined ? Number(req.headers['content-length']) : null;
@@ -153,6 +158,11 @@ export class Uploads {
     if (len !== null && len > this.cfg.uploadMaxBytes) { reply(413, { error: `file is larger than the upload limit (${mb(this.cfg.uploadMaxBytes)}, UPLOAD_MAX_BYTES)` }); return true; }
     if (len !== null && len > this.room(f.tenant)) { reply(413, { error: `upload quota of this token is used up (${mb(this.cfg.uploadQuotaBytes)}, UPLOAD_TENANT_QUOTA_BYTES)` }); return true; }
     if (req.headers.expect && !/^100-continue$/i.test(req.headers.expect)) { reply(417, { error: 'unsupported Expect' }); return true; }
+    // Too many at once: the URL stays valid, try again shortly.
+    if (this.count(f.tenant, 'receiving') >= PUTS_PER_TENANT || [...this.files.values()].filter((x) => x.state === 'receiving').length >= PUTS_TOTAL) {
+      reply(429, { error: `too many uploads in progress (${PUTS_PER_TENANT} per token, ${PUTS_TOTAL} in all); retry this URL in a moment` });
+      return true;
+    }
 
     // The URL is spent from here on: a second PUT, even while this one runs, gets 404.
     f.state = 'receiving';
