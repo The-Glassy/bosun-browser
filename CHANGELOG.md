@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.9.0 — signed-in meeting joins: Google Meet and Zoom
+
+### Added
+
+- **Zoom.** `meeting_join` takes Zoom links: `zoom.us/j/<id>?pwd=…`, any `*.zoom.us` subdomain, webinar `/w/` and
+  web client `/wc/` links. Bosun rewrites them to Zoom's web client (`https://app.zoom.us/wc/<id>/join?pwd=…`) and
+  joins with a profile signed in to Zoom (`profile`).
+  - The preview: the account's name is kept, microphone and camera verifiably off, cookie banners and tips
+    closed. If Zoom shows its app-launch page anyway, Bosun clicks "Join from your browser".
+  - Waiting room and "waiting for the host" count as `waiting`. Once admitted, Bosun joins computer audio (without
+    it nothing is heard or recorded), mutes the microphone Zoom may have turned on, and checks the camera is off.
+  - The rest is the Meet flow: the announcement in the chat before recording, the same audio recorder, every chat
+    message as `bosun:meeting-chat`, the opt-out phrases stop and delete the recording, participants from the
+    toolbar counter, and leaving when the meeting ends, Bosun is removed, or it is alone for 2 minutes.
+  - New join outcomes with their own reason and hint: `invalid-meeting` (wrong ID or passcode, or a link without
+    `?pwd=`), `sign-in-required`, `captcha`. Removal from the waiting room is `denied`.
+  - `platform` is `zoom` in `meeting_status` and in the events (`bosun:platform`).
+- `meeting_status` shows `joined_as`: `account` (signed in) or `guest`.
+
+### Fixed
+
+- **Signed-in Google Meet joins.** The first live signed-in join (`profile: google-glassy`) failed with a
+  `locator.click` timeout on the join button. 0.8.0 already skipped the missing name field, but it clicked the
+  first join button once, with a 10 s timeout, after waiting 5 s for it to be enabled. Now:
+  - The lobby is detected as guest (a name field) or account (no name field, the account shown); `name` is used
+    for guests only.
+  - Dialogs and tips over the lobby ("Do you want people to hear you in the meeting?", "Got it", …) are closed
+    when they take the click. Only buttons inside a dialog are clicked, in EN/DE/SK/UK/RU.
+  - A disabled join button ("Getting ready...") is waited for up to 25 s, and the first *visible* join button is
+    clicked.
+  - With the account already in the call on another device, Bosun picks "Join here too" (also under "Other ways to
+    join") over "Switch here", which would drop the other device.
+  - Which of these caused the live failure isn't known: 0.8.0 fails on the dialog and the other-device case in the
+    stand-in, and on a "Getting ready" phase longer than 15 s.
+
+### Documented
+
+- README: Zoom, the signed-in Meet lobby, and keepalive advice for the meeting profiles (keep them signed in,
+  check `keepalive_list` before an important meeting, and how keepalive visits and meetings share a profile).
+
+### Not tested live
+
+- The signed-in Meet changes and all of Zoom were tested against local stand-ins of the pages (`test/fakemeet.mjs`,
+  `test/fakezoom.mjs`) and, on Linux, with the real audio pipeline. No live meeting was joined for this release.
+
 ## 0.8.0 — security hardening: Chromium sandbox, host allowlist, download budget
 
 From an external security review of 0.7.0 ([docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md)) and the

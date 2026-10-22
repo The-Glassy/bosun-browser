@@ -28,8 +28,8 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
   logged-out profile raises an MCPL `bosun:needs-human` push event. A visit can also **watch** one value (say, a
   "43 neue Nachrichten" counter) and push `bosun:watch-changed` when it goes up. See
   [Keeping logins alive](#keeping-logins-alive) and [Watching a value](#watching-a-value).
-- **Meetings (PoC):** joins a Google Meet as a guest notetaker, announces itself in the chat, records the audio to a
-  file and leaves; a "please don't record" in the chat stops and deletes the recording. Transcription happens later,
+- **Meetings (PoC):** joins a Google Meet (as a guest or signed in) or a Zoom meeting (signed in, in Zoom's web
+  client) as a notetaker, announces itself in the chat, records the audio to a file and leaves; a "please don't record" in the chat stops and deletes the recording. Transcription happens later,
   from the file. See [Meetings (PoC)](#meetings-poc).
 - Sessions are **ephemeral** (wiped on close) or use a named **persistent profile** of the tenant (stays logged in;
   no RAM while idle). A session belongs to the connection that opened it: other connections can't see, use or close
@@ -274,15 +274,20 @@ arrived on average and up to about 40 minutes after (longer in quiet hours). Sev
 > `FEATURES_MEETINGS=0` switches meetings off: the tools are not listed and their handlers are not wired, and nothing
 > of the below runs — no recordings directory, no audio server. Read the consent notes before using them.
 
-Bosun can attend a **Google Meet** as a notetaker: it joins as an **unauthenticated guest**, or with a Bosun
-profile that is **signed in to a Google account**, records the meeting's audio and leaves. Nothing is transcribed live: the agent gets the recording when the meeting ends and transcribes it
-afterwards with whatever it likes. Zoom and Teams are not supported yet; the Meet-specific parts live in
-`src/meetings/platforms/meet.mjs` behind a small platform interface, so another platform is one more file.
+Bosun can attend a **Google Meet** or a **Zoom** meeting as a notetaker, record its audio and leave.
+- **Meet:** as an **unauthenticated guest**, or with a Bosun profile **signed in to a Google account**.
+- **Zoom:** in Zoom's web client, with a Bosun profile **signed in to a Zoom account**. Zoom turns most anonymous
+  browser guests away, so a guest join usually ends with `sign-in-required` or `captcha`.
+
+Nothing is transcribed live. The agent gets the recording when the meeting ends and transcribes it afterwards with
+whatever it likes. Teams is not supported yet. Each platform lives in one file under `src/meetings/platforms/`
+(`meet.mjs`, `zoom.mjs`) behind a small interface, and the meeting flow around it is shared.
 
 ```jsonc
 meeting_join({ "url": "https://meet.google.com/abc-defg-hij" })   // name, announce_text, max_wait_admit_min (10),
                                                                    // profile, engine, leave_on_optout (true)
-//  -> { "meeting_id": "m1a2b3c4d5e6", "state": "waiting", ... }   once the join request is out
+meeting_join({ "url": "https://us02web.zoom.us/j/81234567890?pwd=…", "profile": "zoom" })
+//  -> { "meeting_id": "m1a2b3c4d5e6", "platform": "zoom", "state": "waiting", "joined_as": "account", ... }
 meeting_status({ "meeting_id": "m1a2b3c4d5e6" })   // joining | waiting | admitted | recording | ended, participants, recording_seconds
 meeting_chat_read({ "meeting_id": "…", "since": 0 })      meeting_chat_send({ "meeting_id": "…", "text": "…" })
 meeting_stop_recording({ "meeting_id": "…", "delete": true })   meeting_leave({ "meeting_id": "…" })
@@ -294,22 +299,37 @@ meeting_recording_delete({ "meeting_id": "…" })
 1. **Browser:** a fresh browser of its own, or `profile` (Chromium or patchright only; camoufox is refused).
    - Media permission prompts are accepted (`--use-fake-ui-for-media-stream`), but no fake devices are used: the
      microphone is a silent audio source and there is no camera.
-   - The browser asks for Meet's **English UI** (`hl=en`, Accept-Language `en-US`). Since the account or region can
-     still win, every text and label is also recognized in German, Slovak, Ukrainian and Russian.
+   - The browser asks for an **English UI** (Meet: `hl=en`; Zoom: its language cookie; both: Accept-Language
+     `en-US`). The account or region can still win, so Meet's texts and labels are also recognized in German,
+     Slovak, Ukrainian and Russian, and Zoom's in German and Ukrainian (some Russian).
+   - **Zoom links** (`zoom.us/j/<id>?pwd=…`, any `*.zoom.us` subdomain, webinar `/w/` and web client `/wc/`
+     links) are rewritten to the web client, `https://app.zoom.us/wc/<id>/join?pwd=…`, so Zoom's "open the app"
+     page doesn't come up. If it does anyway, Bosun clicks "Launch Meeting" and then "Join from your browser".
 2. **Lobby:**
    - Microphone and camera must be **verifiably off** before joining. Bosun switches a device off and checks it,
      unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden") and no control shows
      it on; then it already counts as off. If neither can be confirmed, Bosun does not join.
-   - A guest types its name (default `Glassy (notetaker)`); a signed-in profile has no name field and joins under
-     the account's name.
-   - Then **Ask to join** / **Teilnahme erbitten** / **Join now**, and Bosun waits up to `max_wait_admit_min`.
+   - A guest types its name (default `Glassy (notetaker)`). A signed-in Meet profile has no name field and joins
+     under the account's name, so `name` is ignored. Zoom fills in a signed-in account's name, and Bosun keeps it.
+   - Tips and dialogs over the lobby ("Do you want people to hear you in the meeting?", "Got it", cookie banners,
+     "This meeting is being recorded") are closed. Only buttons inside a dialog or banner are clicked.
+   - Then **Ask to join** / **Join now** / **Teilnahme erbitten** (Meet) or **Join** (Zoom). A join button that
+     is still disabled ("Getting ready...") is waited for, up to 25 s. Bosun then waits up to
+     `max_wait_admit_min` for admission. `meeting_status` shows `joined_as`: `account` or `guest`.
+   - **Meet, account already in the call on another device:** Meet offers "Switch here", which would drop the
+     other device. Bosun picks **"Join here too"** (directly, or under "Other ways to join") and uses "Switch here"
+     only when Meet offers nothing else.
 3. **Not getting in:**
    - A denied request or no admission in time ends the meeting with a clear error.
    - **Google turning the guest away** ("You can't join this video call" / "Sie können nicht an diesem Videoanruf
      teilnehmen" after asking, with no waiting room seen) ends with reason `refused_by_google`.
    - That refusal comes with a hint: join with a signed-in profile, or from a residential IP. It is not a captcha,
      and `navigate` reports it as a refusal too.
-4. Once admitted, Bosun opens the chat and **posts the announcement first**. Only then does recording start. The
+   - Zoom ends a join early with `invalid-meeting` (wrong meeting ID or passcode, or a link without `?pwd=` for a
+     meeting that has one), `sign-in-required` (the host admits only signed-in users) or `captcha` (a visible
+     challenge before joining). Being removed from Zoom's waiting room counts as `denied`.
+4. Once admitted (Zoom: computer audio joined first, since without it nothing is heard, then microphone and
+   camera checked off again), Bosun opens the chat and **posts the announcement first**. Only then does recording start. The
    default text is in English and German: *"Hi, I'm Glassy, an AI notetaker. I'm recording audio for notes. If you'd
    rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the
    recording."* With `MEETING_OWNER` set it says whose notetaker it is.
@@ -321,12 +341,20 @@ meeting_recording_delete({ "meeting_id": "…" })
    - On leaving, `bosun:meeting-ended` carries `meeting_id`, `reason`, `duration_s`, `bytes` and the `recording`:
      path, a `file://` URI and size. The payload also has it as an MCP `resource_link`.
 
-**Signed-in profile.** Google turns away anonymous automated guests far more often than signed-in users.
-- **Setup:** `session_open({ "profile": "google" })`, `navigate` to `https://accounts.google.com`, `request_human`
-  so a person signs in, `session_close`.
-- **Joining:** `meeting_join({ "url": "…", "profile": "google" })`.
+**Signed-in profile.** Google turns away anonymous automated guests far more often than signed-in users, and Zoom
+admits almost no anonymous browser guests at all.
+- **Setup:** `session_open({ "profile": "google" })`, `navigate` to `https://accounts.google.com` (Zoom:
+  `https://zoom.us/signin`), `request_human` so a person signs in, `session_close`.
+- **Joining:** `meeting_join({ "url": "…", "profile": "google" })` or `{ …, "profile": "zoom" }`.
 - **Engine:** the profile is opened with the engine it was last used with. It can't be in use by an agent session at
   the same time.
+- **Keep it signed in.** Both sign-ins expire when nobody uses them. Give each profile a keepalive, for example
+  `keepalive_set({ "profile": "google", "url": "https://myaccount.google.com/", "every_hours": 24 })` and
+  `keepalive_set({ "profile": "zoom", "url": "https://zoom.us/profile", "every_hours": 24 })`, and look at
+  `keepalive_list` before an important meeting. A `logged_out` result means a person has to sign in again.
+- **Keepalive and meetings share the profile.** A meeting that starts while a keepalive visit has the profile open
+  takes it over, and a visit that comes due during a meeting is skipped and runs at its next slot. With
+  `MAX_SESSIONS=2`, a meeting and one agent session fill the service, so a keepalive visit then waits too.
 
 The meeting runs in a session of its own, so it outlives the agent's connection. It counts against `MAX_SESSIONS`.
 Events use the MCPL feature set **`bosun.meeting`** (tags `bosun:meeting-chat`, `bosun:meeting-optout`,
@@ -373,9 +401,13 @@ Meetings need a **headful** browser (headless Chromium plays no audio), so run t
 - **Google reviews bot-like guests.** Join requests from automated browsers can land in a review queue or be refused
   outright ("You can't join this video call", reason `refused_by_google`). Datacenter IPs make this much more
   likely. A signed-in profile or a residential connection works best.
-- **Meet's markup changes without notice.** Labels and texts are matched in English, German, Slovak, Ukrainian and
-  Russian (English is requested); the chat sender name is a best-effort guess. A change on Google's side breaks the join or the chat watch until
-  `platforms/meet.mjs` is updated. This PoC has been tested against a local Meet stand-in, not against live Meet.
+- **Meet's and Zoom's markup changes without notice.** Labels and texts are matched in several languages (English
+  is requested), and the chat sender name is a best-effort guess. A change on Google's or Zoom's side breaks the
+  join or the chat watch until `platforms/meet.mjs` or `platforms/zoom.mjs` is updated.
+- **Tested against stand-ins.** The tests run against local stand-ins (`test/fakemeet.mjs`, `test/fakezoom.mjs`)
+  built from how the real pages look. The signed-in Meet lobby (dialogs, "Getting ready...", "Join here too") and
+  all of Zoom are new in 0.9.0 and have not had a live run yet. The Zoom chat watch depends most on Zoom's markup
+  and is the part most likely to need a fix after the first live meeting.
 - **One mixed audio track.** There is no speaker separation and no live transcript.
 - **Consent is the operator's responsibility.** The announcement and the opt-out are a courtesy, not a legal basis.
   Check what applies where the participants are; some places require everyone's explicit consent before recording.
@@ -550,7 +582,7 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
 
 ## Roadmap
 
-M1 meetings beyond the PoC (Zoom, Teams, speaker separation), tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
+M1 meetings beyond the PoC (Teams, speaker separation), tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
 references, watching pages outside keepalive visits · M3 macros.
 
 ## License
