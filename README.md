@@ -6,14 +6,11 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 > Status: **prototype (M0)**. Works end to end in one deployment; APIs will change. See [docs/DESIGN.md](docs/DESIGN.md)
 > and [CHANGELOG.md](CHANGELOG.md).
 
-> **This is a fork.** It adds a [per-tenant host allowlist](#per-tenant-host-allowlist)
-> (`BROWSER_TENANT_ALLOW`), enforced by a forward proxy inside the service that is the browser's only way out, runs
-> Chromium **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), and
-> turns three things off by default: meetings (`FEATURES_MEETINGS=0`), every engine but `chromium`
-> (`FEATURES_ENGINES=chromium`) and downloads (`DOWNLOADS=0`). It also ships a Linux deployment guide
-> ([docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md)). What was reviewed before adopting it, and what is still risky,
-> is written down in [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md). Nothing else was removed, so
-> upstream merges stay easy: the switches are configuration, not deletions.
+> Security: Chromium runs **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), downloads are refused
+> by default (`DOWNLOADS=0`), and a tenant can be kept to a [host allowlist](#per-tenant-host-allowlist)
+> (`BROWSER_TENANT_ALLOW`). A review of 0.7.0, and what is still risky, is in
+> [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md); a Linux deployment guide is in
+> [docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md).
 
 ## What it does today
 
@@ -24,8 +21,8 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - MCP server over **stdio** (Claude Code, Codex, …) or **WebSocket** (shared service).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
-  `keepalive_set` / `keepalive_list` / `keepalive_remove`, and — with `FEATURES_MEETINGS=1`, off by default in this
-  fork — `meeting_join` / `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
+  `keepalive_set` / `keepalive_list` / `keepalive_remove`, and (unless `FEATURES_MEETINGS=0`) `meeting_join` /
+  `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
   `meeting_leave` / `meeting_recording_delete`.
 - **Keepalive** for persistent profiles: scheduled visits keep sliding login sessions alive without a model, and a
   logged-out profile raises an MCPL `bosun:needs-human` push event. A visit can also **watch** one value (say, a
@@ -84,8 +81,8 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `BROWSER_TOKEN_POLICIES` | – (all `full`) | per-tenant policy: `swarm=ephemeral` (see [Read-only tokens for subagents](#read-only-tokens-for-subagents)) |
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
 | `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist, enforced by a per-tenant forward proxy: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
-| `FEATURES_MEETINGS` | `0` | `1` = list and wire the meeting tools (this fork: off) |
-| `FEATURES_ENGINES` | `chromium` | engines a session may ask for, comma list; `ENGINE` is always included |
+| `FEATURES_MEETINGS` | `1` | `0` = the meeting tools are not listed and their handlers not wired |
+| `FEATURES_ENGINES` | all three | engines a session may ask for, comma list (e.g. `chromium`); `ENGINE` is always included |
 | `CHROMIUM_SANDBOX` | `1` | `0` = run Chromium without its own sandbox (logged at every start); see [Chromium sandbox](#chromium-sandbox) |
 | `DOWNLOADS` | `0` | `1` = let pages download files (with the budget below); `0` = the context refuses them |
 | `DOWNLOADS_MAX_MB` / `DOWNLOADS_TOTAL_MAX_MB` | 100 / 500 | downloaded bytes a session, and the whole service, may keep |
@@ -121,7 +118,7 @@ All numbers are validated at startup; a bad value stops the service instead of s
 | `patchright` | a browser per session (persistent context; temp profile for ephemeral sessions) | CDP screencast | patchright's recommended setup: no custom UA, no automation-flag args, window-sized viewport |
 | `camoufox` | a browser per session | Playwright screencast + `page.mouse`/`keyboard` | fingerprint (window, screen, fonts, UA) from Camoufox; `humanize` off (hangs clicks with Playwright 1.64) |
 
-Only the engines in `FEATURES_ENGINES` (default `chromium`, plus whatever `ENGINE` is set to) can be asked for;
+Only the engines in `FEATURES_ENGINES` (default: all three; `ENGINE` is always included) can be asked for;
 `session_open`'s schema lists exactly those, and the session manager refuses the others. A session asking for an
 engine that is enabled but isn't installed gets an error naming the install command; there is no silent
 fallback to another engine. A persistent profile remembers its engine family (Chromium or Firefox) and refuses the
@@ -163,7 +160,7 @@ Chromium spawns many threads: under systemd give the unit a generous `TasksMax` 
   input that ever was `type=password` (incl. shadow roots), and Bosun also notes them when a handoff starts and every
   500 ms during it. On `chromium` Bosun's helpers run in the page's own JavaScript world, so a page can detect them
   — and replace them, which switches masking off for fields that aren't sensitive by markup (probed, see
-  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md) finding H2); on `patchright` and `camoufox` they run
+  [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md) finding H2); on `patchright` and `camoufox` they run
   in an isolated world, which stops that and nothing else (details in [docs/ENGINES.md](docs/ENGINES.md)).
 - Not protected: text the human types into ordinary fields, secrets the page itself echoes as normal text, custom
   widgets that aren't `<input>`/`<textarea>` (e.g. per-digit OTP boxes built from `div`s), closed shadow roots.
@@ -274,8 +271,8 @@ arrived on average and up to about 40 minutes after (longer in quiet hours). Sev
 
 ## Meetings (PoC)
 
-> Off by default in this fork: set `FEATURES_MEETINGS=1` to list the tools and wire their handlers. With `0` nothing
-> of the below runs — no recordings directory, no audio server. Read the consent notes before turning it on.
+> `FEATURES_MEETINGS=0` switches meetings off: the tools are not listed and their handlers are not wired, and nothing
+> of the below runs — no recordings directory, no audio server. Read the consent notes before using them.
 
 Bosun can attend a **Google Meet** as a notetaker: it joins as an **unauthenticated guest**, or with a Bosun
 profile that is **signed in to a Google account**, records the meeting's audio and leaves. Nothing is transcribed live: the agent gets the recording when the meeting ends and transcribes it
@@ -432,8 +429,8 @@ only Node and the `ws` package.
 ## Chromium sandbox
 
 The browser parses untrusted web content, so it runs with **Chromium's own sandbox** (`chromiumSandbox: true`,
-which is what `CHROMIUM_SANDBOX=1`, the default, means). Playwright's default is `--no-sandbox`; this fork does not
-use it.
+which is what `CHROMIUM_SANDBOX=1`, the default, means). Playwright's default is `--no-sandbox`; Bosun does not use
+it (0.7.0 and earlier did).
 
 The sandbox needs something from the host, and startup checks it: Bosun starts the browser once, closes it again,
 and **refuses to run** if that fails, printing what to do. On Linux, one of these has to be true:
@@ -478,7 +475,12 @@ Entries are separated by `;` (or newlines), hosts within an entry by `,`. A host
 A tenant that is named gets **its own forward proxy inside the service** (`src/proxy.mjs`, on loopback, with a
 random password of its own) **and a browser of its own**, launched with that proxy as its only way out
 (`--proxy-bypass-list=<-loopback>`, so not even loopback is exempt; QUIC off and WebRTC's non-proxied UDP off, so
-nothing can go around it; Chromium does not fall back to a direct connection when a proxy refuses). Those flags
+nothing can go around it; Chromium does not fall back to a direct connection when a proxy refuses). A persistent
+Chromium profile (profiles, `patchright`, meetings) ignores the WebRTC flag, so the profile also gets the
+`webrtc.ip_handling_policy` preference before every proxied launch (and loses it again on an unproxied one).
+`camoufox` gets the same as Firefox preferences: loopback through the proxy too
+(`network.proxy.allow_hijacking_localhost`), WebRTC through the proxy only, no HTTP/3, no DNS prefetching. The
+tenant's own browser is closed when its last session ends and relaunched by the next one. Those settings
 belong to that browser alone — tenants without an allowlist share a browser launched exactly the way upstream
 launches it, so one tenant's allowlist never changes another tenant's networking. Every
 connection the browser wants — a navigation, each hop of a redirect, a subresource, XHR, a WebSocket from the page
@@ -487,6 +489,8 @@ checked against the allowlist before a byte leaves the host:
 
 - A denied connection is never made. The browser gets `403` from the proxy, so a denied navigation leaves the tab
   on that URL with the proxy's one-line reason and `navigate` reports `status: 403` and `refused: "host allowlist"`.
+  An `https://` hop is refused at `CONNECT`, which fails the navigation in the browser; `navigate` then answers
+  "navigation refused by the host allowlist of this token: <host>:<port>".
 - Denials are logged as `bosun: tenant <t>: blocked <host>:<port> — <reason>`: host and port, never a path or a
   query. One line per target per tenant (a repeat is counted, not logged again).
 - **DNS is resolved by the proxy, once**, and the connection goes to that address, so the address a decision was
@@ -513,7 +517,7 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
 - Plain `http://` goes through the proxy as HTTP/1.1 (no h2c, no QUIC); `https://` is end-to-end inside the tunnel.
 - A firewall is still the outer boundary: the proxy is a per-tenant rule inside the service, not a replacement for
   network egress policy (see [Security notes](#security-notes) and
-  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md)).
+  [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md)).
 
 ## Security notes
 
@@ -531,8 +535,8 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
 - A named tenant can be kept to a list of hosts, enforced by a per-tenant forward proxy that is the browser's only
   way out (see [Per-tenant host allowlist](#per-tenant-host-allowlist)). That narrows what the agent, the page, its
   workers and its service workers can reach; it does not replace the egress boundary above.
-- The browser runs with its own sandbox (see [Chromium sandbox](#chromium-sandbox)). Upstream's default, and this
-  fork's with `CHROMIUM_SANDBOX=0`, is `--no-sandbox`: then a renderer compromise is directly on the service user,
+- The browser runs with its own sandbox (see [Chromium sandbox](#chromium-sandbox)). Without it (0.7.0 and earlier,
+  or `CHROMIUM_SANDBOX=0`) Chromium runs with `--no-sandbox`: then a renderer compromise is directly on the service user,
   which is where the profiles and the service's environment (tokens included) are.
 - Downloads are off by default (`DOWNLOADS=0`), and bounded by a disk budget when enabled, so a page cannot fill
   the volume.
@@ -541,7 +545,7 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
   **any** engine, and on `chromium` a page can also neutralize the masking helpers outright (they run in its own
   JavaScript world; `patchright` uses an isolated one, which stops that technique and nothing more). Treat the page
   where a credential is typed as trusted, or don't type it there. Details, probes and the standing test:
-  [docs/FORK-SECURITY-REVIEW.md](docs/FORK-SECURITY-REVIEW.md) (finding H2).
+  [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md) (finding H2).
 
 ## Roadmap
 
