@@ -255,13 +255,13 @@ export const zoom = {
   },
 
   // Enter sends unless the account set Enter to a new line: a message still in the box is sent with the Send button.
-  // Sent means it shows up in the chat, not marked private; otherwise this throws (the announcement must have gone
-  // out to everyone before recording starts).
-  async sendChat(page, text) {
+  // Sent means a new message from Bosun ("Me", or its name) with this text shows up in the chat, not marked private;
+  // otherwise this throws (the announcement must have gone out to everyone before recording starts).
+  async sendChat(page, text, { selfName = null } = {}) {
     await this.openChat(page);
     await this.toEveryone(page);
     const box = await chatBox(page);
-    const before = await this.posted(page, text);
+    const before = await this.posted(page, text, selfName);
     await box.fill(text, { timeout: 5000 });
     await box.press('Enter', { timeout: 5000 });
     const left = async () => norm(await box.evaluate((e) => ('value' in e ? e.value : e.innerText))).trim(); // a read error throws
@@ -274,24 +274,34 @@ export const zoom = {
       if (await left()) throw new Error('the Zoom chat message was not sent (still in the chat box)');
     }
     for (let i = 0; i < 40; i++) {
-      const now = await this.posted(page, text);
+      const now = await this.posted(page, text, selfName);
       if (now.count > before.count) {
         if (now.private) throw new Error('the Zoom chat message went to one person only, not to everyone');
         return;
       }
       await page.waitForTimeout(250);
     }
-    throw new Error('the Zoom chat message did not show up in the chat');
+    throw new Error('the Zoom chat message did not show up in the chat as sent by Bosun');
   },
 
-  // How many chat messages read exactly `text`, and whether the last of them is marked as private.
-  async posted(page, text) {
-    return page.evaluate(({ MSG, ITEM, text }) => {
+  // Bosun's own chat messages reading exactly `text` (sender "Me"/"You" or selfName; texts compared as norm() does),
+  // and whether the last of them is marked as private.
+  async posted(page, text, selfName) {
+    const r = await page.evaluate(({ MSG, SENDER, ITEM, text, selfName }) => {
+      const n = (s) => String(s || '').replace(/[\u2018\u2019\u02bc]/g, "'").replace(/\s+/g, ' ').trim();
       const all = [...document.querySelectorAll(MSG)];
-      const hits = all.filter((el) => !all.some((o) => o !== el && el.contains(o))).filter((el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() === text);
-      const last = hits.at(-1);
-      return { count: hits.length, label: last ? ((last.closest(ITEM) || last.parentElement)?.innerText || '').replace(last.innerText || '', ' ').slice(0, 300) : '' };
-    }, { MSG: CHAT_MESSAGE, ITEM: CHAT_ITEM, text: norm(text).trim() }).then((r) => ({ count: r.count, private: PRIVATELY.test(norm(r.label)) }));
+      let last = null, hit = null, count = 0;
+      for (const el of all.filter((e) => !all.some((o) => o !== e && e.contains(o)))) {
+        const item = el.closest(ITEM);
+        const named = item?.querySelector(SENDER);
+        const sender = n(named ? named.innerText || named.textContent : '') || last;
+        last = sender;
+        const own = /^(?:me|you|ich|du|я|ви)$/i.test(sender || '') || (selfName && sender === n(selfName));
+        if (own && n(el.innerText || el.textContent) === text) { count++; hit = el; }
+      }
+      return { count, label: hit ? ((hit.closest(ITEM) || hit.parentElement)?.innerText || '').replace(hit.innerText || '', ' ').slice(0, 300) : '' };
+    }, { MSG: CHAT_MESSAGE, SENDER: CHAT_SENDER, ITEM: CHAT_ITEM, text: norm(text).trim(), selfName });
+    return { count: r.count, private: PRIVATELY.test(norm(r.label)) };
   },
 
   // As meet.mjs: new chat messages are queued in the page under a random, non-enumerable key. Zoom groups consecutive

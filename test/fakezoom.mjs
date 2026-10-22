@@ -23,7 +23,7 @@ function launch(id, search) {
 // recorded" dialog once in), bigChallenge (a visible reCAPTCHA in the preview), title (the meeting's topic shown in
 // the call), recipient (the chat starts addressed to this person; "Everyone" is in its menu unless hostOnly),
 // enterNewline (Enter adds a line break; the Send button sends), hideRecipient (no recipient control shown: messages
-// go to `recipient` anyway, marked "(Privately)"), askPasscode (the preview asks for the passcode even
+// go to `recipient` anyway, marked "(Privately)"), dropSends (the chat box clears but nothing is posted), askPasscode (the preview asks for the passcode even
 // though the link carried one).
 function webClient(id, r) {
   return `<!doctype html><meta charset="utf-8"><title>Zoom Meeting</title>
@@ -64,7 +64,7 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
   </aside>
 </div>
 <script>
-const R = ${JSON.stringify({ tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline })};
+const R = ${JSON.stringify({ tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends })};
 const id = ${JSON.stringify(id)}, $ = (x) => document.getElementById(x);
 const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });
@@ -87,7 +87,7 @@ $('recOk').onclick = () => { $('recDlg').hidden = true; };
 $('chatBtn').onclick = () => { $('panel').hidden = !$('panel').hidden; $('chatBtn').setAttribute('aria-label', $('panel').hidden ? 'open the chat panel' : 'close the chat panel'); };
 $('leave').onclick = () => { $('leaveMenu').hidden = false; };
 $('leaveConfirm').onclick = () => post('leave', {});
-const sendBox = () => { const t = $('box').innerText.trim(); $('box').textContent = ''; if (t) post('chat', { text: t, to: $('to').textContent }); };
+const sendBox = () => { const t = $('box').innerText.trim(); $('box').textContent = ''; if (t && !R.dropSends) post('chat', { text: t, to: $('to').textContent }); };
 $('box').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !R.enterNewline) { e.preventDefault(); sendBox(); } });
 $('send').onclick = sendBox;
 $('to').onclick = () => { $('toMenu').hidden = !$('toMenu').hidden; };

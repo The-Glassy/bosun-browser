@@ -278,7 +278,7 @@ export class Meetings {
     m.sentAll.add(text.trim());
     m.pendingOwn.push(text.trim());
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
-    await m.platform.sendChat(page, text);
+    await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name });
   }
 
   // Ours only if we just sent exactly this text AND the chat shows it as from us; each sent message matches once.

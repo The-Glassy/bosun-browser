@@ -293,3 +293,25 @@ test('Zoom announcement to one person only: a recipient named "Everyone Else" is
     await c.close();
   });
 });
+
+test('Zoom send confirmation: a curly apostrophe in the text still matches; the same text from someone else does not count as sent', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    await zoomProfile(c);
+    const text = 'I’m Glassy’s notetaker, recording audio.';
+    const ok = fake.newRoom({ signedIn: true, open: true });
+    const id = (await c.call('meeting_join', { url: ok.url, profile: 'zoom', announce_text: text })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 20_000);
+    await c.call('meeting_leave', { meeting_id: id });
+    await until(() => svc.manager.used === 0, 10_000);
+    // Sending silently fails, and a participant happens to post the very same text meanwhile.
+    const bad = fake.newRoom({ signedIn: true, open: true, dropSends: true });
+    const bid = (await c.call('meeting_join', { url: bad.url, profile: 'zoom', announce_text: text })).json().meeting_id;
+    await until(async () => (await status(c, bid)).state === 'admitted', 20_000);
+    fake.say(bad.id, 'Guest Two', text);
+    await until(async () => (await status(c, bid)).state === 'ended', 20_000);
+    assert.match((await status(c, bid)).error, /did not show up in the chat as sent by Bosun/);
+    assert.equal(audio.recorders.length, 1);
+    await c.close();
+  });
+});
