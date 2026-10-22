@@ -187,6 +187,33 @@ test('closing the proxy ends open tunnels and never hangs', async () => {
   await new Promise((r) => sink.close(r));
 });
 
+test('a pooled upstream connection is tracked once, however many requests reuse it', async () => {
+  const up = http.createServer((_q, r) => { r.writeHead(200, { 'content-type': 'text/plain' }); r.end('ok'); });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const port = up.address().port;
+  const proxy = await startTenantProxy({ tenant: 't', allow: [parseHostPattern(`127.0.0.1:${port}`)], log: () => {} });
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const warnings = [];
+  const onWarning = (w) => warnings.push(w.name);
+  process.on('warning', onWarning);
+  try {
+    for (let i = 0; i < 20; i++) {
+      await new Promise((resolve, reject) => {
+        http.get({ host: '127.0.0.1', port: proxy.port, path: `http://127.0.0.1:${port}/${i}`, agent,
+          headers: { 'proxy-authorization': `Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')}` } },
+        (res) => { res.resume(); res.on('end', resolve); }).on('error', reject);
+      });
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(!warnings.includes('MaxListenersExceededWarning'), warnings.join());
+  } finally {
+    process.off('warning', onWarning);
+    agent.destroy();
+    await proxy.close();
+    await new Promise((r) => { up.closeAllConnections(); up.close(() => r()); });
+  }
+});
+
 test('a request whose DNS answer arrives after close() never reaches upstream', async () => {
   let connections = 0;
   const sink = net.createServer((sock) => { connections++; sock.destroy(); });

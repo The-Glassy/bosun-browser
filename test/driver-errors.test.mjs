@@ -18,6 +18,9 @@ const FF_STACK = 'Error: Assertion error\n    at assert (/x/node_modules/playwri
 test('only the Firefox driver\'s WebSocket assertion counts as a driver rejection', () => {
   const driver = Object.assign(new Error('Assertion error'), { stack: FF_STACK });
   assert.equal(isDriverRejection(driver), true);
+  // An install path with parentheses in it.
+  const parens = Object.assign(new Error('Assertion error'), { stack: FF_STACK.replaceAll('/x/', '/work/bosun (review)/') });
+  assert.equal(isDriverRejection(parens), true);
   // Our own error thrown from a Playwright event listener has Playwright frames in its stack too: not ignored.
   const ours = Object.assign(new Error('ours'), { stack: 'Error: ours\n    at onDownload (/x/src/sessions.mjs:1:1)\n    at Page.emit (/x/node_modules/playwright-core/lib/coreBundle.js:1:1)' });
   assert.equal(isDriverRejection(ours), false);

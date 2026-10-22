@@ -44,8 +44,14 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
 // Playwright's Firefox driver (camoufox) asserts in FFPage._onWebSocketOpened when a worker opens a WebSocket. It
 // belongs to one session's browser, so it is logged and the service keeps serving every other session. Everything
 // else, including an error thrown by our own code inside a Playwright event, still ends the process.
-export const isDriverRejection = (e) => e instanceof Error && e.message === 'Assertion error'
-  && /\n\s+at assert \([^)]*[\\/](?:playwright|patchright)-core[\\/][^)]*\)\n\s+at FFPage\._onWebSocket\w+ /.test(String(e.stack));
+const DRIVER_FRAME = /[\\/](?:playwright|patchright)-core[\\/]/;
+export const isDriverRejection = (e) => {
+  if (!(e instanceof Error) || e.message !== 'Assertion error') return false;
+  // Whole lines, so an install path with parentheses in it cannot cut a frame short.
+  const [, assertAt = '', caller = ''] = String(e.stack).split('\n');
+  return /^\s+at assert \(.*\)$/.test(assertAt) && DRIVER_FRAME.test(assertAt)
+    && /^\s+at FFPage\._onWebSocket\w+ \(.*\)$/.test(caller) && DRIVER_FRAME.test(caller);
+};
 
 // Installed once per process. Anything that is not that driver rejection ends the process, as Node does by default.
 let guarded = false;

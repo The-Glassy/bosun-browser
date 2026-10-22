@@ -96,7 +96,12 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
   const sockets = new Set(); // every client and upstream socket, so close() can end tunnels too
   const agent = new http.Agent({ keepAlive: true }); // this proxy's own upstream pool for plain http://, closed with it
   let closing = false; // set by close(): nothing new is started, whatever was awaiting when it came
-  const track = (sock) => { sockets.add(sock); sock.once('close', () => sockets.delete(sock)); return sock; };
+  const track = (sock) => {
+    if (sockets.has(sock)) return sock; // a pooled upstream socket is handed to request after request
+    sockets.add(sock);
+    sock.once('close', () => sockets.delete(sock));
+    return sock;
+  };
 
   const authenticated = (req) => {
     const presented = digest(req.headers['proxy-authorization'] || '');
