@@ -152,6 +152,9 @@ Both listeners bind `127.0.0.1`. Nothing is published by Bosun itself.
   clients use the `bosun-mcp-stdio` bridge (README › stdio bridge). If a remote agent needs it, publish it on the
   private network with its own path and keep the token requirement:
   `tailscale serve --bg --https=443 --set-path=/mcp http://127.0.0.1:7360`.
+  The same port takes the one-time upload PUTs (README › Uploading files). Bosun builds their URL from the `Host`
+  the MCP client connected with, as `http://`; behind TLS or a path like the one above, set
+  `UPLOAD_BASE_URL=https://<node>.ts.net/mcp`.
 - **Live view** is published for the human's phone:
 
 ```sh
@@ -212,6 +215,10 @@ FEATURES_ENGINES=chromium
   is kept; one download may still use its own size transiently before it is measured, and Playwright keeps download
   files under `/tmp` — which is RAM-backed on most systems and, with `PrivateTmp=yes`, private to this unit. Give
   the volume a quota, or keep downloads off.
+- Uploads (`FEATURES_UPLOADS=1`, the default) land in `BROWSER_DATA/uploads`, on the data volume and not in `/tmp`,
+  so they never count against `MemoryMax`. `UPLOAD_MAX_BYTES` (300 MB per file) and `UPLOAD_TENANT_QUOTA_BYTES`
+  (1 GB per tenant) bound them; files go when their session closes, after an hour, and at every start. Size the
+  volume for the quota times the tenants that upload, or set `FEATURES_UPLOADS=0`.
 
 ## 6. Operating it
 
@@ -239,7 +246,7 @@ FEATURES_ENGINES=chromium
 - [ ] Every tenant that should be restricted appears in `BROWSER_TENANT_ALLOW`; a `navigate` to another host is
       refused, and the refusal shows up in the journal without the query.
 - [ ] `FEATURES_MEETINGS` matches whether meetings are used, `FEATURES_ENGINES` lists only what is installed,
-      `DOWNLOADS=0` (or a quota on the volume).
+      `DOWNLOADS=0` (or a quota on the volume), `FEATURES_UPLOADS` and the upload quota fit the volume.
 - [ ] The service started without a `CHROMIUM_SANDBOX=0` warning, and no renderer process shows `--no-sandbox`.
 - [ ] Egress to private ranges is blocked for the service.
 - [ ] `ALLOW_NO_TOKEN` is unset.

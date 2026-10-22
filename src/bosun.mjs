@@ -9,6 +9,7 @@ import { buildServer, wall } from './tools.mjs';
 import { Keepalive } from './keepalive.mjs';
 import { EventBus } from './events.mjs';
 import { Meetings } from './meetings/index.mjs';
+import { Uploads } from './uploads.mjs';
 
 export async function startService(cfg, { engines, keepalive: kaOpts = {}, meetings: mOpts = {} } = {}) {
   let live = null;
@@ -25,6 +26,8 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
     keepalive = manager.keepalive = new Keepalive({ cfg, manager, wall, emit: (e) => events.needsHuman(e), onWatch: (e) => events.watchChanged(e), ...kaOpts });
     // FEATURES_MEETINGS=0 switches meetings off: no tools, no handlers, no recordings directory.
     if (cfg.features.meetings) manager.meetings = new Meetings({ cfg, manager, bus: events, ...mOpts });
+    // FEATURES_UPLOADS=0: no upload tools, no PUT endpoint, no uploads directory.
+    if (cfg.features.uploads) manager.uploads = new Uploads(cfg);
   } catch (e) { await live?.close(); throw e; }
   if (cfg.keepalive) keepalive.start();
   const ws = cfg.ws ? await startWsServer({ cfg, manager }) : null;
@@ -36,8 +39,9 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
     await Promise.allSettled([keepalive.stop(), manager.meetings?.stop()]);
     await Promise.allSettled([ws?.close(), live?.close()]);
     await manager.closeAll();
+    await manager.uploads?.close();
   })());
-  return { cfg, live, manager, ws, keepalive, events, meetings: manager.meetings ?? null, shutdown };
+  return { cfg, live, manager, ws, keepalive, events, meetings: manager.meetings ?? null, uploads: manager.uploads ?? null, shutdown };
 }
 
 // The one rejection from inside the browser driver that no caller can catch and that must not end the service:

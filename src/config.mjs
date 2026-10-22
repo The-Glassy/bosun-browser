@@ -42,7 +42,8 @@ export function loadConfig(env = process.env) {
     meetingOwner: (env.MEETING_OWNER || '').trim().slice(0, 60) || null, // named in the meeting announcement ("X's AI notetaker")
     tokens: parseTokens(env),
     // Features a deployment can switch off. FEATURES_MEETINGS=0: no meeting tools, handlers or recordings directory.
-    features: { meetings: flag(env, 'FEATURES_MEETINGS', true) },
+    // FEATURES_UPLOADS=0: no upload tools and no PUT endpoint.
+    features: { meetings: flag(env, 'FEATURES_MEETINGS', true), uploads: flag(env, 'FEATURES_UPLOADS', true) },
     // Chromium's own sandbox. On by default: a renderer that runs untrusted web content must not sit directly on the
     // service user. 0 is an explicit, logged choice (see README > Chromium sandbox).
     chromiumSandbox: flag(env, 'CHROMIUM_SANDBOX', true),
@@ -65,6 +66,20 @@ export function loadConfig(env = process.env) {
   // Disk budget for downloads (only when DOWNLOADS=1): per session, and across all sessions.
   cfg.downloadMaxMb = int(env, 'DOWNLOADS_MAX_MB', 100, 1, 1_000_000);
   cfg.downloadTotalMaxMb = int(env, 'DOWNLOADS_TOTAL_MAX_MB', Math.max(500, cfg.downloadMaxMb), cfg.downloadMaxMb, 10_000_000);
+  // File uploads into pages: the largest file, what one tenant may hold at a time, how long a file is kept and how
+  // long an upload URL stays valid. UPLOAD_BASE_URL: where tenants reach the MCP port, when the Host header they
+  // connect with is not it (TLS in front, another name).
+  cfg.uploadMaxBytes = int(env, 'UPLOAD_MAX_BYTES', 300 * 1024 * 1024, 1, 1024 ** 4);
+  cfg.uploadQuotaBytes = int(env, 'UPLOAD_TENANT_QUOTA_BYTES', Math.max(1024 ** 3, cfg.uploadMaxBytes), cfg.uploadMaxBytes, 1024 ** 5);
+  cfg.uploadTtlMs = int(env, 'UPLOAD_TTL_SEC', 3600, 10, 7 * 86400) * 1000;
+  cfg.uploadUrlTtlMs = int(env, 'UPLOAD_URL_TTL_SEC', 900, 10, 86400) * 1000;
+  cfg.uploadBaseUrl = null;
+  if (env.UPLOAD_BASE_URL) {
+    let u;
+    try { u = new URL(env.UPLOAD_BASE_URL); } catch { throw new Error('UPLOAD_BASE_URL is not a valid URL'); }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('UPLOAD_BASE_URL must be http(s)');
+    cfg.uploadBaseUrl = u.href.replace(/\/+$/, '');
+  }
   cfg.maxSessionsPerTenant = int(env, 'MAX_SESSIONS_PER_TENANT', cfg.maxSessions, 1, cfg.maxSessions);
   cfg.policies = parsePolicies(env, cfg.tokens);
   // Session cap of each tenant with policy "ephemeral".
