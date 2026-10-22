@@ -21,7 +21,7 @@
 // Ukrainian and Russian, so a UI that comes up in another of those languages works too. Markers are labels, roles
 // and texts a person sees; a run against real Meet that fails here is fixed here.
 
-import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, DIALOGS } from './common.mjs';
 
 const TEXT = {
   waiting: any("asking to be let in", "you'll join the call when someone lets you in", 'waiting for the host', 'please wait until a meeting host',
@@ -98,14 +98,17 @@ async function nameInput(page) {
 // form fields are skipped structurally, so a name or a chat line reading "The call has ended" neither ends the
 // meeting nor hides the real banner.
 const PARTICIPANT_CONTROLLED = '[data-message-id], [data-sender-name], [data-participant-id], [role="list"], [role="listitem"], textarea, input, [contenteditable="true"]';
-const pageText = (page) => textOutside(page, PARTICIPANT_CONTROLLED);
+const pageText = (page, roots) => textOutside(page, PARTICIPANT_CONTROLLED, roots);
 const overlays = (page) => dismissOverlays(page, LABEL.dismiss);
+
+// Any button that joins from the lobby: "Ask to join" / "Join now", "Join here too", "Switch here".
+const joinCandidate = async (page) => await firstVisible(button(page, LABEL.join)) || await firstVisible(button(page, LABEL.joinToo)) || firstVisible(button(page, LABEL.switchHere));
 
 // The lobby kind: 'guest' (a name field), 'account' (signed in: no name field, the account shown or no "Sign in"),
 // or null (no lobby yet).
 export async function meetPrejoin(page) {
   if (await nameInput(page)) return 'guest';
-  if (!(await firstVisible(button(page, LABEL.join))) && !(await firstVisible(button(page, LABEL.switchHere)))) return null;
+  if (!(await joinCandidate(page))) return null;
   if (ACCOUNT.test(await pageText(page).catch(() => ''))) return 'account';
   const signIn = (await visible(button(page, SIGN_IN))) || (await visible(page.getByRole('link', { name: SIGN_IN })));
   return signIn ? 'guest' : 'account';
@@ -150,7 +153,7 @@ export const meet = {
     // The lobby renders in steps; wait for a join button (a guest also gets a name field first on some pages). Tips
     // and dialogs Meet lays over it are closed on the way.
     for (;;) {
-      if (await firstVisible(button(page, LABEL.join)) || await firstVisible(button(page, LABEL.switchHere))) break;
+      if (await joinCandidate(page)) break;
       const s = await this.state(page);
       if (STOP.includes(s)) return s;
       if (Date.now() > end) throw new Error(`no "Ask to join" / "Join now" button found on the Meet page (not a Meet lobby, or Meet changed); page ${s}`);
@@ -204,15 +207,18 @@ export const meet = {
   },
 
   async state(page) {
-    const t = await pageText(page).catch(() => '');
+    // In the call (participant tiles or the in-call chat button; the lobby has neither), only Meet's dialogs can say
+    // it ended or Bosun was removed: captions and the meeting title are participants' words. Outside the call the
+    // whole page counts (Meet replaces the call with its end or refusal page).
+    const inCall = await firstVisible(page.locator('[data-participant-id]')) || await visible(button(page, LABEL.chat));
+    const t = await pageText(page, inCall ? DIALOGS : null).catch(() => '');
     if (TEXT.denied.test(t)) return 'denied';
     if (TEXT.cantJoin.test(t)) return 'refused';
     if (TEXT.removed.test(t)) return 'removed';
     if (TEXT.ended.test(t)) return 'ended';
+    if (inCall) return 'admitted';
     if (TEXT.waiting.test(t)) return 'waiting';
-    // In the call: participant tiles or the in-call chat button (the lobby has neither).
-    if (await page.locator('[data-participant-id]').count().catch(() => 0) || await visible(button(page, LABEL.chat))) return 'admitted';
-    if (await firstVisible(button(page, LABEL.join)) || await firstVisible(button(page, LABEL.switchHere))) return 'lobby';
+    if (await joinCandidate(page)) return 'lobby';
     return 'unknown';
   },
 

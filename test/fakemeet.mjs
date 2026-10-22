@@ -29,7 +29,7 @@ const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 // hear you in the meeting?" over the lobby, so a click on the join button is intercepted until it is closed),
 // readyMs (the join button is disabled, "Getting ready...", that long), elsewhere (the account is in the call on
 // another device: "Switch here", and "Join here too" under "Other ways to join").
-function app({ lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false }) {
+function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false }) {
   const L = UI[lang];
   const de = lang === 'de';
   const joinButtons = elsewhere
@@ -55,7 +55,7 @@ ${dialog ? `<div id="dlg" role="dialog" aria-modal="true" style="position:fixed;
 <div id="denied" hidden><h1>${esc(L.cantJoin)}</h1><p>${esc(L.denied)}</p></div>
 <div id="refused" hidden><h1>${esc(L.cantJoin)}</h1><button>${esc(L.home)}</button><p>${esc(L.safe)}</p>${frame}</div>
 <div id="pending" hidden></div>
-<div id="call" hidden><div id="tiles"></div>
+<div id="call" hidden><div id="topic">${esc(title || '')}</div><div id="tiles"></div><div id="captions" class="caption-text"></div>
   <div role="toolbar"><button aria-label="${esc(L.chat)}">chat</button><button aria-label="${esc(L.leave)}">leave</button></div>
   <aside id="panel" hidden><div role="list" id="msgs"></div><textarea aria-label="${esc(L.send)}"></textarea></aside></div>
 <div id="over" hidden><h1 id="overText"></h1></div>
@@ -83,6 +83,7 @@ async function poll() {
   for (const id of ['lobby', 'waiting', 'denied', 'refused', 'pending', 'call', 'over']) $(id).hidden = s.view !== id;
   if (s.view === 'over') $('overText').textContent = L[s.over];
   if (s.view === 'call') {
+    $('captions').textContent = s.caption || '';
     const want = s.participants.join();
     if ($('tiles').dataset.p !== want) {
       $('tiles').dataset.p = want;
@@ -128,7 +129,7 @@ export async function startFakeMeet({ tone = false } = {}) {
       if (r.phase === 'pending' && Date.now() >= r.refuseAt) r.phase = 'refused';
       const view = r.over ? 'over' : ['waiting', 'denied', 'refused', 'pending'].includes(r.phase) ? r.phase : r.phase === 'admitted' ? 'call' : 'lobby';
       const chat = r.chat.map((m) => (m.fillAt && Date.now() < m.fillAt ? { ...m, text: '' } : m));
-      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone });
+      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone, caption: r.caption || null });
     }
     if (req.method === 'POST') {
       const b = await body(req);
@@ -162,6 +163,7 @@ export async function startFakeMeet({ tone = false } = {}) {
     toggles: (c, mode) => { room(c).toggles = mode; },
     setOthers: (c, others) => { room(c).others = others; },
     end: (c) => { room(c).over = 'ended'; },
+    caption: (c, text) => { room(c).caption = text; },
     remove: (c) => { room(c).over = 'removed'; },
     // Variants of a room (set before the page loads): lang, toggles, signedIn, bareName; refuse = Google turns the
     // guest away right after "Ask to join".

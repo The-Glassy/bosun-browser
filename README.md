@@ -326,10 +326,12 @@ meeting_recording_delete({ "meeting_id": "…" })
    - That refusal comes with a hint: join with a signed-in profile, or from a residential IP. It is not a captcha,
      and `navigate` reports it as a refusal too.
    - Zoom ends a join early with `invalid-meeting` (wrong meeting ID or passcode, or a link without `?pwd=` for a
-     meeting that has one), `sign-in-required` (the host admits only signed-in users) or `captcha` (a visible
+     meeting that has one; the link's `pwd` is an encrypted token and is never typed into a passcode field), `sign-in-required` (the host admits only signed-in users) or `captcha` (a visible
      challenge before joining). Being removed from Zoom's waiting room counts as `denied`.
 4. Once admitted (Zoom: computer audio joined first, since without it nothing is heard, then microphone and
-   camera checked off again), Bosun opens the chat and **posts the announcement first**. Only then does recording start. The
+   camera checked off again), Bosun opens the chat and **posts the announcement first**. On Zoom the chat is set to
+   Everyone first. If Zoom allows chat with the host only, or the message stays unsent, Bosun leaves without
+   recording. Only then does recording start. The
    default text is in English and German: *"Hi, I'm Glassy, an AI notetaker. I'm recording audio for notes. If you'd
    rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the
    recording."* With `MEETING_OWNER` set it says whose notetaker it is.

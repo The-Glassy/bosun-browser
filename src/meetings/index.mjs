@@ -257,8 +257,12 @@ export class Meetings {
 
   async tick(m) {
     const s = await this.page(m, (p) => m.platform.state(p));
-    if (s === 'ended') return this.finish(m, 'meeting-ended');
-    if (s === 'removed') return this.finish(m, 'removed');
+    if (s === 'ended' || s === 'removed') {
+      // An objection already in the chat counts before the recording is kept: the page usually still holds it.
+      await this.pollChat(m).catch(() => {});
+      if (m.state === 'ended') return;
+      return this.finish(m, s === 'ended' ? 'meeting-ended' : 'removed');
+    }
     await this.pollChat(m);
     if (m.state === 'ended') return;
     const n = await this.page(m, (p) => m.platform.participants(p));

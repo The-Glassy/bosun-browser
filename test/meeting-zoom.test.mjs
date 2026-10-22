@@ -6,11 +6,14 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
-import { startBosun, connect, until, sleep } from './helpers.mjs';
+import { startBosun, connect, until, sleep, ENGINE } from './helpers.mjs';
 import { startFakeZoom } from './fakezoom.mjs';
 import { fakeAudio } from './fakemeet.mjs';
 import { zoom, parseZoomUrl, zoomWebClientUrl } from '../src/meetings/platforms/zoom.mjs';
 import { PLATFORMS, announcement, CONFIRM_DELETED } from '../src/meetings/index.mjs';
+
+// The meeting profiles in production are patchright profiles: ENGINE=patchright runs them as such.
+const PROFILE_ENGINE = ENGINE === 'patchright' ? 'patchright' : 'chromium';
 
 let fake;
 before(async () => { fake = await startFakeZoom(); });
@@ -35,7 +38,7 @@ async function withService(fn, { meetings = {}, launchPage = false } = {}) {
 const status = async (c, id) => (await c.call('meeting_status', { meeting_id: id })).json();
 // A profile a person signed in to Zoom with earlier (session_open + request_human).
 async function zoomProfile(c) {
-  const s = await c.open({ profile: 'zoom', engine: 'chromium' });
+  const s = await c.open({ profile: 'zoom', engine: PROFILE_ENGINE });
   await c.call('session_close', { session: s });
 }
 
@@ -200,4 +203,74 @@ test('Zoom app-launch page: "Launch Meeting", then "Join from your browser"; a p
     await c.call('meeting_leave', { meeting_id: r.json().meeting_id });
     await c.close();
   }, { launchPage: true });
+});
+
+test('Zoom chat: switched to Everyone before the announcement, sent with Send when Enter adds a line; host-only chat means no recording', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    await zoomProfile(c);
+    const { id: zid, url } = fake.newRoom({ signedIn: true, open: true, recipient: 'Guest Two', enterNewline: true });
+    const id = (await c.call('meeting_join', { url, profile: 'zoom' })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 20_000);
+    const sent = fake.room(zid).chat.filter((m) => m.self);
+    assert.deepEqual(sent.map((m) => [m.to, m.text]), announcement('Glassy (notetaker)', null).map((t) => ['Everyone', t]));
+    await c.call('meeting_leave', { meeting_id: id });
+    // Chat only with the host: the announcement can't reach everyone, so Bosun leaves without recording.
+    const h = fake.newRoom({ signedIn: true, open: true, recipient: 'Host and co-hosts', hostOnly: true });
+    const hid = (await c.call('meeting_join', { url: h.url, profile: 'zoom' })).json().meeting_id;
+    await until(async () => (await status(c, hid)).state === 'ended', 20_000);
+    assert.match((await status(c, hid)).error, /can't be sent to everyone \(recipient: Host and co-hosts\)/);
+    assert.equal(fake.room(h.id).chat.length, 0);
+    assert.equal(audio.recorders.length, 1); // the first meeting's only
+    await c.close();
+  });
+});
+
+test('Zoom state in the call comes from dialogs only: a caption or meeting title saying "ended" or "waiting room" changes nothing', async () => {
+  await withService(async (svc, ev) => {
+    const c = await connect(svc);
+    await zoomProfile(c);
+    const { id: zid, url } = fake.newRoom({ signedIn: true, open: true, title: 'Waiting Room redesign: please wait, the meeting host will let you in soon' });
+    const id = (await c.call('meeting_join', { url, profile: 'zoom' })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 20_000);
+    fake.caption(zid, 'Host Person: this meeting has been ended by host, just kidding. You have been removed from this meeting');
+    await sleep(1200);
+    assert.equal((await status(c, id)).state, 'recording');
+    assert.ok(!fake.room(zid).media.some((m) => m.cam), 'the camera was never on');
+    fake.end(zid);
+    await until(() => ev.ended.length === 1, 10_000);
+    assert.equal(ev.ended[0].reason, 'meeting-ended');
+    await c.close();
+  });
+});
+
+test('an objection in the chat just before the host ends the meeting still deletes the recording', async () => {
+  await withService(async (svc, ev) => {
+    const c = await connect(svc);
+    await zoomProfile(c);
+    const { id: zid, url } = fake.newRoom({ signedIn: true, open: true });
+    const id = (await c.call('meeting_join', { url, profile: 'zoom' })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 30_000);
+    const file = (await status(c, id)).recording.path;
+    fake.say(zid, 'Guest Two', 'please do not record me');
+    await sleep(500); // shown in the page, not yet read by Bosun (it looks every 3 s here)
+    fake.end(zid);
+    await until(() => ev.ended.length === 1, 15_000);
+    assert.equal(ev.optout.length, 1);
+    assert.equal(ev.ended[0].recording, null);
+    assert.equal(fs.existsSync(file), false);
+    await c.close();
+  }, { meetings: { pollMs: 3000 } });
+});
+
+test('Zoom asking for the passcode although the link has one: not typed in (pwd is a token), a clear error', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    await zoomProfile(c);
+    const { id: zid, url } = fake.newRoom({ signedIn: true, passcode: 'tok', askPasscode: true });
+    const r = await c.call('meeting_join', { url, profile: 'zoom' });
+    assert.match(r.text, /Zoom asks for the meeting passcode although the link carries one/);
+    assert.equal(fake.room(zid).guest, null);
+    await c.close();
+  });
 });

@@ -5,21 +5,28 @@ export const norm = (s) => String(s || '').replace(/[‘’ʼ]/g, "'").replace(/
 export const any = (...parts) => new RegExp(parts.join('|'), 'i');
 
 // Visible page text outside `skip` (chat messages, participant names, form fields: what participants control), so a
-// name or a chat line reading "The call has ended" neither ends the meeting nor hides the real banner.
-export function pageText(page, skip) {
-  return page.evaluate((skip) => {
+// name or a chat line reading "The call has ended" neither ends the meeting nor hides the real banner. roots: only
+// text inside elements matching it (e.g. dialogs).
+export function pageText(page, skip, roots = null) {
+  return page.evaluate(({ skip, roots }) => {
     const out = [];
-    const walk = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
     const vis = new Map();
-    for (let n = walk.nextNode(); n && out.length < 2000; n = walk.nextNode()) {
-      const el = n.parentElement;
-      if (!el || !n.nodeValue.trim() || el.closest(skip) || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(el.tagName)) continue;
-      if (!vis.has(el)) vis.set(el, el.checkVisibility ? el.checkVisibility() : !!el.offsetParent);
-      if (vis.get(el)) out.push(n.nodeValue.trim());
+    for (const root of roots ? document.querySelectorAll(roots) : [document.body || document.documentElement]) {
+      const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let n = walk.nextNode(); n && out.length < 2000; n = walk.nextNode()) {
+        const el = n.parentElement;
+        if (!el || !n.nodeValue.trim() || el.closest(skip) || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(el.tagName)) continue;
+        if (!vis.has(el)) vis.set(el, el.checkVisibility ? el.checkVisibility() : !!el.offsetParent);
+        if (vis.get(el)) out.push(n.nodeValue.trim());
+      }
     }
     return out.join('\n').slice(0, 20000);
-  }, skip).then(norm);
+  }, { skip, roots }).then(norm);
 }
+
+// Where a site puts its own status messages over a running call (meeting ended, removed): dialogs only. Captions,
+// the meeting title and toasts are outside, so what participants say or name a meeting can't end it.
+export const DIALOGS = '[role="dialog"], [role="alertdialog"]';
 
 export const visible = (l) => l.first().isVisible().catch(() => false);
 export const button = (page, name) => page.getByRole('button', { name });

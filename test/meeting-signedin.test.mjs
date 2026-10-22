@@ -4,9 +4,12 @@
 // device ("Switch here" / "Join here too"). Also the lobby kind detection (guest or account) on its own.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { startBosun, connect, until } from './helpers.mjs';
+import { startBosun, connect, until, ENGINE } from './helpers.mjs';
 import { startFakeMeet, fakeAudio } from './fakemeet.mjs';
 import { meet, meetPrejoin } from '../src/meetings/platforms/meet.mjs';
+
+// The meeting profiles in production are patchright profiles: ENGINE=patchright runs them as such.
+const PROFILE_ENGINE = ENGINE === 'patchright' ? 'patchright' : 'chromium';
 
 let fake;
 before(async () => { fake = await startFakeMeet(); });
@@ -17,7 +20,7 @@ async function withService(fn) {
   const svc = await startBosun({ KEEPALIVE: '0' }, { meetings: { audio, platformFor: (u) => (u.startsWith(fake.base) ? meet : null), pollMs: 200 } });
   try {
     const c = await connect(svc);
-    const s = await c.open({ profile: 'google', engine: 'chromium' }); // where a person signed in to Google earlier
+    const s = await c.open({ profile: 'google', engine: PROFILE_ENGINE }); // where a person signed in to Google earlier
     await c.call('session_close', { session: s });
     return await fn(svc, c);
   } finally { await svc.stop(); }
@@ -90,6 +93,34 @@ test('a guest lobby with a dialog over it still joins as a guest with the name g
     assert.equal(r.json().joined_as, 'guest');
     assert.deepEqual(fake.room(code).guest, { name: 'Notes Bot', mic: false, cam: false });
     await c.call('meeting_leave', { meeting_id: r.json().meeting_id });
+    await c.close();
+  });
+});
+
+test('Meet state in the call comes from dialogs only: a caption or meeting title saying "ended" or "removed" changes nothing', async () => {
+  await withService(async (svc, c) => {
+    const { code, url } = fake.newRoom();
+    fake.set(code, { signedIn: true, open: true, title: 'You’ve been removed from the meeting (retro)' });
+    const id = (await c.call('meeting_join', { url, profile: 'google' })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    fake.caption(code, 'Alex: the call has ended, said nobody');
+    await new Promise((r) => setTimeout(r, 1200));
+    assert.equal((await status(c, id)).state, 'recording');
+    fake.end(code);
+    await until(async () => (await status(c, id)).state === 'ended', 10_000);
+    assert.equal((await status(c, id)).reason, 'meeting-ended');
+    await c.close();
+  });
+});
+
+test('Meet: "Join here too" offered directly (without "Other ways to join") is found', async () => {
+  await withService(async (svc, c) => {
+    const s = await c.open();
+    const page = svc.manager.sessions.get(s).page;
+    await page.setContent('<h1>You’re in this call on another device</h1><button>Join here too</button><button>Switch here</button>');
+    assert.equal(await meetPrejoin(page), 'account');
+    assert.equal((await meet.joinButton(page)).label, 'Join here too');
+    assert.equal(await meet.state(page), 'lobby');
     await c.close();
   });
 });

@@ -8,11 +8,11 @@
 // and labels are also matched in German and Ukrainian (some Russian). These markers were written from Zoom's web
 // client as documented and seen in screenshots, and tested against a local stand-in (test/fakezoom.mjs), not yet
 // against live Zoom: a run against real Zoom that fails here is fixed here.
-import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, DIALOGS } from './common.mjs';
 
 const TEXT = {
   // The waiting room, or a meeting the host has not started yet (Zoom lets you in when it starts).
-  waiting: any('please wait,? the meeting host will let you in soon', "we've let them know you're here", 'host has joined', 'waiting for the host to start',
+  waiting: any('please wait,? the meeting host will let you in soon', "we've let them know you're here", 'host has joined', 'wait(?:ing)? for the host to start',
     'the meeting will begin when the host joins', 'meeting has not started', 'waiting room',
     'bitte warten sie,? der (?:meeting-)?host', 'lässt sie (?:in kürze|gleich) (?:ein|teilnehmen)', 'warten auf (?:den )?host', 'das meeting beginnt,? (?:wenn|sobald) der host', 'warteraum',
     'зачекайте,? організатор', 'організатор (?:незабаром|скоро) (?:впустить|додасть)', 'очікування організатора', 'зал очікування',
@@ -58,6 +58,10 @@ const LABEL = {
 };
 const NAME_FIELD = 'input#input-for-name, input[aria-label="Your Name" i], input[placeholder="Your Name" i], input[aria-label="Ihr Name" i], input[placeholder="Ihr Name" i], input[aria-label^="Ваше ім" i], input[placeholder^="Ваше ім" i]';
 const PASSCODE_FIELD = 'input#input-for-pwd, input[aria-label*="passcode" i], input[placeholder*="passcode" i], input[aria-label*="kenncode" i], input[placeholder*="kenncode" i]';
+// The chat's recipient ("To: Everyone" / a person / "Host and co-hosts") and its Send button.
+const CHAT_RECIPIENT = '[class*="receiver-list__receiver"], [class*="chat-receiver"] button, [class*="chat-to"] button, button[aria-label^="send to" i], button[aria-label^="chat with" i]';
+const EVERYONE = any('everyone', 'alle(?:n)?\\b', 'jeder', 'всі(?:х)?\\b', 'усі(?:х)?\\b', 'все(?:х|м)?\\b');
+const SEND = any('^send$', '^send message$', '^senden$', '^nachricht senden$', '^надіслати$', '^отправить$');
 const CHAT_INPUT = '.chat-box__chat-textarea, textarea[class*="chat"], [contenteditable="true"][class*="chat"], .tiptap[contenteditable="true"], [contenteditable="true"][data-placeholder*="message" i], textarea[placeholder*="message" i]';
 // One chat message's text (innermost match wins), and the item it belongs to with the sender's name.
 const CHAT_MESSAGE = '[id^="chat-message-content"], .new-chat-message__container, .chat-message__container, [class*="chat-message__text"]';
@@ -66,7 +70,8 @@ const CHAT_ITEM = '.chat-item-container, [class*="chat-item__container"], [class
 
 // What participants control: the chat and its input, names on video tiles and in the participants list.
 const PARTICIPANT_CONTROLLED = '[class*="chat"], [class*="participants-item"], [class*="participants-li"], [class*="video-avatar__avatar-name"], [class*="name-tag"], [class*="avatar-name"], [role="list"], [role="listitem"], textarea, input, [contenteditable="true"]';
-const pageText = (page) => textOutside(page, PARTICIPANT_CONTROLLED);
+const pageText = (page, roots) => textOutside(page, PARTICIPANT_CONTROLLED, roots);
+const MODALS = `${DIALOGS}, [class*="zm-modal"], [class*="modal-dialog"]`;
 const overlays = (page) => dismissOverlays(page, LABEL.dismiss, ['#onetrust-banner-sdk', '[class*="zm-modal"]', '[class*="modal-dialog"]']);
 const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha'];
 
@@ -152,12 +157,14 @@ export const zoom = {
     if (field && !(profile && prefilled)) await field.fill(name, { timeout: 5000 });
     info.joinedAs = profile && (!field || prefilled) ? 'account' : 'guest';
     info.selfName = field ? (await field.inputValue().catch(() => name)).trim() : null;
-    // The passcode comes with the link (pwd); a page that still asks for it gets it, or the join stops here.
+    // The passcode comes with the link (pwd, an encrypted token, not the passcode people type). A page that still
+    // asks for it stops the join: the token typed into the field would only be refused.
     const pass = await firstVisible(page.locator(PASSCODE_FIELD));
     if (pass && !(await pass.inputValue().catch(() => ''))) {
-      const pwd = url && parseZoomUrl(url)?.pwd;
-      if (!pwd) { info.error = 'Zoom asks for the meeting passcode: use the invitation link with ?pwd=…, as Zoom sends it.'; return 'invalid'; }
-      await pass.fill(pwd, { timeout: 5000 });
+      info.error = url && parseZoomUrl(url)?.pwd
+        ? 'Zoom asks for the meeting passcode although the link carries one (pwd); the link may be outdated: ask for a fresh invitation link.'
+        : 'Zoom asks for the meeting passcode: use the invitation link with ?pwd=…, as Zoom sends it.';
+      return 'invalid';
     }
     // In the preview, "Join Audio" (no audio connected yet) also means nothing goes out.
     const micOffOrNoAudio = new RegExp(`${LABEL.micOn.source}|${LABEL.audioMenu.source}`, 'i');
@@ -177,13 +184,17 @@ export const zoom = {
   },
 
   // Once in: computer audio joined (without it nothing is heard or recorded), microphone and camera verifiably off.
+  // Zoom may connect audio with the microphone live; it is muted the moment the control shows up (the browser's
+  // microphone is a silent source anyway, so nothing but silence can go out meanwhile).
   async afterAdmit(page) {
     const until = Date.now() + 20_000;
     for (;;) {
       await overlays(page);
-      if (await visible(button(page, LABEL.micOff)) || await visible(button(page, LABEL.micOn))) break; // audio connected
+      const live = await firstVisible(button(page, LABEL.micOff));
+      if (live) { await live.click({ timeout: 3000 }).catch(() => {}); break; }
+      if (await visible(button(page, LABEL.micOn))) break; // audio connected, muted
       const comp = await firstVisible(button(page, LABEL.joinAudio));
-      if (comp) await comp.click({ timeout: 3000 }).catch(() => {});
+      if (comp) { await comp.click({ timeout: 3000 }).catch(() => {}); continue; }
       else { const menu = await firstVisible(button(page, LABEL.audioMenu)); if (menu) await menu.click({ timeout: 3000 }).catch(() => {}); }
       if (Date.now() > until) throw new Error('could not join computer audio in Zoom (nothing would be heard or recorded); Zoom changed?');
       await page.waitForTimeout(500);
@@ -198,15 +209,18 @@ export const zoom = {
   // 'invalid', 'sign-in', 'captcha' or 'unknown'.
   async state(page) {
     try { if (/\/(?:postattendee|wc\/leave)\b/.test(new URL(page.url()).pathname)) return 'ended'; } catch {}
-    const t = await pageText(page).catch(() => '');
+    // In the call (the toolbar's participants or chat button; not "Leave" alone, the waiting room has one too), only
+    // Zoom's dialogs can say the meeting ended or Bosun was removed: captions and the meeting title ("Waiting room
+    // redesign") are participants' words. Before that, the whole page counts.
+    const inCall = await firstVisible(button(page, LABEL.participants)) || await firstVisible(button(page, LABEL.chat));
+    const t = await pageText(page, inCall ? MODALS : null).catch(() => '');
     if (TEXT.removed.test(t)) return 'removed';
     if (TEXT.ended.test(t)) return 'ended';
+    if (inCall) return 'admitted';
     if (TEXT.invalid.test(t)) return 'invalid';
     if (TEXT.signIn.test(t)) return 'sign-in';
     if (await captchaShown(page)) return 'captcha';
     if (TEXT.waiting.test(t)) return 'waiting';
-    // In the call: the toolbar's Leave or participants button (the preview has neither).
-    if (await firstVisible(button(page, LABEL.leave)) || await firstVisible(button(page, LABEL.participants))) return 'admitted';
     if (await firstVisible(button(page, LABEL.join))) return 'lobby';
     if (await firstVisible(page.getByRole('link', { name: LABEL.fromBrowser })) || await firstVisible(button(page, LABEL.fromBrowser)) || await firstVisible(button(page, LABEL.launch))) return 'launch';
     return 'unknown';
@@ -222,11 +236,36 @@ export const zoom = {
     if (!(await chatBox(page))) throw new Error('the Zoom chat panel did not open');
   },
 
+  // The chat goes to everyone: a recipient control showing someone else (a person, "Host and co-hosts") is switched
+  // to Everyone, or the message is not sent. Without a recipient control (chat to everyone only) it is sent.
+  async toEveryone(page) {
+    const r = await firstVisible(page.locator(CHAT_RECIPIENT));
+    if (!r || EVERYONE.test(norm(await r.innerText().catch(() => '')))) return;
+    await r.click({ timeout: 3000 }).catch(() => {});
+    const opt = await firstVisible(page.getByRole('menuitem', { name: EVERYONE })) || await firstVisible(page.getByRole('option', { name: EVERYONE }))
+      || await firstVisible(page.getByRole('menuitemradio', { name: EVERYONE }));
+    if (opt) await opt.click({ timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(200);
+    const now = norm(await r.innerText().catch(() => ''));
+    if (!EVERYONE.test(now)) throw new Error(`the Zoom chat can't be sent to everyone (recipient: ${now.slice(0, 60) || 'unknown'}); the host may allow chat with the host only`);
+  },
+
+  // Enter sends unless the account set Enter to a new line: a message still in the box is sent with the Send button,
+  // and one that stays there is an error (the announcement must have gone out before recording).
   async sendChat(page, text) {
     await this.openChat(page);
+    await this.toEveryone(page);
     const box = await chatBox(page);
     await box.fill(text, { timeout: 5000 });
     await box.press('Enter', { timeout: 5000 });
+    const left = async () => norm(await box.evaluate((e) => ('value' in e ? e.value : e.innerText)).catch(() => '')).trim();
+    for (let i = 0; i < 8 && await left(); i++) await page.waitForTimeout(150);
+    if (!(await left())) return;
+    await box.fill(text, { timeout: 5000 }); // Enter may have added a line break
+    const send = await firstVisible(button(page, SEND));
+    if (send) await send.click({ timeout: 3000 }).catch(() => {});
+    for (let i = 0; i < 8 && await left(); i++) await page.waitForTimeout(150);
+    if (await left()) throw new Error('the Zoom chat message was not sent (still in the chat box)');
   },
 
   // As meet.mjs: new chat messages are queued in the page under a random, non-enumerable key. Zoom groups consecutive

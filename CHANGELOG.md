@@ -14,8 +14,13 @@
   - The rest is the Meet flow: the announcement in the chat before recording, the same audio recorder, every chat
     message as `bosun:meeting-chat`, the opt-out phrases stop and delete the recording, participants from the
     toolbar counter, and leaving when the meeting ends, Bosun is removed, or it is alone for 2 minutes.
+  - The announcement goes to everyone: the chat's recipient is switched to Everyone first. If the host allows chat
+    with the host only, Bosun leaves without recording. A message still in the chat box after Enter (an account
+    set to "Enter adds a new line") is sent with the Send button, and one that stays there ends the meeting
+    before recording.
   - New join outcomes with their own reason and hint: `invalid-meeting` (wrong ID or passcode, or a link without
-    `?pwd=`), `sign-in-required`, `captcha`. Removal from the waiting room is `denied`.
+    `?pwd=`), `sign-in-required`, `captcha`. Removal from the waiting room is `denied`. The link's `pwd` is an
+    encrypted token: Bosun never types it into a passcode field.
   - `platform` is `zoom` in `meeting_status` and in the events (`bosun:platform`).
 - `meeting_status` shows `joined_as`: `account` (signed in) or `guest`.
 
@@ -34,6 +39,13 @@
     join") over "Switch here", which would drop the other device.
   - Which of these caused the live failure isn't known: 0.8.0 fails on the dialog and the other-device case in the
     stand-in, and on a "Getting ready" phase longer than 15 s.
+
+- **An objection right before the meeting ends was lost** (since 0.6.0). When the host ended the meeting, or removed
+  Bosun, between two chat reads, Bosun finished first and kept the recording. It now reads the chat once more and
+  an objection still deletes the recording.
+- **Captions or a meeting title could end a meeting.** Once in the call, "the meeting has ended" or "you have been
+  removed" now only counts in the platform's own dialogs. Captions, the meeting title and the rest of the page are
+  participants' words. Before the call, the whole page still counts.
 
 ### Documented
 
