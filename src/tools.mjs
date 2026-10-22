@@ -87,7 +87,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const ephemeral = policy === 'ephemeral';
   // When this tenant has a host allowlist, say so in the tool description instead of letting the agent guess.
   const allowed = manager.allowList(tenant);
-  const allowNote = allowed ? `This token may only reach: ${allowed.map((p) => (p.any ? '*' : `${p.wild ? '*.' : ''}${p.host}${p.port ? `:${p.port}` : ''}`)).join(', ')}.` : null;
+  const allowNote = allowed ? `This token may only reach: ${allowed.map((p) => (p.any ? '*' : `${p.wild ? '*.' : ''}${p.host.includes(':') ? `[${p.host}]` : p.host}${p.port ? `:${p.port}` : ''}`)).join(', ')}.` : null;
   const server = new McpServer({ name: 'bosun', version: '0.8.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {

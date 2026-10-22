@@ -40,19 +40,21 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
   return { cfg, live, manager, ws, keepalive, events, meetings: manager.meetings ?? null, shutdown };
 }
 
-// A rejection from inside the browser driver (Playwright or patchright) that no caller can catch, such as the
-// assertion Playwright's Firefox driver hits on some WebSocket events with camoufox. It belongs to one session's
-// browser, so it is logged and the service keeps serving every other session.
-export const isDriverRejection = (e) => /[\\/](playwright|patchright)-core[\\/]/.test(String(e?.stack || ''));
+// The one rejection from inside the browser driver that no caller can catch and that must not end the service:
+// Playwright's Firefox driver (camoufox) asserts in FFPage._onWebSocketOpened when a worker opens a WebSocket. It
+// belongs to one session's browser, so it is logged and the service keeps serving every other session. Everything
+// else, including an error thrown by our own code inside a Playwright event, still ends the process.
+export const isDriverRejection = (e) => e instanceof Error && e.message === 'Assertion error'
+  && /\n\s+at assert \([^)]*[\\/](?:playwright|patchright)-core[\\/][^)]*\)\n\s+at FFPage\._onWebSocket\w+ /.test(String(e.stack));
 
-// Installed once per process. Anything that is not a driver rejection still ends the process, as Node does by default.
+// Installed once per process. Anything that is not that driver rejection ends the process, as Node does by default.
 let guarded = false;
 export function guardDriverRejections(log = (...a) => console.error(...a)) {
   if (guarded) return;
   guarded = true;
   process.on('unhandledRejection', (e) => {
     if (!isDriverRejection(e)) throw e;
-    log(`bosun: browser driver error, ignored: ${String(e?.message || e).slice(0, 200)}`);
+    log(`bosun: browser driver error, ignored (Playwright Firefox driver, worker WebSocket): ${String(e.stack).split('\n').slice(0, 4).join(' | ')}`);
   });
 }
 

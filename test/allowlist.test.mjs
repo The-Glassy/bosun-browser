@@ -42,6 +42,13 @@ test('host patterns: host, *.host, host:port, bracketed IPv6, "*"', () => {
   }
 });
 
+test('address patterns match however the address is written', () => {
+  for (const [pattern, url] of [['[0:0:0:0:0:0:0:1]:4848', 'http://[::1]:4848/'], ['[::ffff:127.0.0.1]:4848', 'http://[::ffff:7f00:1]:4848/'], ['127.1:4848', 'http://127.0.0.1:4848/'], ['[::1]', 'ws://[0::1]/']]) {
+    assert.equal(allowsUrl([parseHostPattern(pattern)], url), true, `${pattern} vs ${url}`);
+  }
+  assert.throws(() => parseHostPattern('[::1::2]:80'), /not a valid host/);
+});
+
 test('allowsUrl: host and port, subdomains only under *., no scheme but http(s)', () => {
   const p = patterns('*.example.org,example.net,127.0.0.1:4848');
   for (const u of ['https://a.example.org/x?y=1', 'http://a.b.example.org:8080/', 'https://A.Example.ORG./',

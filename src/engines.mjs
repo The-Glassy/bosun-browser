@@ -16,18 +16,34 @@ export const PROXY_ARGS = ['--disable-quic', '--force-webrtc-ip-handling-policy=
 const chromiumArgs = (proxy, extra = []) => [...CHROMIUM_ARGS, ...(proxy ? PROXY_ARGS : []), ...extra];
 // A persistent Chromium profile ignores --force-webrtc-ip-handling-policy (full Chromium reads the profile preference
 // instead; only the headless shell honours the flag), so a proxied tenant's profile directory also gets the
-// preference before launch. An unproxied launch removes exactly that value again, so an allowlist that is taken away
-// later does not stay behind in the profile.
+// preference before launch. Bosun notes that it set it (MARKER, with the value it replaced), and an unproxied launch
+// restores exactly that, so an allowlist that is taken away later does not stay behind in the profile, and a
+// preference Bosun did not set is never touched.
 const WEBRTC_POLICY = 'disable_non_proxied_udp';
+const WEBRTC_MARKER = '.bosun-webrtc-policy';
 export function applyWebrtcPolicy(dir, proxied) {
   const file = path.join(dir, 'Default', 'Preferences');
+  const marker = path.join(dir, WEBRTC_MARKER);
+  const owned = fs.existsSync(marker);
+  if (!proxied && !owned) return;
   let prefs = {};
   try { prefs = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
   if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) prefs = {};
-  const set = prefs.webrtc?.ip_handling_policy === WEBRTC_POLICY;
-  if (proxied === set) return;
-  if (proxied) prefs.webrtc = { ...prefs.webrtc, ip_handling_policy: WEBRTC_POLICY };
-  else delete prefs.webrtc.ip_handling_policy;
+  const current = prefs.webrtc?.ip_handling_policy;
+  if (proxied) {
+    if (current === WEBRTC_POLICY) return; // already restricted (by us, or by whoever set it)
+    fs.writeFileSync(marker, JSON.stringify({ previous: current ?? null }), { mode: 0o600 });
+    prefs.webrtc = { ...prefs.webrtc, ip_handling_policy: WEBRTC_POLICY };
+  } else {
+    let previous = null;
+    try { ({ previous = null } = JSON.parse(fs.readFileSync(marker, 'utf8'))); } catch {}
+    if (current === WEBRTC_POLICY) {
+      if (previous === null) delete prefs.webrtc.ip_handling_policy;
+      else prefs.webrtc.ip_handling_policy = previous;
+    }
+    fs.rmSync(marker, { force: true });
+    if (current !== WEBRTC_POLICY) return;
+  }
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   fs.writeFileSync(file, JSON.stringify(prefs), { mode: 0o600 });
 }

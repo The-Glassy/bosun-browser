@@ -88,19 +88,33 @@ test('a proxied tenant\'s persistent profile sends no UDP of its own either', as
   assert.equal(alice.datagrams, 0, `a proxied tenant's profile sent UDP: ${JSON.stringify(alice.candidates)}`);
 });
 
-test('the WebRTC preference is written for a proxied launch and removed again for an unproxied one', () => {
+test('the WebRTC preference is set for a proxied launch and restored on an unproxied one, never touched otherwise', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bosun-rtc-'));
   const file = path.join(dir, 'Default', 'Preferences');
+  const read = () => JSON.parse(fs.readFileSync(file, 'utf8'));
+  const write = (v) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(v)); };
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ webrtc: { multiple_routes_enabled: true }, other: 1 }));
+    write({ webrtc: { multiple_routes_enabled: true }, other: 1 });
     applyWebrtcPolicy(dir, true);
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { webrtc: { multiple_routes_enabled: true, ip_handling_policy: 'disable_non_proxied_udp' }, other: 1 });
+    assert.deepEqual(read(), { webrtc: { multiple_routes_enabled: true, ip_handling_policy: 'disable_non_proxied_udp' }, other: 1 });
     applyWebrtcPolicy(dir, false);
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { webrtc: { multiple_routes_enabled: true }, other: 1 });
+    assert.deepEqual(read(), { webrtc: { multiple_routes_enabled: true }, other: 1 });
+    // A value Bosun replaced comes back.
+    write({ webrtc: { ip_handling_policy: 'default_public_interface_only' } });
+    applyWebrtcPolicy(dir, true);
+    assert.equal(read().webrtc.ip_handling_policy, 'disable_non_proxied_udp');
+    applyWebrtcPolicy(dir, false);
+    assert.equal(read().webrtc.ip_handling_policy, 'default_public_interface_only');
+    // A restriction Bosun did not set stays, both ways.
+    write({ webrtc: { ip_handling_policy: 'disable_non_proxied_udp' } });
+    applyWebrtcPolicy(dir, false);
+    assert.equal(read().webrtc.ip_handling_policy, 'disable_non_proxied_udp');
+    applyWebrtcPolicy(dir, true);
+    applyWebrtcPolicy(dir, false);
+    assert.equal(read().webrtc.ip_handling_policy, 'disable_non_proxied_udp');
     // A fresh profile directory gets the file created.
     fs.rmSync(path.join(dir, 'Default'), { recursive: true });
     applyWebrtcPolicy(dir, true);
-    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).webrtc.ip_handling_policy, 'disable_non_proxied_udp');
+    assert.equal(read().webrtc.ip_handling_policy, 'disable_non_proxied_udp');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

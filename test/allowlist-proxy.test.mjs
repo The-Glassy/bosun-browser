@@ -186,6 +186,26 @@ test('closing the proxy ends open tunnels and never hangs', async () => {
   await new Promise((r) => sink.close(r));
 });
 
+test('a request whose DNS answer arrives after close() never reaches upstream', async () => {
+  let connections = 0;
+  const sink = net.createServer((sock) => { connections++; sock.destroy(); });
+  await new Promise((r) => sink.listen(0, '127.0.0.1', r));
+  const port = sink.address().port;
+  const answers = [];
+  const lookup = () => new Promise((r) => answers.push(r)); // answered by hand, after close()
+  const proxy = await startTenantProxy({ tenant: 't', allow: [parseHostPattern(`app.example.org:${port}`), parseHostPattern(`127.0.0.1:${port}`)], log: () => {}, lookup });
+  const auth = `Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')}`;
+  const send = (text) => { const c = net.connect(proxy.port, '127.0.0.1'); c.on('error', () => {}); c.write(text); return c; };
+  send(`CONNECT app.example.org:${port} HTTP/1.1\r\nProxy-Authorization: ${auth}\r\n\r\n`);
+  send(`GET http://app.example.org:${port}/ HTTP/1.1\r\nHost: app.example.org:${port}\r\nProxy-Authorization: ${auth}\r\n\r\n`);
+  await until(() => answers.length === 2, 5000);
+  await proxy.close();
+  for (const answer of answers) answer('127.0.0.1');
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(connections, 0);
+  await new Promise((r) => sink.close(r));
+});
+
 test('navigate: refused before anything is opened, and the allowed hosts are named in the tool description', async () => {
   const c = await connect(svc, TOKEN);
   try {

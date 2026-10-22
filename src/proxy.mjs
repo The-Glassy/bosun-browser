@@ -94,6 +94,8 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
   const stats = { allowed: 0, denied: 0 };
   const recent = []; // [{at, target}] of the latest denials, newest last
   const sockets = new Set(); // every client and upstream socket, so close() can end tunnels too
+  const agent = new http.Agent({ keepAlive: true }); // this proxy's own upstream pool for plain http://, closed with it
+  let closing = false; // set by close(): nothing new is started, whatever was awaiting when it came
   const track = (sock) => { sockets.add(sock); sock.once('close', () => sockets.delete(sock)); return sock; };
 
   const authenticated = (req) => {
@@ -144,6 +146,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     const authority = parseAuthority(u.host, 80);
     if (!authority) return end(400, 'malformed request target');
     const target = await resolveTarget(allow, authority.host, authority.port, lookup);
+    if (closing || res.destroyed || req.socket.destroyed) return res.destroy(); // closed or gone while resolving
     if (target.denied) {
       deny(authority.host, authority.port, target.denied);
       return end(403, `${bracketed(authority.host)}:${authority.port} ${target.denied}`);
@@ -151,10 +154,11 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     stats.allowed++;
     const headers = { ...req.headers };
     for (const h of HOP_BY_HOP) delete headers[h];
-    const out = http.request({ host: target.ip, port: target.port, path: `${u.pathname}${u.search}`, method: req.method, headers, setHost: false }, (up) => {
+    const out = http.request({ host: target.ip, port: target.port, path: `${u.pathname}${u.search}`, method: req.method, headers, setHost: false, agent }, (up) => {
       res.writeHead(up.statusCode, up.statusMessage, up.headers);
       up.pipe(res);
     });
+    out.on('socket', track);
     out.setTimeout(CONNECT_TIMEOUT_MS, () => out.destroy(new Error('timeout')));
     out.on('error', () => { if (!res.headersSent) end(502, 'upstream failed'); else res.destroy(); });
     res.on('close', () => out.destroy());
@@ -170,6 +174,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     const authority = parseAuthority(req.url, 443);
     if (!authority) return refuse('400 Bad Request', 'malformed CONNECT target');
     const target = await resolveTarget(allow, authority.host, authority.port, lookup);
+    if (closing || sock.destroyed) return sock.destroy(); // closed or gone while resolving
     if (target.denied) {
       deny(authority.host, authority.port, target.denied);
       return refuse('403 Forbidden', `${bracketed(authority.host)}:${authority.port} ${target.denied}`);
@@ -177,7 +182,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     let up;
     try { up = await dial(target); } catch { return refuse('502 Bad Gateway', 'upstream failed'); }
     stats.allowed++;
-    if (sock.destroyed) return up.destroy();
+    if (closing || sock.destroyed) { sock.destroy(); return up.destroy(); }
     sock.write('HTTP/1.1 200 Connection Established\r\nProxy-Agent: bosun\r\n\r\n');
     if (head?.length) up.write(head);
     tunnel(sock, up);
@@ -195,6 +200,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     const authority = parseAuthority(u.host, 80);
     if (!authority) return refuse('400 Bad Request', 'malformed request target');
     const target = await resolveTarget(allow, authority.host, authority.port, lookup);
+    if (closing || sock.destroyed) return sock.destroy(); // closed or gone while resolving
     if (target.denied) {
       deny(authority.host, authority.port, target.denied);
       return refuse('403 Forbidden', `${bracketed(authority.host)}:${authority.port} ${target.denied}`);
@@ -202,7 +208,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     let up;
     try { up = await dial(target); } catch { return refuse('502 Bad Gateway', 'upstream failed'); }
     stats.allowed++;
-    if (sock.destroyed) return up.destroy();
+    if (closing || sock.destroyed) { sock.destroy(); return up.destroy(); }
     const lines = [`${req.method} ${u.pathname}${u.search} HTTP/1.1`];
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
       if (!/^proxy-/i.test(req.rawHeaders[i])) lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
@@ -227,7 +233,9 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     deniedSince(t) { return recent.filter((d) => d.at >= t).map((d) => d.target); },
     // Stops listening and ends every connection, tunnels included; never waits longer than CLOSE_DEADLINE_MS.
     async close() {
+      closing = true;
       const closed = new Promise((r) => srv.close(() => r()));
+      agent.destroy();
       srv.closeAllConnections?.();
       for (const sock of sockets) sock.destroy();
       let timer;

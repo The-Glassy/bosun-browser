@@ -12,21 +12,28 @@ import { connect, until, tmpDir, TOKEN } from './helpers.mjs';
 const BOSUN = new URL('../src/bosun.mjs', import.meta.url).href;
 const SERVER = new URL('../src/server.mjs', import.meta.url).pathname;
 
-test('only rejections from inside the driver count as driver rejections', () => {
-  const driver = Object.assign(new Error('Assertion error'), { stack: 'Error: Assertion error\n    at assert (/x/node_modules/playwright-core/lib/coreBundle.js:885:11)' });
-  const patch = Object.assign(new Error('x'), { stack: 'Error: x\n    at f (C:\\x\\node_modules\\patchright-core\\lib\\a.js:1:1)' });
+const FF_STACK = 'Error: Assertion error\n    at assert (/x/node_modules/playwright-core/lib/coreBundle.js:885:11)\n'
+  + '    at FFPage._onWebSocketOpened (/x/node_modules/playwright-core/lib/coreBundle.js:46538:9)\n    at FFSession.emit (node:events:508:28)';
+
+test('only the Firefox driver\'s WebSocket assertion counts as a driver rejection', () => {
+  const driver = Object.assign(new Error('Assertion error'), { stack: FF_STACK });
   assert.equal(isDriverRejection(driver), true);
-  assert.equal(isDriverRejection(patch), true);
-  assert.equal(isDriverRejection(new Error('ours')), false);
+  // Our own error thrown from a Playwright event listener has Playwright frames in its stack too: not ignored.
+  const ours = Object.assign(new Error('ours'), { stack: 'Error: ours\n    at onDownload (/x/src/sessions.mjs:1:1)\n    at Page.emit (/x/node_modules/playwright-core/lib/coreBundle.js:1:1)' });
+  assert.equal(isDriverRejection(ours), false);
+  // Another assertion in the driver, or the same message from elsewhere: not ignored.
+  const other = Object.assign(new Error('Assertion error'), { stack: 'Error: Assertion error\n    at assert (/x/node_modules/playwright-core/lib/coreBundle.js:885:11)\n    at CRPage._onFrameAttached (/x/node_modules/playwright-core/lib/coreBundle.js:1:1)' });
+  assert.equal(isDriverRejection(other), false);
+  assert.equal(isDriverRejection(Object.assign(new Error('Assertion error'), { stack: 'Error: Assertion error\n    at assert (/x/src/sessions.mjs:1:1)\n    at FFPage._onWebSocketOpened (/x/src/a.mjs:1:1)' })), false);
   assert.equal(isDriverRejection('a string'), false);
   assert.equal(isDriverRejection(null), false);
 });
 
 // Runs a tiny process with the guard installed and one unhandled rejection; returns its exit code and stderr.
-function guarded(stackLine) {
+function guarded(message, stack) {
   const code = `import { guardDriverRejections } from ${JSON.stringify(BOSUN)};
     guardDriverRejections();
-    const e = new Error('boom'); e.stack = 'Error: boom\\n' + ${JSON.stringify(stackLine)};
+    const e = new Error(${JSON.stringify(message)}); e.stack = ${JSON.stringify(stack)};
     Promise.reject(e);
     setTimeout(() => { console.error('still running'); process.exit(0); }, 300);`;
   return new Promise((resolve) => {
@@ -38,11 +45,11 @@ function guarded(stackLine) {
 }
 
 test('the guard logs a driver rejection and keeps the process; anything else still ends it', async () => {
-  const kept = await guarded('    at assert (/x/node_modules/playwright-core/lib/coreBundle.js:885:11)');
+  const kept = await guarded('Assertion error', FF_STACK);
   assert.equal(kept.status, 0, kept.err);
-  assert.match(kept.err, /bosun: browser driver error, ignored: boom/);
+  assert.match(kept.err, /bosun: browser driver error, ignored \(Playwright Firefox driver, worker WebSocket\): Error: Assertion error/);
   assert.match(kept.err, /still running/);
-  const ended = await guarded('    at ours (/x/src/sessions.mjs:1:1)');
+  const ended = await guarded('boom', 'Error: boom\n    at ours (/x/src/sessions.mjs:1:1)');
   assert.notEqual(ended.status, 0);
   assert.doesNotMatch(ended.err, /still running/);
 });
