@@ -1,4 +1,4 @@
-// Per-tenant navigation host allowlist (fork addition): which hosts a tenant may reach. The patterns are matched
+// Per-tenant host allowlist (BROWSER_TENANT_ALLOW): which hosts a tenant may reach. The patterns are matched
 // here; they are enforced in src/proxy.mjs, the per-tenant forward proxy that is the only way out of that tenant's
 // browser (so every navigation, redirect hop, subresource, WebSocket and worker request is checked), and, for a
 // clearer error before anything is opened, on `navigate` and `keepalive_set`. A tenant without an allowlist is

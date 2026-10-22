@@ -1,4 +1,4 @@
-// Per-tenant forward proxy (fork addition): where a tenant's host allowlist is enforced.
+// Per-tenant forward proxy: where a tenant's host allowlist (BROWSER_TENANT_ALLOW) is enforced.
 //
 // A tenant that has an allowlist gets one of these, and its browser contexts are launched with Playwright's proxy
 // option pointing at it, so the proxy is the browser's only way out. Everything the browser would send arrives here
@@ -23,6 +23,8 @@ import { allowsUrl } from './allow.mjs';
 const MAX_LOGGED = 50; // distinct denied targets logged per tenant
 const MAX_CONNECTIONS = 256; // sockets the browser may hold open through one tenant proxy
 const CONNECT_TIMEOUT_MS = 15_000;
+const CLOSE_DEADLINE_MS = 5_000; // close(): open tunnels are destroyed, and nothing waits longer than this
+const RECENT_DENIALS = 64; // denials kept with their time, so navigate can tell a refusal from a network error
 // Headers that belong to one hop and must not be forwarded.
 const HOP_BY_HOP = ['proxy-authorization', 'proxy-connection', 'connection', 'keep-alive', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
 const AUTH_REALM = 'Proxy-Authenticate: Basic realm="bosun"';
@@ -52,17 +54,20 @@ export function parseAuthority(raw, defaultPort) {
 }
 
 // Addresses that an allowlist has to name as an address, not as a name: loopback, private, link-local, CGNAT,
-// multicast and the unspecified address. A name resolving to one of these is what DNS rebinding looks like.
+// benchmarking, IETF protocol assignments, multicast and the unspecified address, and the IPv6 forms that embed or
+// translate to IPv4 (NAT64 64:ff9b::/96 and 64:ff9b:1::/48, 6to4 2002::/16). A name resolving to one of these is
+// what DNS rebinding looks like.
 export function isPrivateAddress(ip) {
   if (net.isIPv4(ip)) {
-    const [a, b] = ip.split('.').map(Number);
+    const [a, b, c] = ip.split('.').map(Number);
     return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
+      || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127)
+      || (a === 198 && (b === 18 || b === 19)) || (a === 192 && b === 0 && c === 0);
   }
   const s = String(ip).toLowerCase().replace(/%.*$/, '');
   if (s === '::' || s === '::1') return true;
   if (s.startsWith('::ffff:')) return net.isIPv4(s.slice(7)) ? isPrivateAddress(s.slice(7)) : true;
-  return /^f[cd]/.test(s) || /^fe[89ab]/.test(s) || /^ff/.test(s);
+  return /^f[cd]/.test(s) || /^fe[89ab]/.test(s) || /^ff/.test(s) || /^64:ff9b:/.test(s) || /^2002:/.test(s);
 }
 
 const resolve = (host) => dns.promises.lookup(host, { verbatim: true }).then((r) => r.address);
@@ -87,6 +92,9 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
   const expected = digest(`Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`);
   const logged = new Set();
   const stats = { allowed: 0, denied: 0 };
+  const recent = []; // [{at, target}] of the latest denials, newest last
+  const sockets = new Set(); // every client and upstream socket, so close() can end tunnels too
+  const track = (sock) => { sockets.add(sock); sock.once('close', () => sockets.delete(sock)); return sock; };
 
   const authenticated = (req) => {
     const presented = digest(req.headers['proxy-authorization'] || '');
@@ -95,6 +103,8 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
   const deny = (what, port, reason) => {
     stats.denied++;
     const at = `${bracketed(what)}:${port}`;
+    recent.push({ at: Date.now(), target: at });
+    if (recent.length > RECENT_DENIALS) recent.shift();
     if (logged.has(at) || logged.size >= MAX_LOGGED) return;
     logged.add(at);
     log(`bosun: tenant ${tenant}: blocked ${at} — ${reason}`);
@@ -103,7 +113,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
   // Connects to the address the decision was made about; the name only travels in the request (and in SNI, which
   // the browser sets inside the tunnel).
   const dial = (t) => new Promise((resolve_, reject) => {
-    const sock = net.connect({ host: t.ip, port: t.port });
+    const sock = track(net.connect({ host: t.ip, port: t.port }));
     sock.setTimeout(CONNECT_TIMEOUT_MS, () => sock.destroy(new Error('timeout')));
     sock.once('connect', () => { sock.setTimeout(0); resolve_(sock); });
     sock.once('error', reject);
@@ -121,6 +131,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
 
   const srv = http.createServer();
   srv.maxConnections = MAX_CONNECTIONS;
+  srv.on('connection', track);
   srv.on('clientError', (_e, sock) => sock.destroy());
 
   // Plain http:// requests, in absolute form. Streamed both ways: nothing is held in memory here.
@@ -212,8 +223,16 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     bypass: '<-loopback>',
     port,
     stats,
+    // host:port targets refused since time t (ms), oldest first.
+    deniedSince(t) { return recent.filter((d) => d.at >= t).map((d) => d.target); },
+    // Stops listening and ends every connection, tunnels included; never waits longer than CLOSE_DEADLINE_MS.
     async close() {
-      await new Promise((r) => { srv.close(() => r()); srv.closeAllConnections?.(); });
+      const closed = new Promise((r) => srv.close(() => r()));
+      srv.closeAllConnections?.();
+      for (const sock of sockets) sock.destroy();
+      let timer;
+      await Promise.race([closed, new Promise((r) => { timer = setTimeout(r, CLOSE_DEADLINE_MS); timer.unref?.(); })]);
+      clearTimeout(timer);
     },
   };
 }

@@ -1,16 +1,20 @@
-// Fork: one tenant's host allowlist must not change another tenant's networking. The flags that keep a proxied
+// One tenant's host allowlist must not change another tenant's networking. The flags that keep a proxied
 // tenant inside its proxy (no QUIC, no non-proxied WebRTC UDP) are Chromium's, and Chromium takes them per browser
 // process — so a tenant with an allowlist gets a browser of its own and the tenants without one keep a browser
 // launched exactly the way upstream launches it.
 //
-// Built from the round-3 review's probe: a UDP socket stands in for a STUN server, and an RTCPeerConnection in the
+// Built from a review probe: a UDP socket stands in for a STUN server, and an RTCPeerConnection in the
 // page says whether the browser is willing to send UDP of its own. Both tenants are checked in the *same* service,
 // with the allowlist in place, since that is the case that regressed.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import dgram from 'dgram';
 import http from 'http';
-import { startBosun, connect, TOKEN, TOKEN_B } from './helpers.mjs';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { applyWebrtcPolicy } from '../src/engines.mjs';
+import { startBosun, connect, until, TOKEN, TOKEN_B } from './helpers.mjs';
 
 let udp, stunPort, srv, base, svc;
 before(async () => {
@@ -33,10 +37,10 @@ after(async () => {
 
 // Opens a session for one token, gathers ICE against the UDP listener and reports what the browser was willing to
 // do. Returns the session's browser as well, to show which one it ran in.
-async function gatherIce(token) {
+async function gatherIce(token, open = {}) {
   const c = await connect(svc, token);
   try {
-    const id = await c.open();
+    const id = await c.open(open);
     assert.equal((await c.call('navigate', { session: id, url: base })).isError, false);
     const session = svc.manager.sessions.get(id);
     udp.datagrams = 0;
@@ -59,8 +63,9 @@ test('a tenant without an allowlist keeps its transports while another tenant is
   // it does with no allowlist configured anywhere.
   const bob = await gatherIce(TOKEN_B);
   assert.equal(bob.allowlisted, false);
-  assert.ok(bob.datagrams > 0, `bob's browser sent no UDP (${bob.datagrams} datagrams), so another tenant's allowlist changed his networking`);
-  assert.ok(bob.candidates.some((c) => / udp /i.test(c)), `bob gathered no UDP candidate: ${JSON.stringify(bob.candidates)}`);
+  // Camoufox gathers no UDP candidates of its own accord, so there is no positive control on that engine.
+  if (process.env.ENGINE !== 'camoufox') assert.ok(bob.datagrams > 0, `bob's browser sent no UDP (${bob.datagrams} datagrams), so another tenant's allowlist changed his networking`);
+  if (process.env.ENGINE !== 'camoufox') assert.ok(bob.candidates.some((c) => / udp /i.test(c)), `bob gathered no UDP candidate: ${JSON.stringify(bob.candidates)}`);
 
   // alice is proxied: her browser may not open UDP of its own, so nothing reaches the listener.
   const alice = await gatherIce(TOKEN);
@@ -68,6 +73,34 @@ test('a tenant without an allowlist keeps its transports while another tenant is
   assert.equal(alice.datagrams, 0, `a proxied tenant's browser sent UDP: ${JSON.stringify(alice.candidates)}`);
 
   // They ran in different browsers, which is what makes the two sets of flags possible at all.
-  assert.ok(alice.browser && bob.browser && alice.browser !== bob.browser, 'both tenants shared one browser');
-  assert.deepEqual([...svc.manager.browsers.keys()].sort(), ['', 'alice']);
+  // On engines with one browser process per session (patchright, camoufox) there is no shared browser to compare.
+  if (!bob.browser) return;
+  assert.ok(alice.browser && alice.browser !== bob.browser, 'both tenants shared one browser');
+  // alice's own browser went away with her last session; the shared one of unproxied tenants stays up.
+  await until(() => [...svc.manager.browsers.keys()].join() === '', 10000);
+});
+
+// A persistent Chromium profile (profiles, patchright, meetings) ignores --force-webrtc-ip-handling-policy: only the
+// profile preference holds it, which is why it is written before every proxied launch.
+test('a proxied tenant\'s persistent profile sends no UDP of its own either', async () => {
+  const alice = await gatherIce(TOKEN, { profile: 'rtc' });
+  assert.equal(alice.allowlisted, true);
+  assert.equal(alice.datagrams, 0, `a proxied tenant's profile sent UDP: ${JSON.stringify(alice.candidates)}`);
+});
+
+test('the WebRTC preference is written for a proxied launch and removed again for an unproxied one', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bosun-rtc-'));
+  const file = path.join(dir, 'Default', 'Preferences');
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ webrtc: { multiple_routes_enabled: true }, other: 1 }));
+    applyWebrtcPolicy(dir, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { webrtc: { multiple_routes_enabled: true, ip_handling_policy: 'disable_non_proxied_udp' }, other: 1 });
+    applyWebrtcPolicy(dir, false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { webrtc: { multiple_routes_enabled: true }, other: 1 });
+    // A fresh profile directory gets the file created.
+    fs.rmSync(path.join(dir, 'Default'), { recursive: true });
+    applyWebrtcPolicy(dir, true);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).webrtc.ip_handling_policy, 'disable_non_proxied_udp');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

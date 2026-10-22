@@ -85,10 +85,10 @@ export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'naviga
 
 export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn = { inflight: 0 } }) {
   const ephemeral = policy === 'ephemeral';
-  // Fork: when this tenant has a host allowlist, say so in the tool description instead of letting the agent guess.
+  // When this tenant has a host allowlist, say so in the tool description instead of letting the agent guess.
   const allowed = manager.allowList(tenant);
   const allowNote = allowed ? `This token may only reach: ${allowed.map((p) => (p.any ? '*' : `${p.wild ? '*.' : ''}${p.host}${p.port ? `:${p.port}` : ''}`)).join(', ')}.` : null;
-  const server = new McpServer({ name: 'bosun', version: '0.7.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.8.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -139,12 +139,23 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   tool('navigate', allowNote ? `Go to a URL (http/https only). ${allowNote}` : 'Go to a URL (http/https only).', { session: str(40), url: z.string().max(4096).url(), wait: z.enum(['load', 'domcontentloaded', 'networkidle']).optional() }, async (a) => {
     const url = manager.checkAllowed(tenant, httpUrl(a.url));
     return run(a.session, async (s) => {
-      const r = await s.page.goto(url, { waitUntil: a.wait || 'domcontentloaded', timeout: 45000 });
+      const t0 = Date.now();
+      let r;
+      try {
+        r = await s.page.goto(url, { waitUntil: a.wait || 'domcontentloaded', timeout: 45000 });
+      } catch (e) {
+        // A redirect hop the tenant's proxy refused over CONNECT (https, wss) fails the navigation in the browser:
+        // say that it was the allowlist, naming host and port only.
+        const denied = /TUNNEL|PROXY/i.test(String(e?.message)) ? await manager.deniedSince(tenant, t0) : [];
+        if (denied.length) throw new Error(`navigation refused by the host allowlist of this token: ${denied[denied.length - 1]}`);
+        throw e;
+      }
       await s.page.waitForTimeout(1200);
       const w = noteWall(s, await wall(s.page));
       const info = await pageInfo(s.page);
-      // The browser follows redirects itself; one that left the allowlist got the tenant proxy's refusal instead.
-      const refused = r?.status() === 403 && !manager.isAllowed(tenant, info.url);
+      // The browser follows plain-http redirects itself; one that left the allowlist, or an allowed name that
+      // resolves into a private address, got the tenant proxy's 403 instead.
+      const refused = r?.status() === 403 && (!manager.isAllowed(tenant, info.url) || (await manager.deniedSince(tenant, t0)).length > 0);
       return ok({ status: r?.status(), ...info, ...(refused ? { refused: 'host allowlist' } : {}), ...(w ? { blocked: w, hint: 'call request_human to let a person solve it' } : {}) });
     });
   });

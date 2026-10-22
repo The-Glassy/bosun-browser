@@ -84,10 +84,11 @@ export class SessionManager {
     this.closeDeadlineMs = CLOSE_DEADLINE_MS;
     this.stuck = new Set(); // per-session browsers that survived SIGKILL; their slots stay reserved
     this.browsers = new Map(); // '' = the shared browser of unproxied tenants, else the proxied tenant's own
+    this.browserHolds = new Map(); // browser key -> sessions and opens using that shared browser
     this.launches = 0;
     this.closing = false;
     this.dlBytes = 0; // bytes of downloads currently kept across all sessions (DOWNLOADS_TOTAL_MAX_MB)
-    this.proxies = new Map(); // tenant -> Promise<Playwright proxy options> (fork: per-tenant forward proxy)
+    this.proxies = new Map(); // tenant -> Promise<Playwright proxy options> (per-tenant forward proxy)
     fs.mkdirSync(path.join(cfg.dataDir, 'profiles'), { recursive: true });
     // Temp profiles of ephemeral per-browser sessions: anything left here is from a process that was killed.
     fs.rmSync(path.join(cfg.dataDir, 'tmp'), { recursive: true, force: true });
@@ -111,6 +112,22 @@ export class SessionManager {
       this.browsers.set(key, p);
     }
     return this.browsers.get(key);
+  }
+
+  // A session (or an open in progress) uses the shared browser under key. A proxied tenant's own browser is closed
+  // when nothing holds it any more, so an idle allowlisted tenant costs no browser process; the next open launches
+  // it again. The browser of unproxied tenants stays up, as upstream keeps it.
+  holdBrowser(key) { this.browserHolds.set(key, (this.browserHolds.get(key) || 0) + 1); }
+
+  async releaseBrowser(key) {
+    const n = (this.browserHolds.get(key) || 0) - 1;
+    if (n > 0) { this.browserHolds.set(key, n); return; }
+    this.browserHolds.delete(key);
+    if (key === '' || this.closing) return; // closeAll() takes care of the rest
+    const bp = this.browsers.get(key);
+    if (!bp) return;
+    this.browsers.delete(key); // a later open launches a fresh one
+    await Promise.race([bp.then((b) => b.close(), () => {}), sleep(this.closeDeadlineMs)]).catch(() => {});
   }
 
   onBrowserGone(browser, key, p) {
@@ -174,11 +191,11 @@ export class SessionManager {
     };
 
     const p = (async () => {
-      let ctx = null, browser = null, dir = null, tmpDir = null, profileDir = null, claimed = false;
+      let ctx = null, browser = null, dir = null, tmpDir = null, profileDir = null, claimed = false, browserKey = null;
       try {
-        // Fork: a tenant with a host allowlist only reaches the network through its own forward proxy, which is
-        // what its browser contexts are launched with. A failure here fails the open rather than opening a session
-        // that is not restricted.
+        // A tenant with a host allowlist only reaches the network through its own forward proxy, which is what its
+        // browser contexts are launched with. A failure here fails the open rather than opening a session that is
+        // not restricted.
         const proxy = await this.tenantProxy(tenant);
         if (profile) {
           profileDir = path.join(this.cfg.dataDir, 'profiles', tenant, profile);
@@ -189,7 +206,11 @@ export class SessionManager {
         try {
           ({ ctx, browser = null, dir = null, tmpDir = null } = await this.engines.open(def.name, {
             cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', media, proxy,
-            shared: (d, bt) => this.getBrowser(d, bt, proxy, proxy ? tenant : ''),
+            shared: (d, bt) => {
+              browserKey = proxy ? tenant : '';
+              this.holdBrowser(browserKey);
+              return this.getBrowser(d, bt, proxy, browserKey);
+            },
           }));
         } catch (e) {
           ({ dir = null, tmpDir = null } = e);
@@ -208,7 +229,7 @@ export class SessionManager {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
           navs: [], ctxErrors: [], wallSeen: null, // recent main-frame navigations {t, at: origin+path}, "context destroyed" failures, last bot check seen (bot-check loops)
-          dlBytes: 0,
+          dlBytes: 0, browserKey,
         };
         this.sessions.set(s.id, s);
         page.on('framenavigated', (f) => {
@@ -229,6 +250,7 @@ export class SessionManager {
         return s;
       } catch (e) {
         if (ctx) await Promise.race([ctx.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
+        if (browserKey !== null) await this.releaseBrowser(browserKey);
         if (await this.reclaim({ dir, tmpDir, release, what: `failed open (${def.name})` })) {
           if (claimed) unclaimProfile(profileDir);
         }
@@ -252,7 +274,7 @@ export class SessionManager {
 
   list(owner) { return [...this.sessions.values()].filter((s) => s.owner === owner); }
 
-  // Fork: the tenant's host allowlist, or null when it has none (then nothing is restricted).
+  // The tenant's host allowlist, or null when it has none (then nothing is restricted).
   allowList(tenant) { return allowFor(this.cfg, tenant); }
 
   // The tenant's forward proxy (Playwright proxy options), started on first use. null for a tenant without an
@@ -270,6 +292,12 @@ export class SessionManager {
   isAllowed(tenant, url) {
     const allow = this.allowList(tenant);
     return !allow || allowsUrl(allow, url);
+  }
+
+  // host:port targets the tenant's proxy refused since time t (ms); [] for a tenant without one.
+  async deniedSince(tenant, t) {
+    const p = this.proxies.get(tenant);
+    return p ? (await p).deniedSince(t) : [];
   }
 
   // Returns the URL, or throws because the tenant's allowlist doesn't cover its host. The message names host and
@@ -378,10 +406,12 @@ export class SessionManager {
     const note = (what) => console.error(`bosun: tenant ${s.tenant}: ${what} ${blockedTarget(d.url())} (download budget)`);
     if (s.dlBytes >= perSession || this.dlBytes >= total) {
       await d.cancel().catch(() => {});
+      await d.delete().catch(() => {}); // a small download may finish before the cancel lands (Firefox): remove it
       return note('refused download of');
     }
     let size;
     try { size = (await fs.promises.stat(await d.path())).size; } catch { return; } // cancelled, failed or already gone
+    if (s.disposed) return; // the session closed meanwhile: its context took the file, and its share is released
     if (s.dlBytes + size > perSession || this.dlBytes + size > total) {
       await d.delete().catch(() => {});
       return note('deleted over-budget download of');
@@ -422,6 +452,7 @@ export class SessionManager {
       let reclaimed = false;
       try {
         await Promise.race([s.ctx.close().catch(() => {}), sleep(this.closeDeadlineMs)]);
+        if (s.browserKey !== null && s.browserKey !== undefined) await this.releaseBrowser(s.browserKey);
         await Promise.allSettled([...s.writes]); // a screenshot being written must not outlive the directory removal
         await fs.promises.rm(path.join(this.cfg.dataDir, 'shots', s.tenant, s.id), { recursive: true, force: true }).catch(() => {});
         reclaimed = await this.reclaim({ dir: s.dir, tmpDir: s.tmpDir, release: s.release, what: `session ${s.id} (${s.engine})` });

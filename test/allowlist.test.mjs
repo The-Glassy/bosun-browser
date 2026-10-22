@@ -1,5 +1,5 @@
-// Fork: the per-tenant navigation host allowlist (BROWSER_TENANT_ALLOW). Pattern parsing and matching, enforcement
-// on navigate and on keepalive_set, and enforcement on the requests a page makes by itself (route interception),
+// The per-tenant host allowlist (BROWSER_TENANT_ALLOW). Pattern parsing and matching, enforcement on navigate and on
+// keepalive_set, and enforcement on the requests a page makes by itself (through the tenant's forward proxy),
 // including a navigation the page starts. A tenant without an allowlist is unrestricted.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
