@@ -67,7 +67,7 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
   const ann = announcement('Glassy (notetaker)', null)[0];
   const run = async (sent, queue) => {
     const events = [], optouts = [];
-    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sent.map((t) => [t, { count: 1, until: 0, norm: normalize(t) }])), optedOut: null, state: 'recording',
+    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sent.map((t) => [t, { count: 1, until: Date.now() + 60_000, norm: normalize(t) }])), optedOut: null, state: 'recording',
       platform: { drainChat: async () => queue.splice(0) } };
     const fake = Object.assign(Object.create(Meetings.prototype), { now: Date.now, page: async (_m, fn) => fn(null), emit: (_m, k, d) => events.push(d), optOut: async (_m, e) => { optouts.push(e); } });
     await fake.pollChat(m);
@@ -80,12 +80,8 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
   assert.deepEqual([r.events, r.optouts], [[], []]);
   r = await run(['Не записуй'], [{ id: '1', sender: 'Oksana', text: BUBBLE('Не записуй') }]);
   assert.equal(r.optouts.length, 1);
-  // Our post is taken out as whole words only ("No" never cuts "not"), and each echo only once: the same words
-  // again, later and without a sender, are someone's.
+  // A short post ("No") never takes words out of someone's message.
   r = await run(['No'], [{ id: '1', sender: null, text: BUBBLE('I do not consent to being recorded') }]);
-  assert.equal(r.optouts.length, 1);
-  r = await run(['Не записуй'], [{ id: '1', sender: null, text: BUBBLE('Не записуй') }, { id: '2', sender: null, text: BUBBLE('Не записуй') }]);
-  assert.equal(r.events.length, 1);
   assert.equal(r.optouts.length, 1);
   // Within a minute of posting: whole copies of a post are ours however often they come, but a short post never
   // takes words out of someone's message, and once the minute is over the same words are someone's.
@@ -101,6 +97,8 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
   assert.deepEqual([r.events, r.optouts], [[], []]); // rendered twice: both ours
   r = await fresh(['recording'], [{ id: 'a', sender: null, text: BUBBLE('recording') }, { id: 'b', sender: null, text: BUBBLE('Please stop recording') }]);
   assert.equal(r.optouts.length, 1); // "recording" is not taken out of the request
+  r = await fresh(['recording'], [{ id: 'b', sender: null, text: BUBBLE('Please stop recording') }, { id: 'a', sender: null, text: BUBBLE('recording') }]);
+  assert.equal(r.optouts.length, 1); // nor before its own echo arrived (a short post is ours only as a whole copy)
   r = await fresh(['Не записуй'], [{ id: 'a', sender: null, text: BUBBLE('Не записуй') }]);
   assert.equal(r.events.length, 0);
   r.fake.now = () => Date.now() + 120_000; // two minutes later

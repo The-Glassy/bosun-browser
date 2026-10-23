@@ -155,7 +155,7 @@ test('Zoom leaves by itself: removed by the host, or alone too long', async () =
     }
     assert.equal(svc.manager.used, 0);
     await c.close();
-  }, { meetings: { aloneMs: 1000 } });
+  }, { meetings: { aloneMs: 1000, aloneLeaveMs: 1000 } });
 });
 
 test('Zoom without the passcode, with a wrong one, sign-in required, a captcha, removed from the waiting room: clear errors, nothing recorded', async () => {

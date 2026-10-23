@@ -356,25 +356,33 @@ export class Meetings {
   // without a participant's name on it: a named participant's message is always judged whole.
   // - A whole-message copy of a post is ours within ECHO_MS of posting, however often the panel renders it, and at any
   //   time if the post is long (ECHO_LONG).
-  // - Inside a larger message, a post is taken out as whole words and only as often as Bosun posted it; every copy
-  //   recognised as ours uses one up. So a participant later writing the same short words is heard, a short post
-  //   ("recording") never takes words out of someone's "please stop recording", and "No" never cuts into "not".
+  // - Inside a larger message, only a long post (ECHO_LONG) is taken out, as whole words and only as often as Bosun
+  //   posted it; every copy recognised as ours, by either ledger, uses one up. A short post ("recording", "No") is
+  //   ours only as a whole copy, so it never takes words out of someone's "please stop recording"; the same short
+  //   words written by someone later are heard.
   // Taking out, not dropping: a message that pastes our announcement and adds "please stop recording" keeps it.
   withoutOwn(m, text) {
     const whole = normalize(text);
     for (const e of m.echoes.values()) {
-      if (e.norm === whole && (this.now() <= e.until || e.norm.length >= ECHO_LONG)) { e.count = Math.max(0, e.count - 1); return ''; }
+      if (e.norm === whole && (this.now() <= e.until || e.norm.length >= ECHO_LONG)) { this.retire(m, e); return ''; }
     }
     const flat = (t) => String(t).replace(/[‘’ʼ]/g, "'").replace(/[“”„]/g, '"');
     let rest = flat(text);
     for (const [sent, e] of [...m.echoes].sort((a, b) => b[0].length - a[0].length)) {
-      if (e.count <= 0) continue;
+      if (e.count <= 0 || e.norm.length < ECHO_LONG) continue;
       const words = flat(sent).trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
       if (!words.length) continue;
       const re = new RegExp(`(?<![\\p{L}\\p{N}])${words.join('\\s+')}(?![\\p{L}\\p{N}])`, 'iu');
-      while (e.count > 0 && re.test(rest)) { rest = rest.replace(re, ' '); e.count--; }
+      while (e.count > 0 && re.test(rest)) { rest = rest.replace(re, ' '); this.retire(m, e); }
     }
     return rest;
+  }
+
+  // One of Bosun's posts was seen: both ledgers (echoes, and pendingOwn for copies labelled as ours) let it go once.
+  retire(m, e) {
+    e.count = Math.max(0, e.count - 1);
+    const i = m.pendingOwn.findIndex((t) => normalize(t) === e.norm);
+    if (i >= 0) m.pendingOwn.splice(i, 1);
   }
 
   // Ours only if we just sent exactly this text AND the chat shows it as from us; each sent message matches once.
@@ -385,6 +393,8 @@ export class Meetings {
     const i = m.pendingOwn.indexOf(text);
     if (i < 0) return false;
     m.pendingOwn.splice(i, 1);
+    const e = m.echoes?.get(text); // the same post can't be taken out of a later senderless message as well
+    if (e) e.count = Math.max(0, e.count - 1);
     return true;
   }
 
