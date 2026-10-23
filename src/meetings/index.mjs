@@ -341,17 +341,18 @@ export class Meetings {
     await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name });
   }
 
-  // A message that contains something Bosun posted in this meeting is Bosun's own, whatever sender the panel shows
-  // (live Meet showed our announcement with no sender, inside UI text). It is never an objection and never an event.
-  // Only that direction: a participant writing a phrase the announcement quotes ("please don't record") is theirs.
-  ownText(m, text) {
-    const t = normalize(text);
-    if (!t) return false;
-    for (const sent of m.sentAll) {
-      const n = normalize(sent);
-      if (n.length >= 12 && t.includes(n)) return true;
+  // What is left of a message once everything Bosun posted in this meeting is taken out of it (live Meet showed our
+  // announcement with no sender, inside UI text). Only for a message without a participant's name on it: a named
+  // participant's message is always judged whole. Taking out, not dropping: a message that pastes our announcement
+  // and adds "please stop recording" keeps that request.
+  withoutOwn(m, text) {
+    const flat = (t) => String(t).replace(/[‘’ʼ]/g, "'").replace(/[“”„]/g, '"');
+    let rest = flat(text);
+    for (const sent of [...m.sentAll].sort((a, b) => b.length - a.length)) {
+      const words = flat(sent).trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+      if (words.length) rest = rest.replace(new RegExp(words.join('\\s+'), 'gi'), ' ');
     }
-    return false;
+    return rest;
   }
 
   // Ours only if we just sent exactly this text AND the chat shows it as from us; each sent message matches once.
@@ -378,12 +379,17 @@ export class Meetings {
       const edited = m.chatTexts.has(msg.id); // the panel filled in or changed a message after it first appeared
       m.chatTexts.set(msg.id, msg.text);
       if (m.chatTexts.size > 2 * MAX_CHAT) m.chatTexts.delete(m.chatTexts.keys().next().value);
-      if ((!edited && this.own(m, msg)) || this.ownText(m, msg.text)) continue;
+      if (!edited && this.own(m, msg)) continue;
+      // A participant's own name on it: theirs, judged whole. Otherwise only what is not Bosun's own words; nothing
+      // left means it was our own message (no event, never an objection).
+      const named = !!msg.sender && !SELF_SENDERS.test(msg.sender) && msg.sender !== m.name && msg.sender !== m.info.selfName;
+      const rest = named ? msg.text : this.withoutOwn(m, msg.text);
+      if (!normalize(rest)) continue;
       const entry = { seq: ++m.chatSeq, at: new Date(this.now()).toISOString(), sender: msg.sender || null, text: msg.text, ...(edited ? { edited: true } : {}) };
       m.chat.push(entry);
       if (m.chat.length > MAX_CHAT) m.chat.shift();
       this.emit(m, 'chat', { sender: entry.sender, text: entry.text, ...(edited ? { edited: true } : {}) });
-      if (!m.optedOut && matchOptOut(msg.text)) await this.optOut(m, entry);
+      if (!m.optedOut && matchOptOut(rest)) await this.optOut(m, entry);
       if (m.state === 'ended') return;
     }
   }

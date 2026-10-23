@@ -73,33 +73,44 @@ const VETO = [
   rx('(?:nezastavuj|nezastavujte|neprestávaj|neprestávajte|nevypínaj|nevypínajte|nemaž)'),
 ];
 
-// Instructions about how to opt out are not an opt-out: a clause that explains ("if you'd rather not be recorded",
-// "to opt out, write …", "e.g.", "wenn ihr nicht …", "zum Abmelden …"), as an announcement does, never counts.
-const INSTRUCTION = rx("if (?:you|anyone|someone)(?:'d| would| do not| don'?t| dont| prefer| want| rather)|(?:to|you can|you may) opt out|e g|for example|"
-  + 'wenn (?:ihr|sie|du|jemand) (?:nicht|lieber)|zum abmelden|z b|zum beispiel|якщо (?:ви|ти) не|если (?:вы|ты) не|ak (?:nechcete|nechceš)');
+// An explanation of how to opt out is not an opt-out: a clause that tells people what to write or say AND says it is
+// explaining ("if you'd rather not be recorded, just say so here in chat (e.g. 'please don't record')", 'to opt out,
+// write "stop" + "recording"', "wenn ihr nicht aufgenommen werden wollt, schreibt es hier in den Chat …") never
+// counts. Anything else is judged as written, quotes included: "I want to opt out, please stop recording",
+// 'Please "stop recording"', "'please don't record', thanks" and "can you write the summary and stop recording" are
+// requests.
+const TELLS = rx("write|type|just say|simply say|say so|schreib\\p{L}*|sag(?:t|en sie)? es|напиш\\p{L}*|скаж\\p{L}*|napíš\\p{L}*|povedz\\p{L}*");
+// …and says it is explaining: a condition, the purpose, an example, or where to write it.
+const EXPLAINS = rx("if (?:you|anyone|someone)|to opt out|e g|for example|here in (?:the )?chat|"
+  + 'wenn (?:ihr|sie|du|jemand)|zum abmelden|z b|zum beispiel|hier in den chat|якщо|если|ak ');
+const QUOTED = /(?:"[^"\n]{1,160}"|“[^”\n]{1,160}”|„[^“”\n]{1,160}[“”]|«[^»\n]{1,160}»|‘(?:[^‘’\n]|(?<=\p{L})’(?=\p{L})){1,160}’|(?<![\p{L}\p{N}])'(?:[^'\n]|(?<=\p{L})'(?=\p{L})){1,160}'(?![\p{L}\p{N}]))/gu;
 
-// Quoted words are a mention ("write 'stop recording' to opt out"), not a request, as long as the clause says
-// something besides them. A message that is only the quoted phrase ("'please don't record'", copied from the
-// announcement with its quotes) still counts. Apostrophes inside words (don't) are not quotes.
-const QUOTED = /(?:"[^"\n]{1,120}"|“[^”\n]{1,120}”|„[^“”\n]{1,120}[“”]|«[^»\n]{1,120}»|‘(?:[^‘’\n]|(?<=\p{L})’(?=\p{L})){1,120}’|(?<![\p{L}\p{N}])'(?:[^'\n]|(?<=\p{L})'(?=\p{L})){1,120}'(?![\p{L}\p{N}]))/gu;
-function unquote(sentence) {
-  const rest = sentence.replace(QUOTED, ' ');
-  return normalize(rest) ? rest : sentence;
+// Sentence ends inside quotes and in "e.g." / "i.e." / "z. B." don't split a message.
+const ABBREV = /(?<![\p{L}\p{N}])(?:e\.\s?g|i\.\s?e|z\.\s?b|u\.\s?a|d\.\s?h)\./giu;
+function protect(text) {
+  return String(text).slice(0, 4000)
+    .replace(QUOTED, (q) => q.replace(/[.!?;\n\u3002]/g, ' '))
+    .replace(ABBREV, (a) => a.replace(/\./g, ' '));
 }
 
 // A message is judged per clause: sentences, and the parts around "but"-like contrasts, so "Bob said keep recording,
 // but I do not consent to being recorded" is an opt-out while "don't stop recording" is not.
 const CONTRAST = /\s(?:but|however|though|aber|jedoch|sondern|doch|але|проте|но|однако|ale|avšak)\s/u;
+// -> [{text, tells}]: each clause normalized; tells: it tells people what to write (then without its quoted words).
 export function clauses(text) {
-  return String(text).slice(0, 4000).split(/(?<!\b(?:e|z|i)\.(?:\s?(?:g|b|e))?)[.!?;\n\u3002]+(?=\s|$)/u)
-    .flatMap((sentence) => normalize(unquote(sentence)).split(CONTRAST))
-    .map((c) => c.trim()).filter(Boolean);
+  return protect(text).split(/[.!?;\n\u3002]+/u)
+    .flatMap((sentence) => {
+      const bare = normalize(sentence.replace(QUOTED, ' '));
+      const told = TELLS.test(bare) && EXPLAINS.test(bare);
+      return normalize(told ? sentence.replace(QUOTED, ' ') : sentence).split(CONTRAST).map((c) => ({ text: c.trim(), told }));
+    })
+    .filter((c) => c.text);
 }
 
 // -> {lang, rule} for an opt-out request, else null.
 export function matchOptOut(text) {
-  for (const c of clauses(text)) {
-    if (VETO.some((v) => v.test(c)) || INSTRUCTION.test(c)) continue;
+  for (const { text: c, told } of clauses(text)) {
+    if (told || VETO.some((v) => v.test(c))) continue;
     for (let i = 0; i < RULES.length; i++) if (RULES[i][1].test(c)) return { lang: RULES[i][0], rule: i };
   }
   return null;

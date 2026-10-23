@@ -10,18 +10,20 @@
     message to pin it", "keep", "Pin message". So Bosun no longer recognised the message as its own.
   - The default text quotes "please don't record" as an example. A custom text with 'write "stop" + "recording"'
     matched "stop recording".
-- **Own messages:** a chat message that contains something Bosun posted in that meeting is Bosun's own, whatever
-  sender the panel shows. It is never an objection and never a `bosun:meeting-chat` event. Only that direction
-  counts: a participant writing the quoted example is still heard.
+- **Own messages.** What Bosun posted in that meeting is taken out of any chat message that carries no
+  participant's name, and only the rest is judged. Nothing left means it was Bosun's own message: no event, never an
+  objection. A message that pastes the announcement and adds "please stop recording" keeps that request. A named
+  participant's message is always judged whole, even if it repeats Bosun's words.
 - **Chat text and sender:** the UI around a message is removed on Meet and Zoom before anything reads it: a leading
   time, and lines that are only the pin control, its tooltip or an icon name. A time or a control is never a
   sender. Meet's sender is read past a time on its header line. Zoom's "<name> to Everyone 10:07 AM" counts as us.
 - **Matcher:**
-  - Quoted words are a mention, not a request, unless the message is only the quoted phrase (people copy
-    "'please don't record'" with its quotes).
-  - A clause that explains how to opt out never counts: "if you'd rather not…", "to opt out…", "e.g.", "wenn ihr
-    nicht…", "zum Abmelden…", "z. B.".
-  - "e.g." and "z. B." no longer split a sentence.
+  - A clause that explains how to opt out never counts, and its quoted words are a mention. Such a clause both
+    tells people what to write or say ("write", "just say so", "schreibt") and says it is explaining ("if you…",
+    "to opt out", "e.g.", "here in chat", "wenn ihr…", "zum Abmelden", "z. B.").
+  - Everything else is judged as written, quotes included: "I want to opt out, please stop recording",
+    'Please "stop recording"' and "'please don't record', thanks" are requests.
+  - Sentence ends inside quotes and in "e.g." / "z. B." don't split a message.
 
 ### Tests
 

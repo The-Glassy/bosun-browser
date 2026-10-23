@@ -25,6 +25,7 @@ test('chat text: the UI around a live Meet bubble is gone; times and controls ar
   assert.equal(cleanSender('10:07 AM'), null);
   assert.equal(cleanSender('keep'), null);
   assert.equal(cleanSender('Alex Example'), 'Alex Example');
+  assert.equal(cleanSender('Host Person 10:07 AM'), 'Host Person');
 });
 
 test('matcher: our announcements (default EN/DE, the live custom one, the confirmation) are no opt-out; requests still are', () => {
@@ -32,8 +33,12 @@ test('matcher: our announcements (default EN/DE, the live custom one, the confir
     'To opt out, write "stop" + "recording" here.', 'Zum Abmelden hier schreiben.', 'If you would rather not be recorded, write "please don\'t record".']) {
     assert.equal(matchOptOut(cleanChatText(BUBBLE(t))), null, t);
   }
+  assert.equal(matchOptOut('Type "stop recording. Please don\'t record." to opt out.'), null); // a sentence end inside the quote
   for (const t of ["please don't record", "'please don't record'", '"stop recording"', 'Stop recording!', 'bitte nicht aufnehmen', '„bitte nicht aufnehmen“',
-    'Please, stop the recording', 'Can you stop recording please']) {
+    'Please, stop the recording', 'Can you stop recording please',
+    // Requests that only look like instructions or quotes (review of the first fix).
+    'I want to opt out, please stop recording', 'If you would please stop recording, I do not consent to being recorded', 'Please "stop recording"',
+    '"please don\'t record", thanks', "Don't stop recording.I do not consent to being recorded.", 'Can you write the summary and stop recording']) {
     assert.ok(matchOptOut(cleanChatText(BUBBLE(t))), t);
   }
 });
@@ -54,6 +59,24 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
     assert.deepEqual(events.map(([, d]) => [d.sender, d.text]), [[null, 'Hi all'], ['Alex Example', "please don't record"]], echoed);
     assert.deepEqual(optouts.map((e) => e.text), ["please don't record"], echoed);
   }
+  // Taken out, not dropped: a senderless message that pastes our announcement and adds a request keeps the request.
+  // A short message of ours echoed back is ours; the same words from a named participant are theirs.
+  const ann = announcement('Glassy (notetaker)', null)[0];
+  const run = async (sent, queue) => {
+    const events = [], optouts = [];
+    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], sentAll: new Set(sent), optedOut: null, state: 'recording',
+      platform: { drainChat: async () => queue.splice(0) } };
+    const fake = Object.assign(Object.create(Meetings.prototype), { now: Date.now, page: async (_m, fn) => fn(null), emit: (_m, k, d) => events.push(d), optOut: async (_m, e) => { optouts.push(e); } });
+    await fake.pollChat(m);
+    return { events, optouts };
+  };
+  let r = await run([ann], [{ id: '1', sender: null, text: BUBBLE(`${ann}\nPlease stop recording.`) }]);
+  assert.equal(r.optouts.length, 1);
+  assert.equal(r.events.length, 1);
+  r = await run(['Не записуй'], [{ id: '1', sender: null, text: BUBBLE('Не записуй') }]);
+  assert.deepEqual([r.events, r.optouts], [[], []]);
+  r = await run(['Не записуй'], [{ id: '1', sender: 'Oksana', text: BUBBLE('Не записуй') }]);
+  assert.equal(r.optouts.length, 1);
 });
 
 let fm, fz;
@@ -110,7 +133,7 @@ test('Zoom with live chat bubbles (our name "to Everyone" with a time): the anno
     assert.deepEqual(ev.chat, []);
     fz.say(id, 'Host Person', 'Stop recording please');
     await until(() => ev.optout.length === 1, 10_000);
-    assert.equal(ev.optout[0].text, 'Stop recording please');
+    assert.deepEqual([ev.optout[0].sender, ev.optout[0].text], ['Host Person', 'Stop recording please']);
     await c.close();
   });
 });

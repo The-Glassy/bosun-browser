@@ -35,7 +35,11 @@ export function cleanChatText(text) {
   return lines.filter(Boolean).join('\n');
 }
 // A sender label that is really a time or a control ("10:07 AM", "keep"): no sender.
-export const cleanSender = (s) => { const t = String(s ?? '').trim(); return t && !CHAT_UI_LINE.test(t) ? t : null; };
+// A trailing time ("Host Person 10:07 AM") is not part of the name.
+export const cleanSender = (s) => {
+  const t = String(s ?? '').trim().replace(/\s+\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?$/i, '').trim();
+  return t && !CHAT_UI_LINE.test(t) ? t : null;
+};
 
 // Where a site puts its own status messages over a running call (meeting ended, removed): dialogs only. Captions,
 // the meeting title and toasts are outside, so what participants say or name a meeting can't end it.
