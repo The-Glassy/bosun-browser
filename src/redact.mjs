@@ -128,6 +128,28 @@ export async function markSensitive(page, l) {
   if (!found.length) throw new Error('could not mark the field for masking (did the page replace it?); nothing was typed');
 }
 
+// After a secret was typed: every input and textarea (any frame, open shadow roots) that holds it becomes sensitive,
+// wherever the page let the typing land (a focus handler can move it to another field). Returns how many.
+export async function markValue(page, value) {
+  const found = await eachFrame(page, (v) => {
+    const KEY = Symbol.for('bosun.sensitive');
+    const seen = window[KEY] || (window[KEY] = new WeakSet());
+    const out = [];
+    const roots = [document];
+    for (let i = 0; i < roots.length; i++) {
+      for (const el of roots[i].querySelectorAll('*')) {
+        if (el.shadowRoot) roots.push(el.shadowRoot);
+        if ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && el.value && (el.value === v || (v.length >= 3 && el.value.includes(v)))) {
+          seen.add(el);
+          out.push(1);
+        }
+      }
+    }
+    return out;
+  }, value);
+  return found.length;
+}
+
 // For engines without same-world init scripts: install the tracker in Bosun's world in every frame.
 export const installTracker = (page) => Promise.all(page.frames().map((f) => f.evaluate(passwordTracker).catch(() => {})));
 
@@ -157,7 +179,14 @@ export async function maskedScreenshot(page, take) {
 const LABEL_RE = new RegExp(String.raw`^(\s*- (?:textbox|searchbox|spinbutton|combobox) "[^"\n]*(?:${HINT_WORDS})[^"\n]*"[^\n]*?): .*$`, 'gim');
 const FIELD_LINE_RE = /^(\s*- (?:textbox|searchbox|spinbutton|combobox)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]]*\])*): (.*)$/;
 
-const unquote = (v) => { if (!v.startsWith('"')) return v; try { return JSON.parse(v); } catch { return v; } };
+// A quoted snapshot value is YAML: JSON's escapes plus \xNN (playwright-core yamlEscapeValueIfNeeded).
+const unquote = (v) => {
+  if (!v.startsWith('"')) return v;
+  try { return JSON.parse(v.replace(/\\(\\|x([0-9a-fA-F]{2}))/g, (m, _c, hex) => (hex ? `\\u00${hex}` : m))); } catch { return v; }
+};
+// The inside of the quotes Playwright puts around a value that needs them.
+const yamlEscaped = (v) => v.replace(/[\\"\x00-\x1f\x7f-\x9f]/g, (c) => ({ '\\': '\\\\', '"': '\\"', '\b': '\\b', '\f': '\\f', '\n': '\\n', '\r': '\\r', '\t': '\\t' })[c]
+  ?? `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
 
 // How Playwright's aria snapshot shows a value: without zero-width spaces and soft hyphens, trimmed, every run of
 // white space one space (playwright-core normalizeWhiteSpace).
@@ -174,8 +203,7 @@ export function maskText(text, values) {
   }).join('\n');
   for (const v of [...vals].filter((v) => v.length >= 3).sort((a, b) => b.length - a.length)) {
     out = out.split(v).join('[masked]');
-    const esc = JSON.stringify(v).slice(1, -1);
-    if (esc !== v) out = out.split(esc).join('[masked]');
+    for (const esc of new Set([JSON.stringify(v).slice(1, -1), yamlEscaped(v)])) if (esc !== v) out = out.split(esc).join('[masked]');
   }
   return out;
 }

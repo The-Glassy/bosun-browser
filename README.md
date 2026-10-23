@@ -230,8 +230,10 @@ type { session, selector: "#password", secret_id: "s9c…", submit: true }
   error carries the value. The result's URL and title have it replaced by `[masked]` (also URL-encoded, for a form
   that submits with GET); later results (`read`, `navigate`, `sessions`, …) return the page's URL and title as they
   are, so a page that puts the secret there shows it to the agent from then on.
-- **One element.** The type check, the masking mark and the fill all go to the element found first. A page that
-  swaps the field for another one in between gets nothing typed.
+- **One element.** The type check, the masking mark and the fill all go to the element found first; a page that
+  swaps the field for another one before the fill gets nothing typed. The fill types through the page's keyboard,
+  so a page can still move the focus while it runs. Afterwards every field that holds the secret is masked, and the
+  call fails unless the checked field got it.
 - **Password fields only, unless you say otherwise.** The field must be an `<input type=password>`. For an OTP, an
   e-mail address or a user name pass `allow_non_password: true`; any text `<input>` or `<textarea>` then takes it.
   Checkboxes, buttons, file inputs and non-inputs are refused. A refusal before the fill leaves the secret unused.

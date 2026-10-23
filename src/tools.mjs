@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { countNodes, markSensitive, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
+import { countNodes, markSensitive, markValue, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, TENANT_RE } from './auth.mjs';
 import { urlKey, httpUrl, HANDOFF_ACTIVE } from './sessions.mjs';
 
@@ -346,6 +346,11 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     const hide = (t) => forms.reduce((out, f) => (value && out.includes(f) ? out.split(f).join('[masked]') : out), String(t));
     try {
       await l.fill(value, { timeout: 15000 });
+      // fill types through the page's keyboard: a page that moves the focus meanwhile gets the text elsewhere. Every
+      // field that holds it now is masked, and the call fails unless it is in the element that was checked.
+      const landed = await l.evaluate((el, v) => el.isConnected && el.value === v, value).catch(() => false);
+      await markValue(s.page, value);
+      if (!landed) throw new Error('the secret did not end up in the field that was checked (the page moved the focus or the field); every field holding it is masked, check the page before going on');
       if (a.submit) { await l.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
       const info = await pageInfo(s.page);
       console.error(`bosun: secret ${a.secret_id} of tenant ${tenant}: typed in session ${s.id}, ${Buffer.byteLength(value)} bytes`);

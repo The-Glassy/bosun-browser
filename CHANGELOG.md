@@ -16,9 +16,11 @@
   elements that are not inputs are refused. A refusal before the fill leaves the secret unused.
 - **A field that got a secret is masked** in `read` and `screenshot` from then on, and cleared after a handoff ends
   with Give up, whatever its type or label (it joins the set of former password fields). The type check, the mark
-  and the fill go to one element: a field the page swaps for another in between gets nothing.
+  and the fill go to one element: a field the page swaps for another before the fill gets nothing. After the fill,
+  every input or textarea that holds the secret is masked too (a page may move the focus during the fill), and the
+  call fails unless the checked field got it.
 - **Masking in `read` also catches a value as the accessibility snapshot shows it** (white space collapsed, trimmed,
-  no soft hyphens), for every sensitive field, not only secrets.
+  no soft hyphens, YAML escapes such as `\x1b`), for every sensitive field, not only secrets.
 - **Refused while Playwright's debug log would print the value:** `DEBUG` with `pw:api`, `pw:protocol` or
   `pw:channel` on.
 

@@ -29,6 +29,15 @@ const PAGES = {
   '/swap': `<title>Swap</title><input id="pw" type="password"><script>
     const pw = document.getElementById('pw');
     new MutationObserver(() => { const t = document.createElement('input'); t.id = 'pw'; pw.replaceWith(t); }).observe(pw, { attributes: true });</script>`,
+  // On focus (fill focuses the field), the password field is replaced by a plain one that takes the focus.
+  '/refocus': `<title>Refocus</title><input id="pw" type="password"><script>
+    const pw = document.getElementById('pw');
+    pw.addEventListener('focus', () => { const t = document.createElement('input'); t.id = 'other'; pw.replaceWith(t); t.focus(); }, { once: true });</script>`,
+  // Bosun's one-off marker attribute is moved from the field to a decoy before Bosun looks for it.
+  '/decoy': `<title>Decoy</title><label>Contact <input id="c"></label><input id="decoy"><script>
+    new MutationObserver((ms) => { for (const m of ms) { const k = m.target.getAttribute('data-bosun-secret');
+      if (m.target.id === 'c' && k) { m.target.removeAttribute('data-bosun-secret'); document.getElementById('decoy').setAttribute('data-bosun-secret', k); } } })
+      .observe(document.body, { attributes: true, subtree: true });</script>`,
   '/search': `<title>Search</title><form method="get" action="/echo"><input id="pw" type="password" name="q"></form>`,
 };
 
@@ -365,6 +374,50 @@ test('a field swapped for another after the check gets nothing, and the secret s
   await c.close();
 });
 
+test('a page that moves the focus during the fill: the call fails, and the field that got the secret is masked', async () => {
+  const c = await client(TOKEN);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${base}/refocus` });
+  const id = await send(c, 'refocus-target-secret');
+  const r = await c.call('type', { session: s, selector: '#pw', secret_id: id });
+  assert.equal(r.isError, true);
+  const page = svc.manager.sessions.get(s).page;
+  const other = await page.$eval('#other', (e) => e.value);
+  if (other) {
+    assert.match(r.text, /did not end up in the field that was checked/);
+    assert.equal(await maskedScreenshot(page, async () => page.$eval('#other', (el) => el.hasAttribute('data-bosun-sensitive'))), true);
+  }
+  for (const mode of ['a11y', 'text']) assert.ok(!(await c.call('read', { session: s, mode })).text.includes('refocus-target'), mode);
+  await c.close();
+});
+
+test('a page that moves the masking marker to a decoy: the field that holds the secret is masked all the same', async () => {
+  const c = await client(TOKEN);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${base}/decoy` });
+  const id = await send(c, 'decoy-target-secret');
+  const r = await c.call('type', { session: s, selector: '#c', secret_id: id, allow_non_password: true });
+  assert.equal(r.isError, false, r.text);
+  assert.equal(await value(c, s, '#c'), 'decoy-target-secret');
+  const r2 = await c.call('read', { session: s });
+  assert.ok(!r2.text.includes('decoy-target'), r2.text);
+  assert.match(r2.text, /textbox "Contact"(?: \[[^\]]*\])*: \[masked\]/);
+  const page = svc.manager.sessions.get(s).page;
+  assert.equal(await maskedScreenshot(page, async () => page.$eval('#c', (el) => el.hasAttribute('data-bosun-sensitive'))), true);
+  await c.close();
+});
+
+test('read masks a secret the snapshot quotes with YAML escapes (control characters)', async () => {
+  const c = await client(TOKEN);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${base}/login` });
+  const id = await send(c, 'ab\u001bcd-esc\u0007tail');
+  assert.equal((await c.call('type', { session: s, selector: '#notes', secret_id: id, allow_non_password: true })).isError, false);
+  const r = await c.call('read', { session: s });
+  assert.ok(!/cd-esc|tail/.test(r.text), r.text);
+  await c.close();
+});
+
 test('read masks a secret as the accessibility snapshot shows it (white space collapsed)', async () => {
   const c = await client(TOKEN);
   const s = await c.open();
@@ -398,7 +451,7 @@ test('DEBUG with a Playwright log that prints typed text: secrets refused', asyn
 });
 
 test('no secret of these tests is in any tool result, PUT answer or log line; the log has id and length', () => {
-  const all = [PW, OTP, 'once-only-secret', 'expiring-secret', 'late-secret', 'alice-only-secret', 'two\nlines', 'echo me & you/100%', 'echo+me', 'swap-target-secret', 'alpha', 'debug-refused-secret'];
+  const all = [PW, OTP, 'once-only-secret', 'expiring-secret', 'late-secret', 'alice-only-secret', 'two\nlines', 'echo me & you/100%', 'echo+me', 'swap-target-secret', 'alpha', 'debug-refused-secret', 'refocus-target', 'decoy-target', 'cd-esc'];
   for (const text of results) for (const v of all) assert.ok(!text.includes(v), `${v} in a result: ${text}`);
   for (const line of logs) for (const v of all) assert.ok(!line.includes(v), `${v} in the log: ${line}`);
   assert.ok(logs.some((l) => /^bosun: secret s[0-9a-f]{16} of tenant alice: received, \d+ bytes$/.test(l)));
