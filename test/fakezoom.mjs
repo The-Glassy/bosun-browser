@@ -165,7 +165,7 @@ const NOTICES = {
 
 export async function startFakeZoom({ tone = false } = {}) {
   const rooms = new Map();
-  const state = { account: false };
+  const state = { account: null };
   const room = (id) => {
     if (!rooms.has(id)) rooms.set(id, { phase: 'preview', guest: null, chat: [], others: ['Host Person', 'Guest Two'], over: null, tone, log: [], seq: 0, media: [], loads: [] });
     return rooms.get(id);
@@ -177,8 +177,10 @@ export async function startFakeZoom({ tone = false } = {}) {
     const html = (h) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(h); };
     let m = u.pathname.match(/^\/j\/(\d{9,12})$/);
     if (m) { room(m[1]).loads.push(u.pathname); return html(launch(m[1], u.search)); }
-    // The account page: 200 when the browser is signed in to the stand-in (account), else off to sign-in.
+    // The account page: 200 when the browser is signed in to the stand-in (account(true)), off to sign-in with
+    // account(false); 404 (Bosun can't tell) until a test says.
     if (u.pathname === '/profile') {
+      if (state.account === null) { res.writeHead(404); return res.end(); }
       if (state.account) return html('<title>Profile - Zoom</title><h1>Profile</h1>');
       res.writeHead(302, { location: '/signin#/login' });
       return res.end();

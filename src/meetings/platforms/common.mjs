@@ -48,19 +48,26 @@ export async function firstVisible(l, max = 5) {
 // mode (size=invisible). Sites that are merely "protected by reCAPTCHA" (Meet, Zoom's web client) carry an invisible
 // widget, its hidden challenge frame parked off screen, and that notice: none of it is a challenge.
 export const CHALLENGE_SRC = /recaptcha|hcaptcha|challenges\.cloudflare|turnstile|captcha-delivery|geo\.captcha/;
+// A challenge page served as the page itself (a captcha-delivery or Cloudflare challenge URL) counts too. A frame
+// inside other frames counts only if every frame on the way up is shown as well.
 export async function challengeShown(page) {
+  const main = page.mainFrame();
+  if (CHALLENGE_SRC.test(main.url())) return true;
   for (const f of page.frames()) {
-    if (f === page.mainFrame()) continue;
+    if (f === main) continue;
     const src = f.url();
     if (!CHALLENGE_SRC.test(src) || /[?&]size=invisible\b/.test(src)) continue;
-    const el = await f.frameElement().catch(() => null);
-    if (!el) continue;
-    const shown = await el.evaluate((e) => {
-      const r = e.getBoundingClientRect();
-      const visible = e.checkVisibility ? e.checkVisibility({ visibilityProperty: true, opacityProperty: true }) : !!e.offsetParent;
-      return visible && r.width >= 60 && r.height >= 60 && r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
-    }).catch(() => false);
-    await el.dispose().catch(() => {});
+    let shown = true;
+    for (let cur = f, own = true; shown && cur && cur !== main; cur = cur.parentFrame(), own = false) {
+      const el = await cur.frameElement().catch(() => null);
+      if (!el) { shown = false; break; }
+      shown = await el.evaluate((e, min) => {
+        const r = e.getBoundingClientRect();
+        const visible = e.checkVisibility ? e.checkVisibility({ visibilityProperty: true, opacityProperty: true }) : !!e.offsetParent;
+        return visible && r.width >= min && r.height >= min && r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
+      }, own ? 60 : 1).catch(() => false);
+      await el.dispose().catch(() => {});
+    }
     if (shown) return true;
   }
   return false;

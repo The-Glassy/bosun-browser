@@ -70,7 +70,7 @@ test('Zoom: the meeting is heard once computer audio is joined, and recorded the
   const { startFakeZoom } = await import('./fakezoom.mjs');
   const { zoom, zoomWebClientUrl } = await import('../src/meetings/platforms/zoom.mjs');
   const z = await startFakeZoom({ tone: true });
-  const platform = { ...zoom, joinUrl: (u) => zoomWebClientUrl(u).replace('https://app.zoom.us', z.base), origins: () => [z.base] };
+  const platform = { ...zoom, accountUrl: `${z.base}/profile`, joinUrl: (u) => zoomWebClientUrl(u).replace('https://app.zoom.us', z.base), origins: () => [z.base] };
   const svc = await startBosun({ KEEPALIVE: '0', HEADLESS: '0', ENGINE: 'chromium' }, { meetings: { platformFor: (u) => (zoom.matches(u) ? platform : null), pollMs: 300 } });
   const ended = [];
   svc.events.on('meeting-ended', (e) => ended.push(e));

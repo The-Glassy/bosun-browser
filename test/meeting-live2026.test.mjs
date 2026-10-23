@@ -122,6 +122,7 @@ test('Zoom, live 2026 preview with a signed-out profile: device question answere
     assert.equal(room.media[0].devices, 'declined');
     assert.equal((await status(c, j.meeting_id)).warning, j.warning);
     await c.call('meeting_leave', { meeting_id: j.meeting_id });
+    fz.account(null);
     await c.close();
   });
 });
@@ -137,13 +138,14 @@ test('Zoom, live 2026 preview with a signed-in profile but an empty name field: 
       assert.equal(r.json().warning, undefined);
       assert.equal(fz.room(id).guest.name, 'Glassy Notetaker');
       await c.call('meeting_leave', { meeting_id: r.json().meeting_id });
-    } finally { fz.account(false); }
+    } finally { fz.account(null); }
     await c.close();
   });
 });
 
 test('Zoom dry_run classifies the preview without typing or joining; an expired link is an invalid meeting', async () => {
   await withService(async (svc, c) => {
+    fz.account(false);
     const { id, url } = fz.newRoom({ web2026: true });
     const d = (await c.call('meeting_join', { url, profile: 'zoom', dry_run: true })).json();
     assert.equal(d.dry_run, true);
@@ -166,4 +168,38 @@ test('Zoom dry_run classifies the preview without typing or joining; an expired 
     assert.equal(parseZoomUrl(exp.url).id, exp.id);
     await c.close();
   });
+});
+
+test('captcha rule: a challenge inside a hidden outer frame is none; a shown one, or a challenge page itself, is', async () => {
+  await withService(async (svc, c) => {
+    const page = svc.manager.sessions.get(await c.open()).page;
+    const inner = `<iframe src="${fm.base}/recaptcha/api2/anchor?k=x" width="300" height="300"></iframe>`;
+    const outer = (style) => `<iframe style="${style}" width="400" height="400" srcdoc='${inner}'></iframe>`;
+    await page.goto(`${fm.base}/nothing`).catch(() => {});
+    for (const [style, want] of [['position:absolute;top:-5000px', null], ['opacity:0', null], ['visibility:hidden', null], ['', 'captcha']]) {
+      await page.setContent(`<title>t</title>${outer(style)}`);
+      await until(() => page.frames().some((f) => /recaptcha/.test(f.url())), 5000);
+      assert.equal(await wall(page), want, style || 'shown');
+    }
+    // A challenge served as the page itself (no frame): its URL says so.
+    await page.goto(`${fm.base}/captcha-delivery/check`).catch(() => {});
+    assert.equal(await wall(page), 'captcha');
+    await c.close();
+  });
+});
+
+test('dry runs reserve capacity before anything starts: concurrent ones past MAX_SESSIONS are refused, no audio server leaks', async () => {
+  const audio = fakeAudio({ openMs: 300 });
+  const svc = await startBosun({ KEEPALIVE: '0', MAX_SESSIONS: '1' }, { meetings: { audio, platformFor: (u) => (u.startsWith(fm.base) ? meet : null), pollMs: 200 } });
+  try {
+    const c = await connect(svc);
+    const { code, url } = fm.newRoom();
+    fm.set(code, LIVE_MEET);
+    const rs = await Promise.all([1, 2, 3].map(() => c.call('meeting_join', { url, dry_run: true })));
+    assert.equal(rs.filter((r) => !r.isError).length, 1, rs.map((r) => r.text).join('\n'));
+    for (const r of rs.filter((x) => x.isError)) assert.match(r.text, /session limit 1 reached/);
+    assert.equal(audio.stats.opened, 1);
+    await until(() => audio.stats.closed === 1 && svc.manager.used === 0);
+    await c.close();
+  } finally { await svc.stop(); }
 });

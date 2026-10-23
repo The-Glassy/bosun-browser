@@ -240,7 +240,7 @@ export const zoom = {
     return {
       state: s,
       join_button: join ? ((await join.getAttribute('aria-label').catch(() => null)) || (await join.innerText().catch(() => '')).trim()) : null,
-      join_enabled: join ? !(await join.isDisabled().catch(() => true)) : null,
+      join_enabled: join ? !(await disabled(join)) : null,
       name_field: field ? { prefilled: (await field.inputValue().catch(() => '')).trim() || null } : null,
       passcode_asked: !!(await firstVisible(page.locator(PASSCODE_FIELD))),
       challenge: await challengeShown(page),

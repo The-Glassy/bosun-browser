@@ -104,6 +104,7 @@ export class Meetings {
     Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs });
     this.dir = path.join(cfg.dataDir, 'recordings');
     this.active = new Map(); // id -> meeting
+    this.dryRuns = new Set(); // dry runs in progress: {tenant, session} (capacity)
     this.ended = new Map(); // id -> meeting (bounded), for status and chat after the end
     this.stopped = false;
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
@@ -156,7 +157,8 @@ export class Meetings {
   // Capacity, synchronously: a meeting still setting up (audio server, browser launch) has no session yet but will
   // need one, so it counts. No audio server starts for a meeting that could not get a session.
   capacity(tenant) {
-    const starting = [...this.active.values()].filter((x) => !x.session && !x.finishing);
+    // Dry runs that have not got their session yet count like meetings still setting up.
+    const starting = [...this.active.values(), ...this.dryRuns].filter((x) => !x.session && !x.finishing);
     if (this.manager.used + starting.length >= this.cfg.maxSessions || starting.length >= MAX_STARTING) throw new Error(`session limit ${this.cfg.maxSessions} reached; close one`);
     const tUse = (this.manager.tenantUse.get(tenant) || 0) + starting.filter((x) => x.tenant === tenant).length;
     if (tUse >= this.cfg.maxSessionsPerTenant) throw new Error(`session limit ${this.cfg.maxSessionsPerTenant} for this tenant reached; close one`);
@@ -170,11 +172,14 @@ export class Meetings {
     const { platform, eng } = checked;
     url = checked.url;
     this.capacity(tenant);
+    // Reserved before anything is awaited, so concurrent dry runs can't overshoot the caps; released below.
+    const slot = { tenant, session: null, finishing: false };
+    this.dryRuns.add(slot);
     const owner = `meeting-dry-run:${crypto.randomBytes(4).toString('hex')}`;
-    const rig = await this.audio.open();
-    let session = null;
+    let rig = null, session = null;
     try {
-      session = await this.manager.open({ owner, tenant, profile: profile || undefined, engine: eng, locale: platform.locale, media: { args: [...MEDIA_ARGS, ...(rig.args || [])], env: rig.browserEnv } });
+      rig = await this.audio.open();
+      session = slot.session = await this.manager.open({ owner, tenant, profile: profile || undefined, engine: eng, locale: platform.locale, media: { args: [...MEDIA_ARGS, ...(rig.args || [])], env: rig.browserEnv } });
       const target = platform.joinUrl ? platform.joinUrl(url) : url;
       for (const origin of new Set([new URL(url).origin, new URL(target).origin, ...(platform.origins ? platform.origins(url) : [])])) {
         await session.ctx.grantPermissions(['microphone', 'camera'], { origin }).catch(() => {});
@@ -188,8 +193,9 @@ export class Meetings {
       });
       return { dry_run: true, platform: platform.name, ...(profile ? { profile } : {}), engine: eng, ...r, note: 'nothing was joined or clicked except the page\'s own tips and device questions' };
     } finally {
+      this.dryRuns.delete(slot);
       if (session) await this.manager.dispose(session, 'meeting-dry-run').catch(() => {});
-      await rig.close().catch(() => {});
+      await rig?.close().catch(() => {});
     }
   }
 
