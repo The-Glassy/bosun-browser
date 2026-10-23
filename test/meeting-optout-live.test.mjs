@@ -10,7 +10,7 @@ import { startFakeZoom } from './fakezoom.mjs';
 import { meet } from '../src/meetings/platforms/meet.mjs';
 import { zoom, zoomWebClientUrl } from '../src/meetings/platforms/zoom.mjs';
 import { cleanChatText, cleanSender } from '../src/meetings/platforms/common.mjs';
-import { matchOptOut } from '../src/meetings/optout.mjs';
+import { matchOptOut, normalize } from '../src/meetings/optout.mjs';
 import { Meetings, announcement, CONFIRM_DELETED } from '../src/meetings/index.mjs';
 
 const PROFILE_ENGINE = ENGINE === 'patchright' ? 'patchright' : 'chromium';
@@ -53,7 +53,7 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
     const events = [], optouts = [];
     const queue = [{ id: '1', sender: null, text: BUBBLE(echoed) }, { id: '2', sender: '10:07 AM', text: BUBBLE('Hi all') },
       { id: '3', sender: 'Alex Example', text: BUBBLE("please don't record") }];
-    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sentTexts.map((t) => [t, 1])), optedOut: null, state: 'recording',
+    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sentTexts.map((t) => [t, { count: 1, until: 0, norm: normalize(t) }])), optedOut: null, state: 'recording',
       platform: { drainChat: async () => queue.splice(0) } };
     const fake = Object.assign(Object.create(Meetings.prototype), {
       now: Date.now, page: async (_m, fn) => fn(null), emit: (_m, kind, data) => events.push([kind, data]), optOut: async (_m, entry) => { optouts.push(entry); },
@@ -67,7 +67,7 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
   const ann = announcement('Glassy (notetaker)', null)[0];
   const run = async (sent, queue) => {
     const events = [], optouts = [];
-    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sent.map((t) => [t, 1])), optedOut: null, state: 'recording',
+    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sent.map((t) => [t, { count: 1, until: Date.now() + 60_000, norm: normalize(t) }])), optedOut: null, state: 'recording',
       platform: { drainChat: async () => queue.splice(0) } };
     const fake = Object.assign(Object.create(Meetings.prototype), { now: Date.now, page: async (_m, fn) => fn(null), emit: (_m, k, d) => events.push(d), optOut: async (_m, e) => { optouts.push(e); } });
     await fake.pollChat(m);
@@ -80,12 +80,30 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
   assert.deepEqual([r.events, r.optouts], [[], []]);
   r = await run(['Не записуй'], [{ id: '1', sender: 'Oksana', text: BUBBLE('Не записуй') }]);
   assert.equal(r.optouts.length, 1);
-  // Our post is taken out as whole words only ("No" never cuts "not"), and each echo only once: the same words
-  // again, later and without a sender, are someone's.
+  // A short post ("No") never takes words out of someone's message.
   r = await run(['No'], [{ id: '1', sender: null, text: BUBBLE('I do not consent to being recorded') }]);
   assert.equal(r.optouts.length, 1);
-  r = await run(['Не записуй'], [{ id: '1', sender: null, text: BUBBLE('Не записуй') }, { id: '2', sender: null, text: BUBBLE('Не записуй') }]);
-  assert.equal(r.events.length, 1);
+  // Within a minute of posting: whole copies of a post are ours however often they come, but a short post never
+  // takes words out of someone's message, and once the minute is over the same words are someone's.
+  const fresh = async (sent, queue, now = Date.now()) => {
+    const events = [], optouts = [];
+    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], optedOut: null, state: 'recording',
+      echoes: new Map(sent.map((t) => [t, { count: 1, until: now + 60_000, norm: normalize(t) }])), platform: { drainChat: async () => queue.splice(0) } };
+    const fake = Object.assign(Object.create(Meetings.prototype), { now: () => now, page: async (_m, fn) => fn(null), emit: (_m, k, d) => events.push(d), optOut: async (_m, e) => { optouts.push(e); } });
+    await fake.pollChat(m);
+    return { events, optouts, m, fake };
+  };
+  r = await fresh([ann], [{ id: 'a', sender: null, text: BUBBLE(ann) }, { id: 'b', sender: null, text: BUBBLE(ann) }]);
+  assert.deepEqual([r.events, r.optouts], [[], []]); // rendered twice: both ours
+  r = await fresh(['recording'], [{ id: 'a', sender: null, text: BUBBLE('recording') }, { id: 'b', sender: null, text: BUBBLE('Please stop recording') }]);
+  assert.equal(r.optouts.length, 1); // "recording" is not taken out of the request
+  r = await fresh(['recording'], [{ id: 'b', sender: null, text: BUBBLE('Please stop recording') }, { id: 'a', sender: null, text: BUBBLE('recording') }]);
+  assert.equal(r.optouts.length, 1); // nor before its own echo arrived (a short post is ours only as a whole copy)
+  r = await fresh(['Не записуй'], [{ id: 'a', sender: null, text: BUBBLE('Не записуй') }]);
+  assert.equal(r.events.length, 0);
+  r.fake.now = () => Date.now() + 120_000; // two minutes later
+  r.m.platform.drainChat = async () => [{ id: 'b', sender: null, text: BUBBLE('Не записуй') }];
+  await r.fake.pollChat(r.m);
   assert.equal(r.optouts.length, 1);
 });
 
@@ -110,10 +128,11 @@ const status = async (c, id) => (await c.call('meeting_status', { meeting_id: id
 
 test('Meet with live chat bubbles: Bosun keeps recording through its own announcement (default and custom); a participant still opts out', async () => {
   await withService(async (svc, c, ev) => {
-    for (const announce of [undefined, CUSTOM]) {
+    // Also with each of our messages rendered twice (as sent, then confirmed under a new id), as live Meet did.
+    for (const [announce, liveChat] of [[undefined, true], [CUSTOM, true], [undefined, 'twice']]) {
       ev.chat.length = 0; ev.optout.length = 0;
       const { code, url } = fm.newRoom();
-      fm.set(code, { liveChat: true, open: true });
+      fm.set(code, { liveChat, open: true });
       const j = (await c.call('meeting_join', { url, ...(announce ? { announce_text: announce } : {}) })).json();
       await until(async () => (await status(c, j.meeting_id)).state === 'recording', 15_000);
       await sleep(2500); // the 2–6 s in which the live bot had left

@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import { z } from 'zod';
 import { countNodes, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, TENANT_RE } from './auth.mjs';
-import { urlKey, httpUrl } from './sessions.mjs';
+import { urlKey, httpUrl, HANDOFF_ACTIVE } from './sessions.mjs';
 
 export { httpUrl };
 import { MANIFEST, mcplConnection } from './events.mjs';
@@ -12,6 +12,8 @@ import { MIN_PERIOD_MIN } from './keepalive.mjs';
 import { meetRefusalPage } from './meetings/platforms/meet.mjs';
 import { challengeShown } from './meetings/platforms/common.mjs';
 import { BASE64_MAX_BYTES } from './uploads.mjs';
+import { INLINE_MAX_BYTES } from './downloads.mjs';
+import { showPattern } from './allow.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
@@ -186,8 +188,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const ephemeral = policy === 'ephemeral';
   // When this tenant has a host allowlist, say so in the tool description instead of letting the agent guess.
   const allowed = manager.allowList(tenant);
-  const allowNote = allowed ? `This token may only reach: ${allowed.map((p) => (p.any ? '*' : `${p.wild ? '*.' : ''}${p.host.includes(':') ? `[${p.host}]` : p.host}${p.port ? `:${p.port}` : ''}`)).join(', ')}.` : null;
-  const server = new McpServer({ name: 'bosun', version: '0.10.2' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const allowNote = allowed ? `This token may only reach: ${allowed.map(showPattern).join(', ')}.` : null;
+  // Downloads this tenant may keep (BROWSER_TENANT_DOWNLOAD_ALLOW); null: its browsers refuse every download.
+  const downloads = manager.downloads?.allowFor(tenant) ? manager.downloads : null;
+  const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
+  // What click and navigate report: a download kept or refused (also "downloads are off for this token").
+  const capture = !ephemeral ? manager.downloads ?? null : null;
+  const server = new McpServer({ name: 'bosun', version: '0.11.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -226,7 +233,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     async (a) => {
       if (ephemeral && a.profile !== undefined) throw new Error(PROFILES_REFUSED);
       if (ephemeral && a.engine && a.engine !== cfg.engine) throw new Error(`engine ${a.engine} is ${NOT_ALLOWED}; use the default (${cfg.engine})`);
-      const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine });
+      const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine, downloads: true });
       return ok({ session: s.id, profile: a.profile || 'ephemeral', engine: s.engine });
     });
 
@@ -239,10 +246,14 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     const url = manager.checkAllowed(tenant, httpUrl(a.url));
     return run(a.session, async (s) => {
       const t0 = Date.now();
+      const mark = capture?.mark();
       let r;
       try {
         r = await s.page.goto(url, { waitUntil: a.wait || 'domcontentloaded', timeout: 45000 });
       } catch (e) {
+        // The URL was a download: the page stays where it was, and the download is the answer.
+        const dl = capture && /Download is starting|net::ERR_ABORTED|NS_BINDING_ABORTED/.test(String(e?.message)) ? await capture.since(s.id, mark, { expectMs: 3000 }) : [];
+        if (dl.length) return ok({ ...(await pageInfo(s.page)), downloads: dl.map((f) => capture.info(f)) });
         // A redirect hop the tenant's proxy refused over CONNECT (https, wss) fails the navigation in the browser:
         // say that it was the allowlist, naming host and port only.
         const denied = /TUNNEL|PROXY/i.test(String(e?.message)) ? await manager.deniedSince(tenant, t0) : [];
@@ -281,11 +292,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       return ok(`url: ${info.url}\ntitle: ${info.title}\nchars: ${total}${total > max ? ` (truncated to ${max})` : ''}\n\n${out.slice(0, max)}`);
     }));
 
-  tool('click', 'Click an element (by ref from read, role+name, selector or text).', { session: str(40), ...target }, async (a) => run(a.session, async (s) => {
+  tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target }, async (a) => run(a.session, async (s) => {
+    const mark = capture?.mark();
     await locate(s.page, a).click({ timeout: 15000 });
     await s.page.waitForTimeout(1000);
+    const dl = capture ? await capture.since(s.id, mark) : [];
     const w = noteWall(s, await wall(s.page));
-    return ok({ ...(await pageInfo(s.page)), ...(w ? { blocked: w } : {}) });
+    return ok({ ...(await pageInfo(s.page)), ...(w ? { blocked: w } : {}), ...(dl.length ? { downloads: dl.map((f) => capture.info(f)) } : {}) });
   }));
 
   tool('type', 'Fill a field. submit=true presses Enter.', { session: str(40), ...target, value: str(10000), submit: z.boolean().optional() }, async (a) => run(a.session, async (s) => {
@@ -381,6 +394,39 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       });
   }
 
+  // Downloads: this tenant's only, kept until fetched, for DOWNLOAD_TTL_SEC, or until a restart.
+  if (downloads) {
+    const ttlMin = Math.round(cfg.downloadTtlMs / 60000);
+    tool('download_wait', `Wait for a download in this session to finish (up to timeoutMs, default 30000) and report it: { download_id, state: ready, filename, size, mime, source_host, page_host } or state refused/failed with the reason. Each finished download is reported once (click already reports what finishes within 5 s of it). Kept: downloads from ${dlHosts}, or started by a page there (blob: and data: downloads count by their page); anything else is cancelled. Up to ${Math.round(cfg.downloadMaxBytes / 1024 / 1024)} MB per file; kept ${ttlMin} min or until fetched.`,
+      { session: str(40), timeoutMs: z.number().int().min(0).max(120000).optional() }, async (a, extra) => {
+        const s = manager.get(owner, a.session);
+        if (s.handoff) throw new Error(HANDOFF_ACTIVE);
+        const f = await downloads.wait(tenant, s.id, a.timeoutMs ?? 30000, extra?.signal);
+        if (!f) return ok({ state: 'none', note: 'no download finished in this session in that time; start one (click) and call download_wait again' });
+        return ok(downloads.info(f));
+      });
+    tool('downloads', 'List the downloads of this token (or of one session): running, ready to fetch, refused or failed, with download_id, filename, size and reason.', { session: str(40).optional() },
+      async (a) => ok(downloads.list(tenant, a.session ?? null).map((f) => downloads.info(f))));
+    tool('download_get', `Fetch a finished download: returns a one-time GET URL (valid ${Math.round(cfg.downloadUrlTtlMs / 60000)} min, this token only) and a ready curl -o line; the file is deleted once it has been fetched in full. inline=true returns the content in the result instead, for UTF-8 text up to ${INLINE_MAX_BYTES / 1024} KB (then the file is deleted too).`,
+      { download_id: str(40), inline: z.boolean().optional() }, async (a) => {
+        const f = downloads.get(tenant, a.download_id);
+        const meta = { download_id: f.id, filename: f.name, size: f.size, mime: f.mime, source_host: f.source };
+        if (a.inline) {
+          const text = await downloads.inline(f);
+          if (text !== null) return ok({ ...meta, inline: true, content: text });
+        }
+        if (!cfg.ws) return ok({ ...meta, path: f.file, note: `no MCP port (stdio): read the file at path; it is deleted ${ttlMin} min after it finished or on a restart` });
+        const where = `/download/${f.id}?t=${downloads.issue(f)}`;
+        const url = uploadBase ? `${uploadBase}${where}` : null;
+        return ok({
+          ...meta, ...(a.inline ? { inline: false, inline_note: `not inline: only UTF-8 text up to ${INLINE_MAX_BYTES / 1024} KB` } : {}),
+          get_url: url ?? where, ...(url ? {} : { get_url_note: 'GET from the host:port of your MCP URL, http, with this path' }),
+          curl: `curl -sS --fail-with-body -o ${shq(f.name)} ${shq(url ?? `http://<mcp host:port>${where}`)}`,
+          valid_min: Math.round(cfg.downloadUrlTtlMs / 60000), next: 'GET it once (curl); the file is deleted after a complete fetch',
+        });
+      });
+  }
+
   const waitResult = async (id, status, h) => {
     if (status === 'still_waiting') return ok({ status, expires_in_sec: Math.max(0, Math.round((h.expiresAt - Date.now()) / 1000)), next: 'call handoff_wait again' });
     const info = await run(id, async (s) => pageInfo(s.page)).catch(() => ({}));
@@ -433,16 +479,17 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const meetings = manager.meetings;
   if (meetings) {
     const mid = { meeting_id: z.string().max(20) };
-    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom refuses most guests). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or it is alone for 2 min; then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting. dry_run=true only checks the lobby (nothing is joined).',
+    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom refuses most guests). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or everyone else has left (after alone_leave_sec, default 30; 2 min while nobody else has joined yet); then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting. dry_run=true only checks the lobby (nothing is joined).',
       { url: z.string().max(2048).url().describe('https://meet.google.com/abc-defg-hij or https://zoom.us/j/<id>?pwd=… (any *.zoom.us, /w/ and /wc/ links too)'), name: str(60).optional().describe('display name for a guest (default "Glassy (notetaker)"); a signed-in profile joins under the account name'),
         announce_text: str(1000).optional(), max_wait_admit_min: z.number().int().min(1).max(60).optional(),
         profile: z.string().regex(TENANT_RE).optional().describe('join with an existing Bosun profile signed in to Google (Meet) or Zoom (gets refused far less often than an anonymous guest)'),
         engine: z.enum(cfg.engines).optional().describe('chromium (default) or patchright; camoufox is not supported for meetings'),
         leave_on_optout: z.boolean().optional(),
+        alone_leave_sec: z.number().int().min(5).max(3600).optional().describe('leave this long after everyone else left (default 30); before anyone else has joined, Bosun waits 2 min'),
         dry_run: z.boolean().optional().describe('only load the meeting page (same profile, engine and devices) and report what Bosun sees: lobby kind, the join button it would click, microphone/camera, a shown captcha; joins nothing') },
       async (a) => ok(a.dry_run ? await meetings.inspect(tenant, { url: a.url, profile: a.profile, engine: a.engine }) : await meetings.join(tenant, {
         url: a.url, name: a.name || 'Glassy (notetaker)', announceText: a.announce_text, maxWaitAdmitMin: a.max_wait_admit_min ?? 10,
-        profile: a.profile, engine: a.engine, leaveOnOptOut: a.leave_on_optout ?? true,
+        profile: a.profile, engine: a.engine, leaveOnOptOut: a.leave_on_optout ?? true, aloneLeaveSec: a.alone_leave_sec ?? null,
       })));
     tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), platform (meet, zoom), joined_as (account, guest), participants if visible, recorded seconds; without meeting_id all your meetings.',
       { meeting_id: z.string().max(20).optional() }, async (a) => ok(meetings.status(tenant, a.meeting_id)));

@@ -47,10 +47,11 @@ export function loadConfig(env = process.env) {
     // Chromium's own sandbox. On by default: a renderer that runs untrusted web content must not sit directly on the
     // service user. 0 is an explicit, logged choice (see README > Chromium sandbox).
     chromiumSandbox: flag(env, 'CHROMIUM_SANDBOX', true),
-    // Downloads a page starts. Off by default: nothing a page fetches is written to disk.
-    downloads: flag(env, 'DOWNLOADS', false),
     engines: null, // engines a session may choose
     tenantAllow: null, // tenant -> host patterns (per-tenant host allowlist, BROWSER_TENANT_ALLOW)
+    // Downloads a page starts: off for every tenant not named in BROWSER_TENANT_DOWNLOAD_ALLOW (tenant -> host
+    // patterns); a tenant that is named keeps the downloads its pages start from those hosts (src/downloads.mjs).
+    downloadAllow: null,
     policies: null,
     ws: null,
     live: null,
@@ -63,9 +64,20 @@ export function loadConfig(env = process.env) {
   for (const e of wanted) if (!ENGINE_NAMES.includes(e)) throw new Error(`FEATURES_ENGINES must be a comma list of ${ENGINE_NAMES.join(', ')} (got "${e}")`);
   cfg.engines = ENGINE_NAMES.filter((e) => e === cfg.engine || wanted.includes(e));
   cfg.tenantAllow = parseTenantAllow(env, cfg.tokens);
-  // Disk budget for downloads (only when DOWNLOADS=1): per session, and across all sessions.
-  cfg.downloadMaxMb = int(env, 'DOWNLOADS_MAX_MB', 100, 1, 1_000_000);
-  cfg.downloadTotalMaxMb = int(env, 'DOWNLOADS_TOTAL_MAX_MB', Math.max(500, cfg.downloadMaxMb), cfg.downloadMaxMb, 10_000_000);
+  // Before 0.11, DOWNLOADS=1 let every tenant download from anywhere, bounded by DOWNLOADS_MAX_MB per session and
+  // DOWNLOADS_TOTAL_MAX_MB in all. DOWNLOADS=0 still means what it always meant; the rest stops the service rather
+  // than being ignored.
+  if (flag(env, 'DOWNLOADS', false)) throw new Error('DOWNLOADS=1 was replaced in 0.11 by BROWSER_TENANT_DOWNLOAD_ALLOW=<tenant>=<host>,<host> (a tenant with "*" may download from any host)');
+  for (const old of ['DOWNLOADS_MAX_MB', 'DOWNLOADS_TOTAL_MAX_MB']) {
+    if (env[old] !== undefined && env[old] !== '') throw new Error(`${old} was replaced in 0.11 by DOWNLOAD_MAX_BYTES (per file) and DOWNLOAD_TENANT_QUOTA_BYTES (per tenant)`);
+  }
+  cfg.downloadAllow = parseTenantAllow(env, cfg.tokens, { name: 'BROWSER_TENANT_DOWNLOAD_ALLOW', empty: 'keep downloads off for it' });
+  // Downloads: the largest file, what one tenant may hold at a time, how long a file is kept and how long a GET URL
+  // for it stays valid.
+  cfg.downloadMaxBytes = int(env, 'DOWNLOAD_MAX_BYTES', 300 * 1024 * 1024, 1, 1024 ** 4);
+  cfg.downloadQuotaBytes = int(env, 'DOWNLOAD_TENANT_QUOTA_BYTES', Math.max(1024 ** 3, cfg.downloadMaxBytes), cfg.downloadMaxBytes, 1024 ** 5);
+  cfg.downloadTtlMs = int(env, 'DOWNLOAD_TTL_SEC', 3600, 10, 7 * 86400) * 1000;
+  cfg.downloadUrlTtlMs = int(env, 'DOWNLOAD_URL_TTL_SEC', 900, 10, 86400) * 1000;
   // File uploads into pages: the largest file, what one tenant may hold at a time, how long a file is kept and how
   // long an upload URL stays valid. UPLOAD_BASE_URL: where tenants reach the MCP port, when the Host header they
   // connect with is not it (TLS in front, another name).
@@ -82,6 +94,10 @@ export function loadConfig(env = process.env) {
   }
   cfg.maxSessionsPerTenant = int(env, 'MAX_SESSIONS_PER_TENANT', cfg.maxSessions, 1, cfg.maxSessions);
   cfg.policies = parsePolicies(env, cfg.tokens);
+  // A read-only token never writes a file: naming one for downloads is a mistake, not something to ignore.
+  for (const t of cfg.downloadAllow.keys()) {
+    if (cfg.policies.get(t) === 'ephemeral') throw new Error(`BROWSER_TENANT_DOWNLOAD_ALLOW names tenant "${t}", whose policy is ephemeral (read-only tokens cannot download)`);
+  }
   // Session cap of each tenant with policy "ephemeral".
   cfg.ephemeralMaxSessions = int(env, 'BROWSER_EPHEMERAL_MAX_SESSIONS', Math.min(2, cfg.maxSessionsPerTenant), 1, cfg.maxSessionsPerTenant);
 

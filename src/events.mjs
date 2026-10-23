@@ -1,7 +1,8 @@
 // MCPL push events (spec §6 feature sets, §9 push/event, §16 tags) for things that need the agent's attention while
 // no tool call is running: a kept-alive profile that is logged out or stuck at a bot check (feature set
-// bosun.handoff), a watched value that changed on a keepalive visit (feature set bosun.watch), and what happens in a
-// meeting Bosun attends: chat messages, an opt-out, the end with the recording (feature set bosun.meeting).
+// bosun.handoff), a watched value that changed on a keepalive visit (feature set bosun.watch), what happens in a
+// meeting Bosun attends: chat messages, an opt-out, the end with the recording (feature set bosun.meeting), and a
+// download that finished or was refused (feature set bosun.download).
 // A connection receives push/event only if its client asked for MCPL at initialize (capabilities.experimental.mcpl)
 // and the host's featureSets/update Request granted pushEvents with the event's feature set enabled. Events for a
 // tenant with no such connection wait (bounded) for the next one.
@@ -15,6 +16,8 @@ export const WATCH_SET = 'bosun.watch';
 export const WATCH_CHANGED = 'bosun:watch-changed';
 export const MEETING_SET = 'bosun.meeting';
 export const MEETING_TAGS = { chat: 'bosun:meeting-chat', optout: 'bosun:meeting-optout', ended: 'bosun:meeting-ended' };
+export const DOWNLOAD_SET = 'bosun.download';
+export const DOWNLOAD = 'bosun:download';
 export const MANIFEST = {
   version: '0.5',
   pushEvents: true,
@@ -45,6 +48,14 @@ export const MANIFEST = {
           [MEETING_TAGS.ended]: { desc: 'Bosun left the meeting; origin carries duration and the recording (if any)' },
         },
         keyed: { 'bosun:meeting': { open: true }, 'bosun:platform': { values: ['meet', 'zoom'] } },
+      },
+    },
+    [DOWNLOAD_SET]: {
+      description: 'Push events when a download a page started has finished (ready to fetch with download_get), was refused (host not allowed, too big, quota) or failed; origin carries download_id, state, filename, size, source_host and reason.',
+      uses: ['pushEvents'],
+      tagOntology: {
+        tags: { [DOWNLOAD]: { desc: 'a download finished, was refused or failed' } },
+        keyed: { 'bosun:state': { values: ['ready', 'refused', 'failed'] }, 'bosun:session': { open: true } },
       },
     },
   },
@@ -94,6 +105,21 @@ export function meetingEvent(kind, { meeting_id, platform, ...data }) {
     tags: [MEETING_TAGS[kind], `bosun:meeting=${meeting_id}`, `bosun:platform=${platform}`],
     origin: { server: 'bosun', source: 'meeting', meeting_id, platform, ...data },
     payload: { content },
+  };
+}
+
+// A download settled -> push/event params. d: what download_wait returns (Downloads.info) plus session.
+export function downloadEvent({ session, ...d }) {
+  const text = d.state === 'ready'
+    ? `Bosun download ready: "${d.filename}" (${d.size} bytes, ${d.mime}, from ${d.source_host}) in session ${session}. Fetch it with download_get { download_id: "${d.download_id}" } within ${d.expires_in_min} min.`
+    : `Bosun download ${d.state}: "${d.filename}" from ${d.source_host} in session ${session}: ${d.reason}`;
+  return {
+    featureSet: DOWNLOAD_SET,
+    eventId: `bosun:${crypto.randomUUID()}`,
+    timestamp: new Date().toISOString(),
+    tags: [DOWNLOAD, `bosun:state=${d.state}`, `bosun:session=${session}`],
+    origin: { server: 'bosun', source: 'download', session, ...d },
+    payload: { content: [{ type: 'text', text }] },
   };
 }
 
@@ -159,6 +185,12 @@ export class EventBus extends EventEmitter {
   meeting(kind, { tenant, ...e }) {
     this.emit(`meeting-${kind}`, { tenant, ...e });
     return this.publish(tenant, meetingEvent(kind, e));
+  }
+
+  // From the downloads: info = Downloads.info(f) plus session.
+  download(tenant, info) {
+    this.emit('download', { tenant, ...info });
+    return this.publish(tenant, downloadEvent(info));
   }
 
   // From a keepalive visit's watch: e = {tenant, profile, label, old, new, url}.

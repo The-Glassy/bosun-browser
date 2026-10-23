@@ -37,6 +37,8 @@ const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 // once both are off). liveChat: chat bubbles as live Meet rendered them (2026-10-23): "10:07 AM: <text>" with the pin
 // control's tooltip, icon names and label inside the message element; Bosun's own messages carry no sender at all,
 // others' sit under a plain header line with the name.
+// liveChat 'twice': each of Bosun's own messages is rendered twice, as sent and again under a new id once confirmed
+// (live Meet, 2026-10-23 11:14: the second copy came through as a chat event from "someone").
 function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false }) {
   const L = UI[lang];
   const de = lang === 'de';
@@ -80,7 +82,7 @@ const L = ${JSON.stringify(L)}, TOGGLES = ${JSON.stringify(toggles)};
 const code = location.pathname.split('/').pop(), $ = (id) => document.getElementById(id);
 if (${live ? 'true' : 'false'}) { document.title = 'Meet - ' + code; $('micPopClose').onclick = () => $('micPop').remove(); }
 // joinName 'devices': the join button is named after the devices it would join without.
-const JOIN_NAME = ${JSON.stringify(joinName)}, LIVE_CHAT = ${liveChat ? 'true' : 'false'};
+const JOIN_NAME = ${JSON.stringify(joinName)}, LIVE_CHAT = ${liveChat ? 'true' : 'false'}, TWICE = ${liveChat === 'twice' ? 'true' : 'false'};
 const nameJoin = () => { if (JOIN_NAME === 'devices' && $('ask')) { if (!mic && !cam) $('ask').setAttribute('aria-label', L.ask + ' without microphone & camera'); else $('ask').removeAttribute('aria-label'); } };
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, ...b }) });
 let mic = true, cam = true, shown = new Set(), toned = false;
@@ -122,6 +124,7 @@ async function poll() {
         const icon = document.createElement('div'); icon.setAttribute('aria-hidden', 'true'); icon.textContent = 'keep';
         const pin = document.createElement('button'); pin.innerHTML = '<div aria-hidden="true">keep</div><div>Pin message</div>';
         d.append(t, tip, icon, pin);
+        if (m.self && TWICE) { const d2 = d.cloneNode(true); d2.dataset.messageId = m.id + '-confirmed'; g.append(d2); }
       } else {
         g.dataset.senderName = m.self ? 'You' : m.sender;
         d.textContent = m.text; // may be empty at first and filled in by a later poll (lateMs)

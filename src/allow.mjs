@@ -65,26 +65,31 @@ export function blockedTarget(raw) {
 // BROWSER_TENANT_ALLOW='ops=*.example.org,127.0.0.1:4848; other=*' -> Map tenant -> patterns[]. Entries are
 // separated by ";" (or newlines), hosts within an entry by ",". A named tenant must have a token (except "default",
 // which is the tenant of the stdio transport), so a typo cannot leave the intended tenant unrestricted.
-export function parseTenantAllow(env, tokens) {
+// name/empty: the same format under another variable (BROWSER_TENANT_DOWNLOAD_ALLOW), and what leaving a tenant out
+// means there.
+export function parseTenantAllow(env, tokens, { name = 'BROWSER_TENANT_ALLOW', empty = 'leave the tenant unrestricted' } = {}) {
   const out = new Map();
   const tenants = new Set(tokens.map((t) => t.tenant));
-  for (const entry of String(env.BROWSER_TENANT_ALLOW || '').split(/[;\n]/).map((s) => s.trim()).filter(Boolean)) {
+  for (const entry of String(env[name] || '').split(/[;\n]/).map((s) => s.trim()).filter(Boolean)) {
     const i = entry.indexOf('=');
-    if (i < 1) throw new Error('BROWSER_TENANT_ALLOW entries must look like <tenant>=<host>,<host> and be separated by ";"');
+    if (i < 1) throw new Error(`${name} entries must look like <tenant>=<host>,<host> and be separated by ";"`);
     const tenant = entry.slice(0, i).trim();
     const hosts = entry.slice(i + 1).split(',').map((s) => s.trim()).filter(Boolean);
-    if (!TENANT_RE.test(tenant)) throw new Error(`BROWSER_TENANT_ALLOW: tenant name "${tenant}" must match ${TENANT_RE}`);
-    if (!tenants.has(tenant) && tenant !== 'default') throw new Error(`BROWSER_TENANT_ALLOW names tenant "${tenant}", which has no token`);
-    if (out.has(tenant)) throw new Error(`BROWSER_TENANT_ALLOW names tenant "${tenant}" twice`);
-    if (!hosts.length) throw new Error(`BROWSER_TENANT_ALLOW: tenant "${tenant}" names no host; remove the entry to leave the tenant unrestricted`);
+    if (!TENANT_RE.test(tenant)) throw new Error(`${name}: tenant name "${tenant}" must match ${TENANT_RE}`);
+    if (!tenants.has(tenant) && tenant !== 'default') throw new Error(`${name} names tenant "${tenant}", which has no token`);
+    if (out.has(tenant)) throw new Error(`${name} names tenant "${tenant}" twice`);
+    if (!hosts.length) throw new Error(`${name}: tenant "${tenant}" names no host; remove the entry to ${empty}`);
     try {
       out.set(tenant, hosts.map(parseHostPattern));
     } catch (e) {
-      throw new Error(`BROWSER_TENANT_ALLOW, tenant "${tenant}": ${e.message}`);
+      throw new Error(`${name}, tenant "${tenant}": ${e.message}`);
     }
   }
   return out;
 }
+
+// Patterns as an operator wrote them: "*.example.org", "[::1]:4848".
+export const showPattern = (p) => (p.any ? '*' : `${p.wild ? '*.' : ''}${p.host.includes(':') ? `[${p.host}]` : p.host}${p.port ? `:${p.port}` : ''}`);
 
 // The patterns of a tenant, or null when it has none (unrestricted).
 export const allowFor = (cfg, tenant) => cfg.tenantAllow?.get(tenant) ?? null;

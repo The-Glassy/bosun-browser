@@ -23,7 +23,10 @@ import { pulseAudio } from './audio.mjs';
 export const ID_RE = /^m[0-9a-f]{12}$/;
 export const PLATFORMS = [meet, zoom];
 const POLL_MS = 1000;
-const ALONE_MS = 120_000; // alone in the call this long: leave
+const ALONE_MS = 120_000; // alone in the call this long while nobody else has been there yet: leave
+const ALONE_LEAVE_MS = 30_000; // alone this long after everyone else left: leave (meeting_join alone_leave_sec)
+const ECHO_MS = 60_000; // after posting, senderless copies of the post are ours however often the panel renders them
+const ECHO_LONG = 40; // a senderless exact copy of a post at least this long (normalized) is ours at any time
 const JOIN_REPLY_MS = 60_000; // meeting_join answers once the join request is out (or after this)
 const MAX_CHAT = 500; // kept per meeting
 const MEDIA_ARGS = ['--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'];
@@ -101,8 +104,8 @@ export class Meetings {
   // audio: {unsupported() -> reason|null, open() -> {browserEnv, args?, record(file), close()}, needsHeadful};
   // platformFor(url) -> platform|null; bus: EventBus (meeting events).
   constructor({ cfg, manager, bus, audio = pulseAudio, platformFor = (url) => PLATFORMS.find((p) => p.matches(url)) || null,
-    now = Date.now, pollMs = POLL_MS, aloneMs = ALONE_MS }) {
-    Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs });
+    now = Date.now, pollMs = POLL_MS, aloneMs = ALONE_MS, aloneLeaveMs = ALONE_LEAVE_MS }) {
+    Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs, aloneLeaveMs });
     this.dir = path.join(cfg.dataDir, 'recordings');
     this.active = new Map(); // id -> meeting
     this.dryRuns = new Set(); // dry runs in progress: {tenant, session} (capacity)
@@ -212,7 +215,7 @@ export class Meetings {
 
   // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
   // meeting could not be joined (denied, not a meeting page, no audio, ...).
-  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true }) {
+  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec = null }) {
     const checked = await this.check(tenant, { url, profile, engine });
     const { platform, eng } = checked;
     url = checked.url;
@@ -220,6 +223,7 @@ export class Meetings {
     const id = `m${crypto.randomBytes(6).toString('hex')}`;
     const m = {
       id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, leaveOnOptOut,
+      aloneLeaveMs: aloneLeaveSec !== null ? aloneLeaveSec * 1000 : this.aloneLeaveMs, othersSeen: false,
       announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner),
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
       createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, stopping: null, recMs: 0, file: null, deleted: false,
@@ -287,6 +291,7 @@ export class Meetings {
     await this.page(m, async (p) => {
       if (platform.afterAdmit) await platform.afterAdmit(p); // Zoom: computer audio joined, mic and camera off
       m.participants = await platform.participants(p);
+      if (m.participants > 1) m.othersSeen = true; // someone else was here: leaving after alone_leave_sec once they go
       await platform.openChat(p);
       await platform.watchChat(p, m.chatKey);
       for (const t of m.announce) await this.say(m, p, t);
@@ -328,39 +333,56 @@ export class Meetings {
     const n = await this.page(m, (p) => m.platform.participants(p));
     m.participants = n;
     if (n !== null && n <= 1) {
+      // Everyone else left: leave soon (aloneLeaveMs). Nobody else has been here yet: wait longer for them (aloneMs).
       m.aloneSince ??= this.now();
-      if (this.now() - m.aloneSince > this.aloneMs) return this.finish(m, 'alone');
-    } else m.aloneSince = null;
+      if (this.now() - m.aloneSince > (m.othersSeen ? m.aloneLeaveMs : this.aloneMs)) return this.finish(m, 'alone');
+    } else {
+      m.aloneSince = null;
+      if (n !== null && n > 1) m.othersSeen = true;
+    }
   }
 
   // Posts in the chat and remembers it, so the copy that shows up in the chat panel is recognized as ours.
   async say(m, page, text) {
-    m.echoes.set(text.trim(), (m.echoes.get(text.trim()) || 0) + 1); // how often its echo may still be taken out
+    const e = m.echoes.get(text.trim()) || { count: 0, until: 0, norm: normalize(text) };
+    m.echoes.set(text.trim(), { ...e, count: e.count + 1, until: this.now() + ECHO_MS }); // see withoutOwn
     m.pendingOwn.push(text.trim());
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
     await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name });
   }
 
-  // What is left of a message once Bosun's own posts are taken out of it (live Meet showed our announcement with no
-  // sender, inside UI text). Only for a message without a participant's name on it: a named participant's message is
-  // always judged whole. Taken out as whole words, and each post only as often as Bosun posted it (an echo is used up
-  // once seen), so a participant later writing the same words is heard, and a short post ("No") never cuts into a
-  // word ("not"). Taking out, not dropping: a message that pastes our announcement and adds "please stop recording"
-  // keeps the request.
+  // What is left of a message once Bosun's own posts are taken out of it (live Meet shows our messages with no sender,
+  // inside UI text, and may render one twice: as sent, then again under a new id once confirmed). Only for a message
+  // without a participant's name on it: a named participant's message is always judged whole.
+  // - A whole-message copy of a post is ours within ECHO_MS of posting, however often the panel renders it, and at any
+  //   time if the post is long (ECHO_LONG).
+  // - Inside a larger message, only a long post (ECHO_LONG) is taken out, as whole words and only as often as Bosun
+  //   posted it; every copy recognised as ours, by either ledger, uses one up. A short post ("recording", "No") is
+  //   ours only as a whole copy, so it never takes words out of someone's "please stop recording"; the same short
+  //   words written by someone later are heard.
+  // Taking out, not dropping: a message that pastes our announcement and adds "please stop recording" keeps it.
   withoutOwn(m, text) {
+    const whole = normalize(text);
+    for (const e of m.echoes.values()) {
+      if (e.norm === whole && (this.now() <= e.until || e.norm.length >= ECHO_LONG)) { this.retire(m, e); return ''; }
+    }
     const flat = (t) => String(t).replace(/[‘’ʼ]/g, "'").replace(/[“”„]/g, '"');
     let rest = flat(text);
-    for (const [sent, n] of [...m.echoes].sort((a, b) => b[0].length - a[0].length)) {
-      if (n <= 0) continue;
+    for (const [sent, e] of [...m.echoes].sort((a, b) => b[0].length - a[0].length)) {
+      if (e.count <= 0 || e.norm.length < ECHO_LONG) continue;
       const words = flat(sent).trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
       if (!words.length) continue;
       const re = new RegExp(`(?<![\\p{L}\\p{N}])${words.join('\\s+')}(?![\\p{L}\\p{N}])`, 'iu');
-      while (m.echoes.get(sent) > 0 && re.test(rest)) {
-        rest = rest.replace(re, ' ');
-        m.echoes.set(sent, m.echoes.get(sent) - 1);
-      }
+      while (e.count > 0 && re.test(rest)) { rest = rest.replace(re, ' '); this.retire(m, e); }
     }
     return rest;
+  }
+
+  // One of Bosun's posts was seen: both ledgers (echoes, and pendingOwn for copies labelled as ours) let it go once.
+  retire(m, e) {
+    e.count = Math.max(0, e.count - 1);
+    const i = m.pendingOwn.findIndex((t) => normalize(t) === e.norm);
+    if (i >= 0) m.pendingOwn.splice(i, 1);
   }
 
   // Ours only if we just sent exactly this text AND the chat shows it as from us; each sent message matches once.
@@ -371,6 +393,8 @@ export class Meetings {
     const i = m.pendingOwn.indexOf(text);
     if (i < 0) return false;
     m.pendingOwn.splice(i, 1);
+    const e = m.echoes?.get(text); // the same post can't be taken out of a later senderless message as well
+    if (e) e.count = Math.max(0, e.count - 1);
     return true;
   }
 

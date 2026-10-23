@@ -42,7 +42,7 @@ an important guarantee or depends entirely on the deployment to be safe. **LOW**
 | M2 | MEDIUM | Masking covers the page dump, not the URL and title returned with it | documented |
 | M3 | MEDIUM | One shared Chromium browser process serves every tenant; the global session cap is shared | narrowed: each session of a tenant with an allowlist gets its own browser process; the rest still share one, caps still global |
 | M4 | MEDIUM | Service secrets are inherited by every browser child process | deploy guidance: own user, own `EnvironmentFile` |
-| M5 | MEDIUM | A page's downloads are written to disk with no budget at all | fixed: `DOWNLOADS=0` by default, per-session and service-wide byte budgets |
+| M5 | MEDIUM | A page's downloads are written to disk with no budget at all | fixed: off by default; since 0.11 per tenant (`BROWSER_TENANT_DOWNLOAD_ALLOW`, host or page origin), streamed to the data volume, cancelled mid-stream past a per-file cap and a per-tenant quota, deleted once fetched / after 1 h / on start |
 | L1 | LOW | Legacy `?token=` query parameter still accepted | deploy guidance: header only |
 | L2 | LOW | No rate limiting, lockout or log on failed authentication | accepted |
 | L3 | LOW | `ALLOW_NO_TOKEN=1` gives any local process a full-policy tenant | deploy guidance: never set |
@@ -291,6 +291,22 @@ either budget is cancelled before it is written, or deleted again if its size wa
 refusal is logged without the URL's query. Closing a session releases its share, since the context takes its files
 with it. Tests: `test/downloads.test.mjs`. What this does *not* bound: a single download transiently uses its own
 size on disk before it can be measured — so give the volume a real quota if you turn downloads on.
+
+**In 0.11.0:** `DOWNLOADS` and its budgets are replaced (`DOWNLOADS=1` and the old budget variables stop the
+service with a hint). Downloads stay off for every tenant except those named in `BROWSER_TENANT_DOWNLOAD_ALLOW`, and
+for those only from the listed hosts: the download URL's host, or the top-level origin of the page that started it
+(`blob:`/`data:` by that page). Anything else is cancelled, with the reason reported to the agent.
+- **Where the bytes go:** such a session gets a browser of its own with `downloadsPath` on the data volume
+  (`BROWSER_DATA/downloads/<tenant>/.in-…`), so nothing lands in `/tmp` and no bytes pass through the service.
+- **Limits:** the growing file is measured every 250 ms and cancelled past `DOWNLOAD_MAX_BYTES` (300 MB) or the
+  tenant's `DOWNLOAD_TENANT_QUOTA_BYTES` (1 GB). The browser deletes what it wrote. The overshoot is bounded by what
+  arrives in 250 ms.
+- **Kept files:** a finished file moves to `BROWSER_DATA/downloads/<tenant>/<id>/` (0600), is fetched once over a
+  one-time GET on the MCP port (tenant-bound), and is deleted once fetched, after `DOWNLOAD_TTL_SEC`, and on every
+  start.
+- **Read-only tokens** cannot be given downloads.
+
+Tests: `test/downloads.test.mjs`, on all three engines.
 
 ## L1 — LOW: the legacy `?token=` query parameter is still accepted
 

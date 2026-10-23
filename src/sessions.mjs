@@ -7,7 +7,7 @@ import path from 'path';
 import { clearSensitive, installTracker, notePasswords, passwordTracker } from './redact.mjs';
 import { createEngines, claimProfile, unclaimProfile, recordProfileUse } from './engines.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, policyOf } from './auth.mjs';
-import { allowFor, allowsUrl, blockedTarget } from './allow.mjs';
+import { allowFor, allowsUrl } from './allow.mjs';
 import { startTenantProxy } from './proxy.mjs';
 
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
@@ -86,7 +86,6 @@ export class SessionManager {
     this.browserP = null;
     this.launches = 0;
     this.closing = false;
-    this.dlBytes = 0; // bytes of downloads currently kept across all sessions (DOWNLOADS_TOTAL_MAX_MB)
     this.proxies = new Map(); // tenant -> Promise<Playwright proxy options> (per-tenant forward proxy)
     fs.mkdirSync(path.join(cfg.dataDir, 'profiles'), { recursive: true });
     // Temp profiles of ephemeral per-browser sessions: anything left here is from a process that was killed.
@@ -116,8 +115,10 @@ export class SessionManager {
     for (const s of this.sessions.values()) if (s.browser === browser) this.dispose(s, 'browser-crashed');
   }
 
-  // media: {args, env} for a meeting's own browser process (see engines.mjs).
-  async open({ owner, tenant, profile, locale, timezone, engine, preempt = true, media = null }) {
+  // media: {args, env} for a meeting's own browser process (see engines.mjs). downloads: the session may keep what
+  // its pages download, if the tenant's download allowlist lets it (sessions the agent opens; keepalive visits and
+  // meetings never download).
+  async open({ owner, tenant, profile, locale, timezone, engine, preempt = true, media = null, downloads = false }) {
     if (this.closing) throw new Error('service is shutting down');
     const def = this.engines.get(engine || this.cfg.engine);
     // Only engines this deployment enabled (FEATURES_ENGINES, plus the default ENGINE).
@@ -139,13 +140,14 @@ export class SessionManager {
       else { this.ownerOpens.delete(owner); this.goneOwners.delete(owner); }
     };
     try {
-      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral });
+      // agent: a session the agent opened (it hears why a download was refused even when its tenant may not download).
+      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral, downloads: downloads && !media && !!this.downloads?.allowFor(tenant), agent: downloads && !media && !ephemeral });
     } finally {
       untrack();
     }
   }
 
-  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral }) {
+  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral, downloads, agent = false }) {
     // The profile was just closed (by session_close, a dropped connection, idle or crash) and its browser is still
     // shutting down; or a background keepalive holds it. Wait for it rather than refusing.
     if (profileKey && this.profilesInUse.has(profileKey)) {
@@ -172,12 +174,14 @@ export class SessionManager {
     };
 
     const p = (async () => {
-      let ctx = null, browser = null, dir = null, tmpDir = null, profileDir = null, claimed = false;
+      let ctx = null, browser = null, dir = null, tmpDir = null, profileDir = null, claimed = false, dlDir = null;
       try {
         // A tenant with a host allowlist only reaches the network through its own forward proxy, which is what its
         // browser contexts are launched with. A failure here fails the open rather than opening a session that is
         // not restricted.
         const proxy = await this.tenantProxy(tenant);
+        // Where this session's browser writes downloads: a directory of its own on the data volume.
+        if (downloads) dlDir = this.downloads.incoming(tenant);
         if (profile) {
           profileDir = path.join(this.cfg.dataDir, 'profiles', tenant, profile);
           fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
@@ -186,7 +190,7 @@ export class SessionManager {
         }
         try {
           ({ ctx, browser = null, dir = null, tmpDir = null } = await this.engines.open(def.name, {
-            cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', media, proxy,
+            cfg: this.cfg, profileDir, locale: locale || 'de-AT', timezone: timezone || 'Europe/Vienna', media, proxy, downloads: dlDir,
             shared: (d, bt) => this.getBrowser(d, bt),
           }));
         } catch (e) {
@@ -206,7 +210,7 @@ export class SessionManager {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
           navs: [], ctxErrors: [], wallSeen: null, // recent main-frame navigations {t, at: origin+path}, "context destroyed" failures, last bot check seen (bot-check loops)
-          dlBytes: 0,
+          dlDir, // null: the context refuses downloads
         };
         this.sessions.set(s.id, s);
         page.on('framenavigated', (f) => {
@@ -214,12 +218,7 @@ export class SessionManager {
           s.navs.push({ t: Date.now(), at: urlKey(f.url()) });
           if (s.navs.length > 100) s.navs.shift();
         });
-        // Downloads are refused by the context unless DOWNLOADS=1; when they are allowed, they get a disk budget.
-        if (this.cfg.downloads) {
-          const budget = (p) => p.on('download', (d) => { this.onDownload(s, d).catch(() => {}); });
-          budget(page);
-          ctx.on('page', budget);
-        }
+        if (dlDir || (agent && this.downloads)) this.downloads.watch(s);
         page.on('close', () => this.dispose(s, 'page-closed'));
         page.on('crash', () => this.dispose(s, 'page-crashed'));
         ctx.on('close', () => this.dispose(s, 'context-closed'));
@@ -230,6 +229,7 @@ export class SessionManager {
         if (await this.reclaim({ dir, tmpDir, release, what: `failed open (${def.name})` })) {
           if (claimed) unclaimProfile(profileDir);
         }
+        if (dlDir) await fs.promises.rm(dlDir, { recursive: true, force: true }).catch(() => {});
         throw e;
       }
     })();
@@ -375,27 +375,6 @@ export class SessionManager {
     }
   }
 
-  // A download that would push this session, or the service, past its disk budget is cancelled; one that was already
-  // written when we learn its size is deleted again. Logged without the URL's query.
-  async onDownload(s, d) {
-    const perSession = this.cfg.downloadMaxMb * 1024 * 1024, total = this.cfg.downloadTotalMaxMb * 1024 * 1024;
-    const note = (what) => console.error(`bosun: tenant ${s.tenant}: ${what} ${blockedTarget(d.url())} (download budget)`);
-    if (s.dlBytes >= perSession || this.dlBytes >= total) {
-      await d.cancel().catch(() => {});
-      await d.delete().catch(() => {}); // a small download may finish before the cancel lands (Firefox): remove it
-      return note('refused download of');
-    }
-    let size;
-    try { size = (await fs.promises.stat(await d.path())).size; } catch { return; } // cancelled, failed or already gone
-    if (s.disposed) return; // the session closed meanwhile: its context took the file, and its share is released
-    if (s.dlBytes + size > perSession || this.dlBytes + size > total) {
-      await d.delete().catch(() => {});
-      return note('deleted over-budget download of');
-    }
-    s.dlBytes += size;
-    this.dlBytes += size;
-  }
-
   async saveShot(s, buf) {
     if (!this.cfg.saveShots || policyOf(this.cfg, s.tenant) === 'ephemeral') return null; // ephemeral: nothing on disk
     if (s.disposed) throw new Error(`session ${s.id} was closed (${s.closeReason})`);
@@ -420,7 +399,6 @@ export class SessionManager {
     s.closeReason = reason;
     this.sessions.delete(s.id);
     this.closed.set(s.id, { owner: s.owner, reason });
-    this.dlBytes = Math.max(0, this.dlBytes - (s.dlBytes || 0)); // the context takes its downloads with it
     if (this.closed.size > 200) this.closed.delete(this.closed.keys().next().value);
     if (s.handoff) s.handoff.cancel();
     const profileKey = s.profile ? `${s.tenant}/${s.profile}` : null;
@@ -436,6 +414,8 @@ export class SessionManager {
       }
       // Files this session put into its pages: the browser that could still read them is gone.
       await this.uploads?.sessionClosed(s.id, (id) => this.sessions.has(id)).catch(() => {});
+      // Its download directory (finished downloads were moved out of it and stay).
+      await this.downloads?.sessionClosed(s).catch(() => {});
     })();
     this.disposals.add(s.disposing);
     if (profileKey) this.closingProfiles.set(profileKey, s.disposing);

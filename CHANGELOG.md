@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.11.0 — safe downloads, per tenant
+
+### Added
+
+- **Downloads, per tenant and per host.** `BROWSER_TENANT_DOWNLOAD_ALLOW='glassy=web.plaud.ai,*.plaud.ai'` uses the
+  same pattern format as `BROWSER_TENANT_ALLOW` (host, `*.host`, `host:port`, `*`).
+  - A tenant that is not named gets what every tenant had: a browser that refuses downloads.
+  - A named tenant keeps a download if the download URL's host **or** the top-level origin of the page that started
+    it is on its list. `blob:` and `data:` count by their page, and a popup without a page of its own by its opener.
+  - Anything else is cancelled, and the reason goes to the agent.
+  - Only sessions opened with `session_open` keep downloads; keepalive visits and meetings never do.
+- **`click` reports downloads** it started (`downloads: [...]`, waiting up to 5 s for them to finish). So does
+  `navigate` to a download URL; the page stays where it was.
+- **`download_wait { session, timeoutMs? }`** reports the session's next finished download (`download_id`,
+  `filename`, `size`, `mime`, `source_host`, `page_host`, `allowed_by`), or a refused or failed one with its reason.
+  Each download is reported once.
+- **`downloads { session? }`** lists the tenant's downloads: running, ready, refused and failed.
+- **`download_get { download_id, inline? }`** returns a one-time GET URL on the MCP port, the same mechanism as the
+  upload PUT. It is valid 15 min, works for this tenant only (or with the tenant's Bearer token), and comes with a
+  ready `curl -o` line. `inline: true` returns UTF-8 text up to 256 KB in the result instead.
+- **Event `bosun:download`** (feature set `bosun.download`) when a download finishes or is refused.
+- A tenant without downloads still learns why: `click` reports `state: refused`, "downloads are off for this token"
+  (sessions the agent opens; read-only tokens record nothing).
+
+### Storage and limits
+
+- **Where the bytes go:** a session that may download gets a browser of its own whose download directory is on the
+  data volume, `BROWSER_DATA/downloads/<tenant>/.in-…`. The browser streams the bytes there itself: not `/tmp`, not
+  Bosun's memory.
+- **Cancelled mid-stream** past `DOWNLOAD_MAX_BYTES` (300 MB per file) or `DOWNLOAD_TENANT_QUOTA_BYTES` (1 GB per
+  tenant, running and kept). The size is checked whenever the browser writes (the session's download directory is
+  watched) and every 250 ms, and the browser deletes what it wrote.
+- **Kept files** move to `BROWSER_DATA/downloads/<tenant>/<id>/<filename>` (0600) and outlive their session.
+  - They are deleted once fetched in full, `DOWNLOAD_TTL_SEC` (1 h) after they finished, and all of them at every
+    start.
+  - A tenant holds at most 50, and fetches at most 4 at once.
+  - A GET whose client reads nothing for 60 s, or that takes over an hour, is cut off. A file being fetched is
+    fetched once: a second `download_get` meanwhile is refused.
+  - A delete that fails keeps the file's bytes and slot charged until the retry succeeds. So does the partial file of
+    a refused or failed download until Bosun has made sure it is gone; it is charged at what is still on disk.
+- **Tenants:** another tenant's `download_id` answers like one that never existed, and a GET with another tenant's
+  token is refused. Naming a read-only (`ephemeral`) tenant stops the service.
+
+### Meetings
+
+- **Leaving when alone is faster.** Once others have been in the call and everyone has left, Bosun leaves after
+  `alone_leave_sec` (new `meeting_join` parameter, default 30 s). Before, it waited 2 min. The 2-minute wait now
+  applies only while nobody else has joined yet. (Live Meet, 2026-10-23 11:14: the host left at 0:20, and Bosun
+  stayed until 2:33.)
+- **Bosun's own chat messages no longer come through as `bosun:meeting-chat` from "someone".**
+  - Live Meet renders our message twice: as sent, then again under a new id once confirmed. 0.10.2 recognised only
+    the first.
+  - Within 60 s of posting, a senderless message that is a whole copy of a post is ours, however often it is
+    rendered. After that, a whole copy of a long post (40+ characters) is ours too.
+  - A short post never takes words out of someone else's message, and the same words written by someone later are
+    heard.
+
+### Changed
+
+- `DOWNLOADS`, `DOWNLOADS_MAX_MB` and `DOWNLOADS_TOTAL_MAX_MB` (0.8.0) are replaced. `DOWNLOADS=0` is still
+  accepted. `DOWNLOADS=1` and the budget variables stop the service with a hint, rather than being ignored.
+
+### Limits
+
+- `mime` comes from the file name's extension.
+- The limits are enforced by watching the file and cancelling; they are not a filesystem quota. A very fast download
+  can pass a limit by what arrives before the cancel lands. Bound the worst case with a quota or a volume of its own
+  for `BROWSER_DATA` (production has a dedicated volume).
+- The in-progress file is found through a private Playwright field (the download's artifact path; versions are
+  pinned). Without it, the whole download directory of the session is measured, which is stricter.
 ## 0.10.2 — Bosun no longer opts itself out
 
 ### Fixed

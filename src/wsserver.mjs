@@ -1,6 +1,7 @@
 // MCP over WebSocket: authenticate in the HTTP upgrade (before any WebSocket or MCP server exists), one MCP server
 // per connection, the connection is the owner of the sessions it opens (closed again when it disconnects). The same
-// port takes the one-time upload PUTs (uploads.mjs), so a tenant reaches them wherever it reaches MCP.
+// port takes the one-time upload PUTs (uploads.mjs) and download GETs (downloads.mjs), so a tenant reaches them
+// wherever it reaches MCP.
 import http from 'http';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -61,7 +62,7 @@ export async function startWsServer({ cfg, manager }) {
   const conns = new Set();
   let seq = 0;
 
-  const uploads = manager.uploads;
+  const uploads = manager.uploads, downloads = manager.downloads;
   const authTenant = (req) => {
     if (!req.headers.authorization) return null;
     return (allowNoToken ? 'default' : auth(tokenFromRequest(req, new URLSearchParams()))) || false;
@@ -69,6 +70,7 @@ export async function startWsServer({ cfg, manager }) {
   const srv = http.createServer(async (req, res) => {
     try {
       if (uploads && await uploads.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
+      if (downloads && await downloads.handle(req, res, { authTenant })) return;
     } catch {
       return res.destroy();
     }
@@ -100,7 +102,7 @@ export async function startWsServer({ cfg, manager }) {
     }
   });
 
-  // Where this client reaches the port: UPLOAD_BASE_URL, else the Host it connected with (a tenant behind a proxy
+  // Where this client reaches the port (upload and download URLs): UPLOAD_BASE_URL, else the Host it connected with (a tenant behind a proxy
   // device knows the port by its own address). Only ever shown to that same client.
   const uploadBase = (req) => {
     if (cfg.uploadBaseUrl) return cfg.uploadBaseUrl;

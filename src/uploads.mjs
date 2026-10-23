@@ -22,7 +22,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms).unref?.());
 // A file name a page will see (File.name): the last path segment, no control characters, at most 200 bytes.
 export function safeName(raw) {
   let n = String(raw ?? '').split(/[\\/]/).pop().replace(/[\x00-\x1f\x7f]/g, '').trim();
-  while (Buffer.byteLength(n) > 200) n = n.slice(0, -1);
+  // Cut by whole characters: slicing UTF-16 units could leave half an emoji (an unpaired surrogate).
+  while (Buffer.byteLength(n) > 200) n = Array.from(n).slice(0, -1).join('');
   if (!n || n === '.' || n === '..') throw new Error('filename must name a file (e.g. "report.pdf")');
   return n;
 }
