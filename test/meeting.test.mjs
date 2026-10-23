@@ -495,7 +495,7 @@ test('Google refusing the guest ("You can\'t join this video call", EN and DE) e
   });
 });
 
-test('the bot-wall check: Meet\'s refusal page (on Meet, as a heading, invisible reCAPTCHA) is a refusal; anything else with a challenge stays a captcha', async () => {
+test('the bot-wall check: Meet\'s refusal page (on Meet, as a heading, invisible reCAPTCHA) is a refusal; a shown challenge stays a captcha', async () => {
   const { wall, MEET_REFUSED } = await import('../src/tools.mjs');
   await withService(async (svc) => {
     const c = await connect(svc);
@@ -510,8 +510,8 @@ test('the bot-wall check: Meet\'s refusal page (on Meet, as a heading, invisible
     const meetHost = new URL(fake.base).hostname;
     await show({ lang: 'de' });
     assert.equal(await wall(page, { meetHost }), MEET_REFUSED);
-    assert.equal(await wall(page), 'captcha'); // not on Meet: the reCAPTCHA frame counts as usual
-    assert.match((await c.call('navigate', { session: s, url: page.url() })).json().blocked, /captcha/);
+    // Not on Meet: the refusal is not Meet's, and its 10x10 reCAPTCHA frame is no challenge (only a shown one is).
+    assert.equal(await wall(page), null);
     await show({ bigChallenge: true }); // a visible challenge on the refusal page: a captcha after all
     assert.equal(await wall(page, { meetHost }), 'captcha');
     await page.setContent('<h1>Help</h1><p>If you see "You can’t join this video call", try again.</p><iframe src="https://example.com/recaptcha/api2/anchor"></iframe>');

@@ -23,6 +23,7 @@ after(async () => { await fake.close(); });
 // link opens Zoom's app-launch page first.
 const zoomAt = (base, { launchPage = false } = {}) => ({
   ...zoom,
+  accountUrl: `${base}/profile`, // never the real zoom.us
   joinUrl: (u) => (launchPage ? `${base}/j/${parseZoomUrl(u).id}${new URL(u).search}` : zoomWebClientUrl(u).replace('https://app.zoom.us', base)),
   origins: () => [base],
 });

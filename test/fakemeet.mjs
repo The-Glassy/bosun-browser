@@ -29,13 +29,19 @@ const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 // hear you in the meeting?" over the lobby, so a click on the join button is intercepted until it is closed),
 // readyMs (the join button is disabled, "Getting ready...", that long), elsewhere (the account is in the call on
 // another device: "Switch here", and "Join here too" under "Other ways to join").
-function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false }) {
+// As live Meet showed it on 2026-10-23 (meet.google.com/<code> redirected to /meet/<code>, set meetPath): live (the
+// "Microphone not found" popover with Close, the "Camera not found" alert, device pickers "Microphone: Mic not found",
+// "Ask to use Companion mode", the Gemini footer, reCAPTCHA's invisible badge and its parked challenge frame);
+// joinName 'without' (the join button's accessible name is "Ask to join without microphone & camera", its text "Ask
+// to join") or 'devices' (plain "Ask to join" while the microphone or camera is on, "… without microphone & camera"
+// once both are off).
+function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null }) {
   const L = UI[lang];
   const de = lang === 'de';
   const joinButtons = elsewhere
     ? `<button id="switch">${de ? 'Hierher wechseln' : 'Switch here'}</button><button id="other" aria-haspopup="menu">${de ? 'Weitere Möglichkeiten zur Teilnahme' : 'Other ways to join'}</button>
        <div role="menu" id="menu" hidden><div role="menuitem" id="too" tabindex="0">${de ? 'Auch hier teilnehmen' : 'Join here too'}</div><div role="menuitem" tabindex="0">${de ? 'Präsentieren' : 'Present'}</div></div>`
-    : `<button id="ask"${readyMs ? ' disabled' : ''}><span>${esc(signedIn ? L.joinNow : L.ask)}</span></button>
+    : `<button id="ask"${readyMs ? ' disabled' : ''}${joinName === 'without' ? ` aria-label="${esc(L.ask)} without microphone &amp; camera"` : ''}><span>${esc(joinName ? L.ask : signedIn ? L.joinNow : L.ask)}</span></button>
        <button id="other">${de ? 'Weitere Möglichkeiten zur Teilnahme' : 'Other ways to join'}</button>`;
   const frame = bigChallenge ? '<iframe src="/recaptcha/api2/anchor?k=x" title="reCAPTCHA" width="300" height="300"></iframe>' : '<iframe src="/recaptcha/api2/anchor?k=x" title="reCAPTCHA" width="10" height="10"></iframe>';
   const nameField = signedIn ? '' : bareName ? '<input type="text">' : `<input type="text" placeholder="${esc(L.name)}"${lang === 'en' ? ` aria-label="${esc(L.name)}"` : ''}>`;
@@ -51,6 +57,14 @@ function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareNa
 ${dialog ? `<div id="dlg" role="dialog" aria-modal="true" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10"><div style="background:#fff;margin:80px auto;width:360px;padding:16px">
   <h2>${de ? 'Möchten Sie, dass andere Sie in der Besprechung hören?' : 'Do you want people to hear you in the meeting?'}</h2>
   <button id="dlgOk">${de ? 'Ohne Mikrofon und Kamera fortfahren' : 'Continue without microphone and camera'}</button></div></div>` : ''}
+${live ? `<div role="alert"><h2><span aria-hidden="true">error</span>${esc(L.noCam)}</h2><div>Make sure your camera is plugged in</div></div>
+<button aria-label="Microphone: Mic not found"><span aria-hidden="true">Mic not found</span></button><button aria-label="Speaker: Speaker not found"><span aria-hidden="true">Speaker not found</span></button><button aria-label="Camera: Camera not found"><span aria-hidden="true">Camera not found</span></button>
+<button aria-label="Ask to use Companion mode">meeting_room</button><button aria-label="Ask to present">present_to_all</button>
+<div role="dialog" id="micPop" style="position:fixed;top:40px;left:20px;z-index:5;background:#fff;padding:8px"><button aria-label="Close" id="micPopClose">close</button><h2>Microphone not found</h2><div>Make sure your microphone is plugged in</div></div>
+<footer role="contentinfo"><p>Gemini in Meetings: Gemini will analyze your conversation via temporary access to meeting content. The meeting host can turn it off. <a href="#">Learn more about Gemini in Meetings.</a></p></footer>
+<div aria-live="polite">Your camera is off. Your microphone is on.</div>
+<div class="grecaptcha-badge" style="position:fixed;bottom:14px;right:0;width:256px;height:60px"><iframe src="/recaptcha/api2/anchor?ar=1&amp;k=x&amp;size=invisible" title="reCAPTCHA" width="256" height="60"></iframe></div>
+<div style="visibility:hidden;position:absolute;top:-10000px"><iframe src="/recaptcha/api2/bframe?k=x" title="recaptcha challenge expires in two minutes" width="400" height="580"></iframe></div>` : ''}
 <div id="waiting" hidden><p>${esc(L.waiting)}</p></div>
 <div id="denied" hidden><h1>${esc(L.cantJoin)}</h1><p>${esc(L.denied)}</p></div>
 <div id="refused" hidden><h1>${esc(L.cantJoin)}</h1><button>${esc(L.home)}</button><p>${esc(L.safe)}</p>${frame}</div>
@@ -61,11 +75,15 @@ ${dialog ? `<div id="dlg" role="dialog" aria-modal="true" style="position:fixed;
 <div id="over" hidden><h1 id="overText"></h1></div>
 <script>
 const L = ${JSON.stringify(L)}, TOGGLES = ${JSON.stringify(toggles)};
-const code = location.pathname.slice(1), $ = (id) => document.getElementById(id);
+const code = location.pathname.split('/').pop(), $ = (id) => document.getElementById(id);
+if (${live ? 'true' : 'false'}) { document.title = 'Meet - ' + code; $('micPopClose').onclick = () => $('micPop').remove(); }
+// joinName 'devices': the join button is named after the devices it would join without.
+const JOIN_NAME = ${JSON.stringify(joinName)};
+const nameJoin = () => { if (JOIN_NAME === 'devices' && $('ask')) { if (!mic && !cam) $('ask').setAttribute('aria-label', L.ask + ' without microphone & camera'); else $('ask').removeAttribute('aria-label'); } };
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, ...b }) });
 let mic = true, cam = true, shown = new Set(), toned = false;
-$('mic').onclick = () => { mic = !mic; $('mic').setAttribute('aria-label', mic ? L.micOff : L.micOn); };
-$('cam').onclick = () => { cam = !cam; $('cam').setAttribute('aria-label', cam ? L.camOff : L.camOn); };
+$('mic').onclick = () => { mic = !mic; $('mic').setAttribute('aria-label', mic ? L.micOff : L.micOn); nameJoin(); };
+$('cam').onclick = () => { cam = !cam; $('cam').setAttribute('aria-label', cam ? L.camOff : L.camOn); nameJoin(); };
 if (TOGGLES === 'none' || TOGGLES === 'nodevices') { $('mic').hidden = $('cam').hidden = true; }
 if (TOGGLES === 'nodevices') { mic = cam = false; }
 if (TOGGLES === 'stuck' || TOGGLES === 'staleBanner') $('mic').onclick = null;
@@ -118,8 +136,13 @@ export async function startFakeMeet({ tone = false } = {}) {
   const srv = http.createServer(async (req, res) => {
     const u = new URL(req.url, 'http://x');
     const json = (o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
-    if (/^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(u.pathname)) {
-      const r = room(u.pathname.slice(1));
+    // meetPath: like live Meet since 2026, /<code> redirects to /meet/<code>.
+    if (/^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(u.pathname) && room(u.pathname.slice(1)).meetPath) {
+      res.writeHead(302, { location: `/meet${u.pathname}${u.search}` });
+      return res.end();
+    }
+    if (/^\/(?:meet\/)?[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(u.pathname)) {
+      const r = room(u.pathname.split('/').pop());
       r.loads.push({ hl: u.searchParams.get('hl'), acceptLanguage: req.headers['accept-language'] || null });
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       return res.end(app(r));
@@ -146,7 +169,8 @@ export async function startFakeMeet({ tone = false } = {}) {
       if (u.pathname === '/api/leave') { r.left = true; r.over = 'left'; r.log.push(['leave', Date.now()]); }
       return json({ ok: true });
     }
-    res.writeHead(404); res.end();
+    // A body: full Chromium replaces an empty error page with its own (chrome-error://), another URL.
+    res.writeHead(404, { 'content-type': 'text/html' }); res.end('<title>Not found</title><p>not found</p>');
   });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${srv.address().port}`;

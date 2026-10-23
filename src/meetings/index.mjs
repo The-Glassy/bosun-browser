@@ -104,6 +104,7 @@ export class Meetings {
     Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs });
     this.dir = path.join(cfg.dataDir, 'recordings');
     this.active = new Map(); // id -> meeting
+    this.dryRuns = new Set(); // dry runs in progress: {tenant, session} (capacity)
     this.ended = new Map(); // id -> meeting (bounded), for status and chat after the end
     this.stopped = false;
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
@@ -129,15 +130,14 @@ export class Meetings {
     return m;
   }
 
-  // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
-  // meeting could not be joined (denied, not a meeting page, no audio, ...).
-  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true }) {
+  // Validation shared by join and inspect: the platform, a signed-in profile (an existing Bosun profile, logged in to
+  // Google or Zoom with session_open + request_human first, opened with the engine it was last used with unless one is
+  // given), the engine, the audio backend.
+  async check(tenant, { url, profile, engine }) {
     if (this.stopped || this.manager.closing) throw new Error('service is shutting down');
     url = httpUrl(url);
     const platform = this.platformFor(url);
     if (!platform) throw new Error('only Google Meet (https://meet.google.com/abc-defg-hij) and Zoom (https://zoom.us/j/<id>?pwd=…) links are supported for now');
-    // A signed-in profile: an existing Bosun profile (logged in to Google or Zoom with session_open + request_human first),
-    // opened with the engine it was last used with unless one is given.
     let meta = null;
     if (profile) {
       if (!TENANT_RE.test(profile)) throw new Error('invalid profile name');
@@ -151,12 +151,71 @@ export class Meetings {
     const why = await this.audio.unsupported();
     if (why) throw new Error(why);
     if (this.audio.needsHeadful && this.cfg.headless) throw new Error('meetings need a headful browser (headless Chromium plays no audio): run the service without HEADLESS=1, under Xvfb');
-    // Capacity first, synchronously: a meeting still setting up (audio server, browser launch) has no session yet but
-    // will need one, so it counts. No audio server starts for a meeting that could not get a session.
-    const starting = [...this.active.values()].filter((x) => !x.session && !x.finishing);
+    return { url, platform, eng };
+  }
+
+  // Capacity, synchronously: a meeting still setting up (audio server, browser launch) has no session yet but will
+  // need one, so it counts. No audio server starts for a meeting that could not get a session.
+  capacity(tenant) {
+    // Dry runs that have not got their session yet count like meetings still setting up.
+    const starting = [...this.active.values(), ...this.dryRuns].filter((x) => !x.session && !x.finishing && !x.handedOver);
     if (this.manager.used + starting.length >= this.cfg.maxSessions || starting.length >= MAX_STARTING) throw new Error(`session limit ${this.cfg.maxSessions} reached; close one`);
     const tUse = (this.manager.tenantUse.get(tenant) || 0) + starting.filter((x) => x.tenant === tenant).length;
     if (tUse >= this.cfg.maxSessionsPerTenant) throw new Error(`session limit ${this.cfg.maxSessionsPerTenant} for this tenant reached; close one`);
+  }
+
+  // dry_run: loads the meeting page exactly as a join would (same profile, engine, devices and language) and reports
+  // what Bosun sees there (platform.inspect): the lobby kind, the button it would click, microphone and camera,
+  // whether a challenge is shown. Nothing is joined: the session is closed again right after.
+  async inspect(tenant, { url, profile, engine }) {
+    const checked = await this.check(tenant, { url, profile, engine });
+    const { platform, eng } = checked;
+    url = checked.url;
+    this.capacity(tenant);
+    // Reserved before anything is awaited, so concurrent dry runs can't overshoot the caps; released below.
+    const slot = { tenant, session: null, finishing: false, handedOver: false, task: null, rig: null };
+    this.dryRuns.add(slot);
+    const owner = `meeting-dry-run:${crypto.randomBytes(4).toString('hex')}`;
+    let rig = null, session = null;
+    const task = (async () => {
+      rig = slot.rig = await this.audio.open();
+      if (this.stopped) throw new Error('service is shutting down');
+      // The session manager reserves its own slot synchronously in open(), unless the profile is still busy (a
+      // keepalive visit, a closing session): then this slot keeps counting until the session is there.
+      const busy = profile && this.manager.profilesInUse.has(`${tenant}/${profile}`);
+      const opening = this.manager.open({ owner, tenant, profile: profile || undefined, engine: eng, locale: platform.locale, media: { args: [...MEDIA_ARGS, ...(rig.args || [])], env: rig.browserEnv } });
+      slot.handedOver = !busy;
+      session = slot.session = await opening;
+      const target = platform.joinUrl ? platform.joinUrl(url) : url;
+      for (const origin of new Set([new URL(url).origin, new URL(target).origin, ...(platform.origins ? platform.origins(url) : [])])) {
+        await session.ctx.grantPermissions(['microphone', 'camera'], { origin }).catch(() => {});
+      }
+      if (platform.prepare) await platform.prepare(session.ctx);
+      const r = await this.manager.run(owner, session.id, async (s) => {
+        await s.page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+        const seen = await platform.inspect(s.page, { profile });
+        const u = new URL(s.page.url());
+        return { ...seen, page: `${u.origin}${u.pathname}`, title: await s.page.title().catch(() => '') };
+      });
+      return { dry_run: true, platform: platform.name, ...(profile ? { profile } : {}), engine: eng, ...r, note: 'nothing was joined or clicked except the page\'s own tips and device questions' };
+    })();
+    // The slot stays tracked until its cleanup is done, so shutdown can wait for it.
+    slot.task = task.finally(async () => {
+      slot.finishing = true;
+      if (session) await this.manager.dispose(session, 'meeting-dry-run').catch(() => {});
+      await (slot.closing ??= rig?.close())?.catch(() => {});
+      this.dryRuns.delete(slot);
+    });
+    return slot.task;
+  }
+
+  // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
+  // meeting could not be joined (denied, not a meeting page, no audio, ...).
+  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true }) {
+    const checked = await this.check(tenant, { url, profile, engine });
+    const { platform, eng } = checked;
+    url = checked.url;
+    this.capacity(tenant);
     const id = `m${crypto.randomBytes(6).toString('hex')}`;
     const m = {
       id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, leaveOnOptOut,
@@ -386,6 +445,7 @@ export class Meetings {
     const bytes = m.file ? fs.statSync(m.file, { throwIfNoEntry: false })?.size ?? 0 : null;
     return {
       meeting_id: m.id, platform: m.platform.name, url: m.url, state: m.state, ...(m.info.joinedAs ? { joined_as: m.info.joinedAs } : {}),
+      ...(m.info.warning ? { warning: m.info.warning } : {}),
       ...(m.reason ? { reason: m.reason } : {}), ...(m.error ? { error: m.error } : {}),
       participants: m.participants, recording_seconds: Math.round(recMs / 1000),
       recording: m.file ? { path: m.file, bytes } : m.deleted ? 'deleted' : null,
@@ -444,6 +504,10 @@ export class Meetings {
   async stop() {
     this.stopped = true;
     clearInterval(this.sweeper);
-    await Promise.race([Promise.allSettled([...this.active.values()].map((m) => this.finish(m, 'shutdown'))), sleep(15_000)]);
+    // A dry run still loading a page is cut short by closing its session; its audio server goes in its own cleanup,
+    // or here, if the dry run is still stuck in setup (a browser launch) when the wait is over.
+    for (const d of this.dryRuns) if (d.session) this.manager.dispose(d.session, 'shutdown').catch(() => {});
+    await Promise.race([Promise.allSettled([...[...this.active.values()].map((m) => this.finish(m, 'shutdown')), ...[...this.dryRuns].map((d) => d.task)]), sleep(15_000)]);
+    await Promise.race([Promise.allSettled([...this.dryRuns].map((d) => (d.closing ??= d.rig?.close()))), sleep(5_000)]);
   }
 }

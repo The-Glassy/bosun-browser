@@ -8,7 +8,7 @@
 // and labels are also matched in German and Ukrainian (some Russian). These markers were written from Zoom's web
 // client as documented and seen in screenshots, and tested against a local stand-in (test/fakezoom.mjs), not yet
 // against live Zoom: a run against real Zoom that fails here is fixed here.
-import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, DIALOGS, HEADINGS } from './common.mjs';
 
 const TEXT = {
   // The waiting room, or a meeting the host has not started yet (Zoom lets you in when it starts).
@@ -24,7 +24,8 @@ const TEXT = {
     'you have left the meeting', 'you left the meeting',
     'dieses meeting wurde (?:vom host )?beendet', 'das meeting wurde beendet', 'sie haben das meeting verlassen',
     'цю конференцію (?:було )?завершено', 'конференцію завершено', 'організатор завершив (?:конференцію|зустріч)', 'конференция завершена', 'организатор завершил'),
-  invalid: any('invalid meeting id', 'this meeting id is not valid', 'meeting id is not valid', 'meeting does not exist', 'incorrect (?:meeting )?passcode', 'passcode (?:is )?(?:wrong|incorrect)',
+  // "This meeting link is invalid (3,001)": an expired or ended meeting's link (Zoom's error 3001).
+  invalid: any('invalid meeting id', 'this meeting id is not valid', 'meeting link is invalid', 'invalid meeting link', '\\(3,?001\\)', 'meeting-link ist ungültig', 'meeting id is not valid', 'meeting does not exist', 'incorrect (?:meeting )?passcode', 'passcode (?:is )?(?:wrong|incorrect)',
     'wrong passcode', 'invalid passcode', 'ungültige meeting-id', 'meeting-id ist ungültig', 'falscher kenncode', 'kenncode ist (?:falsch|ungültig)', 'ungültiger kenncode',
     'недійсний ідентифікатор конференції', 'неправильний (?:код доступу|пароль)', 'неверный идентификатор конференции', 'неверный код доступа'),
   signIn: any('sign in to join', 'authorized attendees only', 'only authenticated users can join', 'only signed-in users', 'requires authentication', 'you need to sign in',
@@ -51,12 +52,17 @@ const LABEL = {
   leaveConfirm: any('^leave meeting$', '^meeting verlassen$', '^вийти з конференції$', '^покинути конференцію$', '^выйти из конференции$'),
   launch: any('^launch meeting$', '^meeting (?:starten|eröffnen)$', '^запустити конференцію$', '^запустить конференцию$'),
   fromBrowser: any('join from (?:your|the) browser', '(?:über|vom|mit) (?:ihrem |dem )?browser (?:aus )?(?:beitreten|teilnehmen)', 'приєднатися (?:з|через) браузер', 'войти из браузера', 'присоединиться из браузера'),
+  // The web client's first question, "Do you want people to see you in the meeting?": answered without devices.
+  noDevices: any('^continue without (?:microphone and camera|microphone or camera|audio (?:and|or) video|microphone|camera)$',
+    '^ohne (?:mikrofon und kamera|mikrofon|kamera) (?:fortfahren|weiter)$', '^weiter ohne (?:mikrofon und kamera|mikrofon|kamera)$',
+    '^продовжити без (?:мікрофона(?: (?:й|і|та) камери)?|камери)$', '^продолжить без (?:микрофона(?: и камеры)?|камеры)$'),
   // Closes what Zoom lays over the page: tips, the cookie banner, "this meeting is being recorded", app prompts.
   dismiss: any('^got it$', '^ok$', '^close$', '^dismiss$', '^not now$', '^no thanks$', '^maybe later$', '^continue$', '^accept(?: all)? cookies$', '^i agree$', '^agree$',
     '^verstanden$', '^schließen$', '^nicht jetzt$', '^nein danke$', '^später$', '^fortfahren$', '^weiter$', '^(?:alle )?cookies akzeptieren$', '^ich stimme zu$', '^zustimmen$',
     '^зрозуміло$', '^закрити$', '^не зараз$', '^ні, дякую$', '^продовжити$', '^прийняти (?:усі )?файли cookie$', '^погоджуюся$', '^понятно$', '^закрыть$', '^не сейчас$', '^продолжить$'),
 };
-const NAME_FIELD = 'input#input-for-name, input[aria-label="Your Name" i], input[placeholder="Your Name" i], input[aria-label="Ihr Name" i], input[placeholder="Ihr Name" i], input[aria-label^="Ваше ім" i], input[placeholder^="Ваше ім" i]';
+// #inputname: Zoom's classic web client (/wc/join/<id>), which some guests are still sent to.
+const NAME_FIELD = 'input#input-for-name, input#inputname, input[aria-label="Your Name" i], input[placeholder="Your Name" i], input[aria-label="Ihr Name" i], input[placeholder="Ihr Name" i], input[aria-label^="Ваше ім" i], input[placeholder^="Ваше ім" i]';
 const PASSCODE_FIELD = 'input#input-for-pwd, input[aria-label*="passcode" i], input[placeholder*="passcode" i], input[aria-label*="kenncode" i], input[placeholder*="kenncode" i]';
 // The chat's recipient ("To: Everyone" / a person / "Host and co-hosts") and its Send button.
 const CHAT_RECIPIENT = '[class*="receiver-list__receiver"], [class*="chat-receiver"] button, [class*="chat-to"] button, button[aria-label^="send to" i], button[aria-label^="chat with" i]';
@@ -75,7 +81,13 @@ const CHAT_ITEM = '.chat-item-container, [class*="chat-item__container"], [class
 const PARTICIPANT_CONTROLLED = '[class*="chat"], [class*="participants-item"], [class*="participants-li"], [class*="video-avatar__avatar-name"], [class*="name-tag"], [class*="avatar-name"], [role="list"], [role="listitem"], textarea, input, [contenteditable="true"]';
 const pageText = (page, roots) => textOutside(page, PARTICIPANT_CONTROLLED, roots);
 const MODALS = `${DIALOGS}, [class*="zm-modal"], [class*="modal-dialog"]`;
-const overlays = (page) => dismissOverlays(page, LABEL.dismiss, ['#onetrust-banner-sdk', '[class*="zm-modal"]', '[class*="modal-dialog"]']);
+// The device question is answered wherever it shows up (Zoom does not always mark it as a dialog); everything else
+// only inside a dialog or banner.
+const overlays = async (page) => {
+  const nd = await firstVisible(button(page, LABEL.noDevices));
+  const n = nd ? await nd.click({ timeout: 2000 }).then(() => 1, () => 0) : 0;
+  return n + await dismissOverlays(page, LABEL.dismiss, ['#onetrust-banner-sdk', '[class*="zm-modal"]', '[class*="modal-dialog"]']);
+};
 const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha'];
 
 // A Zoom meeting link -> {id, pwd, tk} or null. Hosts: zoom.us and its subdomains (us02web.zoom.us, acme.zoom.us,
@@ -102,13 +114,16 @@ export function zoomWebClientUrl(url) {
   return u.href;
 }
 
-// A challenge Zoom shows before joining: a visible reCAPTCHA/hCaptcha frame (an invisible one is not a challenge).
-async function captchaShown(page) {
-  return page.locator('iframe').evaluateAll((fs) => fs.some((f) => {
-    if (!/recaptcha|hcaptcha|challenges\.cloudflare|turnstile/.test(f.src)) return false;
-    const r = f.getBoundingClientRect();
-    return r.width >= 60 && r.height >= 60 && f.checkVisibility?.() !== false;
-  })).catch(() => false);
+// A challenge Zoom shows before joining: a visible reCAPTCHA/hCaptcha frame. The web client is "protected by
+// reCAPTCHA" (an invisible widget and a notice under the Join button): that is not a challenge (common.mjs).
+const captchaShown = challengeShown;
+
+// An app-launch page: "Join from your browser" if it is there, else "Launch Meeting" (which reveals it).
+async function followLaunch(page) {
+  const link = await firstVisible(page.getByRole('link', { name: LABEL.fromBrowser })) || await firstVisible(button(page, LABEL.fromBrowser));
+  if (link) return link.click({ timeout: 5000 }).catch(() => {});
+  const l = await firstVisible(button(page, LABEL.launch));
+  if (l) await l.click({ timeout: 3000 }).catch(() => {});
 }
 
 async function chatBox(page) {
@@ -126,7 +141,21 @@ export const zoom = {
       + '(session_open + request_human), join the meeting page once by hand, close it, and join again.',
   },
 
+  // Where a signed-in session is visible: 200 when signed in, a redirect to the sign-in page when not.
+  accountUrl: 'https://zoom.us/profile',
+
   matches: (url) => parseZoomUrl(url) !== null,
+
+  // Whether the browser's Zoom session is signed in: true, false, or null (could not tell). Asked with the context's
+  // own cookies, outside the page.
+  async signedIn(page) {
+    try {
+      const r = await page.context().request.get(this.accountUrl, { maxRedirects: 0, timeout: 15_000, failOnStatusCode: false });
+      if (r.status() === 200) return !/\/signin\b/.test(r.url());
+      if (r.status() >= 300 && r.status() < 400) return !/signin|login/i.test(r.headers().location || '');
+      return null;
+    } catch { return null; }
+  },
   joinUrl: zoomWebClientUrl,
   origins: (url) => ['https://app.zoom.us', new URL(url).origin],
 
@@ -144,22 +173,30 @@ export const zoom = {
       const s = await this.state(page);
       if (STOP.includes(s)) return s; // e.g. a signed-in profile Zoom lets straight in, or a refusal
       if (s === 'lobby') break;
-      if (s === 'launch') {
-        const link = await firstVisible(page.getByRole('link', { name: LABEL.fromBrowser })) || await firstVisible(button(page, LABEL.fromBrowser));
-        if (link) await link.click({ timeout: 5000 }).catch(() => {});
-        else { const l = await firstVisible(button(page, LABEL.launch)); if (l) await l.click({ timeout: 3000 }).catch(() => {}); }
-      }
+      if (s === 'launch') await followLaunch(page);
       if (Date.now() > end) throw new Error(`no "Join" button found on the Zoom page (not Zoom's web client, or Zoom changed); page ${s}`);
       await overlays(page);
       await page.waitForTimeout(500);
     }
     await overlays(page);
-    // Signed in: Zoom fills in the account's name, which is kept; otherwise (or with an empty field) `name`.
+    // A profile that is no longer signed in to Zoom joins as a guest (and is said to be signed out).
+    if (profile) info.signedIn = await this.signedIn(page);
+    // Signed in: Zoom fills in the account's name, which is kept; otherwise (or with an empty field, which the web
+    // client also shows signed-in accounts) `name`.
     const field = await firstVisible(page.locator(NAME_FIELD));
     const prefilled = field ? (await field.inputValue().catch(() => '')).trim() : '';
-    if (field && !(profile && prefilled)) await field.fill(name, { timeout: 5000 });
-    info.joinedAs = profile && (!field || prefilled) ? 'account' : 'guest';
+    // A remembered name in a signed-out profile is a guest name from earlier: replaced too.
+    if (field && !(profile && prefilled && info.signedIn !== false)) {
+      await field.fill(name, { timeout: 5000 });
+      // The web client enables Join only on typed input; a fill it did not take is typed key by key.
+      const j = await firstVisible(button(page, LABEL.join));
+      await page.waitForTimeout(300);
+      if (j && await disabled(j)) { await field.fill('', { timeout: 3000 }).catch(() => {}); await field.pressSequentially(name, { delay: 25, timeout: 10_000 }).catch(() => {}); }
+    }
+    // Signed in by Zoom's own account page; without that answer, by the prefilled name.
+    info.joinedAs = profile && (info.signedIn === true || (info.signedIn === null && (!field || prefilled))) ? 'account' : 'guest';
     info.selfName = field ? (await field.inputValue().catch(() => name)).trim() : null;
+    if (info.signedIn === false) info.warning = `profile ${profile} is not signed in to Zoom any more: joined as a guest named "${info.selfName || name}" (Zoom turns most guests away). Sign it in again: session_open({profile: "${profile}"}), navigate https://zoom.us/signin, request_human, session_close.`;
     // The passcode comes with the link (pwd, an encrypted token, not the passcode people type). A page that still
     // asks for it stops the join: the token typed into the field would only be refused.
     const pass = await firstVisible(page.locator(PASSCODE_FIELD));
@@ -184,6 +221,31 @@ export const zoom = {
       if (s === 'admitted' || s === 'waiting' || TERMINAL.includes(s)) return s;
     }
     return 'asked';
+  },
+
+  // dry_run: the preview as Bosun sees it, without joining: what it would click and what stands in the way. Only the
+  // cookie banner, tips and the device question are answered; nothing is typed and Join is not clicked.
+  async inspect(page, { profile = null, timeoutMs = 30_000 } = {}) {
+    const end = Date.now() + timeoutMs;
+    let s;
+    for (;;) {
+      await overlays(page);
+      s = await this.state(page);
+      if ((s !== 'unknown' && s !== 'launch') || Date.now() > end) break;
+      if (s === 'launch') await followLaunch(page);
+      await page.waitForTimeout(500);
+    }
+    const field = await firstVisible(page.locator(NAME_FIELD));
+    const join = await firstVisible(button(page, LABEL.join));
+    return {
+      state: s,
+      join_button: join ? ((await join.getAttribute('aria-label').catch(() => null)) || (await join.innerText().catch(() => '')).trim()) : null,
+      join_enabled: join ? !(await disabled(join)) : null,
+      name_field: field ? { prefilled: (await field.inputValue().catch(() => '')).trim() || null } : null,
+      passcode_asked: !!(await firstVisible(page.locator(PASSCODE_FIELD))),
+      challenge: await challengeShown(page),
+      ...(profile ? { profile_signed_in: await this.signedIn(page) } : {}),
+    };
   },
 
   // Once in: computer audio joined (without it nothing is heard or recorded), microphone and camera verifiably off.

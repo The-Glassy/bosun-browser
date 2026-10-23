@@ -32,7 +32,8 @@ export const HEADINGS = 'h1, h2, h3, [role="heading"]';
 
 export const visible = (l) => l.first().isVisible().catch(() => false);
 export const button = (page, name) => page.getByRole('button', { name });
-export const disabled = (l) => l.first().evaluate((b) => b.disabled || b.getAttribute('aria-disabled') === 'true').catch(() => false);
+// Disabled by attribute, ARIA, or (Zoom's web client) only by a "disabled" class.
+export const disabled = (l) => l.first().evaluate((b) => b.disabled || b.getAttribute('aria-disabled') === 'true' || b.classList.contains('disabled')).catch(() => false);
 
 // The first visible match of a locator, or null.
 export async function firstVisible(l, max = 5) {
@@ -40,6 +41,59 @@ export async function firstVisible(l, max = 5) {
     if (await l.nth(i).isVisible().catch(() => false)) return l.nth(i);
   }
   return null;
+}
+
+// A challenge the page actually shows: a reCAPTCHA / hCaptcha / Turnstile frame (in any frame of the page) that is
+// rendered, not hidden by visibility or opacity, on screen and at least 60x60 px, and is not reCAPTCHA's invisible
+// mode (size=invisible). Sites that are merely "protected by reCAPTCHA" (Meet, Zoom's web client) carry an invisible
+// widget, its hidden challenge frame parked off screen, and that notice: none of it is a challenge.
+export const CHALLENGE_SRC = /recaptcha|hcaptcha|challenges\.cloudflare|turnstile|captcha-delivery|geo\.captcha/;
+// A challenge page served as the page itself counts too, by its endpoint only: a DataDome captcha
+// (*.captcha-delivery.com) or Cloudflare's /cdn-cgi/challenge-platform/ pages (not its scripts).
+// Not handled: frames scaled by CSS transforms are measured unscaled.
+const challengePage = (raw) => {
+  try {
+    const u = new URL(raw);
+    return /(?:^|\.)captcha-delivery\.com$/.test(u.hostname) || u.pathname.startsWith('/cdn-cgi/challenge-platform/');
+  } catch { return false; }
+};
+// A frame counts if it is shown where a person would see it: its rectangle (at least 60x60), carried up through every
+// frame above it and cut to each one's viewport, still has 60x60 px left in the page's own viewport, and every frame
+// element on the way is rendered (not hidden by visibility or opacity).
+export async function challengeShown(page) {
+  const main = page.mainFrame();
+  if (challengePage(main.url())) return true;
+  for (const f of page.frames()) {
+    if (f === main) continue;
+    const src = f.url();
+    if (!CHALLENGE_SRC.test(src) || /[?&]size=invisible\b/.test(src)) continue;
+    let rect = null; // the challenge, in the coordinates of the frame being looked at
+    let shown = true;
+    // Up to the top frame, the one without a parent (patchright hands out another object for it than mainFrame()).
+    for (let cur = f; shown && cur?.parentFrame(); cur = cur.parentFrame()) {
+      const el = await cur.frameElement().catch(() => null);
+      if (!el) { shown = false; break; }
+      const g = await el.evaluate((e) => {
+        const r = e.getBoundingClientRect();
+        const visible = e.checkVisibility ? e.checkVisibility({ visibilityProperty: true, opacityProperty: true }) : !!e.offsetParent;
+        return { visible, x: r.left + e.clientLeft, y: r.top + e.clientTop, w: r.width, h: r.height, vw: innerWidth, vh: innerHeight };
+      }).catch(() => null);
+      await el.dispose().catch(() => {});
+      if (!g?.visible) { shown = false; break; }
+      // Into the parent's coordinates: the frame element's own box, or the challenge inside it, moved by the frame's
+      // position; then cut to the parent's viewport.
+      const r = rect ? { x: rect.x + g.x, y: rect.y + g.y, w: rect.w, h: rect.h } : { x: g.x, y: g.y, w: g.w, h: g.h };
+      if (rect) { // also cut to the frame element itself (what lies outside its box is not shown)
+        const x0 = Math.max(r.x, g.x), y0 = Math.max(r.y, g.y), x1 = Math.min(r.x + r.w, g.x + g.w), y1 = Math.min(r.y + r.h, g.y + g.h);
+        Object.assign(r, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+      }
+      const x0 = Math.max(r.x, 0), y0 = Math.max(r.y, 0), x1 = Math.min(r.x + r.w, g.vw), y1 = Math.min(r.y + r.h, g.vh);
+      rect = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+      if (rect.w < 60 || rect.h < 60) shown = false;
+    }
+    if (shown) return true;
+  }
+  return false;
 }
 
 // Closes what the site lays over its page (feature tips, "continue without devices", cookie banners): only buttons

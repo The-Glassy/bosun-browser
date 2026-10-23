@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.10.1 — Meet and Zoom lobbies as they are now
+
+Both platforms failed in production on 2026-10-23 on lobbies that had changed. The fixes are checked against
+stand-ins of the exact pages (`test/meeting-live2026.test.mjs`) and, without joining, on the live pages.
+
+### Fixed
+
+- **Meet: the join button is found again.**
+  - Meet now names it after the devices it joins without: "Ask to join without microphone & camera", while the button
+    still reads "Ask to join". The name also changes the moment Bosun switches microphone and camera off.
+  - Bosun matches that name, with the suffix allowed in all five languages, and falls back to the visible text.
+  - Also new: "Join anyway", "Ask to join anyway", "Join the call now".
+- **Meet: `meet.google.com/meet/<code>`**, where Meet redirects now, is a Meet link too.
+- **No false captcha.**
+  - Meet and Zoom's web client are "protected by reCAPTCHA": an invisible widget, its challenge frame parked off
+    screen, and a notice. `navigate` called that a captcha, and a Zoom join ended with `captcha` after 0 s.
+  - A challenge now counts only if its frame is shown: rendered, not hidden by visibility or opacity, on screen,
+    at least 60×60 px, and not reCAPTCHA's `size=invisible` badge. One rule for `navigate`, Meet and Zoom.
+- **Zoom's web client preview:**
+  - "Do you want people to see you in the meeting?" is answered with "Continue without microphone and camera",
+    wherever it shows up.
+  - An empty name field is filled, also for a signed-in account. If Join stays disabled, the name is typed key by
+    key.
+  - A `disabled` CSS class counts as disabled. `#inputname` (the classic web client) is a name field too.
+  - "This meeting link is invalid (3,001)" is `invalid-meeting`.
+- **Meet:** "No one responded to your request to join" / "Ask to join again" counts as denied. "Check your meeting
+  code" and "Your meeting code has expired" count as an invalid meeting. "Mic not found" in the device picker
+  counts as no microphone.
+
+### Added
+
+- **`meeting_join { dry_run: true }`** loads the lobby as a join would (profile, engine, devices, language) and
+  reports what Bosun sees, without joining:
+  - `state` and the lobby kind;
+  - `join_button`, the exact label it would click;
+  - microphone and camera;
+  - `challenge`, whether one is shown;
+  - for Zoom also `join_enabled`, the name field and `profile_signed_in`.
+- **Zoom: signed-in check.** Before joining with a profile, Bosun asks `zoom.us/profile` with the browser's own
+  cookies. A signed-out profile joins as a guest. `meeting_status` then carries a `warning` that says how to sign
+  it in again.
+- **`docs/MEETING-BOT-REFERENCES.md`** compares how Vexa (Apache-2.0), ScreenApp meeting-bot (MIT) and Attendee
+  (Elastic License 2.0) join the same pages, and which of their fallbacks Bosun adopted. No code was copied.
+
+### Limits
+
+- A challenge frame inside a frame that is scaled with CSS is measured unscaled, so it may be judged too small or
+  off screen.
+- **"Continue without microphone and camera" is not confirmed live.** It is what Zoom's web client offered, but
+  another bot (Vexa) notes that without device permission Zoom may not create the participants' audio. If computer
+  audio then cannot be joined, the meeting ends with that error rather than recording silence. A live Zoom join has
+  to confirm it.
+
 ## 0.10.0 — file uploads into web pages
 
 ### Added

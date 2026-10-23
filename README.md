@@ -351,6 +351,9 @@ meeting_join({ "url": "https://meet.google.com/abc-defg-hij" })   // name, annou
                                                                    // profile, engine, leave_on_optout (true)
 meeting_join({ "url": "https://us02web.zoom.us/j/81234567890?pwd=…", "profile": "zoom" })
 //  -> { "meeting_id": "m1a2b3c4d5e6", "platform": "zoom", "state": "waiting", "joined_as": "account", ... }
+meeting_join({ "url": "https://meet.google.com/abc-defg-hij", "profile": "google", "dry_run": true })
+//  -> { "dry_run": true, "state": "lobby", "lobby": "account", "join_button": "Ask to join without microphone & camera",
+//       "microphone": "on (no device found)", "camera": "no device", "challenge": false, "page": "…/meet/abc-defg-hij", ... }
 meeting_status({ "meeting_id": "m1a2b3c4d5e6" })   // joining | waiting | admitted | recording | ended, participants, recording_seconds
 meeting_chat_read({ "meeting_id": "…", "since": 0 })      meeting_chat_send({ "meeting_id": "…", "text": "…" })
 meeting_stop_recording({ "meeting_id": "…", "delete": true })   meeting_leave({ "meeting_id": "…" })
@@ -373,10 +376,16 @@ meeting_recording_delete({ "meeting_id": "…" })
      unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden") and no control shows
      it on; then it already counts as off. If neither can be confirmed, Bosun does not join.
    - A guest types its name (default `Glassy (notetaker)`). A signed-in Meet profile has no name field and joins
-     under the account's name, so `name` is ignored. Zoom fills in a signed-in account's name, and Bosun keeps it.
+     under the account's name, so `name` is ignored. Zoom fills in a signed-in account's name, and Bosun keeps it; an
+     empty field (Zoom's web client shows one to signed-in accounts too) gets `name`.
+   - **Zoom:** "Do you want people to see you in the meeting?" is answered with "Continue without microphone and
+     camera". Bosun asks `zoom.us/profile` whether the profile is still signed in; a signed-out profile joins as a
+     guest, and `meeting_status` carries a `warning` saying how to sign it in again.
    - Tips and dialogs over the lobby ("Do you want people to hear you in the meeting?", "Got it", cookie banners,
      "This meeting is being recorded") are closed. Only buttons inside a dialog or banner are clicked.
-   - Then **Ask to join** / **Join now** / **Teilnahme erbitten** (Meet) or **Join** (Zoom). A join button that
+   - Then **Ask to join** / **Join now** / **Teilnahme erbitten** (Meet) or **Join** (Zoom). Meet names the button
+     after the devices it joins without ("Ask to join without microphone & camera"); its visible text is enough too.
+     A join button that
      is still disabled ("Getting ready...") is waited for, up to 25 s. Bosun then waits up to
      `max_wait_admit_min` for admission. `meeting_status` shows `joined_as`: `account` or `guest`.
    - **Meet, account already in the call on another device:** Meet offers "Switch here", which would drop the
@@ -389,8 +398,16 @@ meeting_recording_delete({ "meeting_id": "…" })
    - That refusal comes with a hint: join with a signed-in profile, or from a residential IP. It is not a captcha,
      and `navigate` reports it as a refusal too.
    - Zoom ends a join early with `invalid-meeting` (wrong meeting ID or passcode, or a link without `?pwd=` for a
-     meeting that has one; the link's `pwd` is an encrypted token and is never typed into a passcode field), `sign-in-required` (the host admits only signed-in users) or `captcha` (a visible
-     challenge before joining). Being removed from Zoom's waiting room counts as `denied`.
+     meeting that has one, or "This meeting link is invalid (3,001)"; the link's `pwd` is an encrypted token and is
+     never typed into a passcode field), `sign-in-required` (the host admits only signed-in users) or `captcha`.
+   - **Captcha** means a challenge that is shown: a reCAPTCHA / hCaptcha / Turnstile frame that is visible, on screen
+     and at least 60×60 px, and not reCAPTCHA's invisible badge. Meet and Zoom's web client are "protected by
+     reCAPTCHA" on every join; that alone is not a captcha, for meetings or for `navigate`. Being removed from Zoom's
+     waiting room counts as `denied`; Meet's "No one responded to your request" too.
+   - **`dry_run: true`** loads the lobby exactly as a join would (profile, engine, devices) and reports what Bosun
+     sees there, without joining: lobby kind, the button it would click, microphone and camera, a shown challenge,
+     and for Zoom whether the profile is signed in. Use it to check a link or a profile before a meeting.
+     [docs/MEETING-BOT-REFERENCES.md](docs/MEETING-BOT-REFERENCES.md) compares the flows with other open-source bots.
 4. Once admitted (Zoom: computer audio joined first, since without it nothing is heard, then microphone and
    camera checked off again), Bosun opens the chat and **posts the announcement first**. On Zoom the chat is set to
    Everyone first, and the announcement has to show up in the chat, not marked as private. If Zoom allows chat with

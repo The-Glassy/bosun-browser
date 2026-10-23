@@ -10,6 +10,7 @@ export { httpUrl };
 import { MANIFEST, mcplConnection } from './events.mjs';
 import { MIN_PERIOD_MIN } from './keepalive.mjs';
 import { meetRefusalPage } from './meetings/platforms/meet.mjs';
+import { challengeShown } from './meetings/platforms/common.mjs';
 import { BASE64_MAX_BYTES } from './uploads.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
@@ -24,8 +25,8 @@ export async function wall(p, { meetHost } = {}) {
     if (/just a moment|nur einen moment|attention required|verify you are human|robot/.test(title)) return 'bot check page';
     // Meet's refusal page embeds an invisible reCAPTCHA but is a refusal: there is nothing to solve.
     if (await meetRefusalPage(p, meetHost ? { meetHost } : {})) return MEET_REFUSED;
-    const f = p.frames().map((f) => f.url()).join(' ');
-    if (/recaptcha|hcaptcha|challenges\.cloudflare\.com|turnstile|captcha-delivery|geo\.captcha/.test(f)) return 'captcha';
+    // Only a challenge that is shown: "protected by reCAPTCHA" pages (Meet, Zoom) carry an invisible one.
+    if (await challengeShown(p)) return 'captcha';
     const t = (await p.locator('body').innerText({ timeout: 2000 }).catch(() => '')).slice(0, 3000).toLowerCase();
     if (/(kein roboter|not a robot|are you a human|zugriff blockiert|access denied)/.test(t)) return 'bot check text';
   } catch {}
@@ -186,7 +187,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   // When this tenant has a host allowlist, say so in the tool description instead of letting the agent guess.
   const allowed = manager.allowList(tenant);
   const allowNote = allowed ? `This token may only reach: ${allowed.map((p) => (p.any ? '*' : `${p.wild ? '*.' : ''}${p.host.includes(':') ? `[${p.host}]` : p.host}${p.port ? `:${p.port}` : ''}`)).join(', ')}.` : null;
-  const server = new McpServer({ name: 'bosun', version: '0.10.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.10.1' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -432,13 +433,14 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const meetings = manager.meetings;
   if (meetings) {
     const mid = { meeting_id: z.string().max(20) };
-    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom refuses most guests). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or it is alone for 2 min; then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting.',
+    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom refuses most guests). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or it is alone for 2 min; then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting. dry_run=true only checks the lobby (nothing is joined).',
       { url: z.string().max(2048).url().describe('https://meet.google.com/abc-defg-hij or https://zoom.us/j/<id>?pwd=… (any *.zoom.us, /w/ and /wc/ links too)'), name: str(60).optional().describe('display name for a guest (default "Glassy (notetaker)"); a signed-in profile joins under the account name'),
         announce_text: str(1000).optional(), max_wait_admit_min: z.number().int().min(1).max(60).optional(),
         profile: z.string().regex(TENANT_RE).optional().describe('join with an existing Bosun profile signed in to Google (Meet) or Zoom (gets refused far less often than an anonymous guest)'),
         engine: z.enum(cfg.engines).optional().describe('chromium (default) or patchright; camoufox is not supported for meetings'),
-        leave_on_optout: z.boolean().optional() },
-      async (a) => ok(await meetings.join(tenant, {
+        leave_on_optout: z.boolean().optional(),
+        dry_run: z.boolean().optional().describe('only load the meeting page (same profile, engine and devices) and report what Bosun sees: lobby kind, the join button it would click, microphone/camera, a shown captcha; joins nothing') },
+      async (a) => ok(a.dry_run ? await meetings.inspect(tenant, { url: a.url, profile: a.profile, engine: a.engine }) : await meetings.join(tenant, {
         url: a.url, name: a.name || 'Glassy (notetaker)', announceText: a.announce_text, maxWaitAdmitMin: a.max_wait_admit_min ?? 10,
         profile: a.profile, engine: a.engine, leaveOnOptOut: a.leave_on_optout ?? true,
       })));
