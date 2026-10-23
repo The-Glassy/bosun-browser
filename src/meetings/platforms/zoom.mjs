@@ -135,23 +135,30 @@ async function closeToasts(page) {
 
 // Whether "More audio controls" offers leaving computer audio (or switching to phone audio): then computer audio is
 // connected. The menu is opened, read and closed again (Escape, or its button once more); nothing in it is clicked.
-// Only an entry of that menu counts: one in a menu (or the element the button names in aria-controls), outside what
-// participants control, that was not shown before the click, came up with it, and went away when the menu closed. A
-// participant named "Leave computer audio" in another menu or list is none of that.
+// Only an entry of that menu counts: one outside what participants control, in a menu (or the element the button
+// names in aria-controls) that itself was not shown before the click, that came up with the click and went away when
+// the menu closed. A participant named "Leave computer audio" in another menu or list, already open or renamed
+// meanwhile, is none of that. Shown means rendered, visible and not transparent (a closed menu may stay in the page,
+// hidden by visibility or opacity).
 const AUDIO_MENU = '[role="menu"], [role="listbox"], [class*="menu" i], [class*="popover" i], [class*="dropdown" i]';
-function menuEntries([prev, { re, menu, skip, owner }]) {
+// mode 'menus': the menus shown now; else the audio entries shown now whose menu is not among `prev`.
+function menuEntries([prev, { re, menu, skip, owner, mode }]) {
   const R = new RegExp(re, 'i');
   const n = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-  const shown = (e) => (e.checkVisibility ? e.checkVisibility() : !!e.offsetParent);
+  const shown = (e) => (e.checkVisibility ? e.checkVisibility({ visibilityProperty: true, opacityProperty: true }) : !!e.offsetParent);
+  if (mode === 'menus') return [...document.querySelectorAll(menu)].filter(shown);
   const scope = owner && document.getElementById(owner);
-  return [...(scope || document).querySelectorAll('*')].filter((e) => !(prev || []).includes(e) && e.closest(menu) && !e.closest(skip) && shown(e)
-    && (R.test(n(e.getAttribute('aria-label'))) || ([...e.children].every((c) => !R.test(n(c.innerText))) && R.test(n(e.innerText)))));
+  return [...(scope || document).querySelectorAll('*')].filter((e) => {
+    const box = e.parentElement?.closest(menu); // the menu the entry sits in (not the entry itself)
+    return box && !(prev || []).includes(box) && !e.closest(skip) && shown(e)
+      && (R.test(n(e.getAttribute('aria-label'))) || ([...e.children].every((c) => !R.test(n(c.innerText))) && R.test(n(e.innerText))));
+  });
 }
 async function audioConnected(page) {
   const more = await firstVisible(button(page, LABEL.audioMore));
   if (!more) return false;
   const a = { re: LABEL.audioConnected.source, menu: AUDIO_MENU, skip: SPOKEN, owner: (await more.getAttribute('aria-controls').catch(() => null)) || (await more.getAttribute('aria-owns').catch(() => null)) };
-  const before = await page.evaluateHandle(menuEntries, [null, a]).catch(() => null);
+  const before = await page.evaluateHandle(menuEntries, [null, { ...a, mode: 'menus' }]).catch(() => null);
   if (!before || !(await more.click({ timeout: 3000 }).then(() => true, () => false))) { await before?.dispose().catch(() => {}); return false; }
   let came = null;
   for (let i = 0; i < 10; i++) {
@@ -161,7 +168,7 @@ async function audioConnected(page) {
     came = null;
     await page.waitForTimeout(150);
   }
-  const shownNow = () => (came ? came.evaluate((l) => l.some((e) => (e.checkVisibility ? e.checkVisibility() : !!e.offsetParent))).catch(() => true) : false);
+  const shownNow = () => (came ? came.evaluate((l) => l.some((e) => (e.checkVisibility ? e.checkVisibility({ visibilityProperty: true, opacityProperty: true }) : !!e.offsetParent))).catch(() => true) : false);
   await page.keyboard.press('Escape').catch(() => {});
   await page.waitForTimeout(200);
   if (await shownNow()) { await more.click({ timeout: 3000 }).catch(() => {}); await page.waitForTimeout(200); }

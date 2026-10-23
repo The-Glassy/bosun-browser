@@ -100,3 +100,32 @@ test('Zoom: a caption saying "Please enable access to your microphone and camera
     await c.close();
   });
 });
+
+// Codex pass 2: a participant renamed "Leave computer audio" in a menu that was already open, while the audio menu is.
+test('Zoom: a row of a menu already open that reads "Leave computer audio" only while the audio menu is open does not count', async () => {
+  await withService(async (c, { audio, ended }) => {
+    const { url } = fz.newRoom({ ...LIVE, audioJoined: 'notConnected', decoyMenu: 'renames' });
+    const r = await c.call('meeting_join', { url, profile: 'zoom' });
+    assert.equal(r.isError, false, r.text);
+    await until(() => ended.length === 1, 40_000);
+    assert.match(ended[0].error || '', /could not join computer audio in Zoom/);
+    assert.equal(audio.recorders.length, 0);
+    await c.close();
+  });
+});
+
+// Codex pass 2: Zoom may keep the closed menu in the page, hidden by visibility or opacity.
+for (const menuHide of ['visibility', 'opacity']) test(`Zoom: an audio menu closed by ${menuHide} (kept in the page) is still read`, async () => {
+  await withService(async (c) => {
+    const { id, url } = fz.newRoom({ ...LIVE, menuHide });
+    const r = await c.call('meeting_join', { url, profile: 'zoom' });
+    assert.equal(r.isError, false, r.text);
+    const mid = r.json().meeting_id;
+    await until(async () => ['recording', 'ended'].includes((await status(c, mid)).state), 40_000);
+    const st = await status(c, mid);
+    assert.equal(st.state, 'recording', st.error);
+    assert.deepEqual(fz.room(id).media.filter((m) => m.clicked), []);
+    await c.call('meeting_leave', { meeting_id: mid });
+    await c.close();
+  });
+});
