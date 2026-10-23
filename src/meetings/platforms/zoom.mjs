@@ -91,17 +91,27 @@ const overlays = async (page) => {
 };
 const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha'];
 
-// A device question shown: answered "Continue without …". null if none is shown, else the answer's label and whether
-// it took (clicked, and gone).
+// A device question shown: answered "Continue without …". null if none is shown, else the question's text (its dialog,
+// or the nearest box around the answer with more text than it) and whether the answer took (clicked, and gone).
 async function declineDevices(page) {
   const b = await firstVisible(button(page, LABEL.noDevices));
   if (!b) return null;
-  const label = norm((await b.getAttribute('aria-label').catch(() => null)) || await b.innerText().catch(() => '')).trim();
+  const text = norm(await b.evaluate((el) => {
+    const own = (el.innerText || '').length;
+    for (let n = el.parentElement; n && n !== document.body; n = n.parentElement) {
+      if (n.matches('[role="dialog"], [role="alertdialog"], [aria-modal="true"]') || (n.innerText || '').length > own + 30) return n.innerText || '';
+    }
+    return '';
+  }).catch(() => ''));
   const ok = await b.click({ timeout: 2000 }).then(() => true, () => false) && !(await b.isVisible().catch(() => false));
-  return { label, ok };
+  return { text, ok };
 }
-// Which device a question's answer is about ("Continue without microphone and camera": both).
-const ABOUT = { audioinput: /microphone|mikrofon|мікрофон|микрофон|audio/i, videoinput: /camera|kamera|камер|video/i };
+// Which device a question asks for, by the question, not by its answers ("Do you want people to see you…?" offers
+// "Continue without microphone and camera" too): hearing is the microphone, seeing the camera.
+const ASKS = {
+  audioinput: any('\\bhear you\\b', 'sie hören', 'dich hören', 'вас (?:чули|чути)', 'вас слышали', 'вас слышать'),
+  videoinput: any('\\bsee you\\b', 'sie sehen', 'dich sehen', 'вас (?:бачили|бачити)', 'вас видели', 'вас видеть'),
+};
 
 // What the browser could capture (meetings run in Chromium only): how many microphones or cameras it lists (Chromium
 // lists one, unnamed, per kind before permission is given, none when there is none) and the permission state; null
@@ -127,7 +137,7 @@ async function seen(page, kind, onLabel, offLabel) {
 // Microphone or camera verifiably off in Zoom (preview or call). Off: its control shows "turn on"; the browser has no
 // such device or its permission is denied; or clicking the control made Zoom ask for the device (a microphone Zoom
 // never got shows "Mute" with a crossed icon, and clicking it asks "Do you want people to hear you…?" instead of
-// muting): the question is answered without it. Only a question about this device, coming up within 3 s of a click
+// muting): the question is answered without it. Only a question asking for this device, coming up within 3 s of a click
 // that took (none was shown when it was clicked), and answered, counts. A control that shows the device on, takes clicks and neither turns
 // off nor asks is a live device: not joining (throws). Without a control, the page saying the device is missing will
 // do. The permission state "prompt" is not taken as off: Bosun's browsers grant capture on request.
@@ -138,7 +148,7 @@ async function deviceOff(page, { what, kind, onLabel, offLabel, missing, state, 
     if (Date.now() > until) throw new Error(`could not make sure the ${what} is off ${when} (Zoom changed?); ${then}`);
     const q = await declineDevices(page);
     if (q) {
-      if (q.ok && clicked && Date.now() - clicked < 3000 && ABOUT[kind].test(q.label)) return 'not in use';
+      if (q.ok && clicked && Date.now() - clicked < 3000 && ASKS[kind].test(q.text)) return 'not in use';
       await page.waitForTimeout(300);
       continue;
     }

@@ -36,8 +36,8 @@ function launch(id, search) {
 // Name" and "Join" disabled until a name is typed. Clicking "Mute" does not toggle it: it asks "hear you" again
 // ("Use microphone" / "Continue without microphone"); "Stop Video" asks "see you" ("Use camera" / "Continue without
 // camera"; assumed, not seen live). micClick 'stuck': a live microphone whose "Mute" takes clicks and does nothing;
-// 'toggles': a live microphone that mutes; 'asksCamera': a live microphone whose "Mute" does nothing but bring up the
-// camera's question. Every "Use …" click is logged as media {devices: 'used'}.
+// 'toggles': a live microphone that mutes; 'asksCamera' / 'asksCameraBoth': a live microphone whose "Mute" does nothing
+// but bring up the camera's question ("see you"; "Continue without camera" / "… without microphone and camera"). Every "Use …" click is logged as media {devices: 'used'}.
 function webClient(id, r) {
   if (r.expired) {
     return `<!doctype html><meta charset="utf-8"><title>Error - Zoom</title><nav><a href="/join">Join</a> <a href="/signin">Sign In</a></nav>
@@ -118,6 +118,7 @@ if (R.hearYou) {
   $('pmic').onclick = () => {
     if (R.micClick === 'stuck') return;
     if (R.micClick === 'asksCamera') return ask('Do you want people to see you in the meeting?', 'Use camera', 'Continue without camera');
+    if (R.micClick === 'asksCameraBoth') return ask('Do you want people to see you in the meeting?', 'Use microphone and camera', 'Continue without microphone and camera');
     if (R.micClick === 'toggles') { pmic = !pmic; $('pmic').textContent = pmic ? 'Mute' : 'Unmute'; $('pmic').setAttribute('aria-label', $('pmic').textContent); return; }
     ask('Do you want people to hear you in the meeting?', 'Use microphone', 'Continue without microphone');
   };
