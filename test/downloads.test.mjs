@@ -467,6 +467,19 @@ test('robustness: a long name with an emoji, a failed delete keeps its quota, tw
     fs.chmodSync(path.dirname(f.dir), 0o700);
     svc.downloads.sweep();
     await until(() => svc.downloads.used('alice') === 0);
+    // A refused download whose partial file can't be removed stays charged until it is gone.
+    const inDir = path.join(svc.dataDir, 'downloads', 'alice', '.in-test');
+    fs.mkdirSync(inDir, { recursive: true });
+    fs.writeFileSync(path.join(inDir, 'guid.crdownload'), Buffer.alloc(5000));
+    const fr = { id: 'dtest', tenant: 'alice', session: 'sx', seq: 0, state: 'downloading', name: 'x', source: 'h', size: 5000, abs: path.join(inDir, 'guid'), expiresAt: Date.now() + 3600_000 };
+    svc.downloads.files.set(fr.id, fr);
+    fs.chmodSync(inDir, 0o500);
+    await svc.downloads.refuse(fr, null, 'too big');
+    assert.equal(fr.leftover, true);
+    assert.equal(svc.downloads.used('alice'), 5000);
+    fs.chmodSync(inDir, 0o700);
+    svc.downloads.sweep();
+    await until(() => svc.downloads.used('alice') === 0);
     // A GET whose client reads nothing is cut off once the file is past its expiry; then the file goes.
     const d3 = (await clickGo(c, await openAt(c, `${a}/page?to=/dl?kb=4096`))).downloads[0];
     const g = (await c.call('download_get', { download_id: d3.download_id })).json();

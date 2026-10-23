@@ -94,7 +94,7 @@ export class Downloads extends EventEmitter {
 
   // Running and kept downloads, and deleted ones whose file is not gone yet (a removal that failed keeps its bytes
   // and its slot until the sweep's retry succeeds).
-  holding(f) { return f.state === 'downloading' || f.state === 'ready' || (f.state === 'deleted' && !!f.dir); }
+  holding(f) { return f.state === 'downloading' || f.state === 'ready' || (f.state === 'deleted' && !!f.dir) || !!f.leftover; }
   // Bytes of the tenant's running and kept downloads.
   used(tenant) { let n = 0; for (const f of this.files.values()) if (f.tenant === tenant && this.holding(f)) n += f.size; return n; }
   count(tenant) { let n = 0; for (const f of this.files.values()) if (f.tenant === tenant && this.holding(f)) n++; return n; }
@@ -169,7 +169,7 @@ export class Downloads extends EventEmitter {
     // The browser's own file while it grows: <guid>.crdownload (Chromium) or <guid> (Firefox), next to where it ends
     // up. Without that path (a Playwright that no longer exposes it), the session's whole download directory is
     // measured instead, which is stricter.
-    const abs = d._artifact?._initializer?.absolutePath ?? null;
+    const abs = f.abs = d._artifact?._initializer?.absolutePath ?? null;
     const measure = abs
       ? async () => { let n = 0; for (const p of [abs, `${abs}.crdownload`]) { try { n = Math.max(n, (await fs.promises.stat(p)).size); } catch {} } return n; }
       : () => dirBytes(s.dlDir);
@@ -215,9 +215,9 @@ export class Downloads extends EventEmitter {
   async refuse(f, d, reason) {
     f.state = 'refused';
     f.reason = reason;
-    f.size = 0;
     await d?.cancel().catch(() => {});
     await d?.delete().catch(() => {}); // a small download may have finished before the cancel landed
+    await this.dropPartial(f);
     console.error(`bosun: tenant ${f.tenant}: refused download from ${f.source}: ${reason}`);
     this.settle(f);
   }
@@ -225,9 +225,20 @@ export class Downloads extends EventEmitter {
   async fail(f, d, reason) {
     f.state = 'failed';
     f.reason = reason;
-    f.size = 0;
     await d.delete().catch(() => {});
+    await this.dropPartial(f);
     this.settle(f);
+  }
+
+  // What the browser wrote of a download that is not kept, made sure to be gone: its bytes and slot stay charged
+  // (f.leftover) until it is, and the sweep tries again.
+  async dropPartial(f) {
+    if (f.abs) {
+      for (const p of [f.abs, `${f.abs}.crdownload`]) await fs.promises.rm(p, { force: true }).catch(() => {});
+      const left = await Promise.all([f.abs, `${f.abs}.crdownload`].map((p) => fs.promises.stat(p).then(() => true, (e) => e.code !== 'ENOENT')));
+      f.leftover = left.some(Boolean);
+    }
+    if (!f.leftover) f.size = 0;
   }
 
   settle(f) {
@@ -239,7 +250,7 @@ export class Downloads extends EventEmitter {
 
   // Refused and failed downloads are remembered for a while, but only so many per tenant.
   trimNotices(tenant) {
-    const notes = [...this.files.values()].filter((f) => f.tenant === tenant && (f.state === 'refused' || f.state === 'failed'));
+    const notes = [...this.files.values()].filter((f) => f.tenant === tenant && (f.state === 'refused' || f.state === 'failed') && !f.leftover);
     for (const f of notes.slice(0, Math.max(0, notes.length - NOTICES_PER_TENANT))) this.files.delete(f.id);
   }
 
@@ -345,6 +356,7 @@ export class Downloads extends EventEmitter {
   sweep(now = Date.now()) {
     for (const f of [...this.files.values()]) {
       if (f.secret && now > f.urlExpiresAt) f.secret = null;
+      if (f.leftover) { this.dropPartial(f).catch(() => {}); continue; } // a refused download's bytes, not gone yet
       // A GET still sending past the file's expiry is cut off (its client has stalled), then the file goes.
       if (f.sending && now > f.expiresAt + GET_IDLE_MS) f.abort?.();
       if (f.state === 'deleted' || ((f.state === 'ready' || f.state === 'refused' || f.state === 'failed') && now > f.expiresAt && !f.sending)) this.remove(f);
@@ -355,6 +367,7 @@ export class Downloads extends EventEmitter {
   async sessionClosed(s) {
     s.dlWatcher?.close();
     if (s.dlDir) await fs.promises.rm(s.dlDir, { recursive: true, force: true }).catch(() => {});
+    for (const f of this.files.values()) if (f.session === s.id && f.leftover) await this.dropPartial(f); // gone with the directory
   }
 
   // GET /download/<id>?t=<secret>, or GET /download/<id> with the tenant's token in Authorization. Answers the
