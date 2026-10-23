@@ -7,6 +7,7 @@ import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createAuthenticator, policyOf, tokenFromRequest } from './auth.mjs';
 import { buildServer } from './tools.mjs';
+import { Secrets } from './secrets.mjs';
 
 const MAX_PAYLOAD = 2 * 1024 * 1024; // a 1 MiB file as base64 (upload_create content_base64) fits
 const HEARTBEAT_MS = 30_000;
@@ -69,7 +70,8 @@ export async function startWsServer({ cfg, manager }) {
   };
   const srv = http.createServer(async (req, res) => {
     try {
-      if (secrets && await secrets.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
+      // Checked without a tick in between: an upload's body must reach its handler before Node buffers more of it.
+      if (secrets && Secrets.owns(req) && await secrets.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
       if (uploads && await uploads.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
       if (downloads && await downloads.handle(req, res, { authTenant })) return;
     } catch {

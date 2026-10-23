@@ -101,6 +101,8 @@ export class Secrets {
   // itself; returns true when the path was ours. authTenant(req): the tenant of an Authorization header, null
   // without one, false for a token that doesn't authenticate. With both, both must hold. No answer and no log line
   // ever carries the body.
+  static owns(req) { return /^\/secret\/[^/?]+(?:\?|$)/.test(req.url); }
+
   async handle(req, res, { authTenant, policyOf }) {
     const u = new URL(req.url, 'http://x');
     const m = /^\/secret\/([^/]+)$/.exec(u.pathname);
