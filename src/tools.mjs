@@ -347,12 +347,15 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     try {
       await l.fill(value, { timeout: 15000 });
       // fill types through the page's keyboard: a page that moves the focus meanwhile gets the text elsewhere (another
-      // field, a contenteditable). Unless it is in the element that was checked, it is taken out of the page again
-      // and the call fails; otherwise every field that holds it is masked.
+      // field, a contenteditable). Unless it is in the element that was checked, the call fails and the page is left;
+      // otherwise every field that holds it is masked.
       const landed = await l.evaluate((el, v) => el.isConnected && el.value === v, value).catch(() => false);
       if (!landed) {
-        await scrubValue(s.page, value);
-        throw new Error('the secret did not end up in the field that was checked (the page moved the focus or the field); Bosun removed it from the page again, check the page before going on');
+        // Wherever it went (another field, text split over nodes, a canvas), the page is left: nothing on it can
+        // show the secret to a later read or screenshot.
+        await scrubValue(s.page, value).catch(() => {});
+        await s.page.goto('about:blank', { timeout: 15000 });
+        throw new Error('the secret did not end up in the field that was checked (the page moved the focus or the field); Bosun left the page (about:blank) so nothing on it can show the secret, check the site before trying again');
       }
       await markValue(s.page, value);
       if (a.submit) { await l.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }

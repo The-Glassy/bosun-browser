@@ -194,6 +194,9 @@ export async function maskedScreenshot(page, take) {
 
 // A key with ": " or other YAML specials in its name comes single-quoted: - 'textbox "Contact: code" [ref=e3]': value
 const LABEL_RE = new RegExp(String.raw`^(\s*- '?(?:textbox|searchbox|spinbutton|combobox) "[^"\n]*(?:${HINT_WORDS})[^"\n]*"[^\n]*?): .*$`, 'gim');
+const FIELD_HEAD_RE = /^\s*- '?(?:textbox|searchbox|spinbutton|combobox)\b.*:$/;
+const LABEL_HEAD_RE = new RegExp(String.raw`^\s*- '?(?:textbox|searchbox|spinbutton|combobox) "[^"\n]*(?:${HINT_WORDS})`, 'i');
+const CHILD_TEXT_RE = /^(\s*- text): (.*)$/;
 const FIELD_LINE_RE = /^(\s*- (?:'(?:textbox|searchbox|spinbutton|combobox)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]]*\])*'|(?:textbox|searchbox|spinbutton|combobox)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]]*\])*)): (.*)$/;
 
 // A quoted snapshot value is YAML: JSON's escapes plus \xNN (playwright-core yamlEscapeValueIfNeeded).
@@ -214,7 +217,16 @@ const normalized = (v) => v.replace(/[\u200b\u00ad]/g, '').trim().replace(/\s+/g
 export function maskText(text, values) {
   const vals = new Set(values.filter(Boolean).flatMap((v) => [v, normalized(v)]).filter(Boolean));
   let out = text.replace(LABEL_RE, '$1: [masked]');
+  // A field with a placeholder has children, and its value is the "- text:" line among them.
+  let block = null; // { indent, sensitive }: inside such a field
   out = out.split('\n').map((line) => {
+    const indent = line.length - line.trimStart().length;
+    if (block && indent <= block.indent) block = null;
+    if (block) {
+      const t = CHILD_TEXT_RE.exec(line);
+      return t && (block.sensitive || vals.has(unquote(t[2]))) ? `${t[1]}: [masked]` : line;
+    }
+    if (FIELD_HEAD_RE.test(line)) { block = { indent, sensitive: LABEL_HEAD_RE.test(line) }; return line; }
     const m = FIELD_LINE_RE.exec(line);
     return m && vals.has(unquote(m[2])) ? `${m[1]}: [masked]` : line;
   }).join('\n');

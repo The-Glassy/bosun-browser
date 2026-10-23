@@ -190,10 +190,11 @@ field and zeroes the buffer. The field is checked (an `<input type=password>` un
 `allow_non_password`), marked sensitive and filled as one element handle; after the fill every input or textarea
 that holds the value joins the set of former password fields, so `read`, `screenshot` and the post-handoff clearing
 treat it as a credential field whatever its type. If the page moved the focus during the fill and the checked field
-didn't get the value, Bosun removes it from every field and text node again and fails the call. While `DEBUG` turns
-on a Playwright log that prints typed text (`pw:api`, `pw:protocol`, `pw:channel`) or `NODE_DEBUG` is set, secrets are
-refused. Three Codex review rounds found the swaps, focus moves, marker moves and snapshot encodings (normalized white
-space, YAML escapes, quoted keys) this paragraph describes; each has a test. What stays is H2: the set Bosun masks by
+didn't get the value, Bosun fails the call and leaves the page for `about:blank`. While `DEBUG` turns on a Playwright
+log that prints typed text (`pw:api`, `pw:protocol`, `pw:channel`) or `NODE_DEBUG` is set, secrets are refused
+(Node's `stream` log would still print a PUT body sent anyway, e.g. to a URL from before a restart). Four Codex review
+rounds found the swaps, focus moves, marker moves and snapshot encodings (normalized white space, YAML escapes,
+quoted keys, placeholder child lines) this paragraph describes; each has a test. What stays is H2: the set Bosun masks by
 lives in the page's world on `chromium`, and on every engine a page can copy the value somewhere masking doesn't
 look. So this takes the password out of the agent's transcript and its MCP client's logs. It does not make an
 untrusted page safe to type into. M2 still holds after it: the `type` result has the secret masked in its URL and

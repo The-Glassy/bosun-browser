@@ -42,6 +42,7 @@ const PAGES = {
   '/editable': `<title>Editable</title><input id="pw" type="password"><div id="ed" contenteditable style="min-height:20px"></div><script>
     const pw = document.getElementById('pw');
     pw.addEventListener('focus', () => { pw.remove(); document.getElementById('ed').focus(); }, { once: true });</script>`,
+  '/placeholder': `<title>Placeholder</title><input id="ph" aria-label="Contact" placeholder="Enter code">`,
   '/quoted': `<title>Quoted</title><label>Contact: code <input id="q"></label>`,
   '/search': `<title>Search</title><form method="get" action="/echo"><input id="pw" type="password" name="q"></form>`,
 };
@@ -379,34 +380,43 @@ test('a field swapped for another after the check gets nothing, and the secret s
   await c.close();
 });
 
-test('a page that moves the focus during the fill: the call fails, and the field that got the secret is masked', async () => {
+test('a page that moves the focus during the fill: the call fails and Bosun leaves the page', async () => {
   const c = await client(TOKEN);
   const s = await c.open();
   await c.call('navigate', { session: s, url: `${base}/refocus` });
   const id = await send(c, 'refocus-target-secret');
   const r = await c.call('type', { session: s, selector: '#pw', secret_id: id });
   assert.equal(r.isError, true);
-  const page = svc.manager.sessions.get(s).page;
-  const other = await page.$eval('#other', (e) => e.value);
-  if (other) {
-    assert.match(r.text, /did not end up in the field that was checked/);
-    assert.equal(await maskedScreenshot(page, async () => page.$eval('#other', (el) => el.hasAttribute('data-bosun-sensitive'))), true);
-  }
+  assert.match(r.text, /did not end up in the field that was checked.*about:blank/);
+  assert.equal(svc.manager.sessions.get(s).page.url(), 'about:blank');
   for (const mode of ['a11y', 'text']) assert.ok(!(await c.call('read', { session: s, mode })).text.includes('refocus-target'), mode);
   await c.close();
 });
 
-test('a page that moves the focus into a contenteditable: the secret is taken out of the page again', async () => {
+test('a page that moves the focus into a contenteditable (multi-line secret): the page is left', async () => {
   const c = await client(TOKEN);
   const s = await c.open();
   await c.call('navigate', { session: s, url: `${base}/editable` });
-  const id = await send(c, 'editable-target-secret');
+  const id = await send(c, 'editable-target\nsecond-line');
   const r = await c.call('type', { session: s, selector: '#pw', secret_id: id });
   assert.equal(r.isError, true);
-  assert.match(r.text, /did not end up in the field that was checked|not attached|detached/);
+  assert.match(r.text, /did not end up in the field that was checked.*about:blank|not attached|detached/);
   const page = svc.manager.sessions.get(s).page;
-  assert.ok(!(await page.$eval('#ed', (e) => e.textContent)).includes('editable-target'));
-  for (const mode of ['a11y', 'text']) assert.ok(!(await c.call('read', { session: s, mode })).text.includes('editable-target'), mode);
+  if (/about:blank/.test(r.text)) assert.equal(page.url(), 'about:blank');
+  else assert.ok(!(await page.$eval('#ed', (e) => e.textContent)).includes('editable-target'));
+  for (const mode of ['a11y', 'text']) assert.ok(!/editable-target|second-line/.test((await c.call('read', { session: s, mode })).text), mode);
+  await c.close();
+});
+
+test('a short secret in a field with a placeholder (its value is a child line of the snapshot) is masked', async () => {
+  const c = await client(TOKEN);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${base}/placeholder` });
+  const id = await send(c, 'Zq');
+  assert.equal((await c.call('type', { session: s, selector: '#ph', secret_id: id, allow_non_password: true })).isError, false);
+  const r = await c.call('read', { session: s });
+  assert.ok(!r.text.includes('Zq'), r.text);
+  assert.match(r.text, /- text: \[masked\]/);
   await c.close();
 });
 
@@ -494,7 +504,7 @@ test('DEBUG with a Playwright log that prints typed text: secrets refused', asyn
 });
 
 test('no secret of these tests is in any tool result, PUT answer or log line; the log has id and length', () => {
-  const all = [PW, OTP, 'once-only-secret', 'expiring-secret', 'late-secret', 'alice-only-secret', 'two\nlines', 'echo me & you/100%', 'echo+me', 'swap-target-secret', 'alpha', 'debug-refused-secret', 'refocus-target', 'decoy-target', 'cd-esc', 'editable-target', 'debug-put-secret'];
+  const all = [PW, OTP, 'once-only-secret', 'expiring-secret', 'late-secret', 'alice-only-secret', 'two\nlines', 'echo me & you/100%', 'echo+me', 'swap-target-secret', 'alpha', 'debug-refused-secret', 'refocus-target', 'decoy-target', 'cd-esc', 'editable-target', 'second-line', 'debug-put-secret'];
   for (const text of results) for (const v of all) assert.ok(!text.includes(v), `${v} in a result: ${text}`);
   for (const line of logs) for (const v of all) assert.ok(!line.includes(v), `${v} in the log: ${line}`);
   assert.ok(logs.some((l) => /^bosun: secret s[0-9a-f]{16} of tenant alice: received, \d+ bytes$/.test(l)));

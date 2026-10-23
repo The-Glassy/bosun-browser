@@ -82,6 +82,8 @@ export async function main(env = process.env) {
   if (!cfg.chromiumSandbox && cfg.engine !== 'camoufox') {
     console.error('bosun: WARNING — CHROMIUM_SANDBOX=0: the browser runs without its own sandbox, so a renderer that is compromised by a page lands directly on this user');
   }
+  // Node's own diagnostics print request bodies (NODE_DEBUG=stream): secrets are refused then, and said so here.
+  if (process.env.NODE_DEBUG) console.error('bosun: WARNING — NODE_DEBUG is set: Node logs request bodies it reads, so secret_create and type with secret_id are refused');
   const svc = await startService(cfg);
   const exit = (code) => {
     const force = setTimeout(() => process.exit(1), 20_000);

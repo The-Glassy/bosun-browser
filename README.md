@@ -223,8 +223,10 @@ type { session, selector: "#password", secret_id: "s9c…", submit: true }
   arrived, or when the service stops; a restart loses every secret. A PUT gets 60 s in all (30 s without a byte).
 - **No debug logs.** Playwright's `DEBUG=pw:api` log prints what `fill` types, `pw:protocol` / `pw:channel` print
   the messages that carry it, and Node's `NODE_DEBUG=stream` prints the buffers a PUT body arrives in. While `DEBUG`
-  turns any of those Playwright logs on, or `NODE_DEBUG` is set at all, `secret_create`, the PUT (before its body is
-  read) and `type` with `secret_id` are refused.
+  turns any of those Playwright logs on, or `NODE_DEBUG` is set at all, `secret_create`, the PUT and `type` with
+  `secret_id` are refused, and the service warns at start. Node logs a body it parses before Bosun can refuse it,
+  so a PUT to a URL issued before a restart under `NODE_DEBUG` still lands in that log: don't set it where secrets
+  are sent.
 - **Typed once.** `type` with `secret_id` takes the secret out of the store and fills the field. A second `type`
   with that id gets "no secret …", the same answer as for an id that never existed or belongs to another tenant. If
   the fill fails after the secret was taken, it is gone too: call `secret_create` again. Neither the result nor an
@@ -233,9 +235,9 @@ type { session, selector: "#password", secret_id: "s9c…", submit: true }
   are, so a page that puts the secret there shows it to the agent from then on.
 - **One element.** The type check, the masking mark and the fill all go to the element found first; a page that
   swaps the field for another one before the fill gets nothing typed. The fill types through the page's keyboard,
-  so a page can still move the focus while it runs. If the checked field didn't get the secret, Bosun takes it out
-  of every field and text node of the page again (contenteditable included) and the call fails; if it did, every
-  field that holds it is masked.
+  so a page can still move the focus while it runs. If the checked field didn't get the secret, the call fails and Bosun
+  leaves the page (`about:blank`), so nothing on it can show the secret to a later `read` or `screenshot`; if it
+  did, every field that holds it is masked.
 - **Password fields only, unless you say otherwise.** The field must be an `<input type=password>`. For an OTP, an
   e-mail address or a user name pass `allow_non_password: true`; any text `<input>` or `<textarea>` then takes it.
   Checkboxes, buttons, file inputs and non-inputs are refused. A refusal before the fill leaves the secret unused.
