@@ -212,13 +212,19 @@ export const meet = {
       if (s !== 'unknown' || Date.now() > end) break;
       await page.waitForTimeout(500);
     }
-    const b = await joinCandidate(page);
+    // What joinButton() would pick, without opening "Other ways to join": the primary button, "Join here too", or
+    // (with the account in the call elsewhere) "Join here too" from that menu, "Switch here" only without it.
+    const named = async (l) => (l ? ((await l.getAttribute('aria-label').catch(() => null)) || (await l.innerText().catch(() => '')).trim()) : null);
+    const other = await firstVisible(button(page, LABEL.otherWays));
+    const sw = await firstVisible(button(page, LABEL.switchHere));
+    const join = await named(await primaryJoin(page)) || await named(await firstVisible(button(page, LABEL.joinToo)))
+      || (sw && other ? `"Join here too" under "${await named(other)}" if offered, else "${await named(sw)}"` : await named(sw));
     const t = await pageText(page).catch(() => '');
     const device = async (offL, onL, missing) => (await visible(button(page, offL)) ? 'off' : await visible(button(page, onL)) ? (missing.test(t) ? 'on (no device found)' : 'on') : missing.test(t) ? 'no device' : 'unknown');
     return {
       state: s,
       lobby: await meetPrejoin(page),
-      join_button: b ? ((await b.getAttribute('aria-label').catch(() => null)) || (await b.innerText().catch(() => '')).trim()) : null,
+      join_button: join,
       microphone: await device(LABEL.micOn, LABEL.micOff, TEXT.noMic),
       camera: await device(LABEL.camOn, LABEL.camOff, TEXT.noCamera),
       challenge: await challengeShown(page),

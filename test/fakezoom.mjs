@@ -41,7 +41,7 @@ function webClient(id, r) {
 <style>[hidden]{display:none!important} .tile{display:inline-block;width:80px;height:60px;background:#333;margin:4px}</style>
 <div id="preview">
   <h1>Enter Meeting Info</h1>
-  <input id="input-for-name" type="text" aria-label="Your Name" placeholder="Your Name" value="${r.signedIn && !r.web2026 ? 'Glassy Smartie' : ''}">
+  <input id="input-for-name" type="text" aria-label="Your Name" placeholder="Your Name" value="${esc(r.remembered ?? (r.signedIn && !r.web2026 ? 'Glassy Smartie' : ''))}">
   ${r.web2026 ? '<label><input type="checkbox" id="remember"> Remember my name for future meetings</label>' : ''}
   ${(r.passcode && !r.pwdGiven) || r.askPasscode ? '<input id="input-for-pwd" type="password" aria-label="Meeting Passcode" placeholder="Meeting Passcode">' : ''}
   ${r.web2026 ? '<button id="pmic" aria-label="Mute">Mute</button><p>Cannot detect your camera, please check the device and connection and try again.</p>'

@@ -158,7 +158,7 @@ export class Meetings {
   // need one, so it counts. No audio server starts for a meeting that could not get a session.
   capacity(tenant) {
     // Dry runs that have not got their session yet count like meetings still setting up.
-    const starting = [...this.active.values(), ...this.dryRuns].filter((x) => !x.session && !x.finishing);
+    const starting = [...this.active.values(), ...this.dryRuns].filter((x) => !x.session && !x.finishing && !x.handedOver);
     if (this.manager.used + starting.length >= this.cfg.maxSessions || starting.length >= MAX_STARTING) throw new Error(`session limit ${this.cfg.maxSessions} reached; close one`);
     const tUse = (this.manager.tenantUse.get(tenant) || 0) + starting.filter((x) => x.tenant === tenant).length;
     if (tUse >= this.cfg.maxSessionsPerTenant) throw new Error(`session limit ${this.cfg.maxSessionsPerTenant} for this tenant reached; close one`);
@@ -173,13 +173,16 @@ export class Meetings {
     url = checked.url;
     this.capacity(tenant);
     // Reserved before anything is awaited, so concurrent dry runs can't overshoot the caps; released below.
-    const slot = { tenant, session: null, finishing: false };
+    const slot = { tenant, session: null, finishing: false, handedOver: false, task: null };
     this.dryRuns.add(slot);
     const owner = `meeting-dry-run:${crypto.randomBytes(4).toString('hex')}`;
     let rig = null, session = null;
-    try {
+    const task = (async () => {
       rig = await this.audio.open();
-      session = slot.session = await this.manager.open({ owner, tenant, profile: profile || undefined, engine: eng, locale: platform.locale, media: { args: [...MEDIA_ARGS, ...(rig.args || [])], env: rig.browserEnv } });
+      if (this.stopped) throw new Error('service is shutting down');
+      const opening = this.manager.open({ owner, tenant, profile: profile || undefined, engine: eng, locale: platform.locale, media: { args: [...MEDIA_ARGS, ...(rig.args || [])], env: rig.browserEnv } });
+      slot.handedOver = true; // the session manager reserved its own slot synchronously in open()
+      session = slot.session = await opening;
       const target = platform.joinUrl ? platform.joinUrl(url) : url;
       for (const origin of new Set([new URL(url).origin, new URL(target).origin, ...(platform.origins ? platform.origins(url) : [])])) {
         await session.ctx.grantPermissions(['microphone', 'camera'], { origin }).catch(() => {});
@@ -192,11 +195,13 @@ export class Meetings {
         return { ...seen, page: `${u.origin}${u.pathname}`, title: await s.page.title().catch(() => '') };
       });
       return { dry_run: true, platform: platform.name, ...(profile ? { profile } : {}), engine: eng, ...r, note: 'nothing was joined or clicked except the page\'s own tips and device questions' };
-    } finally {
+    })();
+    slot.task = task.finally(async () => {
       this.dryRuns.delete(slot);
       if (session) await this.manager.dispose(session, 'meeting-dry-run').catch(() => {});
       await rig?.close().catch(() => {});
-    }
+    });
+    return slot.task;
   }
 
   // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
@@ -494,6 +499,8 @@ export class Meetings {
   async stop() {
     this.stopped = true;
     clearInterval(this.sweeper);
-    await Promise.race([Promise.allSettled([...this.active.values()].map((m) => this.finish(m, 'shutdown'))), sleep(15_000)]);
+    // A dry run still loading a page is cut short by closing its session; its audio server goes in its own cleanup.
+    for (const d of this.dryRuns) if (d.session) this.manager.dispose(d.session, 'shutdown').catch(() => {});
+    await Promise.race([Promise.allSettled([...[...this.active.values()].map((m) => this.finish(m, 'shutdown')), ...[...this.dryRuns].map((d) => d.task)]), sleep(15_000)]);
   }
 }

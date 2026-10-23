@@ -118,6 +118,14 @@ export function zoomWebClientUrl(url) {
 // reCAPTCHA" (an invisible widget and a notice under the Join button): that is not a challenge (common.mjs).
 const captchaShown = challengeShown;
 
+// An app-launch page: "Join from your browser" if it is there, else "Launch Meeting" (which reveals it).
+async function followLaunch(page) {
+  const link = await firstVisible(page.getByRole('link', { name: LABEL.fromBrowser })) || await firstVisible(button(page, LABEL.fromBrowser));
+  if (link) return link.click({ timeout: 5000 }).catch(() => {});
+  const l = await firstVisible(button(page, LABEL.launch));
+  if (l) await l.click({ timeout: 3000 }).catch(() => {});
+}
+
 async function chatBox(page) {
   return await firstVisible(page.getByRole('textbox', { name: LABEL.chatInput })) || firstVisible(page.locator(CHAT_INPUT));
 }
@@ -165,26 +173,20 @@ export const zoom = {
       const s = await this.state(page);
       if (STOP.includes(s)) return s; // e.g. a signed-in profile Zoom lets straight in, or a refusal
       if (s === 'lobby') break;
-      if (s === 'launch') {
-        const link = await firstVisible(page.getByRole('link', { name: LABEL.fromBrowser })) || await firstVisible(button(page, LABEL.fromBrowser));
-        if (link) await link.click({ timeout: 5000 }).catch(() => {});
-        else { const l = await firstVisible(button(page, LABEL.launch)); if (l) await l.click({ timeout: 3000 }).catch(() => {}); }
-      }
+      if (s === 'launch') await followLaunch(page);
       if (Date.now() > end) throw new Error(`no "Join" button found on the Zoom page (not Zoom's web client, or Zoom changed); page ${s}`);
       await overlays(page);
       await page.waitForTimeout(500);
     }
     await overlays(page);
     // A profile that is no longer signed in to Zoom joins as a guest (and is said to be signed out).
-    if (profile) {
-      info.signedIn = await this.signedIn(page);
-      if (info.signedIn === false) info.warning = `profile ${profile} is not signed in to Zoom any more: joined as a guest named "${name}" (Zoom turns most guests away). Sign it in again: session_open({profile: "${profile}"}), navigate https://zoom.us/signin, request_human, session_close.`;
-    }
+    if (profile) info.signedIn = await this.signedIn(page);
     // Signed in: Zoom fills in the account's name, which is kept; otherwise (or with an empty field, which the web
     // client also shows signed-in accounts) `name`.
     const field = await firstVisible(page.locator(NAME_FIELD));
     const prefilled = field ? (await field.inputValue().catch(() => '')).trim() : '';
-    if (field && !(profile && prefilled)) {
+    // A remembered name in a signed-out profile is a guest name from earlier: replaced too.
+    if (field && !(profile && prefilled && info.signedIn !== false)) {
       await field.fill(name, { timeout: 5000 });
       // The web client enables Join only on typed input; a fill it did not take is typed key by key.
       const j = await firstVisible(button(page, LABEL.join));
@@ -194,6 +196,7 @@ export const zoom = {
     // Signed in by Zoom's own account page; without that answer, by the prefilled name.
     info.joinedAs = profile && (info.signedIn === true || (info.signedIn === null && (!field || prefilled))) ? 'account' : 'guest';
     info.selfName = field ? (await field.inputValue().catch(() => name)).trim() : null;
+    if (info.signedIn === false) info.warning = `profile ${profile} is not signed in to Zoom any more: joined as a guest named "${info.selfName || name}" (Zoom turns most guests away). Sign it in again: session_open({profile: "${profile}"}), navigate https://zoom.us/signin, request_human, session_close.`;
     // The passcode comes with the link (pwd, an encrypted token, not the passcode people type). A page that still
     // asks for it stops the join: the token typed into the field would only be refused.
     const pass = await firstVisible(page.locator(PASSCODE_FIELD));
@@ -229,10 +232,7 @@ export const zoom = {
       await overlays(page);
       s = await this.state(page);
       if ((s !== 'unknown' && s !== 'launch') || Date.now() > end) break;
-      if (s === 'launch') {
-        const link = await firstVisible(page.getByRole('link', { name: LABEL.fromBrowser })) || await firstVisible(button(page, LABEL.fromBrowser));
-        if (link) await link.click({ timeout: 5000 }).catch(() => {});
-      }
+      if (s === 'launch') await followLaunch(page);
       await page.waitForTimeout(500);
     }
     const field = await firstVisible(page.locator(NAME_FIELD));

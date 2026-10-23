@@ -48,25 +48,46 @@ export async function firstVisible(l, max = 5) {
 // mode (size=invisible). Sites that are merely "protected by reCAPTCHA" (Meet, Zoom's web client) carry an invisible
 // widget, its hidden challenge frame parked off screen, and that notice: none of it is a challenge.
 export const CHALLENGE_SRC = /recaptcha|hcaptcha|challenges\.cloudflare|turnstile|captcha-delivery|geo\.captcha/;
-// A challenge page served as the page itself (a captcha-delivery or Cloudflare challenge URL) counts too. A frame
-// inside other frames counts only if every frame on the way up is shown as well.
+// A challenge page served as the page itself counts too, by its endpoint only: a DataDome captcha
+// (*.captcha-delivery.com), Cloudflare's challenge host or its /cdn-cgi/challenge-platform/ pages.
+const challengePage = (raw) => {
+  try {
+    const u = new URL(raw);
+    return /(?:^|\.)captcha-delivery\.com$/.test(u.hostname) || u.hostname === 'challenges.cloudflare.com' || u.pathname.startsWith('/cdn-cgi/challenge-platform/');
+  } catch { return false; }
+};
+// A frame counts if it is shown where a person would see it: its rectangle (at least 60x60), carried up through every
+// frame above it and cut to each one's viewport, still has 60x60 px left in the page's own viewport, and every frame
+// element on the way is rendered (not hidden by visibility or opacity).
 export async function challengeShown(page) {
   const main = page.mainFrame();
-  if (CHALLENGE_SRC.test(main.url())) return true;
+  if (challengePage(main.url())) return true;
   for (const f of page.frames()) {
     if (f === main) continue;
     const src = f.url();
     if (!CHALLENGE_SRC.test(src) || /[?&]size=invisible\b/.test(src)) continue;
+    let rect = null; // the challenge, in the coordinates of the frame being looked at
     let shown = true;
-    for (let cur = f, own = true; shown && cur && cur !== main; cur = cur.parentFrame(), own = false) {
-      const el = await cur.frameElement().catch(() => null);
+    for (let cur = f; shown && cur !== main; cur = cur.parentFrame()) {
+      const el = cur && await cur.frameElement().catch(() => null);
       if (!el) { shown = false; break; }
-      shown = await el.evaluate((e, min) => {
+      const g = await el.evaluate((e) => {
         const r = e.getBoundingClientRect();
         const visible = e.checkVisibility ? e.checkVisibility({ visibilityProperty: true, opacityProperty: true }) : !!e.offsetParent;
-        return visible && r.width >= min && r.height >= min && r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
-      }, own ? 60 : 1).catch(() => false);
+        return { visible, x: r.left + e.clientLeft, y: r.top + e.clientTop, w: r.width, h: r.height, vw: innerWidth, vh: innerHeight };
+      }).catch(() => null);
       await el.dispose().catch(() => {});
+      if (!g?.visible) { shown = false; break; }
+      // Into the parent's coordinates: the frame element's own box, or the challenge inside it, moved by the frame's
+      // position; then cut to the parent's viewport.
+      const r = rect ? { x: rect.x + g.x, y: rect.y + g.y, w: rect.w, h: rect.h } : { x: g.x, y: g.y, w: g.w, h: g.h };
+      if (rect) { // also cut to the frame element itself (what lies outside its box is not shown)
+        const x0 = Math.max(r.x, g.x), y0 = Math.max(r.y, g.y), x1 = Math.min(r.x + r.w, g.x + g.w), y1 = Math.min(r.y + r.h, g.y + g.h);
+        Object.assign(r, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+      }
+      const x0 = Math.max(r.x, 0), y0 = Math.max(r.y, 0), x1 = Math.min(r.x + r.w, g.vw), y1 = Math.min(r.y + r.h, g.vh);
+      rect = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+      if (rect.w < 60 || rect.h < 60) shown = false;
     }
     if (shown) return true;
   }

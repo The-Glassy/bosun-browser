@@ -176,14 +176,17 @@ test('captcha rule: a challenge inside a hidden outer frame is none; a shown one
     const inner = `<iframe src="${fm.base}/recaptcha/api2/anchor?k=x" width="300" height="300"></iframe>`;
     const outer = (style) => `<iframe style="${style}" width="400" height="400" srcdoc='${inner}'></iframe>`;
     await page.goto(`${fm.base}/nothing`).catch(() => {});
-    for (const [style, want] of [['position:absolute;top:-5000px', null], ['opacity:0', null], ['visibility:hidden', null], ['', 'captcha']]) {
+    // Hidden outer frames; an outer frame mostly off screen with the challenge in its off-screen part; shown.
+    for (const [style, want] of [['position:absolute;top:-5000px', null], ['opacity:0', null], ['visibility:hidden', null], ['position:absolute;left:-350px', null], ['', 'captcha']]) {
       await page.setContent(`<title>t</title>${outer(style)}`);
       await until(() => page.frames().some((f) => /recaptcha/.test(f.url())), 5000);
       assert.equal(await wall(page), want, style || 'shown');
     }
-    // A challenge served as the page itself (no frame): its URL says so.
-    await page.goto(`${fm.base}/captcha-delivery/check`).catch(() => {});
+    // A challenge served as the page itself (no frame): its endpoint says so; a page merely mentioning recaptcha doesn't.
+    await page.goto(`${fm.base}/cdn-cgi/challenge-platform/h/b/check`).catch(() => {});
     assert.equal(await wall(page), 'captcha');
+    await page.goto(`${fm.base}/docs/recaptcha?size=invisible`).catch(() => {});
+    assert.equal(await wall(page), null);
     await c.close();
   });
 });
@@ -202,4 +205,36 @@ test('dry runs reserve capacity before anything starts: concurrent ones past MAX
     await until(() => audio.stats.closed === 1 && svc.manager.used === 0);
     await c.close();
   } finally { await svc.stop(); }
+});
+
+test('dry runs predict what a join does: Zoom through its app-launch page, Meet "Join here too" for an account already in the call', async () => {
+  const audio = fakeAudio();
+  const launchVia = { ...zoomAt(fz.base), joinUrl: (u) => `${fz.base}/j/${parseZoomUrl(u).id}${new URL(u).search}` };
+  const svc = await startBosun({ KEEPALIVE: '0' }, { meetings: { audio, platformFor: (u) => (u.startsWith(fm.base) ? meet : zoom.matches(u) ? launchVia : null), pollMs: 200 } });
+  try {
+    const c = await connect(svc);
+    const { url } = fz.newRoom({ web2026: true });
+    const d = (await c.call('meeting_join', { url, dry_run: true })).json();
+    assert.equal(d.state, 'lobby', JSON.stringify(d));
+    assert.match(d.page, /\/wc\/\d+\/join$/);
+    const { code, url: murl } = fm.newRoom();
+    fm.set(code, { signedIn: true, account: true, elsewhere: true });
+    const m = (await c.call('meeting_join', { url: murl, dry_run: true })).json();
+    assert.equal(m.join_button, '"Join here too" under "Other ways to join" if offered, else "Switch here"');
+    await c.close();
+  } finally { await svc.stop(); }
+});
+
+test('Zoom: a remembered name in a signed-out profile is replaced, and the warning names the guest as it joined', async () => {
+  await withService(async (svc, c) => {
+    fz.account(false);
+    const { id, url } = fz.newRoom({ web2026: true, remembered: 'Alice' });
+    const r = await c.call('meeting_join', { url, profile: 'zoom', name: 'Glassy Notetaker' });
+    assert.equal(r.isError, false, r.text);
+    assert.equal(fz.room(id).guest.name, 'Glassy Notetaker');
+    assert.match(r.json().warning, /joined as a guest named "Glassy Notetaker"/);
+    await c.call('meeting_leave', { meeting_id: r.json().meeting_id });
+    fz.account(null);
+    await c.close();
+  });
 });
