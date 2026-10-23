@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.10.2 — Bosun no longer opts itself out
+
+### Fixed
+
+- **Bosun took its own announcement for an objection** (live Meet, 2026-10-23). It deleted the recording and left
+  2–6 s after joining.
+  - Meet now renders our own chat message with no sender, inside UI text: "10:07 AM: <text>", then "Hover over a
+    message to pin it", "keep", "Pin message". So Bosun no longer recognised the message as its own.
+  - The default text quotes "please don't record" as an example. A custom text with 'write "stop" + "recording"'
+    matched "stop recording".
+- **Own messages.** What Bosun posted in that meeting is taken out of any chat message that carries no
+  participant's name, and only the rest is judged. Nothing left means it was Bosun's own message: no event, never an
+  objection.
+  - Posts are taken out as whole words, and each one only as often as Bosun posted it. So a short post like "No"
+    never cuts into "not", and the same words written again later are someone's.
+  - A message that pastes the announcement and adds "please stop recording" keeps that request.
+  - A named participant's message is always judged whole, even if it repeats Bosun's words.
+- **Chat text and sender:** the UI around a message is removed on Meet and Zoom before anything reads it: a leading
+  time, and lines that are only the pin control, its tooltip or an icon name. A time or a control is never a
+  sender. Meet's sender is read past a time on its header line. Zoom's "<name> to Everyone 10:07 AM" counts as us.
+- **Matcher:**
+  - A clause that explains how to opt out never counts, and its quoted words are a mention. Such a clause both
+    tells people what to write or say ("write", "just say so", "schreibt") and says it is explaining ("if you…",
+    "to opt out", "e.g.", "here in chat", "wenn ihr…", "zum Abmelden", "z. B.").
+  - Everything else is judged as written, quotes included: "I want to opt out, please stop recording",
+    'Please "stop recording"' and "'please don't record', thanks" are requests.
+  - Sentence ends inside quotes and in "e.g." / "z. B." don't split a message. Each "but"-clause is judged on its
+    own. A veto ("keep recording", "don't stop") counts only outside quotes, so a quoted "keep recording" never
+    cancels the objection next to it.
+  - Accepted: a reported quote ('Bob said "stop recording" yesterday') still stops the recording, as in 0.10.1.
+    That is the safe direction.
+
+### Tests
+
+- `test/meeting-optout-live.test.mjs`:
+  - the exact live bubble;
+  - the chat loop with our announcement echoed back with no sender (default EN/DE and the live custom text);
+  - full Meet and Zoom joins against stand-ins that render chat like the live pages. Bosun keeps recording
+    through its own announcement, and a participant's "please don't record" / "Stop recording please" still stops
+    and deletes the recording.
+- These tests fail on 0.10.1.
+
 ## 0.10.1 — Meet and Zoom lobbies as they are now
 
 Both platforms failed in production on 2026-10-23 on lobbies that had changed. The fixes are checked against

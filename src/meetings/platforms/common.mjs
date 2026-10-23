@@ -24,6 +24,23 @@ export function pageText(page, skip, roots = null) {
   }, { skip, roots }).then(norm);
 }
 
+// A chat bubble as the panel renders it, without what the UI adds around the message (live Meet, 2026-10-23:
+// "10:07 AM: <text>\nHover over a message to pin it\nkeep\nkeep\nPin message"): a time in front, and lines that are
+// only the pin control's label, tooltip or icon name, or only a time.
+const CHAT_UI_LINE = /^(?:hover over a message to pin it|pin message|unpin message|keep|keep_off|push_pin|more_vert|\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?)$/i;
+const LEAD_TIME = /^\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?\s*[:\-–]\s*/i;
+export function cleanChatText(text) {
+  const lines = String(text ?? '').split('\n').map((l) => l.trim()).filter((l) => l && !CHAT_UI_LINE.test(l));
+  if (lines.length) lines[0] = lines[0].replace(LEAD_TIME, '').trim();
+  return lines.filter(Boolean).join('\n');
+}
+// A sender label that is really a time or a control ("10:07 AM", "keep"): no sender.
+// A trailing time ("Host Person 10:07 AM") is not part of the name.
+export const cleanSender = (s) => {
+  const t = String(s ?? '').trim().replace(/\s+\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?$/i, '').trim();
+  return t && !CHAT_UI_LINE.test(t) ? t : null;
+};
+
 // Where a site puts its own status messages over a running call (meeting ended, removed): dialogs only. Captions,
 // the meeting title and toasts are outside, so what participants say or name a meeting can't end it.
 export const DIALOGS = '[role="dialog"], [role="alertdialog"]';

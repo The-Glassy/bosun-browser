@@ -73,19 +73,50 @@ const VETO = [
   rx('(?:nezastavuj|nezastavujte|neprestávaj|neprestávajte|nevypínaj|nevypínajte|nemaž)'),
 ];
 
+// An explanation of how to opt out is not an opt-out: a clause that tells people what to write or say AND says it is
+// explaining ("if you'd rather not be recorded, just say so here in chat (e.g. 'please don't record')", 'to opt out,
+// write "stop" + "recording"', "wenn ihr nicht aufgenommen werden wollt, schreibt es hier in den Chat …") never
+// counts. Anything else is judged as written, quotes included: "I want to opt out, please stop recording",
+// 'Please "stop recording"', "'please don't record', thanks" and "can you write the summary and stop recording" are
+// requests.
+const TELLS = rx("write|type|just say|simply say|say so|schreib\\p{L}*|sag(?:t|en sie)? es|напиш\\p{L}*|скаж\\p{L}*|napíš\\p{L}*|povedz\\p{L}*");
+// …and says it is explaining: a condition, the purpose, an example, or where to write it.
+const EXPLAINS = rx("if (?:you|anyone|someone)|to opt out|e g|for example|here in (?:the )?chat|"
+  + 'wenn (?:ihr|sie|du|jemand)|zum abmelden|z b|zum beispiel|hier in den chat|якщо|если|ak ');
+const QUOTED = /(?:"[^"\n]{1,160}"|“[^”\n]{1,160}”|„[^“”\n]{1,160}[“”]|«[^»\n]{1,160}»|‘(?:[^‘’\n]|(?<=\p{L})’(?=\p{L})){1,160}’|(?<![\p{L}\p{N}])'(?:[^'\n]|(?<=\p{L})'(?=\p{L})){1,160}'(?![\p{L}\p{N}]))/gu;
+
+// Sentence ends inside quotes and in "e.g." / "i.e." / "z. B." don't split a message.
+const ABBREV = /(?<![\p{L}\p{N}])(?:e\.\s?g|i\.\s?e|z\.\s?b|u\.\s?a|d\.\s?h)\./giu;
+function protect(text) {
+  return String(text).slice(0, 4000)
+    .replace(QUOTED, (q) => q.replace(/[.!?;\n\u3002]/g, ' '))
+    .replace(ABBREV, (a) => a.replace(/\./g, ' '));
+}
+
 // A message is judged per clause: sentences, and the parts around "but"-like contrasts, so "Bob said keep recording,
 // but I do not consent to being recorded" is an opt-out while "don't stop recording" is not.
-const CONTRAST = /\s(?:but|however|though|aber|jedoch|sondern|doch|але|проте|но|однако|ale|avšak)\s/u;
+const CONTRAST = /\s(?:but|however|though|aber|jedoch|sondern|doch|але|проте|но|однако|ale|avšak)\s/iu;
+// What makes an explanation about opting out (with TELLS and EXPLAINS): it quotes the words to use, or speaks of
+// opting out or not being recorded. "If you can write the minutes, please stop recording" is a request.
+const ABOUT = rx("opt out|abmelden|not (?:be |being )?recorded|rather not|nicht aufgenommen|nicht aufgezeichnet");
+// -> [{text, bare, told}] per clause: text normalized; bare: without its quoted words (vetoes are judged on that,
+// so a quoted "keep recording" can't cancel the objection next to it); told: an explanation of how to opt out.
 export function clauses(text) {
-  return String(text).slice(0, 4000).split(/[.!?;\n\u3002]+/u)
-    .flatMap((sentence) => normalize(sentence).split(CONTRAST))
-    .map((c) => c.trim()).filter(Boolean);
+  return protect(text).split(/[.!?;\n\u3002]+/u)
+    .flatMap((sentence) => sentence.split(CONTRAST))
+    .map((part) => {
+      const bare = normalize(part.replace(QUOTED, ' '));
+      const told = TELLS.test(bare) && EXPLAINS.test(bare) && (QUOTED.test(part) || ABOUT.test(bare));
+      QUOTED.lastIndex = 0;
+      return { text: normalize(told ? part.replace(QUOTED, ' ') : part), bare, told };
+    })
+    .filter((c) => c.text);
 }
 
 // -> {lang, rule} for an opt-out request, else null.
 export function matchOptOut(text) {
-  for (const c of clauses(text)) {
-    if (VETO.some((v) => v.test(c))) continue;
+  for (const { text: c, bare, told } of clauses(text)) {
+    if (told || VETO.some((v) => v.test(bare))) continue;
     for (let i = 0; i < RULES.length; i++) if (RULES[i][1].test(c)) return { lang: RULES[i][0], rule: i };
   }
   return null;

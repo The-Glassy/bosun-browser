@@ -356,10 +356,12 @@ export const zoom = {
       for (const el of all.filter((e) => !all.some((o) => o !== e && e.contains(o)))) {
         const item = el.closest(ITEM);
         const named = item?.querySelector(SENDER);
-        const sender = n(named ? named.innerText || named.textContent : '') || last;
+        // The sender line may carry the recipient and a time ("Glassy Notetaker to Everyone 10:07 AM"); the bubble
+        // may carry a time and controls around the text: ours if it contains exactly what was sent.
+        const sender = n(named ? named.innerText || named.textContent : '').replace(/\s+\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?$/i, '').replace(/\s+(?:to|an|для)\s+.*$/i, '') || last;
         last = sender;
         const own = /^(?:me|you|ich|du|я|ви)$/i.test(sender || '') || (selfName && sender === n(selfName));
-        if (own && n(el.innerText || el.textContent) === text) { count++; hit = el; }
+        if (own && n(el.innerText || el.textContent).includes(text)) { count++; hit = el; }
       }
       return { count, label: hit ? ((hit.closest(ITEM) || hit.parentElement)?.innerText || '').replace(hit.innerText || '', ' ').slice(0, 300) : '' };
     }, { MSG: CHAT_MESSAGE, SENDER: CHAT_SENDER, ITEM: CHAT_ITEM, text: norm(text).trim(), selfName });

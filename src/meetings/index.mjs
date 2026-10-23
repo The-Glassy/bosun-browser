@@ -14,7 +14,8 @@ import { pathToFileURL } from 'url';
 import { httpUrl } from '../sessions.mjs';
 import { readProfileMeta } from '../engines.mjs';
 import { TENANT_RE } from '../auth.mjs';
-import { matchOptOut } from './optout.mjs';
+import { matchOptOut, normalize } from './optout.mjs';
+import { cleanChatText, cleanSender } from './platforms/common.mjs';
 import { meet } from './platforms/meet.mjs';
 import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
@@ -222,7 +223,7 @@ export class Meetings {
       announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner),
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
       createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, stopping: null, recMs: 0, file: null, deleted: false,
-      info: {}, noRecord: false, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], sentAll: new Set(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
+      info: {}, noRecord: false, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
       ac: new AbortController(), joined: deferred(), finishing: null,
     };
     this.active.set(id, m);
@@ -334,10 +335,32 @@ export class Meetings {
 
   // Posts in the chat and remembers it, so the copy that shows up in the chat panel is recognized as ours.
   async say(m, page, text) {
-    m.sentAll.add(text.trim());
+    m.echoes.set(text.trim(), (m.echoes.get(text.trim()) || 0) + 1); // how often its echo may still be taken out
     m.pendingOwn.push(text.trim());
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
     await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name });
+  }
+
+  // What is left of a message once Bosun's own posts are taken out of it (live Meet showed our announcement with no
+  // sender, inside UI text). Only for a message without a participant's name on it: a named participant's message is
+  // always judged whole. Taken out as whole words, and each post only as often as Bosun posted it (an echo is used up
+  // once seen), so a participant later writing the same words is heard, and a short post ("No") never cuts into a
+  // word ("not"). Taking out, not dropping: a message that pastes our announcement and adds "please stop recording"
+  // keeps the request.
+  withoutOwn(m, text) {
+    const flat = (t) => String(t).replace(/[‘’ʼ]/g, "'").replace(/[“”„]/g, '"');
+    let rest = flat(text);
+    for (const [sent, n] of [...m.echoes].sort((a, b) => b[0].length - a[0].length)) {
+      if (n <= 0) continue;
+      const words = flat(sent).trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+      if (!words.length) continue;
+      const re = new RegExp(`(?<![\\p{L}\\p{N}])${words.join('\\s+')}(?![\\p{L}\\p{N}])`, 'iu');
+      while (m.echoes.get(sent) > 0 && re.test(rest)) {
+        rest = rest.replace(re, ' ');
+        m.echoes.set(sent, m.echoes.get(sent) - 1);
+      }
+    }
+    return rest;
   }
 
   // Ours only if we just sent exactly this text AND the chat shows it as from us; each sent message matches once.
@@ -357,18 +380,24 @@ export class Meetings {
       await this.page(m, (p) => m.platform.watchChat(p, m.chatKey));
       msgs = [];
     }
-    for (const msg of msgs) {
+    for (const raw of msgs) {
+      // The bubble's text and sender without the UI around them (times, pin control).
+      const msg = { ...raw, text: cleanChatText(raw.text), sender: cleanSender(raw.sender) };
       if (!msg.text || m.chatTexts.get(msg.id) === msg.text) continue;
       const edited = m.chatTexts.has(msg.id); // the panel filled in or changed a message after it first appeared
       m.chatTexts.set(msg.id, msg.text);
       if (m.chatTexts.size > 2 * MAX_CHAT) m.chatTexts.delete(m.chatTexts.keys().next().value);
-      if (!edited && this.own(m, msg)) { m.chatTexts.set(msg.id, msg.text); continue; }
+      if (!edited && this.own(m, msg)) continue;
+      // A participant's own name on it: theirs, judged whole. Otherwise only what is not Bosun's own words; nothing
+      // left means it was our own message (no event, never an objection).
+      const named = !!msg.sender && !SELF_SENDERS.test(msg.sender) && msg.sender !== m.name && msg.sender !== m.info.selfName;
+      const rest = named ? msg.text : this.withoutOwn(m, msg.text);
+      if (!normalize(rest)) continue;
       const entry = { seq: ++m.chatSeq, at: new Date(this.now()).toISOString(), sender: msg.sender || null, text: msg.text, ...(edited ? { edited: true } : {}) };
       m.chat.push(entry);
       if (m.chat.length > MAX_CHAT) m.chat.shift();
       this.emit(m, 'chat', { sender: entry.sender, text: entry.text, ...(edited ? { edited: true } : {}) });
-      // The bot's own wording (the announcement quotes "please don't record") never counts as an objection.
-      if (!m.optedOut && !m.sentAll.has(msg.text.trim()) && matchOptOut(msg.text)) await this.optOut(m, entry);
+      if (!m.optedOut && matchOptOut(rest)) await this.optOut(m, entry);
       if (m.state === 'ended') return;
     }
   }

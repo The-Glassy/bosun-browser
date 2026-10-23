@@ -82,7 +82,7 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
   </aside>
 </div>
 <script>
-const R = ${JSON.stringify({ tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends })};
+const R = ${JSON.stringify({ tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends, liveChat: !!r.liveChat })};
 const id = ${JSON.stringify(id)}, $ = (x) => document.getElementById(x);
 const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });
@@ -137,13 +137,16 @@ async function poll() {
       shown.add(m.id);
       const item = document.createElement('div');
       item.className = 'chat-item-container';
-      const sender = m.self ? 'Me' : m.sender;
+      // liveChat: our own messages under our name with the recipient and a time ("Glassy (notetaker) to Everyone
+      // 10:07 AM"), and each bubble with a time and its menu control inside.
+      const sender = m.self ? (R.liveChat ? m.sender + ' to Everyone 10:07 AM' : 'Me') : (R.liveChat ? m.sender + ' 10:07 AM' : m.sender);
       if (sender !== prev) { const h = document.createElement('div'); h.className = 'chat-item__sender'; h.textContent = sender; item.append(h); }
       prev = sender;
       const d = document.createElement('div');
       d.className = 'new-chat-message__container';
       d.id = 'chat-message-content-' + m.id;
       d.textContent = m.text;
+      if (R.liveChat) { const t = document.createElement('div'); t.textContent = '10:07 AM'; const b = document.createElement('button'); b.setAttribute('aria-label', 'more'); b.textContent = 'more_vert'; d.append(t, b); }
       item.append(d);
       if (m.to && m.to !== 'Everyone') { const p = document.createElement('span'); p.textContent = '(Privately)'; item.append(p); }
       $('msgs').append(item);
