@@ -115,11 +115,13 @@ const hostOs = () => ({ darwin: 'macos', win32: 'windows' })[process.platform] |
 // Each engine: { name, family, cdp, shared, tracker, load(), check(bt, cfg), open(bt, {cfg, dir, locale, timezone,
 // shared, media}) -> {ctx, browser?} }. media ({args, env}, meetings only, Chromium family): extra browser flags and the
 // environment of a browser process of its own (its audio server). proxy: the tenant's forward proxy (host allowlist),
-// or null. shared: ephemeral sessions of tenants without a proxy are contexts of one shared browser (manager.getBrowser);
+// or null. downloads: the directory the browser writes downloads to (a session that may download, src/downloads.mjs),
+// or null: then the context refuses every download. shared: ephemeral sessions of tenants without a proxy are contexts of one shared browser (manager.getBrowser);
 // every other session is a persistent context in a directory Bosun owns (a profile or a temp dir), so its browser
 // processes can be found by that directory. tracker: how the password tracker gets into Bosun's evaluation world
 // ('init' script, or 'navigate': evaluate after every frame navigation). check: throws if the browser binary is absent.
 const exists = (exe) => { if (!exe || !fs.existsSync(exe)) throw Object.assign(new Error(`Executable doesn't exist at ${exe}`), { binary: true }); };
+const dlOpts = (downloads) => (downloads ? { acceptDownloads: true, downloadsPath: downloads } : { acceptDownloads: false });
 function definitions(importer) {
   return {
     chromium: {
@@ -128,10 +130,10 @@ function definitions(importer) {
       // Headless runs use Playwright's separate headless shell, whose path the API doesn't expose: checked at launch.
       async check(bt, cfg) { if (!cfg.headless) exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
       launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: cfg.chromiumSandbox }),
-      async open(bt, { cfg, dir, locale, timezone, shared, media, proxy }) {
-        const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}) };
+      async open(bt, { cfg, dir, locale, timezone, shared, media, proxy, downloads }) {
+        const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: false, ...(proxy ? { proxy } : {}) };
         if (dir) applyWebrtcPolicy(dir, !!proxy);
-        if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, chromiumSandbox: cfg.chromiumSandbox, args: chromiumArgs(proxy, media?.args || []), ...(media?.env ? { env: media.env } : {}), ...o }) };
+        if (dir) return { ctx: await bt.launchPersistentContext(dir, { headless: cfg.headless, chromiumSandbox: cfg.chromiumSandbox, args: chromiumArgs(proxy, media?.args || []), ...(media?.env ? { env: media.env } : {}), ...o, ...dlOpts(downloads) }) };
         const browser = await shared();
         return { ctx: await browser.newContext(o), browser };
       },
@@ -142,12 +144,12 @@ function definitions(importer) {
       async check(bt, cfg) { exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
       // Recommended patchright setup: persistent context, no custom UA/headers, no automation-flag args, the
       // browser's own window size (viewport: null).
-      async open(bt, { cfg, dir, locale, timezone, media, proxy }) {
+      async open(bt, { cfg, dir, locale, timezone, media, proxy, downloads }) {
         applyWebrtcPolicy(dir, !!proxy);
         const ctx = await bt.launchPersistentContext(dir, {
           channel: 'chromium', headless: cfg.headless, viewport: null, locale, timezoneId: timezone,
           args: ['--window-size=1366,900', ...(proxy ? PROXY_ARGS : []), ...(media?.args || [])],
-          chromiumSandbox: cfg.chromiumSandbox, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}),
+          chromiumSandbox: cfg.chromiumSandbox, ...dlOpts(downloads), ...(proxy ? { proxy } : {}),
           ...(media?.env ? { env: media.env } : {}),
         });
         return { ctx };
@@ -164,10 +166,10 @@ function definitions(importer) {
       // OS matches the host unless CAMOUFOX_OS says otherwise, so fonts and rendering stay consistent with the claimed
       // platform. humanize stays off: with Playwright 1.64 its cursor patch makes actionability checks hang.
       // A proxied tenant's Firefox gets the proxy and PROXY_FIREFOX_PREFS (PROXY_ARGS are Chromium flags).
-      async open({ launchOptions, firefox }, { cfg, dir, locale, timezone, proxy }) {
+      async open({ launchOptions, firefox }, { cfg, dir, locale, timezone, proxy, downloads }) {
         const opts = await launchOptions({ headless: cfg.headless, os: cfg.camoufoxOs || hostOs(), locale, humanize: false });
         const prefs = proxy ? { firefoxUserPrefs: { ...opts.firefoxUserPrefs, ...PROXY_FIREFOX_PREFS } } : {};
-        return { ctx: await firefox.launchPersistentContext(dir, { ...opts, ...prefs, viewport: null, timezoneId: timezone, acceptDownloads: cfg.downloads, ...(proxy ? { proxy } : {}) }) };
+        return { ctx: await firefox.launchPersistentContext(dir, { ...opts, ...prefs, viewport: null, timezoneId: timezone, ...dlOpts(downloads), ...(proxy ? { proxy } : {}) }) };
       },
     },
   };
@@ -197,21 +199,22 @@ export function createEngines({ importer = defaultImporter, overrides = {} } = {
       const bt = await load(name);
       try { await get(name).check?.(bt, cfg); } catch (e) { throw explain(name, e); }
     },
-    // Opens a context. Ephemeral sessions of non-shared engines, of meetings and of proxied tenants get a private temp
-    // profile (tmpDir, removed on close): a proxied tenant's browser needs its own launch flags and profile
-    // preferences (applyWebrtcPolicy: full Chromium ignores the WebRTC flag), so it never shares a browser.
-    async open(name, { cfg, profileDir, locale, timezone, shared, media, proxy = null }) {
+    // Opens a context. Ephemeral sessions of non-shared engines, of meetings, of proxied tenants and of sessions that
+    // may download get a private temp profile (tmpDir, removed on close): a proxied tenant's browser needs its own
+    // launch flags and profile preferences (applyWebrtcPolicy: full Chromium ignores the WebRTC flag), and the download
+    // directory is a launch option, so neither ever shares a browser.
+    async open(name, { cfg, profileDir, locale, timezone, shared, media, proxy = null, downloads = null }) {
       const def = get(name);
       if (media && def.family !== 'chromium') throw new EngineUnavailableError(`meetings need a Chromium engine (chromium or patchright), not ${name}`);
       const bt = await load(name);
       let dir = profileDir, tmpDir = null;
-      if (!dir && (!def.shared || media || proxy)) { // media, proxy: a browser process of its own
+      if (!dir && (!def.shared || media || proxy || downloads)) { // media, proxy, downloads: a browser process of its own
         tmpDir = dir = path.join(cfg.dataDir, 'tmp', `${name}-${crypto.randomBytes(6).toString('hex')}`);
         fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       }
       // The caller owns dir/tmpDir from here on, also on failure: a launch that timed out may have left processes.
       try {
-        const r = await def.open(bt, { cfg, dir, locale, timezone, shared: () => shared(def, bt), media, proxy });
+        const r = await def.open(bt, { cfg, dir, locale, timezone, shared: () => shared(def, bt), media, proxy, downloads });
         return { ...r, dir: r.browser ? null : dir, tmpDir };
       } catch (e) {
         throw Object.assign(explain(name, e), { dir, tmpDir });

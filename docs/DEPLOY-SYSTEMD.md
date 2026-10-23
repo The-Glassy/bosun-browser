@@ -210,11 +210,12 @@ FEATURES_ENGINES=chromium
   masking helpers in an isolated world, which stops a page from switching masking off — but not from copying what
   the human typed somewhere masking does not look (review finding H2). No engine makes an untrusted page safe to
   type a credential into.
-- `DOWNLOADS=0` (the default) means the browser context refuses downloads, so a page cannot write files at
-  all. With `DOWNLOADS=1`, `DOWNLOADS_MAX_MB` (per session) and `DOWNLOADS_TOTAL_MAX_MB` (service-wide) bound what
-  is kept; one download may still use its own size transiently before it is measured, and Playwright keeps download
-  files under `/tmp` — which is RAM-backed on most systems and, with `PrivateTmp=yes`, private to this unit. Give
-  the volume a quota, or keep downloads off.
+- Downloads are refused by the browser for every tenant not named in `BROWSER_TENANT_DOWNLOAD_ALLOW`, so a page
+  cannot write files at all. A named tenant's sessions write downloads into `BROWSER_DATA/downloads` on the data
+  volume (never `/tmp`, which is RAM-backed and counts against `MemoryMax`). Each file is cancelled past
+  `DOWNLOAD_MAX_BYTES` (300 MB), and each tenant's holding past `DOWNLOAD_TENANT_QUOTA_BYTES` (1 GB). Size the volume
+  for the quota times the tenants that download. Kept files go once fetched, after an hour, and at every start.
+  `DOWNLOADS=1` and the old `DOWNLOADS_*_MB` budgets stop the service (replaced in 0.11).
 - Uploads (`FEATURES_UPLOADS=1`, the default) land in `BROWSER_DATA/uploads`, on the data volume and not in `/tmp`,
   so they never count against `MemoryMax`. `UPLOAD_MAX_BYTES` (300 MB per file) and `UPLOAD_TENANT_QUOTA_BYTES`
   (1 GB per tenant) bound them; files go when their session closes, after an hour, and at every start. Size the
@@ -246,7 +247,8 @@ FEATURES_ENGINES=chromium
 - [ ] Every tenant that should be restricted appears in `BROWSER_TENANT_ALLOW`; a `navigate` to another host is
       refused, and the refusal shows up in the journal without the query.
 - [ ] `FEATURES_MEETINGS` matches whether meetings are used, `FEATURES_ENGINES` lists only what is installed,
-      `DOWNLOADS=0` (or a quota on the volume), `FEATURES_UPLOADS` and the upload quota fit the volume.
+      `BROWSER_TENANT_DOWNLOAD_ALLOW` names only the tenants that need downloads, and their quota, `FEATURES_UPLOADS`
+      and the upload quota fit the volume.
 - [ ] The service started without a `CHROMIUM_SANDBOX=0` warning, and no renderer process shows `--no-sandbox`.
 - [ ] Egress to private ranges is blocked for the service.
 - [ ] `ALLOW_NO_TOKEN` is unset.

@@ -3,7 +3,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 import { startBosun, connect, until, sleep, TOKEN_B } from './helpers.mjs';
-import { FEATURE_SET, NEEDS_HUMAN, WATCH_SET, WATCH_CHANGED, MEETING_SET, MEETING_TAGS } from '../src/events.mjs';
+import { FEATURE_SET, NEEDS_HUMAN, WATCH_SET, WATCH_CHANGED, MEETING_SET, MEETING_TAGS, DOWNLOAD_SET } from '../src/events.mjs';
 
 let svc;
 before(async () => { svc = await startBosun({ KEEPALIVE: '0' }); });
@@ -26,7 +26,7 @@ test('the manifest declares bosun.handoff and bosun.watch with pushEvents; mcpl/
   const c = await host();
   const m = c.getServerCapabilities().experimental.mcpl;
   assert.equal(m.pushEvents, true);
-  assert.deepEqual(Object.keys(m.featureSets), [FEATURE_SET, WATCH_SET, MEETING_SET]);
+  assert.deepEqual(Object.keys(m.featureSets), [FEATURE_SET, WATCH_SET, MEETING_SET, DOWNLOAD_SET]);
   assert.deepEqual(Object.keys(m.featureSets[MEETING_SET].tagOntology.tags), Object.values(MEETING_TAGS));
   assert.deepEqual(m.featureSets[FEATURE_SET].uses, ['pushEvents']);
   assert.deepEqual(m.featureSets[WATCH_SET].uses, ['pushEvents']);

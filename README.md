@@ -7,7 +7,7 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 > and [CHANGELOG.md](CHANGELOG.md).
 
 > Security: Chromium runs **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), downloads are refused
-> by default (`DOWNLOADS=0`), and a tenant can be kept to a [host allowlist](#per-tenant-host-allowlist)
+> unless a tenant is given [download hosts](#downloading-files), and a tenant can be kept to a [host allowlist](#per-tenant-host-allowlist)
 > (`BROWSER_TENANT_ALLOW`). A review of 0.7.0, and what is still risky, is in
 > [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md); a Linux deployment guide is in
 > [docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md).
@@ -22,6 +22,7 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
   `keepalive_set` / `keepalive_list` / `keepalive_remove`, `upload_create` / `upload` (unless `FEATURES_UPLOADS=0`),
+  `download_wait` / `downloads` / `download_get` (tenants with download hosts),
   and (unless `FEATURES_MEETINGS=0`) `meeting_join` /
   `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
   `meeting_leave` / `meeting_recording_delete`.
@@ -93,8 +94,11 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `UPLOAD_BASE_URL` | – (the `Host` the client connected with, `http://`) | where tenants reach the MCP port, for the PUT URL; set it behind TLS or another name |
 | `FEATURES_ENGINES` | all three | engines a session may ask for, comma list (e.g. `chromium`); `ENGINE` is always included |
 | `CHROMIUM_SANDBOX` | `1` | `0` = run Chromium without its own sandbox (logged at every start); see [Chromium sandbox](#chromium-sandbox) |
-| `DOWNLOADS` | `0` | `1` = let pages download files (with the budget below); `0` = the context refuses them |
-| `DOWNLOADS_MAX_MB` / `DOWNLOADS_TOTAL_MAX_MB` | 100 / 500 | downloaded bytes a session, and the whole service, may keep |
+| `BROWSER_TENANT_DOWNLOAD_ALLOW` | – (no downloads) | `glassy=web.plaud.ai,*.plaud.ai; ops=*`: which tenants keep downloads, and from which hosts (see [Downloading files](#downloading-files)) |
+| `DOWNLOAD_MAX_BYTES` | 314572800 (300 MB) | largest file a download may be; past it the browser cancels it mid-stream |
+| `DOWNLOAD_TENANT_QUOTA_BYTES` | 1073741824 (1 GB) | downloaded bytes one tenant may hold at a time, running and kept (at least `DOWNLOAD_MAX_BYTES`) |
+| `DOWNLOAD_TTL_SEC` / `DOWNLOAD_URL_TTL_SEC` | 3600 / 900 | a download not fetched is deleted this long after it finished; a GET URL is valid this long |
+| `DOWNLOADS` | `0` | before 0.11 the service-wide switch; `0` is still accepted, `1` stops the service with a hint (use `BROWSER_TENANT_DOWNLOAD_ALLOW`, `*` for any host) |
 | `WS_HOST` / `WS_PORT` | `127.0.0.1` / – | WebSocket MCP listener (stdio when `WS_PORT` is unset) |
 | `WS_ALLOWED_ORIGINS` | – | comma list of browser Origins allowed to connect (non-browser clients send none) |
 | `ALLOW_NO_TOKEN` | – | `1` = no auth, loopback only |
@@ -188,6 +192,64 @@ Drag-and-drop is best effort:
 
 Prefer the page's file input or its "Upload" button where there is one: both are as good as a person picking a
 file.
+
+## Downloading files
+
+Off for every tenant unless `BROWSER_TENANT_DOWNLOAD_ALLOW` names it. A tenant that is not named gets the browser
+of 0.10 and earlier: its contexts refuse downloads and nothing a page fetches is written to disk.
+
+```sh
+BROWSER_TENANT_DOWNLOAD_ALLOW='glassy=web.plaud.ai,*.plaud.ai'   # host, *.host, host:port, * — like BROWSER_TENANT_ALLOW
+```
+
+```text
+click { session, selector: "button:has-text('Export')" }
+  -> { url, title, downloads: [ { download_id: "d4c…", state: "ready", filename: "Meeting.txt", size: 18342,
+                                  mime: "text/plain", source_host: "<bucket>.s3.amazonaws.com",
+                                  page_host: "web.plaud.ai", allowed_by: "page origin", expires_in_min: 60 } ] }
+download_wait { session, timeoutMs? }        # a download that takes longer than click waits (5 s), or one started otherwise
+downloads { session? }                       # running, ready, refused and failed ones, with reasons
+download_get { download_id }
+  -> { get_url: "http://127.0.0.1:8002/download/d4c…?t=…", curl: "curl -sS --fail-with-body -o 'Meeting.txt' '…'", valid_min: 15 }
+download_get { download_id, inline: true }   # UTF-8 text up to 256 KB comes back as content instead
+```
+
+- **Which downloads are kept.** One whose URL's host is on the tenant's list, **or** one started by a page whose
+  top-level origin is on it. So a Plaud export kept from `web.plaud.ai` may come from S3, `api.plaud.ai` or a
+  `blob:` the page made, without listing those. `blob:` and `data:` URLs have no host of their own and are judged
+  by the page. A popup with no page of its own (`about:blank`) is judged by its opener. Anything else is cancelled,
+  and the reason is in `click`, `download_wait`, `downloads` and the event, e.g. `example.com from page example.com:
+  neither is in the download allowlist of this token`.
+- **Where the bytes go.**
+  - A session that may download gets a browser of its own. That browser writes downloads, streamed, into a
+    directory of that session on the data volume (`BROWSER_DATA/downloads/<tenant>/.in-…`): never into `/tmp`
+    (tmpfs, counted against `MemoryMax`), and never through Bosun's memory.
+  - The file's size is checked every 250 ms while it grows. Past `DOWNLOAD_MAX_BYTES` or the tenant's
+    `DOWNLOAD_TENANT_QUOTA_BYTES`, the download is cancelled mid-stream and the browser deletes what it wrote.
+  - At most 50 downloads per tenant, running or kept.
+  - A finished file moves to `BROWSER_DATA/downloads/<tenant>/<download_id>/<filename>` (0600). There it outlives
+    its session.
+- **Fetching.**
+  - `download_get` gives a one-time GET URL on the MCP port, the same port and address as the upload PUT
+    (`UPLOAD_BASE_URL` applies), valid for `DOWNLOAD_URL_TTL_SEC`.
+  - Instead of `?t=`, `GET /download/<download_id>` with the tenant's own `Authorization: Bearer` token works too.
+  - Once the whole file has been sent, it is deleted. An interrupted GET leaves it, so call `download_get` again.
+  - At most 4 GETs per tenant at once (`429`).
+- **Gone.** Once fetched, `DOWNLOAD_TTL_SEC` (1 h) after it finished, and all of them at every start and on
+  shutdown.
+- **Tenants.** Another tenant's `download_id` answers like one that never existed, and a GET with another tenant's
+  token is refused. Read-only tokens (policy `ephemeral`) never download: the service refuses to start if one is
+  named.
+- **Events.** MCPL feature set `bosun.download`, tag `bosun:download` (`bosun:state=ready|refused|failed`), when a
+  download finishes or is refused.
+- **What starts a download.** Only sessions the agent opens with `session_open` (profile or not). Keepalive visits
+  and meetings never keep a download.
+- **`navigate` to a download URL.** The page stays where it was, and the result carries `downloads`.
+- **Limits.**
+  - The type (`mime`) comes from the file name's extension; the browser does not report the response's.
+  - The size check samples every 250 ms, so a very fast download can pass the limit by what arrives in that time
+    before it is cancelled.
+  - A download a person starts during a handoff is kept for the agent like any other.
 
 ## Handoff
 
@@ -523,8 +585,8 @@ With policy `ephemeral` the server enforces, not just hides:
 - The tenant has `BROWSER_EPHEMERAL_MAX_SESSIONS` sessions at most, across all its connections. Sessions belong to
   the connection and close when it closes (or after `IDLE_TIMEOUT_SEC`).
 - Nothing is written to `BROWSER_DATA`: screenshots are returned but never saved, even with `SAVE_SHOTS=1`. Ephemeral
-  sessions use temporary browser profiles that are deleted on close; Playwright keeps downloads in its own temporary
-  directory and deletes them with the session. `upload_create` and `upload` are refused, and so is an upload PUT
+  sessions use temporary browser profiles that are deleted on close, and their browsers refuse downloads (a read-only
+  tenant can't be given download hosts). `upload_create` and `upload` are refused, and so is an upload PUT
   that carries this token.
 - No MCPL push events.
 
@@ -661,8 +723,9 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
 - The browser runs with its own sandbox (see [Chromium sandbox](#chromium-sandbox)). Without it (0.7.0 and earlier,
   or `CHROMIUM_SANDBOX=0`) Chromium runs with `--no-sandbox`: then a renderer compromise is directly on the service user,
   which is where the profiles and the service's environment (tokens included) are.
-- Downloads are off by default (`DOWNLOADS=0`), and bounded by a disk budget when enabled, so a page cannot fill
-  the volume.
+- Downloads are off unless a tenant is named in `BROWSER_TENANT_DOWNLOAD_ALLOW`, and then kept only from its hosts
+  (or pages on them), streamed to the data volume and cancelled past a per-file cap and a per-tenant quota, so a page
+  cannot fill the volume or RAM. Kept files leave once fetched, after an hour and at every start.
 - Uploads are written to `BROWSER_DATA/uploads` (on the data volume, not a RAM-backed `/tmp`) under a per-file cap
   and a per-tenant quota, and deleted after use, after an hour and at every start. Once a file is in a page, the page
   can send it anywhere it can reach: upload only what you would hand that site.

@@ -105,8 +105,12 @@ test('the engine launches Chromium with its sandbox, and refuses downloads by de
   await real.open({}, { cfg: loadConfig({}), dir: null, locale: 'de-AT', timezone: 'Europe/Vienna', shared });
   assert.equal(ctxOpts.acceptDownloads, false);
   assert.equal(ctxOpts.proxy, undefined);
-  await real.open({}, { cfg: loadConfig({ DOWNLOADS: '1' }), dir: null, locale: 'de-AT', timezone: 'Europe/Vienna', shared });
-  assert.equal(ctxOpts.acceptDownloads, true);
+  // A session that may download (src/downloads.mjs) gets a persistent browser of its own writing into its directory;
+  // the shared browser's contexts never accept downloads.
+  let dlOpts;
+  await real.open({ launchPersistentContext: async (_d, o) => { dlOpts = o; return {}; } }, { cfg: loadConfig({}), dir: tmpDir(), locale: 'de-AT', timezone: 'Europe/Vienna', shared, downloads: '/data/downloads/t/.in-x' });
+  assert.equal(dlOpts.acceptDownloads, true);
+  assert.equal(dlOpts.downloadsPath, '/data/downloads/t/.in-x');
   // A proxied tenant's browser is a persistent one of its own: the proxy (with <-loopback>, so even loopback goes
   // through it), the flags that keep traffic inside it (no QUIC, no WebRTC UDP of its own), and the WebRTC preference
   // in its profile, which full Chromium reads instead of the flag.
@@ -126,6 +130,9 @@ test('the engine launches Chromium with its sandbox, and refuses downloads by de
   const r = await engines.open('chromium', { cfg: loadConfig({ BROWSER_DATA: tmpDir() }), profileDir: null, locale: 'de-AT', timezone: 'Europe/Vienna', proxy, shared: async () => { sharedAsked = true; } });
   assert.equal(sharedAsked, false);
   assert.ok(r.tmpDir, 'a proxied ephemeral session gets a temp profile of its own');
+  const rd = await engines.open('chromium', { cfg: loadConfig({ BROWSER_DATA: tmpDir() }), profileDir: null, locale: 'de-AT', timezone: 'Europe/Vienna', downloads: tmpDir(), shared: async () => { sharedAsked = true; } });
+  assert.equal(sharedAsked, false);
+  assert.ok(rd.tmpDir, 'so does a session that may download');
 });
 
 test('a sandbox that cannot start stops the service with what the operator has to do', { skip: process.platform !== 'linux' && 'the startup preflight runs on Linux only' }, async () => {
