@@ -1,5 +1,6 @@
 // Sensitive-field handling: find credential/OTP inputs by DOM type and metadata (not just the accessible label),
 // mask their values in snapshots, mask them in screenshots, and clear them after an unsuccessful handoff.
+import crypto from 'crypto';
 
 // Fields that are sensitive by markup alone. Also used as the screenshot mask together with MARK_ATTR.
 export const SENSITIVE_CSS = [
@@ -99,6 +100,31 @@ export function passwordTracker() {
   }
   watch(document);
   document.addEventListener('DOMContentLoaded', () => sweep(document), { once: true });
+}
+
+// An input Bosun types a secret into stays sensitive from then on, whatever its type or label (masked in read and
+// screenshot, cleared like a credential field): it joins the set of former password fields in the scans' world. The
+// locator may run in another world, so the element is tagged with a one-off attribute and found again by it.
+export async function markSensitive(page, l) {
+  const key = crypto.randomBytes(8).toString('hex');
+  await l.evaluate((el, k) => el.setAttribute('data-bosun-secret', k), key, { timeout: 15000 });
+  const found = await eachFrame(page, (k) => {
+    const KEY = Symbol.for('bosun.sensitive');
+    const seen = window[KEY] || (window[KEY] = new WeakSet());
+    const out = [];
+    const roots = [document];
+    for (let i = 0; i < roots.length; i++) {
+      for (const el of roots[i].querySelectorAll('*')) {
+        if (el.shadowRoot) roots.push(el.shadowRoot);
+        if (el.getAttribute('data-bosun-secret') !== k) continue;
+        seen.add(el);
+        el.removeAttribute('data-bosun-secret');
+        out.push(1);
+      }
+    }
+    return out;
+  }, key);
+  if (!found.length) throw new Error('could not mark the field for masking (did the page replace it?); nothing was typed');
 }
 
 // For engines without same-world init scripts: install the tracker in Bosun's world in every frame.

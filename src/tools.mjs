@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { countNodes, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
+import { countNodes, markSensitive, maskText, maskedScreenshot, sensitiveValues } from './redact.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, TENANT_RE } from './auth.mjs';
 import { urlKey, httpUrl, HANDOFF_ACTIVE } from './sessions.mjs';
 
@@ -12,6 +12,7 @@ import { MIN_PERIOD_MIN } from './keepalive.mjs';
 import { meetRefusalPage } from './meetings/platforms/meet.mjs';
 import { challengeShown } from './meetings/platforms/common.mjs';
 import { BASE64_MAX_BYTES } from './uploads.mjs';
+import { SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS } from './secrets.mjs';
 import { INLINE_MAX_BYTES } from './downloads.mjs';
 import { showPattern } from './allow.mjs';
 
@@ -194,7 +195,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.11.2' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.12.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -301,12 +302,49 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     return ok({ ...(await pageInfo(s.page)), ...(w ? { blocked: w } : {}), ...(dl.length ? { downloads: dl.map((f) => capture.info(f)) } : {}) });
   }));
 
-  tool('type', 'Fill a field. submit=true presses Enter.', { session: str(40), ...target, value: str(10000), submit: z.boolean().optional() }, async (a) => run(a.session, async (s) => {
-    const l = locate(s.page, a);
-    await l.fill(a.value, { timeout: 15000 });
-    if (a.submit) { await l.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
-    return ok(await pageInfo(s.page));
-  }));
+  const secrets = manager.secrets ?? null;
+  tool('type', `Fill a field with value. submit=true presses Enter.${secrets && !ephemeral ? ' For a password or other secret, pass secret_id (from secret_create) instead of value: Bosun types it without it passing through you, then deletes it. A secret goes only into an <input type=password>, unless allow_non_password=true (an OTP or e-mail field); that field is masked in read and screenshot from then on.' : ''}`,
+    { session: str(40), ...target, value: str(10000).optional(), ...(secrets ? { secret_id: str(40).optional(), allow_non_password: z.boolean().optional() } : {}), submit: z.boolean().optional() },
+    async (a) => {
+      if ((a.value === undefined) === (a.secret_id === undefined)) throw new Error(secrets ? 'give value or secret_id (not both)' : 'give value');
+      if (a.secret_id !== undefined && ephemeral) throw new Error(`type with secret_id: ${NOT_ALLOWED}`);
+      return run(a.session, async (s) => {
+        const l = locate(s.page, a);
+        if (a.secret_id !== undefined) return ok(await typeSecret(s, l, a));
+        await l.fill(a.value, { timeout: 15000 });
+        if (a.submit) { await l.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
+        return ok(await pageInfo(s.page));
+      });
+    });
+
+  // type with secret_id: the field is checked and marked sensitive first, then the secret is taken (deleted) and
+  // typed. Nothing returned or thrown carries it: the URL and title (a page may echo it there) and any error are
+  // masked with the value itself.
+  const NO_SECRET_TYPES = new Set(['file', 'checkbox', 'radio', 'submit', 'button', 'image', 'reset', 'hidden', 'range', 'color']);
+  async function typeSecret(s, l, a) {
+    secrets.find(tenant, a.secret_id); // fails before the page is touched
+    const kind = await l.evaluate((el) => (el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName === 'textarea' ? 'textarea' : `<${el.localName}>`), null, { timeout: 15000 });
+    if (kind.startsWith('<') || NO_SECRET_TYPES.has(kind)) throw new Error(`a secret goes only into a text field (<input> or <textarea>); this element is ${kind.startsWith('<') ? kind : `<input type=${kind}>`}`);
+    if (kind !== 'password' && !a.allow_non_password) throw new Error(`this field is ${kind === 'textarea' ? 'a <textarea>' : `<input type=${kind}>`}, not a password field; pass allow_non_password: true to type the secret into it anyway (an OTP or e-mail field). The secret was not used.`);
+    await markSensitive(s.page, l);
+    const buf = secrets.take(tenant, a.secret_id);
+    let value = buf.toString('utf8');
+    buf.fill(0);
+    // As typed, and as a form that submits with GET puts it into the URL.
+    const forms = [...new Set([value, encodeURIComponent(value), new URLSearchParams({ v: value }).toString().slice(2)])];
+    const hide = (t) => forms.reduce((out, f) => (value && out.includes(f) ? out.split(f).join('[masked]') : out), String(t));
+    try {
+      await l.fill(value, { timeout: 15000 });
+      if (a.submit) { await l.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
+      const info = await pageInfo(s.page);
+      console.error(`bosun: secret ${a.secret_id} of tenant ${tenant}: typed in session ${s.id}, ${Buffer.byteLength(value)} bytes`);
+      return { ...info, url: hide(info.url), title: hide(info.title), secret: 'typed and deleted' };
+    } catch (e) {
+      throw new Error(`${hide(cleanError(e))} (the secret is deleted; call secret_create for a new one)`);
+    } finally {
+      value = null;
+    }
+  }
 
   tool('select', 'Choose an option in a <select>.', { session: str(40), ...target, value: str(1000) }, async (a) => run(a.session, async (s) => {
     await locate(s.page, a).selectOption({ label: a.value }, { timeout: 15000 }).catch(() => locate(s.page, a).selectOption(a.value, { timeout: 15000 }));
@@ -348,6 +386,25 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       const file = await manager.saveShot(s, buf);
       return { content: [{ type: 'image', data: buf.toString('base64'), mimeType: 'image/jpeg' }, { type: 'text', text: file || 'not saved to disk (SAVE_SHOTS=1 enables it)' }] };
     }));
+
+  // Secrets: sent by the agent's shell over a one-time PUT, typed with type secret_id, never in a tool call.
+  if (secrets) {
+    tool('secret_create', `Get a password or other secret to the browser without it passing through you. Returns secret_id and a one-time PUT URL (valid ${SECRET_URL_TTL_MS / 60000} min, this token only) with a curl line that reads the secret from stdin: pipe it in from where it is stored (e.g. sops -d --extract '["password"]' secrets.yaml | curl …), never echo it or put it in a command line. Up to ${SECRET_MAX_BYTES} bytes of UTF-8; one trailing newline is dropped. Then call type with secret_id: the secret goes into an <input type=password> (other fields only with allow_non_password=true) and is deleted. Kept in memory only, ${SECRET_TTL_MS / 60000} min after it arrived at most, never on disk or in a log.`,
+      { label: str(100).optional().describe('what it is, for you (e.g. "github password"); not secret') },
+      async (a) => {
+        if (!cfg.ws) throw new Error('secret_create needs the WebSocket service (WS_PORT): the secret comes in over an HTTP PUT on that port');
+        const x = secrets.create(tenant, { label: a.label ?? null });
+        const where = `/secret/${x.id}?t=${x.token}`;
+        const url = uploadBase ? `${uploadBase}${where}` : null;
+        return ok({
+          secret_id: x.id, ...(a.label ? { label: a.label } : {}), put_url: url ?? where,
+          ...(url ? {} : { put_url_note: 'PUT to the host:port of your MCP URL, http, with this path' }),
+          curl: `curl -sS --fail-with-body -T - ${shq(url ?? `http://<mcp host:port>${where}`)}`,
+          valid_min: SECRET_URL_TTL_MS / 60000, max_bytes: SECRET_MAX_BYTES,
+          next: 'pipe the secret into the curl line (stdin; the URL works once), then call type with secret_id',
+        });
+      });
+  }
 
   // Uploads: files of this tenant only, put into a page with upload.
   const uploads = manager.uploads;

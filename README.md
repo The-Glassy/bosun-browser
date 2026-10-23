@@ -21,7 +21,7 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - MCP server over **stdio** (Claude Code, Codex, …) or **WebSocket** (shared service).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
-  `keepalive_set` / `keepalive_list` / `keepalive_remove`, `upload_create` / `upload` (unless `FEATURES_UPLOADS=0`),
+  `keepalive_set` / `keepalive_list` / `keepalive_remove`, `secret_create`, `upload_create` / `upload` (unless `FEATURES_UPLOADS=0`),
   `download_wait` / `downloads` / `download_get` (tenants with download hosts),
   and (unless `FEATURES_MEETINGS=0`) `meeting_join` /
   `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
@@ -36,6 +36,9 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - **File uploads** into pages: the agent sends the file with one `curl -T` to a one-time URL on the MCP port
   (streamed to disk, up to 300 MB), then `upload` puts it into a file input, answers the file chooser a button
   opens, or drops it on a drop zone. See [Uploading files](#uploading-files).
+- **Typing secrets** without them passing through the agent: the agent's shell pipes the password into a one-time
+  URL on the MCP port (`sops … | curl -T - …`), and `type { secret_id }` fills it in. It is kept in memory only,
+  typed once, and goes into password fields unless the call allows others. See [Typing secrets](#typing-secrets).
 - Sessions are **ephemeral** (wiped on close) or use a named **persistent profile** of the tenant (stays logged in;
   no RAM while idle). A session belongs to the connection that opened it: other connections can't see, use or close
   it, and it is closed when that connection goes away or after `IDLE_TIMEOUT_SEC` without use.
@@ -192,6 +195,50 @@ Drag-and-drop is best effort:
 
 Prefer the page's file input or its "Upload" button where there is one: both are as good as a person picking a
 file.
+
+## Typing secrets
+
+`type { value: "<password>" }` puts the password into the tool call, so it ends up in the agent's transcript and in
+whatever logs the MCP client keeps. With a secret id the agent's shell sends the password to Bosun itself, and the
+tool call carries only the id:
+
+```text
+secret_create { label: "github password" }
+  -> { secret_id: "s9c…", put_url: "http://127.0.0.1:8002/secret/s9c…?t=…",
+       curl: "curl -sS --fail-with-body -T - 'http://127.0.0.1:8002/secret/s9c…?t=…'", valid_min: 15, max_bytes: 4096 }
+$ sops -d --extract '["github"]["password"]' secrets.yaml | curl -sS --fail-with-body -T - 'http://127.0.0.1:8002/secret/s9c…?t=…'
+  -> {"secret_id":"s9c…","label":"github password","bytes":24,"valid_min":10}
+type { session, selector: "#password", secret_id: "s9c…", submit: true }
+  -> { url, title, secret: "typed and deleted" }
+```
+
+- **Pipe it, never print it.** The curl line reads the secret from stdin (`-T -`). Feed it from where the secret
+  lives (`sops --extract`, `pass show`, a file), not from `echo` with the secret on the command line. One trailing
+  newline is dropped, so `pass show x | curl …` works. Up to 4096 bytes of UTF-8; empty or invalid UTF-8 is `400`,
+  more is `413`.
+- **The PUT goes where uploads go:** the MCP host and port, one request, within 15 min, for the tenant that asked.
+  `PUT /secret/<id>` with the tenant's own Bearer token works instead of `?t=`; another tenant's token is `403`.
+- **Memory only.** Bosun keeps the secret in a buffer of its own: never on disk, never in a log line, an event or a
+  tool result. Log lines name the id and the length in bytes. The buffer is zeroed when the secret is typed, 10 min
+  after it arrived, or when the service stops; a restart loses every secret.
+- **Typed once.** `type` with `secret_id` takes the secret out of the store, fills the field and returns the URL and
+  title with the secret replaced by `[masked]` (also URL-encoded, for a form that submits with GET). A second `type`
+  with that id gets "no secret …", the same answer as for an id that never existed or belongs to another tenant. If
+  the fill fails after the secret was taken, it is gone too: call `secret_create` again. Errors never carry it.
+- **Password fields only, unless you say otherwise.** The field must be an `<input type=password>`. For an OTP, an
+  e-mail address or a user name pass `allow_non_password: true`; any text `<input>` or `<textarea>` then takes it.
+  Checkboxes, buttons, file inputs and non-inputs are refused. A refusal before the fill leaves the secret unused.
+- **Masked afterwards.** A field Bosun typed a secret into counts as a credential field from then on, whatever its
+  type or label: `read` shows `[masked]` for it (and for the value wherever else it appears in the page dump),
+  `screenshot` blacks it out, and it is cleared after a handoff that ends with Give up, like a password field.
+- **Read-only tokens** (policy `ephemeral`) get no secrets: `secret_create` is refused, so is `type` with
+  `secret_id`, and so is a PUT with such a token.
+- **stdio:** without `WS_PORT` there is no port to PUT to, and `secret_create` says so.
+
+What this does not change: once the secret is in the page, the page has it. A page can copy it into ordinary text,
+into its title or URL in a form Bosun doesn't recognise, or send it anywhere it can reach, and on engine `chromium` a
+page can switch off the masking helpers (see [Security notes](#security-notes)). Type secrets only into pages you
+would give them to by hand.
 
 ## Downloading files
 
@@ -737,6 +784,9 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
 - Uploads are written to `BROWSER_DATA/uploads` (on the data volume, not a RAM-backed `/tmp`) under a per-file cap
   and a per-tenant quota, and deleted after use, after an hour and at every start. Once a file is in a page, the page
   can send it anywhere it can reach: upload only what you would hand that site.
+- Secrets sent for `type { secret_id }` stay in the service's memory (at most 4 KB each, 20 per tenant, 10 min),
+  never on disk or in its log, and are zeroed once typed. They keep the password out of the agent's transcript, not
+  out of the page: the page that receives one can do with it what it likes.
 - Credential masking around a handoff covers credential **fields** — their value, and values Bosun saw in them. A
   page that copies what the human typed into ordinary text, or into something it reads later, is not masked on
   **any** engine, and on `chromium` a page can also neutralize the masking helpers outright (they run in its own
