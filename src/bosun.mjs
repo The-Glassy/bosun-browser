@@ -11,6 +11,7 @@ import { EventBus } from './events.mjs';
 import { Meetings } from './meetings/index.mjs';
 import { Uploads } from './uploads.mjs';
 import { Downloads } from './downloads.mjs';
+import { Secrets } from './secrets.mjs';
 
 export async function startService(cfg, { engines, keepalive: kaOpts = {}, meetings: mOpts = {} } = {}) {
   let live = null;
@@ -31,6 +32,8 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
     if (cfg.features.uploads) manager.uploads = new Uploads(cfg);
     // Downloads (tenants named in BROWSER_TENANT_DOWNLOAD_ALLOW). Also wipes what an earlier process left.
     manager.downloads = new Downloads(cfg, { events });
+    // Secrets to type (type with secret_id): in memory only, so a restart drops them.
+    manager.secrets = new Secrets();
   } catch (e) { await live?.close(); throw e; }
   if (cfg.keepalive) keepalive.start();
   const ws = cfg.ws ? await startWsServer({ cfg, manager }) : null;
@@ -42,9 +45,10 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
     await Promise.allSettled([keepalive.stop(), manager.meetings?.stop()]);
     await Promise.allSettled([ws?.close(), live?.close()]);
     await manager.closeAll();
+    manager.secrets?.close();
     await Promise.allSettled([manager.uploads?.close(), manager.downloads?.close()]);
   })());
-  return { cfg, live, manager, ws, keepalive, events, meetings: manager.meetings ?? null, uploads: manager.uploads ?? null, downloads: manager.downloads, shutdown };
+  return { cfg, live, manager, ws, keepalive, events, meetings: manager.meetings ?? null, uploads: manager.uploads ?? null, downloads: manager.downloads, secrets: manager.secrets, shutdown };
 }
 
 // The one rejection from inside the browser driver that no caller can catch and that must not end the service:
@@ -78,6 +82,8 @@ export async function main(env = process.env) {
   if (!cfg.chromiumSandbox && cfg.engine !== 'camoufox') {
     console.error('bosun: WARNING — CHROMIUM_SANDBOX=0: the browser runs without its own sandbox, so a renderer that is compromised by a page lands directly on this user');
   }
+  // Node's own diagnostics print request bodies (NODE_DEBUG=stream): secrets are refused then, and said so here.
+  if (process.env.NODE_DEBUG) console.error('bosun: WARNING — NODE_DEBUG is set: Node logs request bodies it reads, so secret_create and type with secret_id are refused');
   const svc = await startService(cfg);
   const exit = (code) => {
     const force = setTimeout(() => process.exit(1), 20_000);

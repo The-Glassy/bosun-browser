@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.12.0 — type a secret without it passing through the agent
+
+### Added
+
+- **`secret_create { label? }`** returns a `secret_id` and a one-time PUT URL on the MCP port, with a curl line that
+  reads the secret from stdin: `sops -d --extract '["pw"]' secrets.yaml | curl -sS --fail-with-body -T - '<put_url>'`.
+  It is the upload mechanism of 0.10: valid 15 min, this tenant only (or `PUT /secret/<id>` with the tenant's Bearer
+  token), one request. The body is the secret as UTF-8, at most 4096 bytes; one trailing newline is dropped.
+- **`type { …target…, secret_id }`** instead of `value` fills the field with that secret and deletes it. The result
+  says `secret: "typed and deleted"`, and its URL and title have the secret replaced by `[masked]` (as typed and
+  URL-encoded). A second `type` with the same id answers like an id that never existed.
+- **Password fields only by default.** A secret goes into an `<input type=password>`; any other text `<input>` or a
+  `<textarea>` needs `allow_non_password: true` (OTP and e-mail fields). Checkboxes, buttons, file inputs and
+  elements that are not inputs are refused. A refusal before the fill leaves the secret unused.
+- **A field that got a secret is masked** in `read` and `screenshot` from then on, and cleared after a handoff ends
+  with Give up, whatever its type or label (it joins the set of former password fields). The type check, the mark
+  and the fill go to one element: a field the page swaps for another before the fill gets nothing. A page may move
+  the focus during the fill: if the checked field didn't get the secret, the call fails and Bosun leaves the page
+  (`about:blank`); if it did, every input or textarea holding it is masked.
+- **Masking in `read` also catches a value as the accessibility snapshot shows it** (white space collapsed, trimmed,
+  no soft hyphens, YAML escapes such as `\x1b`), for every sensitive field, not only secrets. A field whose label
+  makes the snapshot quote its key (`- 'textbox "Contact: code"': …`) is now recognised too, and so is the value of
+  a field with a placeholder, which the snapshot puts on a `- text:` line under the field. Before, both kept a
+  value of one or two characters (and the first one a credential label) unmasked.
+- **Refused while a debug log would print the value:** `DEBUG` with `pw:api`, `pw:protocol` or `pw:channel` on, or
+  any `NODE_DEBUG` (`stream` prints the PUT body); the service warns about `NODE_DEBUG` at start.
+
+### Storage and limits
+
+- Secrets live in memory only: never on disk, never in a log line, an event, the `type` result or an error. Log lines
+  carry the id and the length: `bosun: secret s… of tenant alice: received, 24 bytes`, `… typed in session …`,
+  `… expired untyped`.
+- A secret is deleted once typed (also when the fill then fails), 10 min after it arrived, and when the service
+  stops; its buffer is zeroed. A restart loses all of them.
+- A tenant holds at most 20 secrets (waiting or not yet typed), the service 200. A PUT gets 60 s in all, 30 s
+  without a byte. An expired secret is refused at once, not only after the next sweep. Over 4096 bytes is `413`, also
+  without `Content-Length`; empty and invalid UTF-8 are `400`.
+- Another tenant's `secret_id` or Bearer token is refused. Read-only (`ephemeral`) tokens get no secrets:
+  `secret_create`, `type` with `secret_id` and a PUT with such a token are all refused.
+
+### Tests
+
+- test/secrets.test.mjs, on all three engines: the curl line fed on stdin, then `type` into a password field, and
+  the test server checks the posted value; a second use refused; URL and secret expiry, buffers zeroed; the size
+  limit with and without `Content-Length`, the trailing newline, empty and non-UTF-8 bodies; wrong tenant and
+  ephemeral tokens; non-password fields refused unless allowed, then masked in `read` and screenshot; a page that
+  echoes the secret into its URL and title; and no secret in any tool result, PUT answer or log line of the run.
+
 ## 0.11.2 — Zoom computer audio that Zoom joined by itself
 
 ### Fixed

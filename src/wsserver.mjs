@@ -1,12 +1,13 @@
 // MCP over WebSocket: authenticate in the HTTP upgrade (before any WebSocket or MCP server exists), one MCP server
 // per connection, the connection is the owner of the sessions it opens (closed again when it disconnects). The same
-// port takes the one-time upload PUTs (uploads.mjs) and download GETs (downloads.mjs), so a tenant reaches them
-// wherever it reaches MCP.
+// port takes the one-time upload and secret PUTs (uploads.mjs, secrets.mjs) and download GETs (downloads.mjs), so a
+// tenant reaches them wherever it reaches MCP.
 import http from 'http';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createAuthenticator, policyOf, tokenFromRequest } from './auth.mjs';
 import { buildServer } from './tools.mjs';
+import { Secrets } from './secrets.mjs';
 
 const MAX_PAYLOAD = 2 * 1024 * 1024; // a 1 MiB file as base64 (upload_create content_base64) fits
 const HEARTBEAT_MS = 30_000;
@@ -62,13 +63,15 @@ export async function startWsServer({ cfg, manager }) {
   const conns = new Set();
   let seq = 0;
 
-  const uploads = manager.uploads, downloads = manager.downloads;
+  const uploads = manager.uploads, downloads = manager.downloads, secrets = manager.secrets;
   const authTenant = (req) => {
     if (!req.headers.authorization) return null;
     return (allowNoToken ? 'default' : auth(tokenFromRequest(req, new URLSearchParams()))) || false;
   };
   const srv = http.createServer(async (req, res) => {
     try {
+      // Checked without a tick in between: an upload's body must reach its handler before Node buffers more of it.
+      if (secrets && Secrets.owns(req) && await secrets.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
       if (uploads && await uploads.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
       if (downloads && await downloads.handle(req, res, { authTenant })) return;
     } catch {

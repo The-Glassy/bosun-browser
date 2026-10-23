@@ -1,5 +1,6 @@
 // Sensitive-field handling: find credential/OTP inputs by DOM type and metadata (not just the accessible label),
 // mask their values in snapshots, mask them in screenshots, and clear them after an unsuccessful handoff.
+import crypto from 'crypto';
 
 // Fields that are sensitive by markup alone. Also used as the screenshot mask together with MARK_ATTR.
 export const SENSITIVE_CSS = [
@@ -101,6 +102,70 @@ export function passwordTracker() {
   document.addEventListener('DOMContentLoaded', () => sweep(document), { once: true });
 }
 
+// An input Bosun types a secret into stays sensitive from then on, whatever its type or label (masked in read and
+// screenshot, cleared like a credential field): it joins the set of former password fields in the scans' world. The
+// element (handle or locator) may live in another world, so it is tagged with a one-off attribute and found again by
+// it.
+export async function markSensitive(page, l) {
+  const key = crypto.randomBytes(8).toString('hex');
+  await l.evaluate((el, k) => el.setAttribute('data-bosun-secret', k), key, { timeout: 15000 });
+  const found = await eachFrame(page, (k) => {
+    const KEY = Symbol.for('bosun.sensitive');
+    const seen = window[KEY] || (window[KEY] = new WeakSet());
+    const out = [];
+    const roots = [document];
+    for (let i = 0; i < roots.length; i++) {
+      for (const el of roots[i].querySelectorAll('*')) {
+        if (el.shadowRoot) roots.push(el.shadowRoot);
+        if (el.getAttribute('data-bosun-secret') !== k) continue;
+        seen.add(el);
+        el.removeAttribute('data-bosun-secret');
+        out.push(1);
+      }
+    }
+    return out;
+  }, key);
+  if (!found.length) throw new Error('could not mark the field for masking (did the page replace it?); nothing was typed');
+}
+
+// After a secret was typed: every input and textarea (any frame, open shadow roots) that holds it becomes sensitive,
+// wherever the page let the typing land (a focus handler can move it to another field). Returns how many.
+export async function markValue(page, value) {
+  const found = await eachFrame(page, (v) => {
+    const KEY = Symbol.for('bosun.sensitive');
+    const seen = window[KEY] || (window[KEY] = new WeakSet());
+    const out = [];
+    const roots = [document];
+    for (let i = 0; i < roots.length; i++) {
+      for (const el of roots[i].querySelectorAll('*')) {
+        if (el.shadowRoot) roots.push(el.shadowRoot);
+        if ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && el.value && (el.value === v || (v.length >= 3 && el.value.includes(v)))) {
+          seen.add(el);
+          out.push(1);
+        }
+      }
+    }
+    return out;
+  }, value);
+  return found.length;
+}
+
+// When a secret landed somewhere other than the field Bosun checked: take it out of every field and every text node
+// (contenteditable included) in every frame and open shadow root, so no later read or screenshot carries it.
+export const scrubValue = (page, value) => eachFrame(page, (v) => {
+  const out = [];
+  const roots = [document];
+  for (let i = 0; i < roots.length; i++) {
+    const walk = document.createTreeWalker(roots[i], NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    for (let n = walk.currentNode; n; n = walk.nextNode()) {
+      if (n.nodeType === 3) { if (n.nodeValue.includes(v)) { n.nodeValue = n.nodeValue.split(v).join(''); out.push(1); } continue; }
+      if (n.shadowRoot) roots.push(n.shadowRoot);
+      if ((n instanceof HTMLInputElement || n instanceof HTMLTextAreaElement) && n.value.includes(v)) { n.value = n.value.split(v).join(''); out.push(1); }
+    }
+  }
+  return out;
+}, value);
+
 // For engines without same-world init scripts: install the tracker in Bosun's world in every frame.
 export const installTracker = (page) => Promise.all(page.frames().map((f) => f.evaluate(passwordTracker).catch(() => {})));
 
@@ -127,24 +192,47 @@ export async function maskedScreenshot(page, take) {
   }
 }
 
-const LABEL_RE = new RegExp(String.raw`^(\s*- (?:textbox|searchbox|spinbutton|combobox) "[^"\n]*(?:${HINT_WORDS})[^"\n]*"[^\n]*?): .*$`, 'gim');
-const FIELD_LINE_RE = /^(\s*- (?:textbox|searchbox|spinbutton|combobox)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]]*\])*): (.*)$/;
+// A key with ": " or other YAML specials in its name comes single-quoted: - 'textbox "Contact: code" [ref=e3]': value
+const LABEL_RE = new RegExp(String.raw`^(\s*- '?(?:textbox|searchbox|spinbutton|combobox) "[^"\n]*(?:${HINT_WORDS})[^"\n]*"[^\n]*?): .*$`, 'gim');
+const FIELD_HEAD_RE = /^\s*- '?(?:textbox|searchbox|spinbutton|combobox)\b.*:$/;
+const LABEL_HEAD_RE = new RegExp(String.raw`^\s*- '?(?:textbox|searchbox|spinbutton|combobox) "[^"\n]*(?:${HINT_WORDS})`, 'i');
+const CHILD_TEXT_RE = /^(\s*- text): (.*)$/;
+const FIELD_LINE_RE = /^(\s*- (?:'(?:textbox|searchbox|spinbutton|combobox)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]]*\])*'|(?:textbox|searchbox|spinbutton|combobox)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]]*\])*)): (.*)$/;
 
-const unquote = (v) => { if (!v.startsWith('"')) return v; try { return JSON.parse(v); } catch { return v; } };
+// A quoted snapshot value is YAML: JSON's escapes plus \xNN (playwright-core yamlEscapeValueIfNeeded).
+const unquote = (v) => {
+  if (!v.startsWith('"')) return v;
+  try { return JSON.parse(v.replace(/\\(\\|x([0-9a-fA-F]{2}))/g, (m, _c, hex) => (hex ? `\\u00${hex}` : m))); } catch { return v; }
+};
+// The inside of the quotes Playwright puts around a value that needs them.
+const yamlEscaped = (v) => v.replace(/[\\"\x00-\x1f\x7f-\x9f]/g, (c) => ({ '\\': '\\\\', '"': '\\"', '\b': '\\b', '\f': '\\f', '\n': '\\n', '\r': '\\r', '\t': '\\t' })[c]
+  ?? `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
 
-// Mask an aria snapshot / text dump: fields with a sensitive label, fields whose value is a sensitive value, and any
-// other occurrence of a sensitive value of 3+ characters.
+// How Playwright's aria snapshot shows a value: without zero-width spaces and soft hyphens, trimmed, every run of
+// white space one space (playwright-core normalizeWhiteSpace).
+const normalized = (v) => v.replace(/[\u200b\u00ad]/g, '').trim().replace(/\s+/g, ' ');
+
+// Mask an aria snapshot / text dump: fields with a sensitive label, fields whose value is a sensitive value (as typed
+// or as the snapshot normalizes it), and any other occurrence of either of 3+ characters.
 export function maskText(text, values) {
-  const vals = new Set(values.filter(Boolean));
+  const vals = new Set(values.filter(Boolean).flatMap((v) => [v, normalized(v)]).filter(Boolean));
   let out = text.replace(LABEL_RE, '$1: [masked]');
+  // A field with a placeholder has children, and its value is the "- text:" line among them.
+  let block = null; // { indent, sensitive }: inside such a field
   out = out.split('\n').map((line) => {
+    const indent = line.length - line.trimStart().length;
+    if (block && indent <= block.indent) block = null;
+    if (block) {
+      const t = CHILD_TEXT_RE.exec(line);
+      return t && (block.sensitive || vals.has(unquote(t[2]))) ? `${t[1]}: [masked]` : line;
+    }
+    if (FIELD_HEAD_RE.test(line)) { block = { indent, sensitive: LABEL_HEAD_RE.test(line) }; return line; }
     const m = FIELD_LINE_RE.exec(line);
     return m && vals.has(unquote(m[2])) ? `${m[1]}: [masked]` : line;
   }).join('\n');
   for (const v of [...vals].filter((v) => v.length >= 3).sort((a, b) => b.length - a.length)) {
     out = out.split(v).join('[masked]');
-    const esc = JSON.stringify(v).slice(1, -1);
-    if (esc !== v) out = out.split(esc).join('[masked]');
+    for (const esc of new Set([JSON.stringify(v).slice(1, -1), yamlEscaped(v)])) if (esc !== v) out = out.split(esc).join('[masked]');
   }
   return out;
 }

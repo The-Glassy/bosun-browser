@@ -183,6 +183,24 @@ scans off the page world for `chromium` too, a design change left for later. Wha
 the tenant may reach at all, and **the page where a human types a credential has to be a trusted one, whatever the
 engine**. If that is not true for some flow, the credential does not belong in this browser.
 
+**In 0.12.0:** `type { secret_id }` lets an agent fill a password field without the password ever being in a tool
+call. The agent's shell PUTs it to a one-time URL on the MCP port (`src/secrets.mjs`), the service keeps it in a
+buffer of its own (never on disk or in a log; log lines carry id and length), and `type` takes it out, fills the
+field and zeroes the buffer. The field is checked (an `<input type=password>` unless the call says
+`allow_non_password`), marked sensitive and filled as one element handle; after the fill every input or textarea
+that holds the value joins the set of former password fields, so `read`, `screenshot` and the post-handoff clearing
+treat it as a credential field whatever its type. If the page moved the focus during the fill and the checked field
+didn't get the value, Bosun fails the call and leaves the page for `about:blank`. While `DEBUG` turns on a Playwright
+log that prints typed text (`pw:api`, `pw:protocol`, `pw:channel`) or `NODE_DEBUG` is set, secrets are refused
+(Node's `stream` log would still print a PUT body sent anyway, e.g. to a URL from before a restart). Four Codex review
+rounds found the swaps, focus moves, marker moves and snapshot encodings (normalized white space, YAML escapes,
+quoted keys, placeholder child lines) this paragraph describes; each has a test. What stays is H2: the set Bosun masks by
+lives in the page's world on `chromium`, and on every engine a page can copy the value somewhere masking doesn't
+look. So this takes the password out of the agent's transcript and its MCP client's logs. It does not make an
+untrusted page safe to type into. M2 still holds after it: the `type` result has the secret masked in its URL and
+title, but later results of `navigate`, `click` or `read` return URL and title as they are. Tests:
+`test/secrets.test.mjs`, on all three engines.
+
 ## H3 — HIGH: Chromium runs without its own sandbox
 
 Neither Chromium launch path passes `chromiumSandbox` (`src/engines.mjs:49-55` in 0.7.0), and the pinned Playwright
