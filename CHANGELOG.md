@@ -10,13 +10,17 @@
   controls". It has no "Join Audio" and no "Mute"/"Unmute", and those were what Bosun waited for.
 - **Computer audio counts as joined when its menu says so.** If none of "Mute", "Unmute" or "Join Audio" is shown,
   Bosun opens "More audio controls", reads it and closes it again. "Leave computer audio" or "Switch to phone audio"
-  on offer means computer audio is connected. Nothing in the menu is clicked, and neither is "Audio" itself (it would
-  ask for the microphone). "Join Audio" / "Join Audio by Computer" are still clicked when they are shown.
+  on offer means computer audio is connected. Only an entry of that menu counts: it was not shown before the click,
+  came up with it and went away when the menu closed, and it isn't inside anything participants control. A
+  participant named "Leave computer audio" in another menu doesn't count. Nothing in the menu is clicked, and neither
+  is "Audio" itself (it would ask for the microphone). "Join Audio" / "Join Audio by Computer" are still clicked when
+  they are shown.
 - **The error now names the audio controls it saw** (for example "audio controls: audio, More audio controls"), so the
   next change on Zoom's side shows up in the error.
 - **Zoom's notices over the call are closed:** "Introducing My Notes…" (Got it), "…enable hardware acceleration" (×)
   and "Please enable access to your microphone and camera…" (×). Bosun finds each one by its text and clicks only that
-  notice's own close or "Got it" button.
+  notice's own close or "Got it" button. Captions, chat and names never count as a notice, and no box holding them is
+  searched for a button.
 
 ### Tests
 
@@ -25,7 +29,8 @@
   `noDeviceList` option makes the browser list no microphone or camera, like the production server.
 - test/meeting-zoom-audio.test.mjs: the 15:00 call is joined, announced and recorded, with nothing clicked but the
   menu button and the notices' own buttons. On 0.11.1 it fails with the production error. A menu that offers neither
-  "Leave computer audio" nor "Switch to phone audio" still ends with the error.
+  "Leave computer audio" nor "Switch to phone audio" still ends with the error, also with a participant named "Leave
+  computer audio" in another menu; a caption that reads like Zoom's notice closes nothing.
 - test/meeting-audio.test.mjs (Linux, real PulseAudio, headful): the same call, with no microphone listed, is
   recorded with the host's tone audible.
 

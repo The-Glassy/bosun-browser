@@ -49,6 +49,8 @@ function launch(id, search) {
 // Chrome's <permission> element. A click on "Audio", "Video", a menu entry or the <permission> element is logged as
 // media {clicked}. audioJoined 'notConnected': the same toolbar, but the menu offers neither leaving computer audio nor
 // switching to phone audio. noDeviceList: the browser lists no microphone or camera (a server without devices).
+// decoyMenu: a menu shown in the call with a participant named "Leave computer audio". captionClose: the captions
+// panel has a close button of its own (clicks logged as media {clicked: 'captions close'}).
 function webClient(id, r) {
   if (r.expired) {
     return `<!doctype html><meta charset="utf-8"><title>Error - Zoom</title><nav><a href="/join">Join</a> <a href="/signin">Sign In</a></nav>
@@ -113,7 +115,9 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
 <div id="call" hidden>
   ${r.title ? `<div class="meeting-info-container__topic">${esc(r.title)}</div>` : ''}
   <div id="tiles"></div>
-  <div id="captions" class="live-transcription-subtitle__box"></div>
+  ${r.captionClose ? '<div class="live-transcription-subtitle__container"><div id="captions" class="live-transcription-subtitle__box"></div><button id="capClose" aria-label="close">×</button></div>'
+    : '<div id="captions" class="live-transcription-subtitle__box"></div>'}
+  ${r.decoyMenu ? '<div class="pin-dropdown-menu" role="menu"><div role="menuitem">Leave computer audio</div><div role="menuitem">Host Person</div></div>' : ''}
   ${toasts}
   <div role="dialog" id="audioDlg" hidden><h2>Join Audio</h2><button id="byComputer">Join Audio by Computer</button></div>
   <div role="dialog" id="recDlg" hidden><p>This meeting is being recorded</p><button id="recOk">Got it</button><button>Leave Meeting</button></div>
@@ -175,6 +179,7 @@ if (R.audioJoined) {
   $('audioMore').onclick = () => { $('audioPop').hidden = !$('audioPop').hidden; };
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('audioPop').hidden = true; });
   for (const it of document.querySelectorAll('#audioPop [role^=menuitem]')) it.onclick = () => { clicked(it.textContent); if (/leave computer audio/i.test(it.textContent)) audio = false; $('audioPop').hidden = true; };
+  if ($('capClose')) $('capClose').onclick = () => clicked('captions close');
   for (const t of document.querySelectorAll('.zm-toast button')) t.onclick = () => { t.parentElement.hidden = true; post('media', { toast: t.parentElement.id }); };
 }
 $('mic').onclick = () => { if (!audio) { $('audioDlg').hidden = false; return; } mic = !mic; micLabel(); post('media', { mic, cam }); };

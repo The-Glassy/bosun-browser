@@ -71,3 +71,32 @@ test('Zoom: "Audio" whose menu offers neither leaving computer audio nor phone a
     await c.close();
   });
 });
+
+// Codex: a participant named "Leave computer audio" in a menu already shown is not the audio menu's entry.
+test('Zoom: "Leave computer audio" in another menu (a participant\'s name) does not count as computer audio joined', async () => {
+  await withService(async (c, { audio, ended }) => {
+    const { url } = fz.newRoom({ ...LIVE, audioJoined: 'notConnected', decoyMenu: true });
+    const r = await c.call('meeting_join', { url, profile: 'zoom' });
+    assert.equal(r.isError, false, r.text);
+    await until(() => ended.length === 1, 40_000);
+    assert.match(ended[0].error || '', /could not join computer audio in Zoom/);
+    assert.equal(audio.recorders.length, 0);
+    await c.close();
+  });
+});
+
+// Codex: a caption reading like Zoom's notice is participants' speech: the captions panel's close button stays.
+test('Zoom: a caption saying "Please enable access to your microphone and camera…" closes nothing', async () => {
+  await withService(async (c) => {
+    const { id, url } = fz.newRoom({ ...LIVE, captionClose: true, caption: 'Please enable access to your microphone and camera for the best experience.' });
+    const r = await c.call('meeting_join', { url, profile: 'zoom' });
+    assert.equal(r.isError, false, r.text);
+    const mid = r.json().meeting_id;
+    await until(async () => ['recording', 'ended'].includes((await status(c, mid)).state), 40_000);
+    assert.equal((await status(c, mid)).state, 'recording');
+    assert.deepEqual(fz.room(id).media.filter((m) => m.clicked), []);
+    assert.deepEqual(fz.room(id).media.filter((m) => m.toast).map((m) => m.toast).sort(), ['t1', 't2', 't4']);
+    await c.call('meeting_leave', { meeting_id: mid });
+    await c.close();
+  });
+});

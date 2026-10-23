@@ -99,10 +99,12 @@ const overlays = async (page) => {
 // Notices the call shows outside any dialog (live Zoom, 2026-10-23): "Introducing My Notes…" (Got it), "For a better
 // meeting experience, enable … hardware acceleration" (×), "Please enable access to your microphone and camera for
 // the best experience." (×). Each is closed by a close or "Got it" button of its own, found from the notice's text
-// (the nearest box around it, up to a short notice's size); nothing participants control counts.
+// (the nearest box around it, up to a short notice's size). Nothing participants control or say counts: not as the
+// notice's text, and no box holding any of it (chat, names, captions) is searched for the button.
 const TOAST = any('^introducing my notes', 'enable (?:browser |the )?hardware acceleration', 'enable access to your microphone and camera',
   'hardwarebeschleunigung', 'zugriff auf (?:ihr|dein) mikrofon und (?:ihre|deine) kamera', 'апаратне прискорення', 'аппаратное ускорение');
 const TOAST_CLOSE = any('^got it$', '^close$', '^dismiss$', '^x$', '^×$', '^✕$', '^verstanden$', '^schließen$', '^зрозуміло$', '^закрити$', '^понятно$', '^закрыть$');
+const SPOKEN = `${PARTICIPANT_CONTROLLED}, [class*="subtitle"], [class*="caption"], [class*="transcript"]`;
 async function closeToasts(page) {
   const found = await page.evaluateHandle(({ toast, close, skip }) => {
     const T = new RegExp(toast, 'i'), C = new RegExp(close, 'i');
@@ -113,14 +115,14 @@ async function closeToasts(page) {
     for (let t = walk.nextNode(), i = 0; t && i < 5000; t = walk.nextNode(), i++) {
       const el = t.parentElement;
       if (!el || !T.test(n(el.innerText || t.nodeValue)) || el.closest(skip) || !shown(el)) continue;
-      for (let box = el, up = 0; box && box !== document.body && up < 6 && n(box.innerText).length < 400; box = box.parentElement, up++) {
+      for (let box = el, up = 0; box && box !== document.body && up < 6 && n(box.innerText).length < 400 && !box.querySelector(skip); box = box.parentElement, up++) {
         const b = [...box.querySelectorAll('button, [role="button"]')].find((b) => shown(b) && !b.closest(skip)
           && (C.test(n(b.getAttribute('aria-label') || b.innerText || b.title)) || (!n(b.getAttribute('aria-label') || b.innerText) && /close/i.test(b.className))));
         if (b) { out.add(b); break; }
       }
     }
     return [...out];
-  }, { toast: TOAST.source, close: TOAST_CLOSE.source, skip: PARTICIPANT_CONTROLLED }).catch(() => null);
+  }, { toast: TOAST.source, close: TOAST_CLOSE.source, skip: SPOKEN }).catch(() => null);
   if (!found) return 0;
   let n = 0;
   for (const h of (await found.getProperties().catch(() => new Map())).values()) {
@@ -133,17 +135,39 @@ async function closeToasts(page) {
 
 // Whether "More audio controls" offers leaving computer audio (or switching to phone audio): then computer audio is
 // connected. The menu is opened, read and closed again (Escape, or its button once more); nothing in it is clicked.
+// Only an entry of that menu counts: one in a menu (or the element the button names in aria-controls), outside what
+// participants control, that was not shown before the click, came up with it, and went away when the menu closed. A
+// participant named "Leave computer audio" in another menu or list is none of that.
+const AUDIO_MENU = '[role="menu"], [role="listbox"], [class*="menu" i], [class*="popover" i], [class*="dropdown" i]';
+function menuEntries([prev, { re, menu, skip, owner }]) {
+  const R = new RegExp(re, 'i');
+  const n = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const shown = (e) => (e.checkVisibility ? e.checkVisibility() : !!e.offsetParent);
+  const scope = owner && document.getElementById(owner);
+  return [...(scope || document).querySelectorAll('*')].filter((e) => !(prev || []).includes(e) && e.closest(menu) && !e.closest(skip) && shown(e)
+    && (R.test(n(e.getAttribute('aria-label'))) || ([...e.children].every((c) => !R.test(n(c.innerText))) && R.test(n(e.innerText)))));
+}
 async function audioConnected(page) {
   const more = await firstVisible(button(page, LABEL.audioMore));
-  if (!more || !(await more.click({ timeout: 3000 }).then(() => true, () => false))) return false;
-  const MENU = '[role="menu"], [role="listbox"], [class*="menu" i], [class*="popover" i], [class*="dropdown" i]';
-  const item = page.locator(MENU).getByText(LABEL.audioConnected).or(page.getByRole('menuitem', { name: LABEL.audioConnected }));
-  let yes = false;
-  for (let i = 0; i < 10 && !(yes = !!(await firstVisible(item))); i++) await page.waitForTimeout(150);
-  const open = () => firstVisible(page.locator(MENU).getByText(/^(?:audio settings|test speaker|leave computer audio|switch to phone audio)/i).or(item));
+  if (!more) return false;
+  const a = { re: LABEL.audioConnected.source, menu: AUDIO_MENU, skip: SPOKEN, owner: (await more.getAttribute('aria-controls').catch(() => null)) || (await more.getAttribute('aria-owns').catch(() => null)) };
+  const before = await page.evaluateHandle(menuEntries, [null, a]).catch(() => null);
+  if (!before || !(await more.click({ timeout: 3000 }).then(() => true, () => false))) { await before?.dispose().catch(() => {}); return false; }
+  let came = null;
+  for (let i = 0; i < 10; i++) {
+    came = await page.evaluateHandle(menuEntries, [before, a]).catch(() => null);
+    if (came && await came.evaluate((l) => l.length).catch(() => 0)) break;
+    await came?.dispose().catch(() => {});
+    came = null;
+    await page.waitForTimeout(150);
+  }
+  const shownNow = () => (came ? came.evaluate((l) => l.some((e) => (e.checkVisibility ? e.checkVisibility() : !!e.offsetParent))).catch(() => true) : false);
   await page.keyboard.press('Escape').catch(() => {});
   await page.waitForTimeout(200);
-  if (await open()) await more.click({ timeout: 3000 }).catch(() => {});
+  if (await shownNow()) { await more.click({ timeout: 3000 }).catch(() => {}); await page.waitForTimeout(200); }
+  const yes = !!came && !(await shownNow());
+  await came?.dispose().catch(() => {});
+  await before.dispose().catch(() => {});
   return yes;
 }
 // The toolbar's audio controls as labelled, for the error when computer audio can't be joined.
