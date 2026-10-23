@@ -20,7 +20,9 @@ const wipe = (b) => { if (b) b.fill(0); };
 // Playwright log that prints what is typed: pw:api logs fill("<value>"), pw:protocol and pw:channel the messages
 // that carry it. Then no secret is typed.
 const DRIVER_LOGS = ['pw:api', 'pw:protocol', 'pw:channel'];
-export function driverLogsValues(debug = process.env.DEBUG) {
+// NODE_DEBUG (Node's own diagnostics: stream logs the buffers a PUT body arrives in) counts too, whatever it names.
+export function driverLogsValues(debug = process.env.DEBUG, nodeDebug = process.env.NODE_DEBUG) {
+  if (String(nodeDebug || '').trim()) return true;
   const on = [], off = [];
   for (const p of String(debug || '').split(/[\s,]+/).filter(Boolean)) {
     const neg = p.startsWith('-');
@@ -29,7 +31,7 @@ export function driverLogsValues(debug = process.env.DEBUG) {
   }
   return DRIVER_LOGS.some((n) => on.some((r) => r.test(n)) && !off.some((r) => r.test(n)));
 }
-export const DRIVER_LOGS_REFUSED = 'secrets are refused while DEBUG turns on a Playwright log that prints what is typed (pw:api, pw:protocol or pw:channel); the operator has to switch it off';
+export const DRIVER_LOGS_REFUSED = 'secrets are refused while DEBUG turns on a Playwright log that prints what is typed (pw:api, pw:protocol or pw:channel), or NODE_DEBUG is set; the operator has to switch it off';
 
 export class Secrets {
   constructor({ log = (...a) => console.error(...a) } = {}) {
@@ -118,6 +120,12 @@ export class Secrets {
     if (!x || !okToken || x.state !== 'pending' || Date.now() > x.urlExpiresAt) { reply(404, { error: 'no such secret URL (used, expired, or never issued); call secret_create again' }); return true; }
     if (hdr === false || (hdr !== null && hdr !== x.tenant)) { reply(403, { error: 'this token may not send to that URL' }); return true; }
     if (policyOf(x.tenant) === 'ephemeral') { reply(403, { error: 'secrets are not allowed for this token' }); return true; }
+    // A debug log could print the body: refuse without reading a byte of it.
+    if (driverLogsValues()) {
+      res.writeHead(403, { 'content-type': 'application/json', connection: 'close' });
+      res.end(JSON.stringify({ error: DRIVER_LOGS_REFUSED }) + '\n', () => req.socket?.destroy());
+      return true;
+    }
     const len = req.headers['content-length'] !== undefined ? Number(req.headers['content-length']) : null;
     if (len !== null && (!Number.isSafeInteger(len) || len < 0)) { reply(400, { error: 'bad Content-Length' }); return true; }
     if (len !== null && len > SECRET_MAX_BYTES + 1) { reply(413, { error: `a secret is at most ${SECRET_MAX_BYTES} bytes` }); return true; }

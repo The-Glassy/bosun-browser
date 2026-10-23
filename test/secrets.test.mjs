@@ -38,6 +38,11 @@ const PAGES = {
     new MutationObserver((ms) => { for (const m of ms) { const k = m.target.getAttribute('data-bosun-secret');
       if (m.target.id === 'c' && k) { m.target.removeAttribute('data-bosun-secret'); document.getElementById('decoy').setAttribute('data-bosun-secret', k); } } })
       .observe(document.body, { attributes: true, subtree: true });</script>`,
+  // On focus the password field goes, and a contenteditable takes the focus (and so the typing).
+  '/editable': `<title>Editable</title><input id="pw" type="password"><div id="ed" contenteditable style="min-height:20px"></div><script>
+    const pw = document.getElementById('pw');
+    pw.addEventListener('focus', () => { pw.remove(); document.getElementById('ed').focus(); }, { once: true });</script>`,
+  '/quoted': `<title>Quoted</title><label>Contact: code <input id="q"></label>`,
   '/search': `<title>Search</title><form method="get" action="/echo"><input id="pw" type="password" name="q"></form>`,
 };
 
@@ -391,6 +396,32 @@ test('a page that moves the focus during the fill: the call fails, and the field
   await c.close();
 });
 
+test('a page that moves the focus into a contenteditable: the secret is taken out of the page again', async () => {
+  const c = await client(TOKEN);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${base}/editable` });
+  const id = await send(c, 'editable-target-secret');
+  const r = await c.call('type', { session: s, selector: '#pw', secret_id: id });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /did not end up in the field that was checked|not attached|detached/);
+  const page = svc.manager.sessions.get(s).page;
+  assert.ok(!(await page.$eval('#ed', (e) => e.textContent)).includes('editable-target'));
+  for (const mode of ['a11y', 'text']) assert.ok(!(await c.call('read', { session: s, mode })).text.includes('editable-target'), mode);
+  await c.close();
+});
+
+test('a short secret in a field whose label makes the snapshot quote its key is masked', async () => {
+  const c = await client(TOKEN);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${base}/quoted` });
+  const id = await send(c, 'Zq');
+  assert.equal((await c.call('type', { session: s, selector: '#q', secret_id: id, allow_non_password: true })).isError, false);
+  const r = await c.call('read', { session: s });
+  assert.match(r.text, /'textbox "Contact: code"(?: \[[^\]]*\])*': \[masked\]/);
+  assert.ok(!r.text.includes('Zq'), r.text);
+  await c.close();
+});
+
 test('a page that moves the masking marker to a decoy: the field that holds the secret is masked all the same', async () => {
   const c = await client(TOKEN);
   const s = await c.open();
@@ -432,18 +463,30 @@ test('read masks a secret as the accessibility snapshot shows it (white space co
 
 test('DEBUG with a Playwright log that prints typed text: secrets refused', async () => {
   for (const d of ['pw:api', 'pw:*', '*', 'foo,pw:protocol', 'pw:channel*', 'x pw:api']) assert.equal(driverLogsValues(d), true, d);
-  for (const d of [undefined, '', 'pw:browser', 'express:*', 'pw:*,-pw:api,-pw:protocol,-pw:channel', '-pw:*']) assert.equal(driverLogsValues(d), false, String(d));
+  for (const d of [undefined, '', 'pw:browser', 'express:*', 'pw:*,-pw:api,-pw:protocol,-pw:channel', '-pw:*']) assert.equal(driverLogsValues(d, ''), false, String(d));
+  assert.equal(driverLogsValues('', 'stream'), true); // Node's own: stream logs the PUT body's buffers
+  assert.equal(driverLogsValues('', 'http,net'), true);
   const c = await client(TOKEN);
   const s = await c.open();
   await c.call('navigate', { session: s, url: `${base}/login` });
   const id = await send(c, 'debug-refused-secret');
   const prev = process.env.DEBUG;
+  const pending = (await c.call('secret_create')).json().put_url;
   process.env.DEBUG = 'pw:api';
   try {
     assert.match((await c.call('secret_create')).text, /DEBUG turns on a Playwright log/);
     assert.match((await c.call('type', { session: s, selector: '#pw', secret_id: id })).text, /DEBUG turns on a Playwright log/);
+    const p = await put(pending, Buffer.from('debug-put-secret')); // refused before the body is read
+    assert.equal(p.status, 403, JSON.stringify(p));
   } finally {
     if (prev === undefined) delete process.env.DEBUG; else process.env.DEBUG = prev;
+  }
+  const prevNode = process.env.NODE_DEBUG;
+  process.env.NODE_DEBUG = 'stream';
+  try {
+    assert.match((await c.call('secret_create')).text, /NODE_DEBUG is set/);
+  } finally {
+    if (prevNode === undefined) delete process.env.NODE_DEBUG; else process.env.NODE_DEBUG = prevNode;
   }
   assert.equal(await value(c, s, '#pw'), '');
   assert.equal((await c.call('type', { session: s, selector: '#pw', secret_id: id })).isError, false);
@@ -451,7 +494,7 @@ test('DEBUG with a Playwright log that prints typed text: secrets refused', asyn
 });
 
 test('no secret of these tests is in any tool result, PUT answer or log line; the log has id and length', () => {
-  const all = [PW, OTP, 'once-only-secret', 'expiring-secret', 'late-secret', 'alice-only-secret', 'two\nlines', 'echo me & you/100%', 'echo+me', 'swap-target-secret', 'alpha', 'debug-refused-secret', 'refocus-target', 'decoy-target', 'cd-esc'];
+  const all = [PW, OTP, 'once-only-secret', 'expiring-secret', 'late-secret', 'alice-only-secret', 'two\nlines', 'echo me & you/100%', 'echo+me', 'swap-target-secret', 'alpha', 'debug-refused-secret', 'refocus-target', 'decoy-target', 'cd-esc', 'editable-target', 'debug-put-secret'];
   for (const text of results) for (const v of all) assert.ok(!text.includes(v), `${v} in a result: ${text}`);
   for (const line of logs) for (const v of all) assert.ok(!line.includes(v), `${v} in the log: ${line}`);
   assert.ok(logs.some((l) => /^bosun: secret s[0-9a-f]{16} of tenant alice: received, \d+ bytes$/.test(l)));

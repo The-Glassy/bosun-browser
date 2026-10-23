@@ -150,6 +150,22 @@ export async function markValue(page, value) {
   return found.length;
 }
 
+// When a secret landed somewhere other than the field Bosun checked: take it out of every field and every text node
+// (contenteditable included) in every frame and open shadow root, so no later read or screenshot carries it.
+export const scrubValue = (page, value) => eachFrame(page, (v) => {
+  const out = [];
+  const roots = [document];
+  for (let i = 0; i < roots.length; i++) {
+    const walk = document.createTreeWalker(roots[i], NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    for (let n = walk.currentNode; n; n = walk.nextNode()) {
+      if (n.nodeType === 3) { if (n.nodeValue.includes(v)) { n.nodeValue = n.nodeValue.split(v).join(''); out.push(1); } continue; }
+      if (n.shadowRoot) roots.push(n.shadowRoot);
+      if ((n instanceof HTMLInputElement || n instanceof HTMLTextAreaElement) && n.value.includes(v)) { n.value = n.value.split(v).join(''); out.push(1); }
+    }
+  }
+  return out;
+}, value);
+
 // For engines without same-world init scripts: install the tracker in Bosun's world in every frame.
 export const installTracker = (page) => Promise.all(page.frames().map((f) => f.evaluate(passwordTracker).catch(() => {})));
 
@@ -176,8 +192,9 @@ export async function maskedScreenshot(page, take) {
   }
 }
 
-const LABEL_RE = new RegExp(String.raw`^(\s*- (?:textbox|searchbox|spinbutton|combobox) "[^"\n]*(?:${HINT_WORDS})[^"\n]*"[^\n]*?): .*$`, 'gim');
-const FIELD_LINE_RE = /^(\s*- (?:textbox|searchbox|spinbutton|combobox)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]]*\])*): (.*)$/;
+// A key with ": " or other YAML specials in its name comes single-quoted: - 'textbox "Contact: code" [ref=e3]': value
+const LABEL_RE = new RegExp(String.raw`^(\s*- '?(?:textbox|searchbox|spinbutton|combobox) "[^"\n]*(?:${HINT_WORDS})[^"\n]*"[^\n]*?): .*$`, 'gim');
+const FIELD_LINE_RE = /^(\s*- (?:'(?:textbox|searchbox|spinbutton|combobox)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]]*\])*'|(?:textbox|searchbox|spinbutton|combobox)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]]*\])*)): (.*)$/;
 
 // A quoted snapshot value is YAML: JSON's escapes plus \xNN (playwright-core yamlEscapeValueIfNeeded).
 const unquote = (v) => {
