@@ -21,12 +21,12 @@ after(async () => { await fz.close(); });
 
 const zoomAt = (base) => ({ ...zoom, accountUrl: `${base}/profile`, joinUrl: (u) => zoomWebClientUrl(u).replace('https://app.zoom.us', base), origins: () => [base] });
 
-// fakeDevices: the browser gets Chromium's fake microphone and camera.
+// fakeDevices: the browser gets Chromium's fake microphone and camera (fakeAudio's default); false: the host's.
 async function withService(fn, { fakeDevices = true } = {}) {
   const audio = fakeAudio();
-  if (fakeDevices) {
+  if (!fakeDevices) {
     const open = audio.open.bind(audio);
-    audio.open = async () => { const rig = await open(); rig.args = [...rig.args, '--use-fake-device-for-media-stream']; return rig; };
+    audio.open = async () => { const rig = await open(); rig.args = rig.args.filter((a) => a !== '--use-fake-device-for-media-stream'); return rig; };
   }
   const z = zoomAt(fz.base);
   const svc = await startBosun({ KEEPALIVE: '0' }, { meetings: { audio, platformFor: (u) => (zoom.matches(u) ? z : null), pollMs: 200 } });
