@@ -227,7 +227,8 @@ export function fakeAudio({ openMs = 0, stopMs = 0 } = {}) {
       let closed = false;
       return {
         browserEnv: undefined,
-        args: ['--mute-audio'],
+        // Chromium's fake microphone and camera: the stand-ins show live devices, and the browser has them on every host.
+        args: ['--mute-audio', '--use-fake-device-for-media-stream'],
         record(file) {
           fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
           fs.writeFileSync(file, 'OggS', { mode: 0o600 });

@@ -29,32 +29,46 @@ function launch(id, search) {
 // over everything, an empty "Your Name" field even for a signed-in account, "Remember my name for future meetings",
 // "Join" disabled until a name is typed, "This site is protected by reCAPTCHA …" with reCAPTCHA's invisible badge and
 // parked challenge frame, a microphone but "Cannot detect your camera". expired: Zoom's "This meeting link is invalid
-// (3,001)" page instead.
+// (3,001)" page instead. hearYou: the preview as live Zoom showed it on 2026-10-23 13:23 (no devices granted): the
+// "see you" question, then a second question as a dialog, "Do you want people to hear you in the meeting?" ('both':
+// "Continue without microphone and camera"; 'mic': "Use microphone" / "Continue without microphone"), then "Mute" with
+// a crossed microphone (no permission: muted in effect), "Stop Video", "Cannot detect your camera…", an empty "Your
+// Name" and "Join" disabled until a name is typed. Clicking "Mute" does not toggle it: it asks "hear you" again
+// ("Use microphone" / "Continue without microphone"); "Stop Video" asks "see you" ("Use camera" / "Continue without
+// camera"; assumed, not seen live). hearDelayMs: when the second question comes up after the first (500 ms). micClick 'stuck': a live microphone whose "Mute" takes clicks and does nothing;
+// 'toggles': a live microphone that mutes; 'asksCamera' / 'asksCameraBoth': a live microphone whose "Mute" does nothing
+// but bring up the camera's question ("see you"; "Continue without camera" / "… without microphone and camera"). Every "Use …" click is logged as media {devices: 'used'}.
 function webClient(id, r) {
   if (r.expired) {
     return `<!doctype html><meta charset="utf-8"><title>Error - Zoom</title><nav><a href="/join">Join</a> <a href="/signin">Sign In</a></nav>
 <div>This meeting link is invalid (3,001)</div><div role="alertdialog" aria-label="Privacy"><p>Zoom uses cookies.</p><button>Decline Cookies</button><button>Accept Cookies</button></div>
 <button aria-label="Open chat dialog">:)</button>`;
   }
-  if (r.web2026) r = { ...r, noDevices: false, signedInName: false };
+  if (r.web2026 || r.hearYou) r = { ...r, noDevices: false, signedInName: false };
+  const hy = r.hearYou ? (r.hearYou === 'mic' ? ['Use microphone', 'Continue without microphone'] : [null, 'Continue without microphone and camera']) : null;
+  const crossed = '<svg class="zm-icon zm-icon-mic-disabled" aria-hidden="true" width="16" height="16"><path d="M2 2l12 12" stroke="red"/></svg>';
   return `<!doctype html><meta charset="utf-8"><title>Zoom Meeting</title>
 <style>[hidden]{display:none!important} .tile{display:inline-block;width:80px;height:60px;background:#333;margin:4px}</style>
 <div id="preview">
   <h1>Enter Meeting Info</h1>
   <input id="input-for-name" type="text" aria-label="Your Name" placeholder="Your Name" value="${esc(r.remembered ?? (r.signedIn && !r.web2026 ? 'Glassy Smartie' : ''))}">
-  ${r.web2026 ? '<label><input type="checkbox" id="remember"> Remember my name for future meetings</label>' : ''}
+  ${r.web2026 || r.hearYou ? '<label><input type="checkbox" id="remember"> Remember my name for future meetings</label>' : ''}
   ${(r.passcode && !r.pwdGiven) || r.askPasscode ? '<input id="input-for-pwd" type="password" aria-label="Meeting Passcode" placeholder="Meeting Passcode">' : ''}
-  ${r.web2026 ? '<button id="pmic" aria-label="Mute">Mute</button><p>Cannot detect your camera, please check the device and connection and try again.</p>'
+  ${r.hearYou ? `<button id="pmic" aria-label="Mute">${r.micClick ? '' : crossed}Mute</button><button id="pcam" aria-label="Stop Video">Stop Video</button><p>Cannot detect your camera, please check the device and connection and try again.</p>`
+    : r.web2026 ? '<button id="pmic" aria-label="Mute">Mute</button><p>Cannot detect your camera, please check the device and connection and try again.</p>'
     : r.noDevices ? '<p>Cannot detect your camera</p><p>Cannot detect your microphone</p>' : '<button id="pmic" aria-label="Mute">Mute</button><button id="pcam" aria-label="Stop Video">Stop Video</button>'}
-  <button id="join" class="preview-join-button"${r.web2026 ? ' disabled' : ''}>Join</button>
+  <button id="join" class="preview-join-button"${r.web2026 || r.hearYou ? ' disabled' : ''}>Join</button>
   <p>By clicking "Join", you agree to our Terms of Service and Privacy Statement</p>
   ${r.web2026 ? `<p>This site is protected by reCAPTCHA and the Google Privacy Policy and Terms of Service apply.</p><div class="grecaptcha-badge" style="position:fixed;bottom:14px;right:0;width:256px;height:60px"><iframe src="/recaptcha/api2/anchor?ar=1&amp;k=x&amp;size=invisible" title="reCAPTCHA" width="256" height="60"></iframe></div>
 <div style="visibility:hidden;position:absolute;top:-10000px"><iframe src="/recaptcha/api2/bframe?k=x" title="recaptcha challenge expires in two minutes" width="400" height="580"></iframe></div>` : ''}
   ${r.bigChallenge ? '<iframe src="/recaptcha/api2/anchor?k=x" title="reCAPTCHA" width="300" height="300"></iframe>' : ''}
 </div>
-${r.web2026 ? `<div id="devq" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:20"><div style="background:#fff;margin:80px auto;width:380px;padding:16px">
+${r.web2026 || r.hearYou ? `<div id="devq" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:20"><div style="background:#fff;margin:80px auto;width:380px;padding:16px">
   <h2>Do you want people to see you in the meeting?</h2><p>You can still turn off your microphone and camera anytime in the meeting.</p>
   <button id="devUse">Use microphone and camera</button><button id="devNo">Continue without microphone and camera</button></div></div>` : ''}
+${hy ? `<div id="hearq" role="dialog" aria-modal="true" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:20"><div style="background:#fff;margin:80px auto;width:380px;padding:16px">
+  <h2 id="hearTitle">Do you want people to hear you in the meeting?</h2><p>You can still turn off your microphone anytime in the meeting.</p>
+  <button id="hearUse"${hy[0] ? '' : ' hidden'}>${hy[0] || 'Use microphone'}</button><button id="hearNo">${hy[1]}</button></div></div>` : ''}
 ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10"><p>We use cookies.</p>
   <button id="onetrust-accept-btn-handler">Accept Cookies</button></div>` : ''}
 <div id="waiting" hidden><h2>Please wait, the meeting host will let you in soon.</h2><button>Leave</button></div>
@@ -82,7 +96,7 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
   </aside>
 </div>
 <script>
-const R = ${JSON.stringify({ tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends, liveChat: !!r.liveChat })};
+const R = ${JSON.stringify({ tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null })};
 const id = ${JSON.stringify(id)}, $ = (x) => document.getElementById(x);
 const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });
@@ -93,7 +107,23 @@ if (${r.noDevices ? 'true' : 'false'}) pmic = false;
 $('onetrust-accept-btn-handler') && ($('onetrust-accept-btn-handler').onclick = () => $('onetrust-banner-sdk').remove());
 if ($('devq')) { $('devNo').onclick = () => { $('devq').remove(); post('media', { devices: 'declined' }); }; $('devUse').onclick = () => { $('devq').remove(); post('media', { devices: 'used' }); }; }
 if ($('remember')) $('input-for-name').addEventListener('input', () => { $('join').disabled = !$('input-for-name').value.trim(); });
-if (${r.web2026 ? 'true' : 'false'}) pcam = false;
+if (${r.web2026 || r.hearYou ? 'true' : 'false'}) pcam = false;
+if (R.hearYou) {
+  pmic = !!R.micClick; // without permission the microphone sends nothing
+  // A question in the dialog: [title, use label, decline label]; the decline only closes it, "Use …" is logged.
+  const ask = (title, use, no) => { $('hearTitle').textContent = title; $('hearUse').textContent = use; $('hearUse').hidden = false; $('hearNo').textContent = no; $('hearq').hidden = false; };
+  $('hearNo').onclick = () => { $('hearq').hidden = true; post('media', { devices: 'declined', question: $('hearTitle').textContent }); };
+  $('hearUse').onclick = () => { $('hearq').hidden = true; post('media', { devices: 'used', question: $('hearTitle').textContent }); };
+  $('devNo').onclick = () => { $('devq').remove(); post('media', { devices: 'declined' }); setTimeout(() => { $('hearq').hidden = false; }, R.hearDelayMs ?? 500); };
+  $('pmic').onclick = () => {
+    if (R.micClick === 'stuck') return;
+    if (R.micClick === 'asksCamera') return ask('Do you want people to see you in the meeting?', 'Use camera', 'Continue without camera');
+    if (R.micClick === 'asksCameraBoth') return ask('Do you want people to see you in the meeting?', 'Use microphone and camera', 'Continue without microphone and camera');
+    if (R.micClick === 'toggles') { pmic = !pmic; $('pmic').textContent = pmic ? 'Mute' : 'Unmute'; $('pmic').setAttribute('aria-label', $('pmic').textContent); return; }
+    ask('Do you want people to hear you in the meeting?', 'Use microphone', 'Continue without microphone');
+  };
+  $('pcam').onclick = () => ask('Do you want people to see you in the meeting?', 'Use camera', 'Continue without camera');
+}
 $('join').onclick = () => {
   const pwd = $('input-for-pwd') ? $('input-for-pwd').value : params.get('pwd');
   mic = pmic; cam = pcam;

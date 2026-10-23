@@ -8,7 +8,7 @@
 // and labels are also matched in German and Ukrainian (some Russian). These markers were written from Zoom's web
 // client as documented and seen in screenshots, and tested against a local stand-in (test/fakezoom.mjs), not yet
 // against live Zoom: a run against real Zoom that fails here is fixed here.
-import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, DIALOGS, HEADINGS } from './common.mjs';
 
 const TEXT = {
   // The waiting room, or a meeting the host has not started yet (Zoom lets you in when it starts).
@@ -52,7 +52,8 @@ const LABEL = {
   leaveConfirm: any('^leave meeting$', '^meeting verlassen$', '^вийти з конференції$', '^покинути конференцію$', '^выйти из конференции$'),
   launch: any('^launch meeting$', '^meeting (?:starten|eröffnen)$', '^запустити конференцію$', '^запустить конференцию$'),
   fromBrowser: any('join from (?:your|the) browser', '(?:über|vom|mit) (?:ihrem |dem )?browser (?:aus )?(?:beitreten|teilnehmen)', 'приєднатися (?:з|через) браузер', 'войти из браузера', 'присоединиться из браузера'),
-  // The web client's first question, "Do you want people to see you in the meeting?": answered without devices.
+  // The web client's device questions, "Do you want people to see you in the meeting?" and "Do you want people to hear
+  // you in the meeting?": answered without devices ("Use microphone…" is never clicked).
   noDevices: any('^continue without (?:microphone and camera|microphone or camera|audio (?:and|or) video|microphone|camera)$',
     '^ohne (?:mikrofon und kamera|mikrofon|kamera) (?:fortfahren|weiter)$', '^weiter ohne (?:mikrofon und kamera|mikrofon|kamera)$',
     '^продовжити без (?:мікрофона(?: (?:й|і|та) камери)?|камери)$', '^продолжить без (?:микрофона(?: и камеры)?|камеры)$'),
@@ -89,6 +90,89 @@ const overlays = async (page) => {
   return n + await dismissOverlays(page, LABEL.dismiss, ['#onetrust-banner-sdk', '[class*="zm-modal"]', '[class*="modal-dialog"]']);
 };
 const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha'];
+
+// A device question shown: answered "Continue without …". null if none is shown, else the question's text (its dialog,
+// or the nearest box around the answer with more text than it) and whether the answer took (clicked, and gone).
+async function declineDevices(page) {
+  const b = await firstVisible(button(page, LABEL.noDevices));
+  if (!b) return null;
+  const text = norm(await b.evaluate((el) => {
+    const own = (el.innerText || '').length;
+    for (let n = el.parentElement; n && n !== document.body; n = n.parentElement) {
+      if (n.matches('[role="dialog"], [role="alertdialog"], [aria-modal="true"]') || (n.innerText || '').length > own + 30) return n.innerText || '';
+    }
+    return '';
+  }).catch(() => ''));
+  const ok = await b.click({ timeout: 2000 }).then(() => true, () => false) && !(await b.isVisible().catch(() => false));
+  return { text, ok };
+}
+// Which device a question asks for, by the question, not by its answers ("Do you want people to see you…?" offers
+// "Continue without microphone and camera" too): hearing is the microphone, seeing the camera.
+const ASKS = {
+  audioinput: any('\\bhear you\\b', 'sie hören', 'dich hören', 'вас (?:чули|чути)', 'вас слышали', 'вас слышать'),
+  videoinput: any('\\bsee you\\b', 'sie sehen', 'dich sehen', 'вас (?:бачили|бачити)', 'вас видели', 'вас видеть'),
+};
+
+// What the browser could capture (meetings run in Chromium only): how many microphones or cameras it lists (Chromium
+// lists one, unnamed, per kind before permission is given, none when there is none) and the permission state; null
+// where it can't tell.
+async function devices(page, kind) {
+  return page.evaluate(async (kind) => {
+    const out = { count: null, permission: null };
+    try { out.count = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === kind).length; } catch {}
+    try { out.permission = (await navigator.permissions.query({ name: kind === 'audioinput' ? 'microphone' : 'camera' })).state; } catch {}
+    return out;
+  }, kind).catch(() => ({ count: null, permission: null }));
+}
+
+// dry_run: a device as Bosun sees it, nothing clicked: its control's label (a microphone Zoom never got also shows
+// "Mute"), how many the browser lists and the permission.
+async function seen(page, kind, onLabel, offLabel) {
+  const c = await firstVisible(button(page, onLabel)) || await firstVisible(button(page, offLabel));
+  const control = c ? ((await c.getAttribute('aria-label').catch(() => null)) || (await c.innerText().catch(() => '')).trim()) : null;
+  const d = await devices(page, kind);
+  return { control, devices: d.count, permission: d.permission };
+}
+
+// Microphone or camera verifiably off in Zoom (preview or call). Off: its control shows "turn on"; the browser has no
+// such device or its permission is denied; or clicking the control made Zoom ask for the device (a microphone Zoom
+// never got shows "Mute" with a crossed icon, and clicking it asks "Do you want people to hear you…?" instead of
+// muting): the question is answered without it. Only a question asking for this device, coming up within 3 s of a click
+// that took (none was shown when it was clicked), and answered, counts, and it has to happen twice in a row: Zoom's own
+// first questions can come late and just after a click. A control that shows the device on, takes clicks and neither turns
+// off nor asks is a live device: not joining (throws). Without a control, the page saying the device is missing will
+// do. The permission state "prompt" is not taken as off: Bosun's browsers grant capture on request.
+async function deviceOff(page, { what, kind, onLabel, offLabel, missing, state, when = 'before joining', then = 'not joining', timeoutMs = 15_000 }) {
+  const until = Date.now() + timeoutMs;
+  let clicked = 0; // when the control last took a click
+  let asked = 0; // clicks in a row that made Zoom ask for the device
+  for (;;) {
+    if (Date.now() > until) throw new Error(`could not make sure the ${what} is off ${when} (Zoom changed?); ${then}`);
+    const q = await declineDevices(page);
+    if (q) {
+      if (q.ok && clicked && Date.now() - clicked < 3000 && ASKS[kind].test(q.text)) {
+        if (++asked >= 2) return 'not in use';
+        clicked = 0; // asked once: click again
+      }
+      await page.waitForTimeout(300);
+      continue;
+    }
+    if (await visible(button(page, offLabel))) return 'off';
+    const st = await state(page);
+    if (TERMINAL.includes(st)) return st;
+    const d = await devices(page, kind);
+    if (d.count === 0) return 'no device';
+    if (d.permission === 'denied') return 'no permission';
+    const on = await firstVisible(button(page, onLabel));
+    if (!on && missing.test(await pageText(page).catch(() => ''))) return 'no device';
+    // One click, then time for Zoom to toggle it or ask (a second click could turn a just-muted microphone back on).
+    if (on && Date.now() - clicked > 2000 && !(await disabled(on))) {
+      if (clicked) asked = 0; // the last click brought no question
+      clicked = await on.click({ timeout: 3000 }).then(() => Date.now(), () => clicked);
+    }
+    await page.waitForTimeout(300);
+  }
+}
 
 // A Zoom meeting link -> {id, pwd, tk} or null. Hosts: zoom.us and its subdomains (us02web.zoom.us, acme.zoom.us,
 // app.zoom.us); paths: /j/<id>, /w/<id> (webinar), /wc/join/<id>, /wc/<id>/join, /wc/<id>.
@@ -178,7 +262,15 @@ export const zoom = {
       await overlays(page);
       await page.waitForTimeout(500);
     }
-    await overlays(page);
+    // Zoom asks "see you" first and "hear you" next: both answered, and the microphone and camera made sure off,
+    // before the name is typed (a question coming up takes the keyboard).
+    for (let quiet = 0, t = Date.now() + 5000; quiet < 3 && Date.now() < t; await page.waitForTimeout(300)) quiet = (await overlays(page)) ? 0 : quiet + 1;
+    // In the preview, "Join Audio" (no audio connected yet) also means nothing goes out.
+    const micOffOrNoAudio = new RegExp(`${LABEL.micOn.source}|${LABEL.audioMenu.source}`, 'i');
+    for (const [what, kind, onLabel, offLabel, missing] of [['microphone', 'audioinput', LABEL.micOff, micOffOrNoAudio, TEXT.noMic], ['camera', 'videoinput', LABEL.camOff, LABEL.camOn, TEXT.noCamera]]) {
+      const r = await deviceOff(page, { what, kind, onLabel, offLabel, missing, state: (p) => this.state(p) });
+      if (TERMINAL.includes(r)) return r;
+    }
     // A profile that is no longer signed in to Zoom joins as a guest (and is said to be signed out).
     if (profile) info.signedIn = await this.signedIn(page);
     // Signed in: Zoom fills in the account's name, which is kept; otherwise (or with an empty field, which the web
@@ -205,12 +297,6 @@ export const zoom = {
         ? 'Zoom asks for the meeting passcode although the link carries one (pwd); the link may be outdated: ask for a fresh invitation link.'
         : 'Zoom asks for the meeting passcode: use the invitation link with ?pwd=…, as Zoom sends it.';
       return 'invalid';
-    }
-    // In the preview, "Join Audio" (no audio connected yet) also means nothing goes out.
-    const micOffOrNoAudio = new RegExp(`${LABEL.micOn.source}|${LABEL.audioMenu.source}`, 'i');
-    for (const [what, onLabel, offLabel, missing] of [['microphone', LABEL.micOff, micOffOrNoAudio, TEXT.noMic], ['camera', LABEL.camOff, LABEL.camOn, TEXT.noCamera]]) {
-      const r = await ensureOff(page, { what, onLabel, offLabel, missing, text: pageText, state: (p) => this.state(p), stop: TERMINAL, site: 'Zoom' });
-      if (TERMINAL.includes(r)) return r;
     }
     const join = await firstVisible(button(page, LABEL.join));
     if (!join) throw new Error('the Zoom page has no "Join" button any more (Zoom changed?)');
@@ -243,6 +329,8 @@ export const zoom = {
       join_enabled: join ? !(await disabled(join)) : null,
       name_field: field ? { prefilled: (await field.inputValue().catch(() => '')).trim() || null } : null,
       passcode_asked: !!(await firstVisible(page.locator(PASSCODE_FIELD))),
+      microphone: await seen(page, 'audioinput', LABEL.micOff, LABEL.micOn),
+      camera: await seen(page, 'videoinput', LABEL.camOff, LABEL.camOn),
       challenge: await challengeShown(page),
       ...(profile ? { profile_signed_in: await this.signedIn(page) } : {}),
     };
@@ -264,8 +352,8 @@ export const zoom = {
       if (Date.now() > until) throw new Error('could not join computer audio in Zoom (nothing would be heard or recorded); Zoom changed?');
       await page.waitForTimeout(500);
     }
-    for (const [what, onLabel, offLabel, missing] of [['microphone', LABEL.micOff, LABEL.micOn, TEXT.noMic], ['camera', LABEL.camOff, LABEL.camOn, TEXT.noCamera]]) {
-      const r = await ensureOff(page, { what, onLabel, offLabel, missing, text: pageText, state: (p) => this.state(p), stop: TERMINAL, site: 'Zoom' });
+    for (const [what, kind, onLabel, offLabel, missing] of [['microphone', 'audioinput', LABEL.micOff, LABEL.micOn, TEXT.noMic], ['camera', 'videoinput', LABEL.camOff, LABEL.camOn, TEXT.noCamera]]) {
+      const r = await deviceOff(page, { what, kind, onLabel, offLabel, missing, state: (p) => this.state(p), when: 'in the meeting', then: 'leaving' });
       if (TERMINAL.includes(r)) throw new Error(`the meeting ended while switching the ${what} off (${r})`);
     }
   },
