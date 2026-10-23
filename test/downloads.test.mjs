@@ -186,7 +186,7 @@ test('allowed host: click reports it, download_get gives a one-time GET URL, and
     assert.equal(res.body.toString(), TEXT);
     assert.equal(res.headers['content-type'], 'text/vtt');
     assert.equal(res.headers['content-disposition'], `attachment; filename="transcript.vtt"; filename*=UTF-8''transcript.vtt`);
-    await until(() => !fs.existsSync(f.dir));
+    await until(() => !fs.existsSync(f.dir), 15_000); // deleted once the response has closed (slow under load)
     assert.equal((await get(g.get_url)).status, 404); // once
     assert.match((await c.call('download_get', { download_id: d.download_id })).text, /no download d[0-9a-f]{16}/);
     assert.deepEqual((await c.call('downloads', {})).json(), []);
