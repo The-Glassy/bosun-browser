@@ -98,14 +98,14 @@ test('Zoom: the meeting is heard once computer audio is joined, and recorded the
 });
 
 // Live Zoom on 2026-10-23 15:00: both device questions declined, computer audio connected by Zoom itself without a
-// microphone ("Audio" in the toolbar, "Leave computer audio" in its menu). The browser lists no microphone or camera,
-// as in production (noDeviceList, so a runner with a camera doesn't change that): the meeting must still be heard and
-// recorded.
+// microphone ("Audio" in the toolbar, "Leave computer audio" in its menu). Bosun is told the browser lists no
+// microphone or camera, as production's does (so a runner with a camera doesn't change that): the meeting must still be
+// heard and recorded.
 test('Zoom 15:00: computer audio connected by Zoom itself, no microphone listed: the meeting is heard and recorded', { skip: why || false }, async () => {
   const { startFakeZoom } = await import('./fakezoom.mjs');
   const { zoom, zoomWebClientUrl } = await import('../src/meetings/platforms/zoom.mjs');
   const z = await startFakeZoom({ tone: true });
-  const platform = { ...zoom, accountUrl: `${z.base}/profile`, joinUrl: (u) => zoomWebClientUrl(u).replace('https://app.zoom.us', z.base), origins: () => [z.base] };
+  const platform = { ...zoom, accountUrl: `${z.base}/profile`, joinUrl: (u) => zoomWebClientUrl(u).replace('https://app.zoom.us', z.base), origins: () => [z.base], devices: async () => ({ count: 0, permission: 'granted' }) };
   const svc = await startBosun({ KEEPALIVE: '0', HEADLESS: '0', ENGINE: 'chromium' }, { meetings: { platformFor: (u) => (zoom.matches(u) ? platform : null), pollMs: 300 } });
   const ended = [];
   svc.events.on('meeting-ended', (e) => ended.push(e));
@@ -113,7 +113,7 @@ test('Zoom 15:00: computer audio connected by Zoom itself, no microphone listed:
     const c = await connect(svc);
     const s = await c.open({ profile: 'zoom', engine: 'chromium' });
     await c.call('session_close', { session: s });
-    const { id: zid, url } = z.newRoom({ hearYou: 'both', audioJoined: true, noDeviceList: true, open: true, passcode: 'p1' });
+    const { id: zid, url } = z.newRoom({ hearYou: 'both', audioJoined: true, open: true, passcode: 'p1' });
     const res = await c.call('meeting_join', { url, profile: 'zoom', name: 'Glassy Notetaker' });
     assert.equal(res.isError, false, res.text);
     const id = res.json().meeting_id;

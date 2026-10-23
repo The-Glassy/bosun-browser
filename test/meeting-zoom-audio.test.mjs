@@ -17,7 +17,10 @@ let fz;
 before(async () => { fz = await startFakeZoom(); });
 after(async () => { await fz.close(); });
 
-const zoomAt = (base) => ({ ...zoom, accountUrl: `${base}/profile`, joinUrl: (u) => zoomWebClientUrl(u).replace('https://app.zoom.us', base), origins: () => [base] });
+// The production server lists no microphone or camera (and grants the permission): so does this platform, on every
+// engine and host.
+const NONE = async () => ({ count: 0, permission: 'granted' });
+const zoomAt = (base) => ({ ...zoom, accountUrl: `${base}/profile`, joinUrl: (u) => zoomWebClientUrl(u).replace('https://app.zoom.us', base), origins: () => [base], devices: NONE });
 
 async function withService(fn) {
   const audio = fakeAudio();
@@ -33,7 +36,7 @@ async function withService(fn) {
   } finally { fz.account(null); await svc.stop(); }
 }
 const status = async (c, id) => (await c.call('meeting_status', { meeting_id: id })).json();
-const LIVE = { hearYou: 'both', audioJoined: true, noDeviceList: true, open: true, passcode: 'p1', title: "Mykhailo Buialo's Zoom Meeting" };
+const LIVE = { hearYou: 'both', audioJoined: true, open: true, passcode: 'p1', title: "Mykhailo Buialo's Zoom Meeting" };
 
 test('Zoom 15:00: computer audio Zoom connected by itself ("Audio", its menu offering "Leave computer audio") counts as joined; notices closed; announced, then recording', async () => {
   await withService(async (c, { audio }) => {

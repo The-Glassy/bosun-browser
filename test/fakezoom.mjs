@@ -48,7 +48,7 @@ function launch(id, search) {
 // was not seen: one carries aria-label "close", the other only a close class). The "hear you" dialog also holds
 // Chrome's <permission> element. A click on "Audio", "Video", a menu entry or the <permission> element is logged as
 // media {clicked}. audioJoined 'notConnected': the same toolbar, but the menu offers neither leaving computer audio nor
-// switching to phone audio. noDeviceList: the browser lists no microphone or camera (a server without devices).
+// switching to phone audio. (A host without devices, as production is, is the test's platform: zoom.devices.)
 // decoyMenu: a menu shown in the call with a participant named "Leave computer audio"; 'renames': that participant is
 // named "Leave computer audio" while the audio menu is open, and gone from that menu once it closes. menuHide 'visibility' / 'opacity': the audio menu
 // stays in the page when closed, hidden by visibility or opacity instead of display. captionClose: the captions
@@ -138,7 +138,6 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
 </div>
 <script>
 const R = ${JSON.stringify({ decoyMenu: r.decoyMenu || null, menuHide: r.menuHide || null, tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null, audioJoined: r.audioJoined || null })};
-if (${r.noDeviceList ? 'true' : 'false'}) Object.defineProperty(MediaDevices.prototype, 'enumerateDevices', { value: async () => [] });
 const id = ${JSON.stringify(id)}, $ = (x) => document.getElementById(x);
 const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });

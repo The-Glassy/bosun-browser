@@ -27,8 +27,10 @@
 ### Tests
 
 - test/fakezoom.mjs has an `audioJoined` mode with the call as live Zoom showed it on 2026-10-23 15:00: the toolbar,
-  the audio menu, the notices, and Chrome's `<permission>` element in the "hear you" question (never clicked). Its
-  `noDeviceList` option makes the browser list no microphone or camera, like the production server.
+  the audio menu, the notices, and Chrome's `<permission>` element in the "hear you" question (never clicked).
+- The Zoom platform has a `devices(page, kind)` method (what the browser lists, and the permission). The new tests
+  replace it with what the production server reports, no microphone or camera, so they hold on every engine and host.
+  patchright reads the page from a world of its own, so a stand-in page can't hide the host's devices from it.
 - test/meeting-zoom-audio.test.mjs: the 15:00 call is joined, announced and recorded, with nothing clicked but the
   menu button and the notices' own buttons. On 0.11.1 it fails with the production error. A menu that offers neither
   "Leave computer audio" nor "Switch to phone audio" still ends with the error, also with a participant named "Leave
