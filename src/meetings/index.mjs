@@ -291,6 +291,7 @@ export class Meetings {
     await this.page(m, async (p) => {
       if (platform.afterAdmit) await platform.afterAdmit(p); // Zoom: computer audio joined, mic and camera off
       m.participants = await platform.participants(p);
+      if (m.participants > 1) m.othersSeen = true; // someone else was here: leaving after alone_leave_sec once they go
       await platform.openChat(p);
       await platform.watchChat(p, m.chatKey);
       for (const t of m.announce) await this.say(m, p, t);
@@ -343,38 +344,35 @@ export class Meetings {
 
   // Posts in the chat and remembers it, so the copy that shows up in the chat panel is recognized as ours.
   async say(m, page, text) {
-    const e = m.echoes.get(text.trim()) || { count: 0, until: 0 };
-    m.echoes.set(text.trim(), { count: e.count + 1, until: this.now() + ECHO_MS }); // when its echoes may be taken out
+    const e = m.echoes.get(text.trim()) || { count: 0, until: 0, norm: normalize(text) };
+    m.echoes.set(text.trim(), { ...e, count: e.count + 1, until: this.now() + ECHO_MS }); // see withoutOwn
     m.pendingOwn.push(text.trim());
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
     await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name });
   }
 
   // What is left of a message once Bosun's own posts are taken out of it (live Meet shows our messages with no sender,
-  // inside UI text, and may render one twice: first as it is sent, then again under a new id once confirmed). Only for
-  // a message without a participant's name on it: a named participant's message is always judged whole. Taken out as
-  // whole words; within ECHO_MS of posting as often as the panel shows it, later only as often as Bosun posted it
-  // (each later copy uses one up), so a participant writing the same short words later is heard and a short post
-  // ("No") never cuts into a word ("not"). A senderless exact copy of a long post (ECHO_LONG) is ours at any time.
+  // inside UI text, and may render one twice: as sent, then again under a new id once confirmed). Only for a message
+  // without a participant's name on it: a named participant's message is always judged whole.
+  // - A whole-message copy of a post is ours within ECHO_MS of posting, however often the panel renders it, and at any
+  //   time if the post is long (ECHO_LONG).
+  // - Inside a larger message, a post is taken out as whole words and only as often as Bosun posted it; every copy
+  //   recognised as ours uses one up. So a participant later writing the same short words is heard, a short post
+  //   ("recording") never takes words out of someone's "please stop recording", and "No" never cuts into "not".
   // Taking out, not dropping: a message that pastes our announcement and adds "please stop recording" keeps it.
   withoutOwn(m, text) {
-    const flat = (t) => String(t).replace(/[‘’ʼ]/g, "'").replace(/[“”„]/g, '"');
     const whole = normalize(text);
-    for (const sent of m.echoes.keys()) {
-      const n = normalize(sent);
-      if (n.length >= ECHO_LONG && n === whole) return '';
+    for (const e of m.echoes.values()) {
+      if (e.norm === whole && (this.now() <= e.until || e.norm.length >= ECHO_LONG)) { e.count = Math.max(0, e.count - 1); return ''; }
     }
+    const flat = (t) => String(t).replace(/[‘’ʼ]/g, "'").replace(/[“”„]/g, '"');
     let rest = flat(text);
     for (const [sent, e] of [...m.echoes].sort((a, b) => b[0].length - a[0].length)) {
-      const fresh = this.now() <= e.until;
-      if (!fresh && e.count <= 0) continue;
+      if (e.count <= 0) continue;
       const words = flat(sent).trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
       if (!words.length) continue;
       const re = new RegExp(`(?<![\\p{L}\\p{N}])${words.join('\\s+')}(?![\\p{L}\\p{N}])`, 'iu');
-      while (re.test(rest) && (this.now() <= e.until || e.count > 0)) {
-        rest = rest.replace(re, ' ');
-        if (this.now() > e.until) e.count--;
-      }
+      while (e.count > 0 && re.test(rest)) { rest = rest.replace(re, ' '); e.count--; }
     }
     return rest;
   }

@@ -52,9 +52,10 @@
 - **Bosun's own chat messages no longer come through as `bosun:meeting-chat` from "someone".**
   - Live Meet renders our message twice: as sent, then again under a new id once confirmed. 0.10.2 recognised only
     the first.
-  - Within 60 s of posting, every senderless copy of a post is ours. After that, a senderless exact copy of a long
-    post (40+ characters) is ours too.
-  - Short messages later from someone else are still heard.
+  - Within 60 s of posting, a senderless message that is a whole copy of a post is ours, however often it is
+    rendered. After that, a whole copy of a long post (40+ characters) is ours too.
+  - A short post never takes words out of someone else's message, and the same words written by someone later are
+    heard.
 
 ### Changed
 
