@@ -23,7 +23,10 @@ import { pulseAudio } from './audio.mjs';
 export const ID_RE = /^m[0-9a-f]{12}$/;
 export const PLATFORMS = [meet, zoom];
 const POLL_MS = 1000;
-const ALONE_MS = 120_000; // alone in the call this long: leave
+const ALONE_MS = 120_000; // alone in the call this long while nobody else has been there yet: leave
+const ALONE_LEAVE_MS = 30_000; // alone this long after everyone else left: leave (meeting_join alone_leave_sec)
+const ECHO_MS = 60_000; // after posting, senderless copies of the post are ours however often the panel renders them
+const ECHO_LONG = 40; // a senderless exact copy of a post at least this long (normalized) is ours at any time
 const JOIN_REPLY_MS = 60_000; // meeting_join answers once the join request is out (or after this)
 const MAX_CHAT = 500; // kept per meeting
 const MEDIA_ARGS = ['--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'];
@@ -101,8 +104,8 @@ export class Meetings {
   // audio: {unsupported() -> reason|null, open() -> {browserEnv, args?, record(file), close()}, needsHeadful};
   // platformFor(url) -> platform|null; bus: EventBus (meeting events).
   constructor({ cfg, manager, bus, audio = pulseAudio, platformFor = (url) => PLATFORMS.find((p) => p.matches(url)) || null,
-    now = Date.now, pollMs = POLL_MS, aloneMs = ALONE_MS }) {
-    Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs });
+    now = Date.now, pollMs = POLL_MS, aloneMs = ALONE_MS, aloneLeaveMs = ALONE_LEAVE_MS }) {
+    Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs, aloneLeaveMs });
     this.dir = path.join(cfg.dataDir, 'recordings');
     this.active = new Map(); // id -> meeting
     this.dryRuns = new Set(); // dry runs in progress: {tenant, session} (capacity)
@@ -212,7 +215,7 @@ export class Meetings {
 
   // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
   // meeting could not be joined (denied, not a meeting page, no audio, ...).
-  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true }) {
+  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec = null }) {
     const checked = await this.check(tenant, { url, profile, engine });
     const { platform, eng } = checked;
     url = checked.url;
@@ -220,6 +223,7 @@ export class Meetings {
     const id = `m${crypto.randomBytes(6).toString('hex')}`;
     const m = {
       id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, leaveOnOptOut,
+      aloneLeaveMs: aloneLeaveSec !== null ? aloneLeaveSec * 1000 : this.aloneLeaveMs, othersSeen: false,
       announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner),
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
       createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, stopping: null, recMs: 0, file: null, deleted: false,
@@ -328,36 +332,48 @@ export class Meetings {
     const n = await this.page(m, (p) => m.platform.participants(p));
     m.participants = n;
     if (n !== null && n <= 1) {
+      // Everyone else left: leave soon (aloneLeaveMs). Nobody else has been here yet: wait longer for them (aloneMs).
       m.aloneSince ??= this.now();
-      if (this.now() - m.aloneSince > this.aloneMs) return this.finish(m, 'alone');
-    } else m.aloneSince = null;
+      if (this.now() - m.aloneSince > (m.othersSeen ? m.aloneLeaveMs : this.aloneMs)) return this.finish(m, 'alone');
+    } else {
+      m.aloneSince = null;
+      if (n !== null && n > 1) m.othersSeen = true;
+    }
   }
 
   // Posts in the chat and remembers it, so the copy that shows up in the chat panel is recognized as ours.
   async say(m, page, text) {
-    m.echoes.set(text.trim(), (m.echoes.get(text.trim()) || 0) + 1); // how often its echo may still be taken out
+    const e = m.echoes.get(text.trim()) || { count: 0, until: 0 };
+    m.echoes.set(text.trim(), { count: e.count + 1, until: this.now() + ECHO_MS }); // when its echoes may be taken out
     m.pendingOwn.push(text.trim());
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
     await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name });
   }
 
-  // What is left of a message once Bosun's own posts are taken out of it (live Meet showed our announcement with no
-  // sender, inside UI text). Only for a message without a participant's name on it: a named participant's message is
-  // always judged whole. Taken out as whole words, and each post only as often as Bosun posted it (an echo is used up
-  // once seen), so a participant later writing the same words is heard, and a short post ("No") never cuts into a
-  // word ("not"). Taking out, not dropping: a message that pastes our announcement and adds "please stop recording"
-  // keeps the request.
+  // What is left of a message once Bosun's own posts are taken out of it (live Meet shows our messages with no sender,
+  // inside UI text, and may render one twice: first as it is sent, then again under a new id once confirmed). Only for
+  // a message without a participant's name on it: a named participant's message is always judged whole. Taken out as
+  // whole words; within ECHO_MS of posting as often as the panel shows it, later only as often as Bosun posted it
+  // (each later copy uses one up), so a participant writing the same short words later is heard and a short post
+  // ("No") never cuts into a word ("not"). A senderless exact copy of a long post (ECHO_LONG) is ours at any time.
+  // Taking out, not dropping: a message that pastes our announcement and adds "please stop recording" keeps it.
   withoutOwn(m, text) {
     const flat = (t) => String(t).replace(/[‘’ʼ]/g, "'").replace(/[“”„]/g, '"');
+    const whole = normalize(text);
+    for (const sent of m.echoes.keys()) {
+      const n = normalize(sent);
+      if (n.length >= ECHO_LONG && n === whole) return '';
+    }
     let rest = flat(text);
-    for (const [sent, n] of [...m.echoes].sort((a, b) => b[0].length - a[0].length)) {
-      if (n <= 0) continue;
+    for (const [sent, e] of [...m.echoes].sort((a, b) => b[0].length - a[0].length)) {
+      const fresh = this.now() <= e.until;
+      if (!fresh && e.count <= 0) continue;
       const words = flat(sent).trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
       if (!words.length) continue;
       const re = new RegExp(`(?<![\\p{L}\\p{N}])${words.join('\\s+')}(?![\\p{L}\\p{N}])`, 'iu');
-      while (m.echoes.get(sent) > 0 && re.test(rest)) {
+      while (re.test(rest) && (this.now() <= e.until || e.count > 0)) {
         rest = rest.replace(re, ' ');
-        m.echoes.set(sent, m.echoes.get(sent) - 1);
+        if (this.now() > e.until) e.count--;
       }
     }
     return rest;

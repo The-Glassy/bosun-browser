@@ -94,7 +94,7 @@ export class Downloads extends EventEmitter {
 
   // Running and kept downloads, and deleted ones whose file is not gone yet (a removal that failed keeps its bytes
   // and its slot until the sweep's retry succeeds).
-  holding(f) { return f.state === 'downloading' || f.state === 'ready' || (f.state === 'deleted' && !!f.dir) || !!f.leftover; }
+  holding(f) { return f.state === 'downloading' || f.state === 'ready' || (f.state === 'deleted' && !!f.dir) || f.leftover || f.cleaning; }
   // Bytes of the tenant's running and kept downloads.
   used(tenant) { let n = 0; for (const f of this.files.values()) if (f.tenant === tenant && this.holding(f)) n += f.size; return n; }
   count(tenant) { let n = 0; for (const f of this.files.values()) if (f.tenant === tenant && this.holding(f)) n++; return n; }
@@ -146,6 +146,8 @@ export class Downloads extends EventEmitter {
       name: (() => { try { return safeName(d.suggestedFilename()); } catch { return 'download'; } })(),
       source: sourceOf(url), page: null, by: null, size: 0, reason: null, startedAt: Date.now(), delivered: false,
       dir: null, file: null, secret: null, urlExpiresAt: 0, expiresAt: Date.now() + this.cfg.downloadTtlMs, sending: false,
+      // The browser's own file (see keep), known from the start so every refusal can make sure it is gone.
+      abs: s.dlDir ? d._artifact?._initializer?.absolutePath ?? null : null, cleaning: false, leftover: false,
     };
     f.mime = mimeOf(f.name);
     this.files.set(f.id, f);
@@ -169,7 +171,7 @@ export class Downloads extends EventEmitter {
     // The browser's own file while it grows: <guid>.crdownload (Chromium) or <guid> (Firefox), next to where it ends
     // up. Without that path (a Playwright that no longer exposes it), the session's whole download directory is
     // measured instead, which is stricter.
-    const abs = f.abs = d._artifact?._initializer?.absolutePath ?? null;
+    const abs = f.abs;
     const measure = abs
       ? async () => { let n = 0; for (const p of [abs, `${abs}.crdownload`]) { try { n = Math.max(n, (await fs.promises.stat(p)).size); } catch {} } return n; }
       : () => dirBytes(s.dlDir);
@@ -213,6 +215,7 @@ export class Downloads extends EventEmitter {
 
   // d: null when the browser refused the download itself (nothing to cancel).
   async refuse(f, d, reason) {
+    f.cleaning = true; // still charged, and kept, until dropPartial has made sure its file is gone
     f.state = 'refused';
     f.reason = reason;
     await d?.cancel().catch(() => {});
@@ -223,6 +226,7 @@ export class Downloads extends EventEmitter {
   }
 
   async fail(f, d, reason) {
+    f.cleaning = true;
     f.state = 'failed';
     f.reason = reason;
     await d.delete().catch(() => {});
@@ -233,12 +237,17 @@ export class Downloads extends EventEmitter {
   // What the browser wrote of a download that is not kept, made sure to be gone: its bytes and slot stay charged
   // (f.leftover) until it is, and the sweep tries again.
   async dropPartial(f) {
-    if (f.abs) {
-      for (const p of [f.abs, `${f.abs}.crdownload`]) await fs.promises.rm(p, { force: true }).catch(() => {});
-      const left = await Promise.all([f.abs, `${f.abs}.crdownload`].map((p) => fs.promises.stat(p).then(() => true, (e) => e.code !== 'ENOENT')));
-      f.leftover = left.some(Boolean);
-    }
-    if (!f.leftover) f.size = 0;
+    try {
+      if (f.abs) {
+        for (const p of [f.abs, `${f.abs}.crdownload`]) await fs.promises.rm(p, { force: true }).catch(() => {});
+        // What is still there, charged at its current size (or, if it can't be measured, at least what was known).
+        const left = await Promise.all([f.abs, `${f.abs}.crdownload`].map((p) => fs.promises.stat(p).then((st) => st.size, (e) => (e.code === 'ENOENT' ? null : f.size))));
+        const sizes = left.filter((x) => x !== null);
+        f.leftover = sizes.length > 0;
+        if (f.leftover) f.size = Math.max(f.size, ...sizes);
+      }
+      if (!f.leftover) f.size = 0;
+    } finally { f.cleaning = false; }
   }
 
   settle(f) {
@@ -250,7 +259,7 @@ export class Downloads extends EventEmitter {
 
   // Refused and failed downloads are remembered for a while, but only so many per tenant.
   trimNotices(tenant) {
-    const notes = [...this.files.values()].filter((f) => f.tenant === tenant && (f.state === 'refused' || f.state === 'failed') && !f.leftover);
+    const notes = [...this.files.values()].filter((f) => f.tenant === tenant && (f.state === 'refused' || f.state === 'failed') && !f.leftover && !f.cleaning);
     for (const f of notes.slice(0, Math.max(0, notes.length - NOTICES_PER_TENANT))) this.files.delete(f.id);
   }
 
@@ -356,7 +365,8 @@ export class Downloads extends EventEmitter {
   sweep(now = Date.now()) {
     for (const f of [...this.files.values()]) {
       if (f.secret && now > f.urlExpiresAt) f.secret = null;
-      if (f.leftover) { this.dropPartial(f).catch(() => {}); continue; } // a refused download's bytes, not gone yet
+      if (f.cleaning) continue;
+      if (f.leftover) { f.cleaning = true; this.dropPartial(f).catch(() => {}); continue; } // a refused download's bytes, not gone yet
       // A GET still sending past the file's expiry is cut off (its client has stalled), then the file goes.
       if (f.sending && now > f.expiresAt + GET_IDLE_MS) f.abort?.();
       if (f.state === 'deleted' || ((f.state === 'ready' || f.state === 'refused' || f.state === 'failed') && now > f.expiresAt && !f.sending)) this.remove(f);

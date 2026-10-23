@@ -471,7 +471,8 @@ test('robustness: a long name with an emoji, a failed delete keeps its quota, tw
     const inDir = path.join(svc.dataDir, 'downloads', 'alice', '.in-test');
     fs.mkdirSync(inDir, { recursive: true });
     fs.writeFileSync(path.join(inDir, 'guid.crdownload'), Buffer.alloc(5000));
-    const fr = { id: 'dtest', tenant: 'alice', session: 'sx', seq: 0, state: 'downloading', name: 'x', source: 'h', size: 5000, abs: path.join(inDir, 'guid'), expiresAt: Date.now() + 3600_000 };
+    // Refused before its size was ever measured (size 0): charged at what is still on disk.
+    const fr = { id: 'dtest', tenant: 'alice', session: 'sx', seq: 0, state: 'downloading', name: 'x', source: 'h', size: 0, abs: path.join(inDir, 'guid'), expiresAt: Date.now() + 3600_000 };
     svc.downloads.files.set(fr.id, fr);
     fs.chmodSync(inDir, 0o500);
     await svc.downloads.refuse(fr, null, 'too big');

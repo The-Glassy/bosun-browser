@@ -194,7 +194,35 @@ test('leaves by itself: the meeting ends, the bot is removed, or it is alone too
     await run((code) => fake.setOthers(code, []), 'alone');
     assert.equal(svc.manager.used, 0);
     await c.close();
-  }, { meetings: { aloneMs: 1000 } });
+  }, { meetings: { aloneMs: 1000, aloneLeaveMs: 1000 } });
+});
+
+test('alone: right after everyone else left, Bosun leaves after alone_leave_sec; before anyone joined, it waits longer', async () => {
+  await withService(async (svc, ev) => {
+    const c = await connect(svc);
+    // Others were there, then all left: gone after alone_leave_sec (5), not the long wait (20 s here).
+    let { code, url } = fake.newRoom();
+    fake.open(code);
+    let id = (await c.call('meeting_join', { url, alone_leave_sec: 5 })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    await sleep(800);
+    const t0 = Date.now();
+    fake.setOthers(code, []);
+    await until(() => ev.ended.some((e) => e.meeting_id === id), 15_000);
+    assert.equal(ev.ended.find((e) => e.meeting_id === id).reason, 'alone');
+    assert.ok(Date.now() - t0 < 12_000, `left after ${Date.now() - t0} ms`);
+    // Nobody else ever there: still in after alone_leave_sec, and only the long wait ends it.
+    ({ code, url } = fake.newRoom());
+    fake.setOthers(code, []);
+    fake.open(code);
+    id = (await c.call('meeting_join', { url, alone_leave_sec: 5 })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    await sleep(8000);
+    assert.equal((await status(c, id)).state, 'recording');
+    await until(() => ev.ended.some((e) => e.meeting_id === id), 20_000);
+    assert.equal(ev.ended.find((e) => e.meeting_id === id).reason, 'alone');
+    await c.close();
+  }, { meetings: { aloneMs: 12_000 } });
 });
 
 test("denied, can't join, not admitted in time: clear errors and an ended event without recording", async () => {

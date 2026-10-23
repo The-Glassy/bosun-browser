@@ -483,7 +483,8 @@ meeting_recording_delete({ "meeting_id": "…" })
 5. While in the call:
    - Every chat message from someone else is pushed to the agent as `bosun:meeting-chat`, with `meeting_id`,
      `sender` and `text`. `meeting_chat_read` returns them too.
-   - Bosun leaves by itself when the meeting ends, when it is removed, or after **2 minutes alone**.
+   - Bosun leaves by itself when the meeting ends, when it is removed, or when it is alone. That is **30 s** after
+     everyone else left (`alone_leave_sec`), or 2 minutes if nobody else has joined yet.
    - The agent can leave with `meeting_leave`.
    - On leaving, `bosun:meeting-ended` carries `meeting_id`, `reason`, `duration_s`, `bytes` and the `recording`:
      path, a `file://` URI and size. The payload also has it as an MCP `resource_link`.

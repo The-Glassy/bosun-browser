@@ -38,9 +38,23 @@
   - A tenant holds at most 50, and fetches at most 4 at once.
   - A GET whose client reads nothing for 60 s, or that takes over an hour, is cut off. A file being fetched is
     fetched once: a second `download_get` meanwhile is refused.
-  - A delete that fails keeps the file's bytes and slot charged until the retry succeeds.
+  - A delete that fails keeps the file's bytes and slot charged until the retry succeeds. So does the partial file of
+    a refused or failed download until Bosun has made sure it is gone; it is charged at what is still on disk.
 - **Tenants:** another tenant's `download_id` answers like one that never existed, and a GET with another tenant's
   token is refused. Naming a read-only (`ephemeral`) tenant stops the service.
+
+### Meetings
+
+- **Leaving when alone is faster.** Once others have been in the call and everyone has left, Bosun leaves after
+  `alone_leave_sec` (new `meeting_join` parameter, default 30 s). Before, it waited 2 min. The 2-minute wait now
+  applies only while nobody else has joined yet. (Live Meet, 2026-10-23 11:14: the host left at 0:20, and Bosun
+  stayed until 2:33.)
+- **Bosun's own chat messages no longer come through as `bosun:meeting-chat` from "someone".**
+  - Live Meet renders our message twice: as sent, then again under a new id once confirmed. 0.10.2 recognised only
+    the first.
+  - Within 60 s of posting, every senderless copy of a post is ours. After that, a senderless exact copy of a long
+    post (40+ characters) is ours too.
+  - Short messages later from someone else are still heard.
 
 ### Changed
 
