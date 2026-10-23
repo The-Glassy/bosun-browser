@@ -14,7 +14,8 @@ import { pathToFileURL } from 'url';
 import { httpUrl } from '../sessions.mjs';
 import { readProfileMeta } from '../engines.mjs';
 import { TENANT_RE } from '../auth.mjs';
-import { matchOptOut } from './optout.mjs';
+import { matchOptOut, normalize } from './optout.mjs';
+import { cleanChatText, cleanSender } from './platforms/common.mjs';
 import { meet } from './platforms/meet.mjs';
 import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
@@ -340,6 +341,19 @@ export class Meetings {
     await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name });
   }
 
+  // A message that contains something Bosun posted in this meeting is Bosun's own, whatever sender the panel shows
+  // (live Meet showed our announcement with no sender, inside UI text). It is never an objection and never an event.
+  // Only that direction: a participant writing a phrase the announcement quotes ("please don't record") is theirs.
+  ownText(m, text) {
+    const t = normalize(text);
+    if (!t) return false;
+    for (const sent of m.sentAll) {
+      const n = normalize(sent);
+      if (n.length >= 12 && t.includes(n)) return true;
+    }
+    return false;
+  }
+
   // Ours only if we just sent exactly this text AND the chat shows it as from us; each sent message matches once.
   // A participant named "You" or after the bot, or repeating something the bot said, is not taken for the bot.
   own(m, msg) {
@@ -357,18 +371,19 @@ export class Meetings {
       await this.page(m, (p) => m.platform.watchChat(p, m.chatKey));
       msgs = [];
     }
-    for (const msg of msgs) {
+    for (const raw of msgs) {
+      // The bubble's text and sender without the UI around them (times, pin control).
+      const msg = { ...raw, text: cleanChatText(raw.text), sender: cleanSender(raw.sender) };
       if (!msg.text || m.chatTexts.get(msg.id) === msg.text) continue;
       const edited = m.chatTexts.has(msg.id); // the panel filled in or changed a message after it first appeared
       m.chatTexts.set(msg.id, msg.text);
       if (m.chatTexts.size > 2 * MAX_CHAT) m.chatTexts.delete(m.chatTexts.keys().next().value);
-      if (!edited && this.own(m, msg)) { m.chatTexts.set(msg.id, msg.text); continue; }
+      if ((!edited && this.own(m, msg)) || this.ownText(m, msg.text)) continue;
       const entry = { seq: ++m.chatSeq, at: new Date(this.now()).toISOString(), sender: msg.sender || null, text: msg.text, ...(edited ? { edited: true } : {}) };
       m.chat.push(entry);
       if (m.chat.length > MAX_CHAT) m.chat.shift();
       this.emit(m, 'chat', { sender: entry.sender, text: entry.text, ...(edited ? { edited: true } : {}) });
-      // The bot's own wording (the announcement quotes "please don't record") never counts as an objection.
-      if (!m.optedOut && !m.sentAll.has(msg.text.trim()) && matchOptOut(msg.text)) await this.optOut(m, entry);
+      if (!m.optedOut && matchOptOut(msg.text)) await this.optOut(m, entry);
       if (m.state === 'ended') return;
     }
   }

@@ -293,11 +293,14 @@ export const meet = {
       const sender = (el) => {
         const named = el.closest('[data-sender-name]');
         if (named) return named.getAttribute('data-sender-name');
-        // Meet groups consecutive messages under one header line with the sender's name.
+        // Meet groups consecutive messages under one header line with the sender's name (and a time, "Alex 10:07 AM";
+        // a time or the pin control's text is no name).
+        const ui = /^(?:\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?|hover over a message to pin it|pin message|unpin message|keep|keep_off|push_pin|more_vert)$/i;
         const own = new Set((el.innerText || '').split('\n').map((s) => s.trim()));
         for (let g = el.parentElement, i = 0; g && i < 3; g = g.parentElement, i++) {
-          const first = (g.innerText || '').split('\n').map((s) => s.trim()).find(Boolean);
-          if (first && !own.has(first) && first.length <= 80) return first;
+          const first = (g.innerText || '').split('\n').map((s) => s.trim()).find((l) => l && !ui.test(l));
+          const name = first?.replace(/\s+\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?$/i, '').trim();
+          if (name && !own.has(first) && name.length <= 80) return name;
         }
         return null;
       };

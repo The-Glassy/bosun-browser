@@ -34,8 +34,10 @@ const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 // "Ask to use Companion mode", the Gemini footer, reCAPTCHA's invisible badge and its parked challenge frame);
 // joinName 'without' (the join button's accessible name is "Ask to join without microphone & camera", its text "Ask
 // to join") or 'devices' (plain "Ask to join" while the microphone or camera is on, "… without microphone & camera"
-// once both are off).
-function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null }) {
+// once both are off). liveChat: chat bubbles as live Meet rendered them (2026-10-23): "10:07 AM: <text>" with the pin
+// control's tooltip, icon names and label inside the message element; Bosun's own messages carry no sender at all,
+// others' sit under a plain header line with the name.
+function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false }) {
   const L = UI[lang];
   const de = lang === 'de';
   const joinButtons = elsewhere
@@ -78,7 +80,7 @@ const L = ${JSON.stringify(L)}, TOGGLES = ${JSON.stringify(toggles)};
 const code = location.pathname.split('/').pop(), $ = (id) => document.getElementById(id);
 if (${live ? 'true' : 'false'}) { document.title = 'Meet - ' + code; $('micPopClose').onclick = () => $('micPop').remove(); }
 // joinName 'devices': the join button is named after the devices it would join without.
-const JOIN_NAME = ${JSON.stringify(joinName)};
+const JOIN_NAME = ${JSON.stringify(joinName)}, LIVE_CHAT = ${liveChat ? 'true' : 'false'};
 const nameJoin = () => { if (JOIN_NAME === 'devices' && $('ask')) { if (!mic && !cam) $('ask').setAttribute('aria-label', L.ask + ' without microphone & camera'); else $('ask').removeAttribute('aria-label'); } };
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, ...b }) });
 let mic = true, cam = true, shown = new Set(), toned = false;
@@ -108,13 +110,22 @@ async function poll() {
       $('tiles').replaceChildren(...s.participants.map((p) => { const t = document.createElement('div'); t.className = 'tile'; t.dataset.participantId = p; t.textContent = p; return t; }));
     }
     for (const m of s.chat) {
-      if (shown.has(m.id)) { const d = document.querySelector('[data-message-id="' + m.id + '"]'); if (d.textContent !== m.text) d.textContent = m.text; continue; }
+      if (shown.has(m.id)) { const d = document.querySelector('[data-message-id="' + m.id + '"]'); if (!LIVE_CHAT && d.textContent !== m.text) d.textContent = m.text; continue; }
       shown.add(m.id);
       const g = document.createElement('div');
-      g.dataset.senderName = m.self ? 'You' : m.sender;
       const d = document.createElement('div');
       d.dataset.messageId = m.id;
-      d.textContent = m.text; // may be empty at first and filled in by a later poll (lateMs)
+      if (LIVE_CHAT) {
+        if (!m.self) { const h = document.createElement('div'); h.textContent = m.sender + ' 10:07 AM'; g.append(h); }
+        const t = document.createElement('div'); t.textContent = '10:07 AM: ' + m.text;
+        const tip = document.createElement('div'); tip.setAttribute('role', 'tooltip'); tip.textContent = 'Hover over a message to pin it';
+        const icon = document.createElement('div'); icon.setAttribute('aria-hidden', 'true'); icon.textContent = 'keep';
+        const pin = document.createElement('button'); pin.innerHTML = '<div aria-hidden="true">keep</div><div>Pin message</div>';
+        d.append(t, tip, icon, pin);
+      } else {
+        g.dataset.senderName = m.self ? 'You' : m.sender;
+        d.textContent = m.text; // may be empty at first and filled in by a later poll (lateMs)
+      }
       g.append(d);
       $('msgs').append(g);
     }

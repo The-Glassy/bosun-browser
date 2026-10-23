@@ -449,7 +449,9 @@ recording`, `bitte nicht aufnehmen`, `не записуй`, `не записыв
   deleted. / Aufnahme gestoppt und gelöscht." in the chat, sends `bosun:meeting-optout` and leaves. With
   `leave_on_optout: false` it stays but never records again in that meeting.
 - **The matcher is conservative.** "don't stop recording", "keep recording" or "record the next steps" do not
-  trigger it.
+  trigger it, and neither do instructions about opting out ("if you'd rather not…", "to opt out, write 'stop
+  recording'"): quoted words in a longer message are a mention. Bosun's own messages never count. A message that
+  contains something Bosun posted is its own, however the chat panel labels it.
 - **Because it can miss phrasings,** every chat message also reaches the agent, which can call
   `meeting_stop_recording` itself.
 

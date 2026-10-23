@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.10.2 — Bosun no longer opts itself out
+
+### Fixed
+
+- **Bosun took its own announcement for an objection** (live Meet, 2026-10-23). It deleted the recording and left
+  2–6 s after joining.
+  - Meet now renders our own chat message with no sender, inside UI text: "10:07 AM: <text>", then "Hover over a
+    message to pin it", "keep", "Pin message". So Bosun no longer recognised the message as its own.
+  - The default text quotes "please don't record" as an example. A custom text with 'write "stop" + "recording"'
+    matched "stop recording".
+- **Own messages:** a chat message that contains something Bosun posted in that meeting is Bosun's own, whatever
+  sender the panel shows. It is never an objection and never a `bosun:meeting-chat` event. Only that direction
+  counts: a participant writing the quoted example is still heard.
+- **Chat text and sender:** the UI around a message is removed on Meet and Zoom before anything reads it: a leading
+  time, and lines that are only the pin control, its tooltip or an icon name. A time or a control is never a
+  sender. Meet's sender is read past a time on its header line. Zoom's "<name> to Everyone 10:07 AM" counts as us.
+- **Matcher:**
+  - Quoted words are a mention, not a request, unless the message is only the quoted phrase (people copy
+    "'please don't record'" with its quotes).
+  - A clause that explains how to opt out never counts: "if you'd rather not…", "to opt out…", "e.g.", "wenn ihr
+    nicht…", "zum Abmelden…", "z. B.".
+  - "e.g." and "z. B." no longer split a sentence.
+
+### Tests
+
+- `test/meeting-optout-live.test.mjs`:
+  - the exact live bubble;
+  - the chat loop with our announcement echoed back with no sender (default EN/DE and the live custom text);
+  - full Meet and Zoom joins against stand-ins that render chat like the live pages. Bosun keeps recording
+    through its own announcement, and a participant's "please don't record" / "Stop recording please" still stops
+    and deletes the recording.
+- These tests fail on 0.10.1.
+
 ## 0.10.1 — Meet and Zoom lobbies as they are now
 
 Both platforms failed in production on 2026-10-23 on lobbies that had changed. The fixes are checked against

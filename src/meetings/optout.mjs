@@ -73,19 +73,33 @@ const VETO = [
   rx('(?:nezastavuj|nezastavujte|neprestávaj|neprestávajte|nevypínaj|nevypínajte|nemaž)'),
 ];
 
+// Instructions about how to opt out are not an opt-out: a clause that explains ("if you'd rather not be recorded",
+// "to opt out, write …", "e.g.", "wenn ihr nicht …", "zum Abmelden …"), as an announcement does, never counts.
+const INSTRUCTION = rx("if (?:you|anyone|someone)(?:'d| would| do not| don'?t| dont| prefer| want| rather)|(?:to|you can|you may) opt out|e g|for example|"
+  + 'wenn (?:ihr|sie|du|jemand) (?:nicht|lieber)|zum abmelden|z b|zum beispiel|якщо (?:ви|ти) не|если (?:вы|ты) не|ak (?:nechcete|nechceš)');
+
+// Quoted words are a mention ("write 'stop recording' to opt out"), not a request, as long as the clause says
+// something besides them. A message that is only the quoted phrase ("'please don't record'", copied from the
+// announcement with its quotes) still counts. Apostrophes inside words (don't) are not quotes.
+const QUOTED = /(?:"[^"\n]{1,120}"|“[^”\n]{1,120}”|„[^“”\n]{1,120}[“”]|«[^»\n]{1,120}»|‘(?:[^‘’\n]|(?<=\p{L})’(?=\p{L})){1,120}’|(?<![\p{L}\p{N}])'(?:[^'\n]|(?<=\p{L})'(?=\p{L})){1,120}'(?![\p{L}\p{N}]))/gu;
+function unquote(sentence) {
+  const rest = sentence.replace(QUOTED, ' ');
+  return normalize(rest) ? rest : sentence;
+}
+
 // A message is judged per clause: sentences, and the parts around "but"-like contrasts, so "Bob said keep recording,
 // but I do not consent to being recorded" is an opt-out while "don't stop recording" is not.
 const CONTRAST = /\s(?:but|however|though|aber|jedoch|sondern|doch|але|проте|но|однако|ale|avšak)\s/u;
 export function clauses(text) {
-  return String(text).slice(0, 4000).split(/[.!?;\n\u3002]+/u)
-    .flatMap((sentence) => normalize(sentence).split(CONTRAST))
+  return String(text).slice(0, 4000).split(/(?<!\b(?:e|z|i)\.(?:\s?(?:g|b|e))?)[.!?;\n\u3002]+(?=\s|$)/u)
+    .flatMap((sentence) => normalize(unquote(sentence)).split(CONTRAST))
     .map((c) => c.trim()).filter(Boolean);
 }
 
 // -> {lang, rule} for an opt-out request, else null.
 export function matchOptOut(text) {
   for (const c of clauses(text)) {
-    if (VETO.some((v) => v.test(c))) continue;
+    if (VETO.some((v) => v.test(c)) || INSTRUCTION.test(c)) continue;
     for (let i = 0; i < RULES.length; i++) if (RULES[i][1].test(c)) return { lang: RULES[i][0], rule: i };
   }
   return null;
