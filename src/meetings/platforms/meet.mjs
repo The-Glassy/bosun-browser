@@ -21,7 +21,16 @@
 // Ukrainian and Russian, so a UI that comes up in another of those languages works too. Markers are labels, roles
 // and texts a person sees; a run against real Meet that fails here is fixed here.
 
-import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, DIALOGS, HEADINGS } from './common.mjs';
+
+const JOIN_LABELS = ['ask to join', 'join now', 'join', 'ask to join anyway', 'join anyway', 'join the call now', 'trotzdem teilnehmen', 'teilnahme erbitten', 'teilnahme anfragen', 'teilnehmen anfragen', 'jetzt teilnehmen', 'teilnehmen', 'beitreten',
+  'požiadať o pripojenie', 'pripojiť sa', 'pripojiť sa teraz', 'попросити приєднатися', 'попросити дозволу приєднатися', 'приєднатися', 'приєднатися зараз',
+  'попросить разрешения присоединиться', 'присоединиться', 'присоединиться сейчас'];
+// "^<label>$", or the label followed by what it joins without ("… without microphone & camera", "… ohne Mikrofon
+// und Kamera", "… bez mikrofónu", "… без мікрофона", "… без микрофона").
+function joinLabel(labels) {
+  return new RegExp(labels.map((l) => `^${l}(?: (?:without|ohne|bez|без) [^,;]{1,60})?$`).join('|'), 'i');
+}
 
 const TEXT = {
   waiting: any("asking to be let in", "you'll join the call when someone lets you in", 'waiting for the host', 'please wait until a meeting host',
@@ -30,13 +39,18 @@ const TEXT = {
     'просимо дозволу', 'ви приєднаєтеся до дзвінка, коли вас',
     'запрашиваем разрешение', 'вы присоединитесь к звонку, когда вас'),
   // A participant (the host) said no.
-  denied: any('denied your request', 'request to join was denied', "weren't allowed to join", 'not allowed to join',
+  // "No one responded to your request to join the call": nobody let Bosun in before Meet gave up (it offers "Ask to
+  // join again"); counted as a denial, as other bots do.
+  denied: any('denied your request', 'request to join was denied', "weren't allowed to join", 'not allowed to join', 'no one responded to your request', 'ask to join again',
     'hat ihre anfrage (?:auf teilnahme )?abgelehnt', 'anfrage.*abgelehnt', 'zamietol (?:vašu )?žiadosť', 'відхилив (?:ваш )?запит', 'отклонил (?:ваш )?запрос'),
   // "You can't join this (video) call": Google turning the guest away, usually before anyone could be asked.
   cantJoin: any("(?:can't|cannot|can not) join this (?:video )?call", 'sie können nicht an diesem (?:video)?anruf teilnehmen',
     'sie können diesem (?:video)?anruf nicht beitreten', 'du kannst nicht an diesem (?:video)?anruf teilnehmen',
     'k tomuto (?:video)?hovoru sa nemôžete pripojiť', 'nemôžete sa pripojiť k tomuto (?:video)?hovoru',
     'ви не можете приєднатися до цього (?:відео)?дзвінка', 'вы не можете присоединиться к этому (?:видео)?(?:звонку|вызову)'),
+  // A link that is no meeting (any more).
+  invalid: any('check your meeting code', 'invalid video call name', 'your meeting code has expired', "the meeting code you entered doesn't work",
+    'überprüfen sie ihren besprechungscode', 'ungültiger name für den videoanruf', 'ihr besprechungscode ist abgelaufen'),
   removed: any("you've been removed", 'you have been removed', 'removed you from the (?:meeting|call)', 'aus (?:dem|der) (?:meeting|besprechung|anruf|videoanruf) entfernt',
     'vás odstránil', 'вас видалено', 'вас удалили'),
   ended: any('the call has ended', 'call ended', 'meeting (?:has )?ended', 'you left the meeting', 'you left the call', 'der anruf wurde beendet',
@@ -44,16 +58,18 @@ const TEXT = {
     'hovor sa skončil', 'opustili ste (?:hovor|stretnutie)', 'дзвінок завершено', 'ви вийшли', 'звонок завершен', 'вы покинули'),
   // Shown in the lobby when the browser has no such device: the control is off by construction.
   noCamera: any('camera not found', 'no camera found', 'kamera nicht gefunden', 'keine kamera gefunden', 'kamera sa nenašla', 'камеру не знайдено', 'камера не найдена'),
-  noMic: any('microphone not found', 'no microphone found', 'mikrofon nicht gefunden', 'kein mikrofon gefunden', 'mikrofón sa nenašiel', 'мікрофон не знайдено', 'микрофон не найден'),
+  // "Mic not found": the device picker ("Microphone: Mic not found").
+  noMic: any('microphone not found', 'no microphone found', '\\bmic not found', 'mikrofon nicht gefunden', 'kein mikrofon gefunden', 'mikrofón sa nenašiel', 'мікрофон не знайдено', 'микрофон не найден'),
 };
 const LABEL = {
   micOff: any('^turn off microphone', '^mikrofon (?:deaktivieren|ausschalten)', '^vypnúť mikrofón', '^вимкнути мікрофон', '^выключить микрофон'), // it is on
   micOn: any('^turn on microphone', '^mikrofon (?:aktivieren|einschalten)', '^zapnúť mikrofón', '^увімкнути мікрофон', '^включить микрофон'), // it is off
   camOff: any('^turn off camera', '^kamera (?:deaktivieren|ausschalten)', '^vypnúť kameru', '^вимкнути камеру', '^выключить камеру'),
   camOn: any('^turn on camera', '^kamera (?:aktivieren|einschalten)', '^zapnúť kameru', '^увімкнути камеру', '^включить камеру'),
-  join: any('^ask to join$', '^join now$', '^join$', '^teilnahme erbitten$', '^teilnahme anfragen$', '^teilnehmen anfragen$', '^jetzt teilnehmen$', '^teilnehmen$', '^beitreten$',
-    '^požiadať o pripojenie$', '^pripojiť sa$', '^pripojiť sa teraz$', '^попросити приєднатися$', '^попросити дозволу приєднатися$', '^приєднатися$', '^приєднатися зараз$',
-    '^попросить разрешения присоединиться$', '^присоединиться$', '^присоединиться сейчас$'),
+  // Meet names the button after the devices it joins with: with the microphone and camera off (or none found) the
+  // accessible name is "Ask to join without microphone & camera" / "Join now without camera", while the visible
+  // text stays "Ask to join". Both forms count (JOIN_TEXT matches the visible text).
+  join: joinLabel(JOIN_LABELS),
   // The account is in this call on another device: "Switch here" moves it over (and drops the other device), "Join
   // here too" (directly, or under "Other ways to join") keeps both. Bosun prefers "Join here too".
   joinToo: any('^join here too$', '^auch hier teilnehmen$', '^hier ebenfalls teilnehmen$', '^hier auch teilnehmen$', '^pripojiť sa aj tu$', '^приєднатися й тут$', '^приєднатися і тут$', '^приєднатися також тут$', '^присоединиться и здесь$', '^присоединиться также здесь$'),
@@ -101,8 +117,12 @@ const PARTICIPANT_CONTROLLED = '[data-message-id], [data-sender-name], [data-par
 const pageText = (page, roots) => textOutside(page, PARTICIPANT_CONTROLLED, roots);
 const overlays = (page) => dismissOverlays(page, LABEL.dismiss);
 
+// The primary join button: by its accessible name, else by its visible text alone (the name is what Meet changes).
+const JOIN_TEXT = new RegExp(JOIN_LABELS.map((l) => `^${l}$`).join('|'), 'i');
+const primaryJoin = async (page) => await firstVisible(button(page, LABEL.join))
+  || firstVisible(page.locator('button, [role="button"]').filter({ hasText: JOIN_TEXT }).filter({ hasNotText: LABEL.otherWays }));
 // Any button that joins from the lobby: "Ask to join" / "Join now", "Join here too", "Switch here".
-const joinCandidate = async (page) => await firstVisible(button(page, LABEL.join)) || await firstVisible(button(page, LABEL.joinToo)) || firstVisible(button(page, LABEL.switchHere));
+const joinCandidate = async (page) => await primaryJoin(page) || await firstVisible(button(page, LABEL.joinToo)) || firstVisible(button(page, LABEL.switchHere));
 
 // The lobby kind: 'guest' (a name field), 'account' (signed in: no name field, the account shown or no "Sign in"),
 // or null (no lobby yet).
@@ -122,12 +142,7 @@ export async function meetRefusalPage(page, { meetHost = 'meet.google.com' } = {
   try { if (new URL(page.url()).hostname !== meetHost) return false; } catch { return false; }
   const headings = await page.locator('h1, h2, [role="heading"]').allInnerTexts().catch(() => []);
   if (!headings.some(meetCantJoin)) return false;
-  const challenge = await page.locator('iframe').evaluateAll((fs) => fs.some((f) => {
-    if (!/recaptcha|hcaptcha|challenges\.cloudflare|turnstile/.test(f.src)) return false;
-    const r = f.getBoundingClientRect();
-    return r.width >= 60 && r.height >= 60 && f.checkVisibility?.() !== false;
-  })).catch(() => false);
-  return !challenge;
+  return !(await challengeShown(page));
 }
 
 export const meet = {
@@ -137,7 +152,8 @@ export const meet = {
   matches(url) {
     try {
       const u = new URL(url);
-      return u.protocol === 'https:' && u.hostname === 'meet.google.com' && /^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(u.pathname);
+      // meet.google.com/<code>, and the /meet/<code> form Meet redirects to (2026).
+      return u.protocol === 'https:' && u.hostname === 'meet.google.com' && /^\/(?:meet\/)?[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(u.pathname);
     } catch { return false; }
   },
 
@@ -149,7 +165,7 @@ export const meet = {
 
   async lobby(page, { name, info = {}, timeoutMs = 30_000 }) {
     const end = Date.now() + timeoutMs;
-    const STOP = ['denied', 'refused', 'ended'];
+    const STOP = ['denied', 'refused', 'ended', 'invalid'];
     // The lobby renders in steps; wait for a join button (a guest also gets a name field first on some pages). Tips
     // and dialogs Meet lays over it are closed on the way.
     for (;;) {
@@ -185,12 +201,37 @@ export const meet = {
     return 'asked'; // the request went out, but no waiting room was seen (yet)
   },
 
+  // dry_run: the lobby as Bosun sees it, without joining: what it would click and what stands in the way. Only
+  // Meet's tips and device popovers are closed; the microphone and camera are not touched and nothing is clicked.
+  async inspect(page, { timeoutMs = 30_000 } = {}) {
+    const end = Date.now() + timeoutMs;
+    let s;
+    for (;;) {
+      await overlays(page);
+      s = await this.state(page);
+      if (s !== 'unknown' || Date.now() > end) break;
+      await page.waitForTimeout(500);
+    }
+    const b = await joinCandidate(page);
+    const t = await pageText(page).catch(() => '');
+    const device = async (offL, onL, missing) => (await visible(button(page, offL)) ? 'off' : await visible(button(page, onL)) ? (missing.test(t) ? 'on (no device found)' : 'on') : missing.test(t) ? 'no device' : 'unknown');
+    return {
+      state: s,
+      lobby: await meetPrejoin(page),
+      join_button: b ? ((await b.getAttribute('aria-label').catch(() => null)) || (await b.innerText().catch(() => '')).trim()) : null,
+      microphone: await device(LABEL.micOn, LABEL.micOff, TEXT.noMic),
+      camera: await device(LABEL.camOn, LABEL.camOff, TEXT.noCamera),
+      challenge: await challengeShown(page),
+    };
+  },
+
   // The button that joins: "Ask to join" / "Join now"; with the account already in the call elsewhere, "Join here
   // too" (also behind "Other ways to join"), else "Switch here". -> {button, label} | null
   async joinButton(page) {
-    const pick = async (re) => { const b = await firstVisible(button(page, re)); return b ? { button: b, label: (await b.innerText().catch(() => '')).trim() || String(re) } : null; };
-    const primary = await pick(LABEL.join);
-    if (primary) return primary;
+    const label = async (b, re) => (await b.getAttribute('aria-label').catch(() => null)) || (await b.innerText().catch(() => '')).trim() || String(re);
+    const pick = async (re) => { const b = await firstVisible(button(page, re)); return b ? { button: b, label: await label(b, re) } : null; };
+    const p = await primaryJoin(page);
+    if (p) return { button: p, label: await label(p, LABEL.join) };
     const too = await pick(LABEL.joinToo);
     if (too) return too;
     const other = await firstVisible(button(page, LABEL.otherWays));
@@ -214,6 +255,7 @@ export const meet = {
     const t = await pageText(page, inCall ? DIALOGS : admitted ? `${DIALOGS}, ${HEADINGS}` : null).catch(() => '');
     if (TEXT.denied.test(t)) return 'denied';
     if (TEXT.cantJoin.test(t)) return 'refused';
+    if (!inCall && !admitted && TEXT.invalid.test(t)) return 'invalid';
     if (TEXT.removed.test(t)) return 'removed';
     if (TEXT.ended.test(t)) return 'ended';
     if (inCall || admitted) return 'admitted';

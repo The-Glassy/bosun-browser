@@ -32,7 +32,8 @@ export const HEADINGS = 'h1, h2, h3, [role="heading"]';
 
 export const visible = (l) => l.first().isVisible().catch(() => false);
 export const button = (page, name) => page.getByRole('button', { name });
-export const disabled = (l) => l.first().evaluate((b) => b.disabled || b.getAttribute('aria-disabled') === 'true').catch(() => false);
+// Disabled by attribute, ARIA, or (Zoom's web client) only by a "disabled" class.
+export const disabled = (l) => l.first().evaluate((b) => b.disabled || b.getAttribute('aria-disabled') === 'true' || b.classList.contains('disabled')).catch(() => false);
 
 // The first visible match of a locator, or null.
 export async function firstVisible(l, max = 5) {
@@ -40,6 +41,29 @@ export async function firstVisible(l, max = 5) {
     if (await l.nth(i).isVisible().catch(() => false)) return l.nth(i);
   }
   return null;
+}
+
+// A challenge the page actually shows: a reCAPTCHA / hCaptcha / Turnstile frame (in any frame of the page) that is
+// rendered, not hidden by visibility or opacity, on screen and at least 60x60 px, and is not reCAPTCHA's invisible
+// mode (size=invisible). Sites that are merely "protected by reCAPTCHA" (Meet, Zoom's web client) carry an invisible
+// widget, its hidden challenge frame parked off screen, and that notice: none of it is a challenge.
+export const CHALLENGE_SRC = /recaptcha|hcaptcha|challenges\.cloudflare|turnstile|captcha-delivery|geo\.captcha/;
+export async function challengeShown(page) {
+  for (const f of page.frames()) {
+    if (f === page.mainFrame()) continue;
+    const src = f.url();
+    if (!CHALLENGE_SRC.test(src) || /[?&]size=invisible\b/.test(src)) continue;
+    const el = await f.frameElement().catch(() => null);
+    if (!el) continue;
+    const shown = await el.evaluate((e) => {
+      const r = e.getBoundingClientRect();
+      const visible = e.checkVisibility ? e.checkVisibility({ visibilityProperty: true, opacityProperty: true }) : !!e.offsetParent;
+      return visible && r.width >= 60 && r.height >= 60 && r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
+    }).catch(() => false);
+    await el.dispose().catch(() => {});
+    if (shown) return true;
+  }
+  return false;
 }
 
 // Closes what the site lays over its page (feature tips, "continue without devices", cookie banners): only buttons

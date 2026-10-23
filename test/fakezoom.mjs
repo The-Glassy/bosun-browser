@@ -24,19 +24,37 @@ function launch(id, search) {
 // the call), recipient (the chat starts addressed to this person; "Everyone" is in its menu unless hostOnly),
 // enterNewline (Enter adds a line break; the Send button sends), hideRecipient (no recipient control shown: messages
 // go to `recipient` anyway, marked "(Privately)"), dropSends (the chat box clears but nothing is posted), askPasscode (the preview asks for the passcode even
-// though the link carried one).
+// though the link carried one). web2026: the preview as live Zoom showed it on 2026-10-23: first the question "Do you
+// want people to see you in the meeting?" ("Use microphone and camera" / "Continue without microphone and camera")
+// over everything, an empty "Your Name" field even for a signed-in account, "Remember my name for future meetings",
+// "Join" disabled until a name is typed, "This site is protected by reCAPTCHA …" with reCAPTCHA's invisible badge and
+// parked challenge frame, a microphone but "Cannot detect your camera". expired: Zoom's "This meeting link is invalid
+// (3,001)" page instead.
 function webClient(id, r) {
+  if (r.expired) {
+    return `<!doctype html><meta charset="utf-8"><title>Error - Zoom</title><nav><a href="/join">Join</a> <a href="/signin">Sign In</a></nav>
+<div>This meeting link is invalid (3,001)</div><div role="alertdialog" aria-label="Privacy"><p>Zoom uses cookies.</p><button>Decline Cookies</button><button>Accept Cookies</button></div>
+<button aria-label="Open chat dialog">:)</button>`;
+  }
+  if (r.web2026) r = { ...r, noDevices: false, signedInName: false };
   return `<!doctype html><meta charset="utf-8"><title>Zoom Meeting</title>
 <style>[hidden]{display:none!important} .tile{display:inline-block;width:80px;height:60px;background:#333;margin:4px}</style>
 <div id="preview">
   <h1>Enter Meeting Info</h1>
-  <input id="input-for-name" type="text" aria-label="Your Name" placeholder="Your Name" value="${r.signedIn ? 'Glassy Smartie' : ''}">
+  <input id="input-for-name" type="text" aria-label="Your Name" placeholder="Your Name" value="${r.signedIn && !r.web2026 ? 'Glassy Smartie' : ''}">
+  ${r.web2026 ? '<label><input type="checkbox" id="remember"> Remember my name for future meetings</label>' : ''}
   ${(r.passcode && !r.pwdGiven) || r.askPasscode ? '<input id="input-for-pwd" type="password" aria-label="Meeting Passcode" placeholder="Meeting Passcode">' : ''}
-  ${r.noDevices ? '<p>Cannot detect your camera</p><p>Cannot detect your microphone</p>' : '<button id="pmic" aria-label="Mute">Mute</button><button id="pcam" aria-label="Stop Video">Stop Video</button>'}
-  <button id="join" class="preview-join-button">Join</button>
+  ${r.web2026 ? '<button id="pmic" aria-label="Mute">Mute</button><p>Cannot detect your camera, please check the device and connection and try again.</p>'
+    : r.noDevices ? '<p>Cannot detect your camera</p><p>Cannot detect your microphone</p>' : '<button id="pmic" aria-label="Mute">Mute</button><button id="pcam" aria-label="Stop Video">Stop Video</button>'}
+  <button id="join" class="preview-join-button"${r.web2026 ? ' disabled' : ''}>Join</button>
   <p>By clicking "Join", you agree to our Terms of Service and Privacy Statement</p>
+  ${r.web2026 ? `<p>This site is protected by reCAPTCHA and the Google Privacy Policy and Terms of Service apply.</p><div class="grecaptcha-badge" style="position:fixed;bottom:14px;right:0;width:256px;height:60px"><iframe src="/recaptcha/api2/anchor?ar=1&amp;k=x&amp;size=invisible" title="reCAPTCHA" width="256" height="60"></iframe></div>
+<div style="visibility:hidden;position:absolute;top:-10000px"><iframe src="/recaptcha/api2/bframe?k=x" title="recaptcha challenge expires in two minutes" width="400" height="580"></iframe></div>` : ''}
   ${r.bigChallenge ? '<iframe src="/recaptcha/api2/anchor?k=x" title="reCAPTCHA" width="300" height="300"></iframe>' : ''}
 </div>
+${r.web2026 ? `<div id="devq" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:20"><div style="background:#fff;margin:80px auto;width:380px;padding:16px">
+  <h2>Do you want people to see you in the meeting?</h2><p>You can still turn off your microphone and camera anytime in the meeting.</p>
+  <button id="devUse">Use microphone and camera</button><button id="devNo">Continue without microphone and camera</button></div></div>` : ''}
 ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10"><p>We use cookies.</p>
   <button id="onetrust-accept-btn-handler">Accept Cookies</button></div>` : ''}
 <div id="waiting" hidden><h2>Please wait, the meeting host will let you in soon.</h2><button>Leave</button></div>
@@ -70,9 +88,12 @@ const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });
 let pmic = true, pcam = ${r.noDevices ? 'false' : 'true'}, audio = false, mic = true, cam = false, shown = new Set(), toned = false, inCall = false;
 if ($('pmic')) { $('pmic').onclick = () => { pmic = !pmic; $('pmic').textContent = pmic ? 'Mute' : 'Unmute'; $('pmic').setAttribute('aria-label', $('pmic').textContent); };
-  $('pcam').onclick = () => { pcam = !pcam; $('pcam').textContent = pcam ? 'Stop Video' : 'Start Video'; $('pcam').setAttribute('aria-label', $('pcam').textContent); }; }
+  if ($('pcam')) $('pcam').onclick = () => { pcam = !pcam; $('pcam').textContent = pcam ? 'Stop Video' : 'Start Video'; $('pcam').setAttribute('aria-label', $('pcam').textContent); }; }
 if (${r.noDevices ? 'true' : 'false'}) pmic = false;
 $('onetrust-accept-btn-handler') && ($('onetrust-accept-btn-handler').onclick = () => $('onetrust-banner-sdk').remove());
+if ($('devq')) { $('devNo').onclick = () => { $('devq').remove(); post('media', { devices: 'declined' }); }; $('devUse').onclick = () => { $('devq').remove(); post('media', { devices: 'used' }); }; }
+if ($('remember')) $('input-for-name').addEventListener('input', () => { $('join').disabled = !$('input-for-name').value.trim(); });
+if (${r.web2026 ? 'true' : 'false'}) pcam = false;
 $('join').onclick = () => {
   const pwd = $('input-for-pwd') ? $('input-for-pwd').value : params.get('pwd');
   mic = pmic; cam = pcam;
@@ -144,6 +165,7 @@ const NOTICES = {
 
 export async function startFakeZoom({ tone = false } = {}) {
   const rooms = new Map();
+  const state = { account: false };
   const room = (id) => {
     if (!rooms.has(id)) rooms.set(id, { phase: 'preview', guest: null, chat: [], others: ['Host Person', 'Guest Two'], over: null, tone, log: [], seq: 0, media: [], loads: [] });
     return rooms.get(id);
@@ -155,6 +177,12 @@ export async function startFakeZoom({ tone = false } = {}) {
     const html = (h) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(h); };
     let m = u.pathname.match(/^\/j\/(\d{9,12})$/);
     if (m) { room(m[1]).loads.push(u.pathname); return html(launch(m[1], u.search)); }
+    // The account page: 200 when the browser is signed in to the stand-in (account), else off to sign-in.
+    if (u.pathname === '/profile') {
+      if (state.account) return html('<title>Profile - Zoom</title><h1>Profile</h1>');
+      res.writeHead(302, { location: '/signin#/login' });
+      return res.end();
+    }
     m = u.pathname.match(/^\/wc\/(\d{9,12})\/join$/);
     if (m) {
       const r = room(m[1]);
@@ -203,6 +231,8 @@ export async function startFakeZoom({ tone = false } = {}) {
     caption: (id, text) => { room(id).caption = text; },
     remove: (id) => { room(id).over = 'removed'; },
     set: (id, opts) => { Object.assign(room(id), opts); },
+    // Whether /profile says the browser is signed in.
+    account: (v) => { state.account = v; },
     close: () => new Promise((r) => { srv.close(r); srv.closeAllConnections(); }),
   };
 }
