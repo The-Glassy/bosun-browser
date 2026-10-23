@@ -44,6 +44,15 @@ stand-ins of the exact pages (`test/meeting-live2026.test.mjs`) and, without joi
 - **`docs/MEETING-BOT-REFERENCES.md`** compares how Vexa (Apache-2.0), ScreenApp meeting-bot (MIT) and Attendee
   (Elastic License 2.0) join the same pages, and which of their fallbacks Bosun adopted. No code was copied.
 
+### Limits
+
+- A challenge frame inside a frame that is scaled with CSS is measured unscaled, so it may be judged too small or
+  off screen.
+- **"Continue without microphone and camera" is not confirmed live.** It is what Zoom's web client offered, but
+  another bot (Vexa) notes that without device permission Zoom may not create the participants' audio. If computer
+  audio then cannot be joined, the meeting ends with that error rather than recording silence. A live Zoom join has
+  to confirm it.
+
 ## 0.10.0 — file uploads into web pages
 
 ### Added
