@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.11.1 — Zoom joins without microphone permission
+
+### Fixed
+
+- **Zoom joins failed with "could not make sure the microphone is off before joining"** (live Zoom, 2026-10-23
+  13:23). After "Do you want people to see you in the meeting?" Zoom now asks a second question, "Do you want people
+  to hear you in the meeting?". Its preview then shows "Mute" with a crossed microphone: Zoom has no permission and
+  nothing goes out. Clicking "Mute" doesn't turn it into "Unmute"; it asks "hear you" again. Bosun waited for
+  "Unmute", which never came.
+- **Microphone and camera off, Zoom's way.** Both device questions are answered "Continue without …", one after the
+  other, and "Use microphone" is never clicked. A device counts as off when any of these is true:
+  - its control shows it off ("Unmute", "Start Video", "Join Audio");
+  - the browser lists no such device, or its permission is denied;
+  - clicking its control made Zoom ask for it. The question is answered without it.
+  A permission that is only "prompt" doesn't count, because Bosun's browsers grant capture when asked.
+- **A live microphone still stops the join.** A control that shows the device on, takes clicks, and neither turns
+  off nor asks is a live device, and Bosun doesn't join. Bosun clicks once and waits 2 s before clicking again, so a
+  slow toggle isn't switched back on.
+- **The camera had the same trap.** "Stop Video" next to "Cannot detect your camera" was clicked until the check
+  gave up. The same rules now apply to the camera, in the lobby and in the call.
+- The name is typed after the device questions are answered, so a question coming up can't take the keyboard.
+
+### Added
+
+- **`meeting_join { dry_run: true }` on Zoom** reports `microphone` and `camera`: the control's label, how many
+  devices the browser lists, and the permission. Nothing is clicked.
+
 ## 0.11.0 — safe downloads, per tenant
 
 ### Added

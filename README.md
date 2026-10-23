@@ -443,8 +443,12 @@ meeting_recording_delete({ "meeting_id": "…" })
    - A guest types its name (default `Glassy (notetaker)`). A signed-in Meet profile has no name field and joins
      under the account's name, so `name` is ignored. Zoom fills in a signed-in account's name, and Bosun keeps it; an
      empty field (Zoom's web client shows one to signed-in accounts too) gets `name`.
-   - **Zoom:** "Do you want people to see you in the meeting?" is answered with "Continue without microphone and
-     camera". Bosun asks `zoom.us/profile` whether the profile is still signed in; a signed-out profile joins as a
+   - **Zoom:** "Do you want people to see you in the meeting?" and then "Do you want people to hear you in the
+     meeting?" are answered "Continue without …"; "Use microphone" is never clicked. Without permission, Zoom shows
+     "Mute" with a crossed microphone, and clicking it asks "hear you" again instead of muting. So on Zoom a device
+     also counts as off if the browser lists none, its permission is denied, or clicking its control made Zoom ask for
+     it (answered without it). A control that takes clicks and neither turns off nor asks is a live device: no join.
+     Bosun asks `zoom.us/profile` whether the profile is still signed in; a signed-out profile joins as a
      guest, and `meeting_status` carries a `warning` saying how to sign it in again.
    - Tips and dialogs over the lobby ("Do you want people to hear you in the meeting?", "Got it", cookie banners,
      "This meeting is being recorded") are closed. Only buttons inside a dialog or banner are clicked.
