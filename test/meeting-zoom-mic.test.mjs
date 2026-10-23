@@ -53,8 +53,8 @@ for (const fakeDevices of [true, false]) {
         assert.deepEqual(used(room), [], '"Use microphone…" is never clicked');
         assert.equal(room.media[0].devices, 'declined'); // "see you"
         assert.ok(hearYou(room).length >= 1, JSON.stringify(room.media));
-        // With a microphone listed, "Mute" was clicked once and its question answered without the microphone.
-        if (fakeDevices) assert.equal(hearYou(room).length, 2, JSON.stringify(room.media));
+        // With a microphone listed, "Mute" was clicked twice, each time answered without the microphone.
+        if (fakeDevices) assert.equal(hearYou(room).length, 3, JSON.stringify(room.media));
         await c.call('meeting_leave', { meeting_id: r.json().meeting_id });
         await c.close();
       }, { fakeDevices });
@@ -62,9 +62,10 @@ for (const fakeDevices of [true, false]) {
   }
 }
 
-test('Zoom: a live microphone whose "Mute" takes clicks and stays on is not joined with', async () => {
+// hearDelayMs 2500: Zoom's own "hear you" comes up late, just after Bosun's first click on "Mute".
+for (const hearDelayMs of [500, 2500]) test(`Zoom: a live microphone whose "Mute" takes clicks and stays on is not joined with (second question after ${hearDelayMs} ms)`, async () => {
   await withService(async (c) => {
-    const { id, url } = fz.newRoom({ hearYou: 'both', micClick: 'stuck', passcode: 'p1' });
+    const { id, url } = fz.newRoom({ hearYou: 'both', micClick: 'stuck', hearDelayMs, passcode: 'p1' });
     const r = await c.call('meeting_join', { url, profile: 'zoom' });
     assert.equal(r.isError, true, r.text);
     assert.match(r.text, /could not make sure the microphone is off before joining \(Zoom changed\?\); not joining/);
@@ -83,6 +84,18 @@ for (const micClick of ['asksCamera', 'asksCameraBoth']) test(`Zoom: a camera qu
     assert.equal(fz.room(id).guest, null, 'Join was not clicked');
     assert.ok(fz.room(id).media.some((m) => m.devices === 'declined' && /see you/.test(m.question || '')), 'the camera question was answered');
     assert.deepEqual(used(fz.room(id)), []);
+    await c.close();
+  });
+});
+
+test('Zoom: a second question that comes up late is answered, and the crossed "Mute" still counts as off', async () => {
+  await withService(async (c) => {
+    const { id, url } = fz.newRoom({ hearYou: 'both', hearDelayMs: 2500, passcode: 'p1' });
+    const r = await c.call('meeting_join', { url, profile: 'zoom', name: 'Glassy Notetaker' });
+    assert.equal(r.isError, false, r.text);
+    assert.deepEqual(fz.room(id).guest, { name: 'Glassy Notetaker', mic: false, cam: false });
+    assert.deepEqual(used(fz.room(id)), []);
+    await c.call('meeting_leave', { meeting_id: r.json().meeting_id });
     await c.close();
   });
 });

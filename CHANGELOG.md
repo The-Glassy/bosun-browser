@@ -13,7 +13,10 @@
   other, and "Use microphone" is never clicked. A device counts as off when any of these is true:
   - its control shows it off ("Unmute", "Start Video", "Join Audio");
   - the browser lists no such device, or its permission is denied;
-  - clicking its control made Zoom ask for it. The question is answered without it.
+  - clicking its control made Zoom ask for it. The question is answered without it. Only a question that asks for
+    that device counts ("hear you" for the microphone, "see you" for the camera), judged by the question and not
+    by its buttons. It also has to come up within 3 s of a click that took, and twice in a row: Zoom's own
+    questions can come up late, just after a click.
   A permission that is only "prompt" doesn't count, because Bosun's browsers grant capture when asked.
 - **A live microphone still stops the join.** A control that shows the device on, takes clicks, and neither turns
   off nor asks is a live device, and Bosun doesn't join. Bosun clicks once and waits 2 s before clicking again, so a

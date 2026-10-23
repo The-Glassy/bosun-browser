@@ -138,17 +138,22 @@ async function seen(page, kind, onLabel, offLabel) {
 // such device or its permission is denied; or clicking the control made Zoom ask for the device (a microphone Zoom
 // never got shows "Mute" with a crossed icon, and clicking it asks "Do you want people to hear you…?" instead of
 // muting): the question is answered without it. Only a question asking for this device, coming up within 3 s of a click
-// that took (none was shown when it was clicked), and answered, counts. A control that shows the device on, takes clicks and neither turns
+// that took (none was shown when it was clicked), and answered, counts, and it has to happen twice in a row: Zoom's own
+// first questions can come late and just after a click. A control that shows the device on, takes clicks and neither turns
 // off nor asks is a live device: not joining (throws). Without a control, the page saying the device is missing will
 // do. The permission state "prompt" is not taken as off: Bosun's browsers grant capture on request.
 async function deviceOff(page, { what, kind, onLabel, offLabel, missing, state, when = 'before joining', then = 'not joining', timeoutMs = 15_000 }) {
   const until = Date.now() + timeoutMs;
   let clicked = 0; // when the control last took a click
+  let asked = 0; // clicks in a row that made Zoom ask for the device
   for (;;) {
     if (Date.now() > until) throw new Error(`could not make sure the ${what} is off ${when} (Zoom changed?); ${then}`);
     const q = await declineDevices(page);
     if (q) {
-      if (q.ok && clicked && Date.now() - clicked < 3000 && ASKS[kind].test(q.text)) return 'not in use';
+      if (q.ok && clicked && Date.now() - clicked < 3000 && ASKS[kind].test(q.text)) {
+        if (++asked >= 2) return 'not in use';
+        clicked = 0; // asked once: click again
+      }
       await page.waitForTimeout(300);
       continue;
     }
@@ -161,7 +166,10 @@ async function deviceOff(page, { what, kind, onLabel, offLabel, missing, state, 
     const on = await firstVisible(button(page, onLabel));
     if (!on && missing.test(await pageText(page).catch(() => ''))) return 'no device';
     // One click, then time for Zoom to toggle it or ask (a second click could turn a just-muted microphone back on).
-    if (on && Date.now() - clicked > 2000 && !(await disabled(on))) clicked = await on.click({ timeout: 3000 }).then(() => Date.now(), () => clicked);
+    if (on && Date.now() - clicked > 2000 && !(await disabled(on))) {
+      if (clicked) asked = 0; // the last click brought no question
+      clicked = await on.click({ timeout: 3000 }).then(() => Date.now(), () => clicked);
+    }
     await page.waitForTimeout(300);
   }
 }

@@ -35,7 +35,7 @@ function launch(id, search) {
 // a crossed microphone (no permission: muted in effect), "Stop Video", "Cannot detect your camera…", an empty "Your
 // Name" and "Join" disabled until a name is typed. Clicking "Mute" does not toggle it: it asks "hear you" again
 // ("Use microphone" / "Continue without microphone"); "Stop Video" asks "see you" ("Use camera" / "Continue without
-// camera"; assumed, not seen live). micClick 'stuck': a live microphone whose "Mute" takes clicks and does nothing;
+// camera"; assumed, not seen live). hearDelayMs: when the second question comes up after the first (500 ms). micClick 'stuck': a live microphone whose "Mute" takes clicks and does nothing;
 // 'toggles': a live microphone that mutes; 'asksCamera' / 'asksCameraBoth': a live microphone whose "Mute" does nothing
 // but bring up the camera's question ("see you"; "Continue without camera" / "… without microphone and camera"). Every "Use …" click is logged as media {devices: 'used'}.
 function webClient(id, r) {
@@ -96,7 +96,7 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
   </aside>
 </div>
 <script>
-const R = ${JSON.stringify({ tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micClick: r.micClick || null })};
+const R = ${JSON.stringify({ tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null })};
 const id = ${JSON.stringify(id)}, $ = (x) => document.getElementById(x);
 const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });
@@ -114,7 +114,7 @@ if (R.hearYou) {
   const ask = (title, use, no) => { $('hearTitle').textContent = title; $('hearUse').textContent = use; $('hearUse').hidden = false; $('hearNo').textContent = no; $('hearq').hidden = false; };
   $('hearNo').onclick = () => { $('hearq').hidden = true; post('media', { devices: 'declined', question: $('hearTitle').textContent }); };
   $('hearUse').onclick = () => { $('hearq').hidden = true; post('media', { devices: 'used', question: $('hearTitle').textContent }); };
-  $('devNo').onclick = () => { $('devq').remove(); post('media', { devices: 'declined' }); setTimeout(() => { $('hearq').hidden = false; }, 500); };
+  $('devNo').onclick = () => { $('devq').remove(); post('media', { devices: 'declined' }); setTimeout(() => { $('hearq').hidden = false; }, R.hearDelayMs ?? 500); };
   $('pmic').onclick = () => {
     if (R.micClick === 'stuck') return;
     if (R.micClick === 'asksCamera') return ask('Do you want people to see you in the meeting?', 'Use camera', 'Continue without camera');
