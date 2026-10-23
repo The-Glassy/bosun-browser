@@ -173,15 +173,18 @@ export class Meetings {
     url = checked.url;
     this.capacity(tenant);
     // Reserved before anything is awaited, so concurrent dry runs can't overshoot the caps; released below.
-    const slot = { tenant, session: null, finishing: false, handedOver: false, task: null };
+    const slot = { tenant, session: null, finishing: false, handedOver: false, task: null, rig: null };
     this.dryRuns.add(slot);
     const owner = `meeting-dry-run:${crypto.randomBytes(4).toString('hex')}`;
     let rig = null, session = null;
     const task = (async () => {
-      rig = await this.audio.open();
+      rig = slot.rig = await this.audio.open();
       if (this.stopped) throw new Error('service is shutting down');
+      // The session manager reserves its own slot synchronously in open(), unless the profile is still busy (a
+      // keepalive visit, a closing session): then this slot keeps counting until the session is there.
+      const busy = profile && this.manager.profilesInUse.has(`${tenant}/${profile}`);
       const opening = this.manager.open({ owner, tenant, profile: profile || undefined, engine: eng, locale: platform.locale, media: { args: [...MEDIA_ARGS, ...(rig.args || [])], env: rig.browserEnv } });
-      slot.handedOver = true; // the session manager reserved its own slot synchronously in open()
+      slot.handedOver = !busy;
       session = slot.session = await opening;
       const target = platform.joinUrl ? platform.joinUrl(url) : url;
       for (const origin of new Set([new URL(url).origin, new URL(target).origin, ...(platform.origins ? platform.origins(url) : [])])) {
@@ -196,10 +199,12 @@ export class Meetings {
       });
       return { dry_run: true, platform: platform.name, ...(profile ? { profile } : {}), engine: eng, ...r, note: 'nothing was joined or clicked except the page\'s own tips and device questions' };
     })();
+    // The slot stays tracked until its cleanup is done, so shutdown can wait for it.
     slot.task = task.finally(async () => {
-      this.dryRuns.delete(slot);
+      slot.finishing = true;
       if (session) await this.manager.dispose(session, 'meeting-dry-run').catch(() => {});
-      await rig?.close().catch(() => {});
+      await (slot.closing ??= rig?.close())?.catch(() => {});
+      this.dryRuns.delete(slot);
     });
     return slot.task;
   }
@@ -499,8 +504,10 @@ export class Meetings {
   async stop() {
     this.stopped = true;
     clearInterval(this.sweeper);
-    // A dry run still loading a page is cut short by closing its session; its audio server goes in its own cleanup.
+    // A dry run still loading a page is cut short by closing its session; its audio server goes in its own cleanup,
+    // or here, if the dry run is still stuck in setup (a browser launch) when the wait is over.
     for (const d of this.dryRuns) if (d.session) this.manager.dispose(d.session, 'shutdown').catch(() => {});
     await Promise.race([Promise.allSettled([...[...this.active.values()].map((m) => this.finish(m, 'shutdown')), ...[...this.dryRuns].map((d) => d.task)]), sleep(15_000)]);
+    await Promise.race([Promise.allSettled([...this.dryRuns].map((d) => (d.closing ??= d.rig?.close()))), sleep(5_000)]);
   }
 }

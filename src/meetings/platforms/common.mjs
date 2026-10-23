@@ -49,11 +49,12 @@ export async function firstVisible(l, max = 5) {
 // widget, its hidden challenge frame parked off screen, and that notice: none of it is a challenge.
 export const CHALLENGE_SRC = /recaptcha|hcaptcha|challenges\.cloudflare|turnstile|captcha-delivery|geo\.captcha/;
 // A challenge page served as the page itself counts too, by its endpoint only: a DataDome captcha
-// (*.captcha-delivery.com), Cloudflare's challenge host or its /cdn-cgi/challenge-platform/ pages.
+// (*.captcha-delivery.com) or Cloudflare's /cdn-cgi/challenge-platform/ pages (not its scripts).
+// Not handled: frames scaled by CSS transforms are measured unscaled.
 const challengePage = (raw) => {
   try {
     const u = new URL(raw);
-    return /(?:^|\.)captcha-delivery\.com$/.test(u.hostname) || u.hostname === 'challenges.cloudflare.com' || u.pathname.startsWith('/cdn-cgi/challenge-platform/');
+    return /(?:^|\.)captcha-delivery\.com$/.test(u.hostname) || u.pathname.startsWith('/cdn-cgi/challenge-platform/');
   } catch { return false; }
 };
 // A frame counts if it is shown where a person would see it: its rectangle (at least 60x60), carried up through every
