@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.11.2 — Zoom computer audio that Zoom joined by itself
+
+### Fixed
+
+- **Zoom joins ended with "could not join computer audio in Zoom (nothing would be heard or recorded); Zoom
+  changed?"** (production, 2026-10-23 14:45, 20 s after being let in). Zoom now connects computer audio by itself when
+  it was let in without a microphone. The toolbar then shows "Audio" (a microphone with a warning sign) and "More audio
+  controls". It has no "Join Audio" and no "Mute"/"Unmute", and those were what Bosun waited for.
+- **Computer audio counts as joined when its menu says so.** If none of "Mute", "Unmute" or "Join Audio" is shown,
+  Bosun opens "More audio controls", reads it and closes it again. "Leave computer audio" or "Switch to phone audio"
+  on offer means computer audio is connected. Only an entry of that menu counts: it sits in a menu that was not shown
+  before the click, it came up with the click and went away when the menu closed, and it isn't inside anything
+  participants control. A participant named "Leave computer audio" in another menu doesn't count, even one renamed
+  while the audio menu is open. A menu Zoom closes by visibility or opacity, keeping it in the page, is read the same
+  way. Nothing in the menu is clicked, and neither
+  is "Audio" itself (it would ask for the microphone). "Join Audio" / "Join Audio by Computer" are still clicked when
+  they are shown.
+- **The error now names the audio controls it saw** (for example "audio controls: audio, More audio controls"), so the
+  next change on Zoom's side shows up in the error.
+- **Zoom's notices over the call are closed:** "Introducing My Notes…" (Got it), "…enable hardware acceleration" (×)
+  and "Please enable access to your microphone and camera…" (×). Bosun finds each one by its text and clicks only that
+  notice's own close or "Got it" button. Captions, chat and names never count as a notice, and no box holding them is
+  searched for a button.
+
+### Tests
+
+- test/fakezoom.mjs has an `audioJoined` mode with the call as live Zoom showed it on 2026-10-23 15:00: the toolbar,
+  the audio menu, the notices, and Chrome's `<permission>` element in the "hear you" question (never clicked).
+- The Zoom platform has a `devices(page, kind)` method (what the browser lists, and the permission). The new tests
+  replace it with what the production server reports, no microphone or camera, so they hold on every engine and host.
+  patchright reads the page from a world of its own, so a stand-in page can't hide the host's devices from it.
+- test/meeting-zoom-audio.test.mjs: the 15:00 call is joined, announced and recorded, with nothing clicked but the
+  menu button and the notices' own buttons. On 0.11.1 it fails with the production error. A menu that offers neither
+  "Leave computer audio" nor "Switch to phone audio" still ends with the error, also with a participant named "Leave
+  computer audio" in another menu (also one renamed only while the audio menu is open); a caption that reads like
+  Zoom's notice closes nothing; a menu closed by visibility or opacity is still read.
+- test/meeting-audio.test.mjs (Linux, real PulseAudio, headful): the same call, with no microphone or camera listed,
+  is recorded with the host's tone audible.
+
 ## 0.11.1 — Zoom joins without microphone permission
 
 ### Fixed

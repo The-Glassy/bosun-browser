@@ -38,6 +38,21 @@ function launch(id, search) {
 // camera"; assumed, not seen live). hearDelayMs: when the second question comes up after the first (500 ms). micClick 'stuck': a live microphone whose "Mute" takes clicks and does nothing;
 // 'toggles': a live microphone that mutes; 'asksCamera' / 'asksCameraBoth': a live microphone whose "Mute" does nothing
 // but bring up the camera's question ("see you"; "Continue without camera" / "… without microphone and camera"). Every "Use …" click is logged as media {devices: 'used'}.
+// audioJoined: the call as live Zoom showed it on 2026-10-23 15:00, let in without a microphone: computer audio is
+// connected by itself (no "Join Audio" anywhere), the toolbar has "Audio" (a microphone with a warning sign) and "More
+// audio controls", whose menu reads "Microphone modes", "Background noise suppression", "Test Speaker & Microphone",
+// "Switch to phone audio", "Leave computer audio", "Audio Settings"; then "Video", "More video controls", "open the
+// participants list pane,[n] particpants", chat, "Chat Settings", "React", "Share", "More meeting control", "Leave";
+// and notices outside any dialog: "Introducing My Notes…" (Got it), "…enable hardware acceleration" (×), "<host> is
+// the host now." and "⚠ Please enable access to your microphone and camera…" (×; how the two × buttons are labelled
+// was not seen: one carries aria-label "close", the other only a close class). The "hear you" dialog also holds
+// Chrome's <permission> element. A click on "Audio", "Video", a menu entry or the <permission> element is logged as
+// media {clicked}. audioJoined 'notConnected': the same toolbar, but the menu offers neither leaving computer audio nor
+// switching to phone audio. (A host without devices, as production is, is the test's platform: zoom.devices.)
+// decoyMenu: a menu shown in the call with a participant named "Leave computer audio"; 'renames': that participant is
+// named "Leave computer audio" while the audio menu is open, and gone from that menu once it closes. menuHide 'visibility' / 'opacity': the audio menu
+// stays in the page when closed, hidden by visibility or opacity instead of display. captionClose: the captions
+// panel has a close button of its own (clicks logged as media {clicked: 'captions close'}).
 function webClient(id, r) {
   if (r.expired) {
     return `<!doctype html><meta charset="utf-8"><title>Error - Zoom</title><nav><a href="/join">Join</a> <a href="/signin">Sign In</a></nav>
@@ -45,6 +60,31 @@ function webClient(id, r) {
 <button aria-label="Open chat dialog">:)</button>`;
   }
   if (r.web2026 || r.hearYou) r = { ...r, noDevices: false, signedInName: false };
+  const aj = r.audioJoined;
+  const icon = (c) => `<svg class="zm-icon ${c}" aria-hidden="true" width="16" height="16"><path d="M2 2h12v12H2z"/></svg>`;
+  const footer = aj ? `<button id="mic" aria-label="audio">${icon('zm-icon-mic')}${icon('zm-icon-warning')}Audio</button>
+    <button id="audioMore" aria-label="More audio controls">${icon('zm-icon-chevron')}</button>
+    <ul id="audioPop" class="audio-option-menu__pop-menu" role="menu" hidden>
+      <li class="dropdown-header" role="presentation">Microphone modes</li>
+      <li role="menuitemcheckbox" aria-checked="true">✓ Background noise suppression</li>
+      <li role="menuitem">Test Speaker &amp; Microphone</li>
+      ${aj === 'notConnected' ? '' : '<li role="menuitem">Switch to phone audio</li><li role="menuitem">Leave computer audio</li>'}
+      <li role="menuitem">Audio Settings</li>
+    </ul>
+    <button id="cam" aria-label="Video">Video</button><button aria-label="More video controls">${icon('zm-icon-chevron')}</button>
+    <button id="parts" aria-label="open the participants list pane,[0] particpants"><span class="footer-button__number-counter" id="count">0</span>Participants</button>
+    <button id="chatBtn" aria-label="open the chat panel">Chat</button><button aria-label="Chat Settings">${icon('zm-icon-chevron')}</button>
+    <button aria-label="React">React</button><button aria-label="Share">Share</button><button aria-label="More meeting control">More</button>`
+    : `<button id="mic" aria-label="join audio">Join Audio</button>
+    <button id="cam" aria-label="start my video">Start Video</button>
+    <button id="parts" aria-label="open the manage participants list pane,[0] particpants"><span class="footer-button__number-counter" id="count">0</span>Participants</button>
+    <button id="chatBtn" aria-label="open the chat panel">Chat</button>`;
+  const toasts = aj ? `<div id="toasts" style="position:fixed;top:40px;right:10px;width:320px">
+    <div class="zm-toast" id="t1"><span>Introducing My Notes: take private notes during the meeting.</span><button>Got it</button></div>
+    <div class="zm-toast" id="t2"><span>For a better meeting experience, enable browser hardware acceleration in your settings.</span><button aria-label="close">${icon('zm-icon-close')}</button></div>
+    <div class="zm-toast" id="t3">Host Person is the host now.</div>
+    <div class="zm-toast" id="t4"><span>⚠ Please enable access to your microphone and camera for the best experience.</span><button class="zm-toast__close-btn">${icon('zm-icon-close')}</button></div>
+  </div>` : '';
   const hy = r.hearYou ? (r.hearYou === 'mic' ? ['Use microphone', 'Continue without microphone'] : [null, 'Continue without microphone and camera']) : null;
   const crossed = '<svg class="zm-icon zm-icon-mic-disabled" aria-hidden="true" width="16" height="16"><path d="M2 2l12 12" stroke="red"/></svg>';
   return `<!doctype html><meta charset="utf-8"><title>Zoom Meeting</title>
@@ -68,6 +108,7 @@ ${r.web2026 || r.hearYou ? `<div id="devq" style="position:fixed;inset:0;backgro
   <button id="devUse">Use microphone and camera</button><button id="devNo">Continue without microphone and camera</button></div></div>` : ''}
 ${hy ? `<div id="hearq" role="dialog" aria-modal="true" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:20"><div style="background:#fff;margin:80px auto;width:380px;padding:16px">
   <h2 id="hearTitle">Do you want people to hear you in the meeting?</h2><p>You can still turn off your microphone anytime in the meeting.</p>
+  ${aj ? '<permission id="pepc" type="microphone" style="display:inline-block;width:24px;height:24px;cursor:pointer"></permission>' : ''}
   <button id="hearUse"${hy[0] ? '' : ' hidden'}>${hy[0] || 'Use microphone'}</button><button id="hearNo">${hy[1]}</button></div></div>` : ''}
 ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10"><p>We use cookies.</p>
   <button id="onetrust-accept-btn-handler">Accept Cookies</button></div>` : ''}
@@ -76,14 +117,14 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
 <div id="call" hidden>
   ${r.title ? `<div class="meeting-info-container__topic">${esc(r.title)}</div>` : ''}
   <div id="tiles"></div>
-  <div id="captions" class="live-transcription-subtitle__box"></div>
+  ${r.captionClose ? '<div class="live-transcription-subtitle__container"><div id="captions" class="live-transcription-subtitle__box"></div><button id="capClose" aria-label="close">×</button></div>'
+    : '<div id="captions" class="live-transcription-subtitle__box"></div>'}
+  ${r.decoyMenu ? `<div class="pin-dropdown-menu" role="menu"><div role="menuitem" id="decoy">${r.decoyMenu === 'renames' ? 'Guest Two' : 'Leave computer audio'}</div><div role="menuitem">Host Person</div></div>` : ''}
+  ${toasts}
   <div role="dialog" id="audioDlg" hidden><h2>Join Audio</h2><button id="byComputer">Join Audio by Computer</button></div>
   <div role="dialog" id="recDlg" hidden><p>This meeting is being recorded</p><button id="recOk">Got it</button><button>Leave Meeting</button></div>
   <footer>
-    <button id="mic" aria-label="join audio">Join Audio</button>
-    <button id="cam" aria-label="start my video">Start Video</button>
-    <button id="parts" aria-label="open the manage participants list pane,[0] particpants"><span class="footer-button__number-counter" id="count">0</span>Participants</button>
-    <button id="chatBtn" aria-label="open the chat panel">Chat</button>
+    ${footer}
     <button id="leave" aria-label="Leave">Leave</button>
     <div id="leaveMenu" hidden><button id="leaveConfirm">Leave Meeting</button></div>
   </footer>
@@ -96,7 +137,7 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
   </aside>
 </div>
 <script>
-const R = ${JSON.stringify({ tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null })};
+const R = ${JSON.stringify({ decoyMenu: r.decoyMenu || null, menuHide: r.menuHide || null, tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null, audioJoined: r.audioJoined || null })};
 const id = ${JSON.stringify(id)}, $ = (x) => document.getElementById(x);
 const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });
@@ -129,7 +170,26 @@ $('join').onclick = () => {
   mic = pmic; cam = pcam;
   post('join', { name: $('input-for-name').value, pwd, mic: pmic, cam: pcam });
 };
-const micLabel = () => { $('mic').setAttribute('aria-label', !audio ? 'join audio' : mic ? 'mute my microphone' : 'unmute my microphone'); $('mic').textContent = !audio ? 'Join Audio' : mic ? 'Mute' : 'Unmute'; };
+const micLabel = () => { if (R.audioJoined) return; $('mic').setAttribute('aria-label', !audio ? 'join audio' : mic ? 'mute my microphone' : 'unmute my microphone'); $('mic').textContent = !audio ? 'Join Audio' : mic ? 'Mute' : 'Unmute'; };
+if (R.audioJoined) {
+  audio = R.audioJoined !== 'notConnected'; // connected by Zoom itself, without a microphone
+  const clicked = (what) => post('media', { clicked: what });
+  $('mic').addEventListener('click', (e) => { e.stopImmediatePropagation(); clicked('Audio'); }, true);
+  $('cam').addEventListener('click', (e) => { e.stopImmediatePropagation(); clicked('Video'); }, true);
+  $('pepc').onclick = () => clicked('permission');
+  // The menu shown or not: by display (hidden), or kept in the page and hidden by visibility or opacity.
+  const pop = $('audioPop'), hide = { visibility: ['visibility', 'hidden', 'visible'], opacity: ['opacity', '0', '1'] }[R.menuHide];
+  const popOpen = () => (hide ? pop.style[hide[0]] === hide[2] : !pop.hidden);
+  const popShow = (on) => { if (hide) { pop.hidden = false; pop.style[hide[0]] = on ? hide[2] : hide[1]; } else pop.hidden = !on; if (R.decoyMenu === 'renames' && decoyArmed) { $('decoy').textContent = on ? 'Leave computer audio' : 'Guest Two'; $('decoy').hidden = !on; } };
+  let decoyArmed = false;
+  popShow(false);
+  decoyArmed = true;
+  $('audioMore').onclick = () => popShow(!popOpen());
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') popShow(false); });
+  for (const it of document.querySelectorAll('#audioPop [role^=menuitem]')) it.onclick = () => { clicked(it.textContent); if (/leave computer audio/i.test(it.textContent)) audio = false; popShow(false); };
+  if ($('capClose')) $('capClose').onclick = () => clicked('captions close');
+  for (const t of document.querySelectorAll('.zm-toast button')) t.onclick = () => { t.parentElement.hidden = true; post('media', { toast: t.parentElement.id }); };
+}
 $('mic').onclick = () => { if (!audio) { $('audioDlg').hidden = false; return; } mic = !mic; micLabel(); post('media', { mic, cam }); };
 // Zoom may connect computer audio with the microphone live, whatever the preview said: Bosun has to mute it.
 $('byComputer').onclick = () => { audio = true; mic = true; $('audioDlg').hidden = true; micLabel(); post('media', { audio, mic, cam }); };
@@ -152,13 +212,13 @@ async function poll() {
   $('notice').hidden = s.view !== 'notice';
   if (s.view === 'notice') $('noticeText').textContent = s.notice;
   if (s.view === 'call') {
-    if (!inCall) { inCall = true; $('audioDlg').hidden = false; if (R.recordedNotice) $('recDlg').hidden = false; micLabel(); }
+    if (!inCall) { inCall = true; $('audioDlg').hidden = !!R.audioJoined; if (R.recordedNotice) $('recDlg').hidden = false; micLabel(); }
     const want = s.participants.join();
     if ($('tiles').dataset.p !== want) {
       $('tiles').dataset.p = want;
       $('tiles').replaceChildren(...s.participants.map((p) => { const t = document.createElement('div'); t.className = 'tile video-avatar__avatar-name'; t.textContent = p; return t; }));
       $('count').textContent = s.participants.length;
-      $('parts').setAttribute('aria-label', 'open the manage participants list pane,[' + s.participants.length + '] particpants');
+      $('parts').setAttribute('aria-label', 'open the ' + (R.audioJoined ? '' : 'manage ') + 'participants list pane,[' + s.participants.length + '] particpants');
     }
     $('captions').textContent = s.caption || '';
     let prev = null;

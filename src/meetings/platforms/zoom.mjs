@@ -45,6 +45,12 @@ const LABEL = {
   joinAudio: any('^join audio by computer$', '^join with computer audio$', '^computer audio$', '^per computer (?:dem )?audio beitreten$', '^mit computeraudio beitreten$', '^computer-?audio beitreten$',
     "^приєднатися до аудіо (?:з|через) комп'ютер(?:а)?$", "^аудіо комп'ютера$", '^войти с использованием звука компьютера$', '^звук компьютера$'),
   audioMenu: any('^join audio$', '^audio beitreten$', '^приєднатися до аудіо$', '^войти в аудиоконференцию$'),
+  // Computer audio already connected without a microphone (live Zoom, 2026-10-23 15:00): the toolbar shows "Audio"
+  // (no Mute/Unmute, no Join Audio) next to "More audio controls", whose menu offers leaving computer audio or
+  // switching to phone audio. That menu is read, never clicked in.
+  audioMore: any('^more audio controls$', '^weitere audio-?steuerelemente$', '^weitere audiooptionen$', '^більше (?:елементів керування|параметрів) аудіо$', '^другие (?:элементы управления|параметры) звук(?:ом|а)$'),
+  audioConnected: any('^leave computer audio\\b', '^switch to phone audio\\b', '^computer-?audio verlassen\\b', '^zu telefon-?audio wechseln\\b',
+    "^вийти з аудіо комп'ютера", '^перейти на (?:аудіо|звук) телефону', '^выйти из звука компьютера', '^переключиться на звук телефона'),
   chat: any('^open the chat pane(?:l)?$', '^chat$', '^open chat$', '^chat öffnen$', '^chatbereich öffnen$', '^відкрити (?:панель )?чат(?:у)?$', '^чат$', '^открыть (?:панель )?чат(?:а)?$'),
   chatInput: any('type message', 'chat message', 'message to', 'nachricht', 'повідомлення', 'сообщение'),
   participants: any('participants?\\b', 'particpants', 'teilnehmer', 'учасник', 'участник'),
@@ -87,8 +93,97 @@ const MODALS = `${DIALOGS}, [class*="zm-modal"], [class*="modal-dialog"]`;
 const overlays = async (page) => {
   const nd = await firstVisible(button(page, LABEL.noDevices));
   const n = nd ? await nd.click({ timeout: 2000 }).then(() => 1, () => 0) : 0;
-  return n + await dismissOverlays(page, LABEL.dismiss, ['#onetrust-banner-sdk', '[class*="zm-modal"]', '[class*="modal-dialog"]']);
+  return n + await dismissOverlays(page, LABEL.dismiss, ['#onetrust-banner-sdk', '[class*="zm-modal"]', '[class*="modal-dialog"]']) + await closeToasts(page);
 };
+
+// Notices the call shows outside any dialog (live Zoom, 2026-10-23): "Introducing My Notes…" (Got it), "For a better
+// meeting experience, enable … hardware acceleration" (×), "Please enable access to your microphone and camera for
+// the best experience." (×). Each is closed by a close or "Got it" button of its own, found from the notice's text
+// (the nearest box around it, up to a short notice's size). Nothing participants control or say counts: not as the
+// notice's text, and no box holding any of it (chat, names, captions) is searched for the button.
+const TOAST = any('^introducing my notes', 'enable (?:browser |the )?hardware acceleration', 'enable access to your microphone and camera',
+  'hardwarebeschleunigung', 'zugriff auf (?:ihr|dein) mikrofon und (?:ihre|deine) kamera', 'апаратне прискорення', 'аппаратное ускорение');
+const TOAST_CLOSE = any('^got it$', '^close$', '^dismiss$', '^x$', '^×$', '^✕$', '^verstanden$', '^schließen$', '^зрозуміло$', '^закрити$', '^понятно$', '^закрыть$');
+const SPOKEN = `${PARTICIPANT_CONTROLLED}, [class*="subtitle"], [class*="caption"], [class*="transcript"]`;
+async function closeToasts(page) {
+  const found = await page.evaluateHandle(({ toast, close, skip }) => {
+    const T = new RegExp(toast, 'i'), C = new RegExp(close, 'i');
+    const n = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const shown = (e) => (e.checkVisibility ? e.checkVisibility() : !!e.offsetParent);
+    const out = new Set();
+    const walk = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+    for (let t = walk.nextNode(), i = 0; t && i < 5000; t = walk.nextNode(), i++) {
+      const el = t.parentElement;
+      if (!el || !T.test(n(el.innerText || t.nodeValue)) || el.closest(skip) || !shown(el)) continue;
+      for (let box = el, up = 0; box && box !== document.body && up < 6 && n(box.innerText).length < 400 && !box.querySelector(skip); box = box.parentElement, up++) {
+        const b = [...box.querySelectorAll('button, [role="button"]')].find((b) => shown(b) && !b.closest(skip)
+          && (C.test(n(b.getAttribute('aria-label') || b.innerText || b.title)) || (!n(b.getAttribute('aria-label') || b.innerText) && /close/i.test(b.className))));
+        if (b) { out.add(b); break; }
+      }
+    }
+    return [...out];
+  }, { toast: TOAST.source, close: TOAST_CLOSE.source, skip: SPOKEN }).catch(() => null);
+  if (!found) return 0;
+  let n = 0;
+  for (const h of (await found.getProperties().catch(() => new Map())).values()) {
+    const el = h.asElement();
+    if (el && await el.click({ timeout: 2000 }).then(() => true, () => false)) n++;
+  }
+  await found.dispose().catch(() => {});
+  return n;
+}
+
+// Whether "More audio controls" offers leaving computer audio (or switching to phone audio): then computer audio is
+// connected. The menu is opened, read and closed again (Escape, or its button once more); nothing in it is clicked.
+// Only an entry of that menu counts: one outside what participants control, in a menu (or the element the button
+// names in aria-controls) that itself was not shown before the click, that came up with the click and went away when
+// the menu closed. A participant named "Leave computer audio" in another menu or list, already open or renamed
+// meanwhile, is none of that. Shown means rendered, visible and not transparent (a closed menu may stay in the page,
+// hidden by visibility or opacity).
+const AUDIO_MENU = '[role="menu"], [role="listbox"], [class*="menu" i], [class*="popover" i], [class*="dropdown" i]';
+// mode 'menus': the menus shown now; else the audio entries shown now whose menu is not among `prev`.
+function menuEntries([prev, { re, menu, skip, owner, mode }]) {
+  const R = new RegExp(re, 'i');
+  const n = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const shown = (e) => (e.checkVisibility ? e.checkVisibility({ visibilityProperty: true, opacityProperty: true }) : !!e.offsetParent);
+  if (mode === 'menus') return [...document.querySelectorAll(menu)].filter(shown);
+  const scope = owner && document.getElementById(owner);
+  return [...(scope || document).querySelectorAll('*')].filter((e) => {
+    const box = e.parentElement?.closest(menu); // the menu the entry sits in (not the entry itself)
+    return box && !(prev || []).includes(box) && !e.closest(skip) && shown(e)
+      && (R.test(n(e.getAttribute('aria-label'))) || ([...e.children].every((c) => !R.test(n(c.innerText))) && R.test(n(e.innerText))));
+  });
+}
+async function audioConnected(page) {
+  const more = await firstVisible(button(page, LABEL.audioMore));
+  if (!more) return false;
+  const a = { re: LABEL.audioConnected.source, menu: AUDIO_MENU, skip: SPOKEN, owner: (await more.getAttribute('aria-controls').catch(() => null)) || (await more.getAttribute('aria-owns').catch(() => null)) };
+  const before = await page.evaluateHandle(menuEntries, [null, { ...a, mode: 'menus' }]).catch(() => null);
+  if (!before || !(await more.click({ timeout: 3000 }).then(() => true, () => false))) { await before?.dispose().catch(() => {}); return false; }
+  let came = null;
+  for (let i = 0; i < 10; i++) {
+    came = await page.evaluateHandle(menuEntries, [before, a]).catch(() => null);
+    if (came && await came.evaluate((l) => l.length).catch(() => 0)) break;
+    await came?.dispose().catch(() => {});
+    came = null;
+    await page.waitForTimeout(150);
+  }
+  const shownNow = () => (came ? came.evaluate((l) => l.some((e) => (e.checkVisibility ? e.checkVisibility({ visibilityProperty: true, opacityProperty: true }) : !!e.offsetParent))).catch(() => true) : false);
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.waitForTimeout(200);
+  if (await shownNow()) { await more.click({ timeout: 3000 }).catch(() => {}); await page.waitForTimeout(200); }
+  const yes = !!came && !(await shownNow());
+  await came?.dispose().catch(() => {});
+  await before.dispose().catch(() => {});
+  return yes;
+}
+// The toolbar's audio controls as labelled, for the error when computer audio can't be joined.
+async function audioControls(page) {
+  return page.evaluate(() => [...document.querySelectorAll('button, [role="button"]')]
+    .filter((b) => (b.checkVisibility ? b.checkVisibility() : !!b.offsetParent))
+    .map((b) => (b.getAttribute('aria-label') || b.innerText || '').replace(/\s+/g, ' ').trim())
+    .filter((l) => /audio|mute|micro|mikro|мікро|микро|звук/i.test(l)).slice(0, 8)).catch(() => []);
+}
 const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha'];
 
 // A device question shown: answered "Continue without …". null if none is shown, else the question's text (its dialog,
@@ -127,10 +222,10 @@ async function devices(page, kind) {
 
 // dry_run: a device as Bosun sees it, nothing clicked: its control's label (a microphone Zoom never got also shows
 // "Mute"), how many the browser lists and the permission.
-async function seen(page, kind, onLabel, offLabel) {
+async function seen(page, kind, onLabel, offLabel, list = devices) {
   const c = await firstVisible(button(page, onLabel)) || await firstVisible(button(page, offLabel));
   const control = c ? ((await c.getAttribute('aria-label').catch(() => null)) || (await c.innerText().catch(() => '')).trim()) : null;
-  const d = await devices(page, kind);
+  const d = await list(page, kind);
   return { control, devices: d.count, permission: d.permission };
 }
 
@@ -142,7 +237,7 @@ async function seen(page, kind, onLabel, offLabel) {
 // first questions can come late and just after a click. A control that shows the device on, takes clicks and neither turns
 // off nor asks is a live device: not joining (throws). Without a control, the page saying the device is missing will
 // do. The permission state "prompt" is not taken as off: Bosun's browsers grant capture on request.
-async function deviceOff(page, { what, kind, onLabel, offLabel, missing, state, when = 'before joining', then = 'not joining', timeoutMs = 15_000 }) {
+async function deviceOff(page, { what, kind, onLabel, offLabel, missing, state, list = devices, when = 'before joining', then = 'not joining', timeoutMs = 15_000 }) {
   const until = Date.now() + timeoutMs;
   let clicked = 0; // when the control last took a click
   let asked = 0; // clicks in a row that made Zoom ask for the device
@@ -160,7 +255,7 @@ async function deviceOff(page, { what, kind, onLabel, offLabel, missing, state, 
     if (await visible(button(page, offLabel))) return 'off';
     const st = await state(page);
     if (TERMINAL.includes(st)) return st;
-    const d = await devices(page, kind);
+    const d = await list(page, kind);
     if (d.count === 0) return 'no device';
     if (d.permission === 'denied') return 'no permission';
     const on = await firstVisible(button(page, onLabel));
@@ -242,6 +337,9 @@ export const zoom = {
   },
   joinUrl: zoomWebClientUrl,
   origins: (url) => ['https://app.zoom.us', new URL(url).origin],
+  // The microphones or cameras the browser lists, and the permission (see devices()). A method so a test can stand
+  // in for a host without devices on any engine (patchright reads the page from a world of its own).
+  devices: (page, kind) => devices(page, kind),
 
   // Zoom's language cookie, so the web client comes up in English where the account doesn't say otherwise.
   async prepare(ctx) {
@@ -268,7 +366,7 @@ export const zoom = {
     // In the preview, "Join Audio" (no audio connected yet) also means nothing goes out.
     const micOffOrNoAudio = new RegExp(`${LABEL.micOn.source}|${LABEL.audioMenu.source}`, 'i');
     for (const [what, kind, onLabel, offLabel, missing] of [['microphone', 'audioinput', LABEL.micOff, micOffOrNoAudio, TEXT.noMic], ['camera', 'videoinput', LABEL.camOff, LABEL.camOn, TEXT.noCamera]]) {
-      const r = await deviceOff(page, { what, kind, onLabel, offLabel, missing, state: (p) => this.state(p) });
+      const r = await deviceOff(page, { what, kind, onLabel, offLabel, missing, state: (p) => this.state(p), list: (p, k) => this.devices(p, k) });
       if (TERMINAL.includes(r)) return r;
     }
     // A profile that is no longer signed in to Zoom joins as a guest (and is said to be signed out).
@@ -329,8 +427,8 @@ export const zoom = {
       join_enabled: join ? !(await disabled(join)) : null,
       name_field: field ? { prefilled: (await field.inputValue().catch(() => '')).trim() || null } : null,
       passcode_asked: !!(await firstVisible(page.locator(PASSCODE_FIELD))),
-      microphone: await seen(page, 'audioinput', LABEL.micOff, LABEL.micOn),
-      camera: await seen(page, 'videoinput', LABEL.camOff, LABEL.camOn),
+      microphone: await seen(page, 'audioinput', LABEL.micOff, LABEL.micOn, (p, k) => this.devices(p, k)),
+      camera: await seen(page, 'videoinput', LABEL.camOff, LABEL.camOn, (p, k) => this.devices(p, k)),
       challenge: await challengeShown(page),
       ...(profile ? { profile_signed_in: await this.signedIn(page) } : {}),
     };
@@ -338,22 +436,30 @@ export const zoom = {
 
   // Once in: computer audio joined (without it nothing is heard or recorded), microphone and camera verifiably off.
   // Zoom may connect audio with the microphone live; it is muted the moment the control shows up (the browser's
-  // microphone is a silent source anyway, so nothing but silence can go out meanwhile).
+  // microphone is a silent source anyway, so nothing but silence can go out meanwhile). Let in without a microphone,
+  // Zoom connects computer audio by itself and shows "Audio" instead: its menu says so ("Leave computer audio").
   async afterAdmit(page) {
     const until = Date.now() + 20_000;
-    for (;;) {
+    for (let menuAt = 0; ; ) {
       await overlays(page);
       const live = await firstVisible(button(page, LABEL.micOff));
       if (live) { await live.click({ timeout: 3000 }).catch(() => {}); break; }
       if (await visible(button(page, LABEL.micOn))) break; // audio connected, muted
       const comp = await firstVisible(button(page, LABEL.joinAudio));
-      if (comp) await comp.click({ timeout: 3000 }).catch(() => {});
-      else { const menu = await firstVisible(button(page, LABEL.audioMenu)); if (menu) await menu.click({ timeout: 3000 }).catch(() => {}); }
-      if (Date.now() > until) throw new Error('could not join computer audio in Zoom (nothing would be heard or recorded); Zoom changed?');
+      const menu = comp ? null : await firstVisible(button(page, LABEL.audioMenu));
+      if (comp || menu) await (comp || menu).click({ timeout: 3000 }).catch(() => {});
+      else if (Date.now() - menuAt > 2000) { // the menu is read every 2 s at most
+        if (await audioConnected(page)) break;
+        menuAt = Date.now();
+      }
+      if (Date.now() > until) {
+        const seen = await audioControls(page);
+        throw new Error(`could not join computer audio in Zoom (nothing would be heard or recorded); Zoom changed? (audio controls: ${seen.length ? seen.join(', ') : 'none'})`);
+      }
       await page.waitForTimeout(500);
     }
     for (const [what, kind, onLabel, offLabel, missing] of [['microphone', 'audioinput', LABEL.micOff, LABEL.micOn, TEXT.noMic], ['camera', 'videoinput', LABEL.camOff, LABEL.camOn, TEXT.noCamera]]) {
-      const r = await deviceOff(page, { what, kind, onLabel, offLabel, missing, state: (p) => this.state(p), when: 'in the meeting', then: 'leaving' });
+      const r = await deviceOff(page, { what, kind, onLabel, offLabel, missing, state: (p) => this.state(p), list: (p, k) => this.devices(p, k), when: 'in the meeting', then: 'leaving' });
       if (TERMINAL.includes(r)) throw new Error(`the meeting ended while switching the ${what} off (${r})`);
     }
   },
