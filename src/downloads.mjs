@@ -29,6 +29,8 @@ const FILES_PER_TENANT = 50; // downloads a tenant holds at a time (running or r
 const NOTICES_PER_TENANT = 100; // refused and failed downloads remembered per tenant, for the agent to read
 const GETS_PER_TENANT = 4; // GETs streaming at once, per tenant
 const SETTLE_MS = 5000; // click waits this long for a download it started to finish
+const GET_IDLE_MS = 60_000; // a GET whose client reads nothing for this long is dropped
+const GET_MAX_MS = 60 * 60_000; // and none may take longer than an hour
 const ID_RE = /^d[0-9a-f]{16}$/;
 
 const MIME = {
@@ -66,7 +68,7 @@ async function topUrl(page) {
 }
 
 // Content-Disposition with a plain fallback and the exact (UTF-8) name.
-const disposition = (name) => `attachment; filename="${name.replace(/[^\x20-\x7e]|["\\]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+const disposition = (name) => `attachment; filename="${name.replace(/[^\x20-\x7e]|["\\]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name.toWellFormed?.() ?? name)}`;
 
 export class Downloads extends EventEmitter {
   constructor(cfg, { events = null } = {}) {
@@ -90,7 +92,9 @@ export class Downloads extends EventEmitter {
     return this.cfg.downloadAllow?.get(tenant) ?? null;
   }
 
-  holding(f) { return f.state === 'downloading' || f.state === 'ready'; }
+  // Running and kept downloads, and deleted ones whose file is not gone yet (a removal that failed keeps its bytes
+  // and its slot until the sweep's retry succeeds).
+  holding(f) { return f.state === 'downloading' || f.state === 'ready' || (f.state === 'deleted' && !!f.dir); }
   // Bytes of the tenant's running and kept downloads.
   used(tenant) { let n = 0; for (const f of this.files.values()) if (f.tenant === tenant && this.holding(f)) n += f.size; return n; }
   count(tenant) { let n = 0; for (const f of this.files.values()) if (f.tenant === tenant && this.holding(f)) n++; return n; }
@@ -102,11 +106,19 @@ export class Downloads extends EventEmitter {
     return dir;
   }
 
-  // Every page of the session's context, now and later, reports its downloads here.
+  // Every page of the session's context, now and later, reports its downloads here; a session without a download
+  // directory (a tenant that may not download) only to say why it was refused. The directory is watched, so a write
+  // triggers the size check at once rather than at the next POLL_MS.
   watch(s) {
     const on = (p) => p.on('download', (d) => { this.onDownload(s, d).catch((e) => console.error(`bosun: download in session ${s.id}: ${e.message}`)); });
     for (const p of s.ctx.pages()) on(p);
     s.ctx.on('page', on);
+    if (s.dlDir) {
+      try {
+        s.dlWatcher = fs.watch(s.dlDir, () => { for (const f of this.files.values()) if (f.session === s.id && f.state === 'downloading') f.check?.(); });
+        s.dlWatcher.on('error', () => {});
+      } catch {} // without it, the poll still runs
+    }
   }
 
   // Why this download may not be kept, or null.
@@ -118,6 +130,17 @@ export class Downloads extends EventEmitter {
 
   async onDownload(s, d) {
     const url = d.url();
+    if (!s.dlDir) { // the context refuses it anyway (acceptDownloads false); this records why
+      return this.refuse(this.track(s, d, url), null, 'downloads are off for this token (it is not in BROWSER_TENANT_DOWNLOAD_ALLOW)');
+    }
+    const f = this.track(s, d, url);
+    const top = await topUrl(d.page()).catch(() => null);
+    f.page = hostOf(top);
+    return this.keep(s, d, url, f, top);
+  }
+
+  // A new record for a download that just started.
+  track(s, d, url) {
     const f = {
       id: `d${crypto.randomBytes(8).toString('hex')}`, tenant: s.tenant, session: s.id, seq: ++this.seq, state: 'downloading',
       name: (() => { try { return safeName(d.suggestedFilename()); } catch { return 'download'; } })(),
@@ -128,8 +151,10 @@ export class Downloads extends EventEmitter {
     this.files.set(f.id, f);
     this.trimNotices(f.tenant);
     this.emit('change', f);
-    const top = await topUrl(d.page()).catch(() => null);
-    f.page = hostOf(top);
+    return f;
+  }
+
+  async keep(s, d, url, f, top) {
     const allow = this.allowFor(s.tenant) || [];
     if (allowsUrl(allow, url)) f.by = 'url';
     else if (top && allowsUrl(allow, top)) f.by = 'page';
@@ -149,18 +174,19 @@ export class Downloads extends EventEmitter {
       ? async () => { let n = 0; for (const p of [abs, `${abs}.crdownload`]) { try { n = Math.max(n, (await fs.promises.stat(p)).size); } catch {} } return n; }
       : () => dirBytes(s.dlDir);
     let over = null, busy = false;
-    const timer = setInterval(async () => {
-      if (busy || over) return;
+    const check = f.check = async () => {
+      if (busy || over || f.state !== 'downloading') return;
       busy = true;
       try {
         f.size = await measure();
         over = this.overLimit(f);
         if (over) await d.cancel().catch(() => {});
       } finally { busy = false; }
-    }, POLL_MS);
+    };
+    const timer = setInterval(check, POLL_MS);
     timer.unref?.();
     let failure;
-    try { failure = await d.failure(); } catch (e) { failure = String(e?.message || e); } finally { clearInterval(timer); }
+    try { failure = await d.failure(); } catch (e) { failure = String(e?.message || e); } finally { clearInterval(timer); f.check = null; }
     while (busy) await sleep(10); // a check still running when the download ended
     if (over) return this.refuse(f, d, over);
     if (failure) return this.fail(f, d, s.disposed ? `session closed (${s.closeReason})` : failure);
@@ -185,12 +211,13 @@ export class Downloads extends EventEmitter {
     this.settle(f);
   }
 
+  // d: null when the browser refused the download itself (nothing to cancel).
   async refuse(f, d, reason) {
     f.state = 'refused';
     f.reason = reason;
     f.size = 0;
-    await d.cancel().catch(() => {});
-    await d.delete().catch(() => {}); // a small download may have finished before the cancel landed
+    await d?.cancel().catch(() => {});
+    await d?.delete().catch(() => {}); // a small download may have finished before the cancel landed
     console.error(`bosun: tenant ${f.tenant}: refused download from ${f.source}: ${reason}`);
     this.settle(f);
   }
@@ -274,6 +301,7 @@ export class Downloads extends EventEmitter {
     if (!f || f.tenant !== tenant || f.state === 'deleted') throw new Error(`no download ${String(id).slice(0, 40)} (deleted once fetched, ${Math.round(this.cfg.downloadTtlMs / 60000)} min after it finished, or on a service restart)`);
     if (f.state === 'downloading') throw new Error(`download ${id} is still running (${f.size} bytes so far); call download_wait`);
     if (f.state !== 'ready') throw new Error(`download ${id} was ${f.state}: ${f.reason}`);
+    if (f.sending) throw new Error(`download ${id} is being fetched right now; it is deleted once that completes (call download_get again if it fails)`);
     return f;
   }
 
@@ -287,10 +315,13 @@ export class Downloads extends EventEmitter {
   // The file's text, if it is small and UTF-8 text (no NUL), and then it counts as fetched; otherwise null.
   async inline(f) {
     if (f.size > INLINE_MAX_BYTES || f.sending) return null;
-    const buf = await fs.promises.readFile(f.file);
-    if (buf.includes(0)) return null;
-    let text;
-    try { text = new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch { return null; }
+    f.sending = true; // claimed before anything is awaited: a second fetch meanwhile is refused (get())
+    let text = null;
+    try {
+      const buf = await fs.promises.readFile(f.file);
+      if (!buf.includes(0)) { try { text = new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch {} }
+    } finally { f.sending = false; }
+    if (text === null) return null;
     await this.remove(f);
     return text;
   }
@@ -314,12 +345,15 @@ export class Downloads extends EventEmitter {
   sweep(now = Date.now()) {
     for (const f of [...this.files.values()]) {
       if (f.secret && now > f.urlExpiresAt) f.secret = null;
+      // A GET still sending past the file's expiry is cut off (its client has stalled), then the file goes.
+      if (f.sending && now > f.expiresAt + GET_IDLE_MS) f.abort?.();
       if (f.state === 'deleted' || ((f.state === 'ready' || f.state === 'refused' || f.state === 'failed') && now > f.expiresAt && !f.sending)) this.remove(f);
     }
   }
 
   // The session's browser is gone (its context deleted whatever was still running): drop its download directory.
   async sessionClosed(s) {
+    s.dlWatcher?.close();
     if (s.dlDir) await fs.promises.rm(s.dlDir, { recursive: true, force: true }).catch(() => {});
   }
 
@@ -353,20 +387,31 @@ export class Downloads extends EventEmitter {
     // The URL is spent from here on.
     f.secret = null;
     f.sending = true;
+    let stream = null;
+    const ac = new AbortController();
+    f.abort = () => ac.abort();
+    // A client that stops reading is dropped: GET_IDLE_MS without progress, GET_MAX_MS in all.
+    res.setTimeout(GET_IDLE_MS, () => ac.abort());
+    const deadline = setTimeout(() => ac.abort(), GET_MAX_MS);
     try {
-      const stream = fs.createReadStream(f.file);
-      await new Promise((resolve, reject) => { stream.once('open', resolve); stream.once('error', reject); });
-      res.writeHead(200, {
+      const headers = {
         'content-type': f.mime, 'content-length': String(f.size), 'content-disposition': disposition(f.name),
         'x-content-type-options': 'nosniff', 'cache-control': 'no-store', connection: 'close',
-      });
-      await pipeline(stream, res);
+      };
+      stream = fs.createReadStream(f.file);
+      await new Promise((resolve, reject) => { stream.once('open', resolve); stream.once('error', reject); });
+      res.writeHead(200, headers);
+      await pipeline(stream, res, { signal: ac.signal });
       f.sending = false;
       await this.remove(f); // fetched
     } catch {
+      stream?.destroy();
       f.sending = false;
       if (!res.headersSent) reply(500, { error: 'could not read the file; call download_get again' });
       else res.destroy();
+    } finally {
+      clearTimeout(deadline);
+      f.abort = null;
     }
     return true;
   }

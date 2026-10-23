@@ -224,8 +224,9 @@ download_get { download_id, inline: true }   # UTF-8 text up to 256 KB comes bac
   - A session that may download gets a browser of its own. That browser writes downloads, streamed, into a
     directory of that session on the data volume (`BROWSER_DATA/downloads/<tenant>/.in-…`): never into `/tmp`
     (tmpfs, counted against `MemoryMax`), and never through Bosun's memory.
-  - The file's size is checked every 250 ms while it grows. Past `DOWNLOAD_MAX_BYTES` or the tenant's
-    `DOWNLOAD_TENANT_QUOTA_BYTES`, the download is cancelled mid-stream and the browser deletes what it wrote.
+  - The file's size is checked whenever the browser writes to it (the directory is watched), and every 250 ms. Past
+    `DOWNLOAD_MAX_BYTES` or the tenant's `DOWNLOAD_TENANT_QUOTA_BYTES`, the download is cancelled mid-stream and the
+    browser deletes what it wrote.
   - At most 50 downloads per tenant, running or kept.
   - A finished file moves to `BROWSER_DATA/downloads/<tenant>/<download_id>/<filename>` (0600). There it outlives
     its session.
@@ -234,7 +235,8 @@ download_get { download_id, inline: true }   # UTF-8 text up to 256 KB comes bac
     (`UPLOAD_BASE_URL` applies), valid for `DOWNLOAD_URL_TTL_SEC`.
   - Instead of `?t=`, `GET /download/<download_id>` with the tenant's own `Authorization: Bearer` token works too.
   - Once the whole file has been sent, it is deleted. An interrupted GET leaves it, so call `download_get` again.
-  - At most 4 GETs per tenant at once (`429`).
+  - At most 4 GETs per tenant at once (`429`). A GET whose client reads nothing for 60 s, or that takes over an hour,
+    is cut off.
 - **Gone.** Once fetched, `DOWNLOAD_TTL_SEC` (1 h) after it finished, and all of them at every start and on
   shutdown.
 - **Tenants.** Another tenant's `download_id` answers like one that never existed, and a GET with another tenant's
@@ -247,8 +249,9 @@ download_get { download_id, inline: true }   # UTF-8 text up to 256 KB comes bac
 - **`navigate` to a download URL.** The page stays where it was, and the result carries `downloads`.
 - **Limits.**
   - The type (`mime`) comes from the file name's extension; the browser does not report the response's.
-  - The size check samples every 250 ms, so a very fast download can pass the limit by what arrives in that time
-    before it is cancelled.
+  - The limits are enforced by watching and cancelling, not by a filesystem quota: a very fast download can pass one
+    by what arrives before the cancel lands. Give `BROWSER_DATA` a quota or a volume of its own for a hard bound.
+  - A tenant that is not named sees why in `click`: `downloads are off for this token`.
   - A download a person starts during a handoff is kept for the agent like any other.
 
 ## Handoff

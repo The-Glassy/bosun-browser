@@ -141,8 +141,9 @@ test('a tenant that is not named cannot download at all, and has no download too
     assert.equal(s.dlDir, null);
     const wait = s.page.waitForEvent('download', { timeout: 15000 });
     const r = await clickGo(c, id);
-    assert.equal(r.downloads, undefined);
     assert.match(String(await (await wait).failure()), /acceptDownloads/); // the context refused it
+    // ...and click says why.
+    assert.deepEqual(r.downloads.map((x) => [x.state, x.reason]), [['refused', 'downloads are off for this token (it is not in BROWSER_TENANT_DOWNLOAD_ALLOW)']]);
     assert.deepEqual(files(path.join(svc.dataDir, 'downloads')), []);
     // alice (named) has them.
     const al = await connect(svc, TOKEN);
@@ -442,4 +443,42 @@ test('bosun:download is pushed to an MCPL host when a download finishes or is re
     assert.match(c.pushes[1].origin.reason, /download allowlist/);
     await c.close();
   } finally { await svc.stop(); }
+});
+
+test('robustness: a long name with an emoji, a failed delete keeps its quota, two inline fetches at once, a stalled GET', async () => {
+  const svc = await start();
+  const origErr = console.error; console.error = () => {};
+  try {
+    const { safeName } = await import('../src/uploads.mjs');
+    const n = safeName('a'.repeat(197) + '😀');
+    assert.equal(n, 'a'.repeat(197)); // cut by whole characters, never half an emoji
+    const c = await connect(svc, TOKEN);
+    const id = await openAt(c, `${a}/page?to=/dl`);
+    // Two inline fetches at once: one gets the content, the other is refused.
+    const d1 = (await clickGo(c, id)).downloads[0];
+    const both = await Promise.all([1, 2].map(() => c.call('download_get', { download_id: d1.download_id, inline: true })));
+    assert.equal(both.filter((r) => !r.isError && r.json().inline === true).length, 1, both.map((r) => r.text).join('\n'));
+    // A removal that fails keeps the bytes charged until it succeeds.
+    const d2 = (await clickGo(c, id)).downloads[0];
+    const f = svc.downloads.files.get(d2.download_id);
+    fs.chmodSync(path.dirname(f.dir), 0o500);
+    await svc.downloads.remove(f);
+    assert.equal(svc.downloads.used('alice'), f.size);
+    fs.chmodSync(path.dirname(f.dir), 0o700);
+    svc.downloads.sweep();
+    await until(() => svc.downloads.used('alice') === 0);
+    // A GET whose client reads nothing is cut off once the file is past its expiry; then the file goes.
+    const d3 = (await clickGo(c, await openAt(c, `${a}/page?to=/dl?kb=4096`))).downloads[0];
+    const g = (await c.call('download_get', { download_id: d3.download_id })).json();
+    const req = http.get(g.get_url, (res) => res.pause()); // never reads
+    req.on('error', () => {});
+    const f3 = svc.downloads.files.get(d3.download_id);
+    await until(() => f3.sending, 5000);
+    svc.downloads.sweep(Date.now() + 3600_000 + 120_000);
+    await until(() => !f3.sending, 5000);
+    svc.downloads.sweep(Date.now() + 3600_000 + 120_000);
+    await until(() => !fs.existsSync(f3.dir), 5000);
+    req.destroy();
+    await c.close();
+  } finally { console.error = origErr; await svc.stop(); }
 });

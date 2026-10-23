@@ -140,13 +140,14 @@ export class SessionManager {
       else { this.ownerOpens.delete(owner); this.goneOwners.delete(owner); }
     };
     try {
-      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral, downloads: downloads && !media && !!this.downloads?.allowFor(tenant) });
+      // agent: a session the agent opened (it hears why a download was refused even when its tenant may not download).
+      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral, downloads: downloads && !media && !!this.downloads?.allowFor(tenant), agent: downloads && !media && !ephemeral });
     } finally {
       untrack();
     }
   }
 
-  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral, downloads }) {
+  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral, downloads, agent = false }) {
     // The profile was just closed (by session_close, a dropped connection, idle or crash) and its browser is still
     // shutting down; or a background keepalive holds it. Wait for it rather than refusing.
     if (profileKey && this.profilesInUse.has(profileKey)) {
@@ -217,7 +218,7 @@ export class SessionManager {
           s.navs.push({ t: Date.now(), at: urlKey(f.url()) });
           if (s.navs.length > 100) s.navs.shift();
         });
-        if (dlDir) this.downloads.watch(s);
+        if (dlDir || (agent && this.downloads)) this.downloads.watch(s);
         page.on('close', () => this.dispose(s, 'page-closed'));
         page.on('crash', () => this.dispose(s, 'page-crashed'));
         ctx.on('close', () => this.dispose(s, 'context-closed'));

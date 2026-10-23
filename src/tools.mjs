@@ -192,6 +192,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   // Downloads this tenant may keep (BROWSER_TENANT_DOWNLOAD_ALLOW); null: its browsers refuse every download.
   const downloads = manager.downloads?.allowFor(tenant) ? manager.downloads : null;
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
+  // What click and navigate report: a download kept or refused (also "downloads are off for this token").
+  const capture = !ephemeral ? manager.downloads ?? null : null;
   const server = new McpServer({ name: 'bosun', version: '0.11.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
@@ -244,14 +246,14 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     const url = manager.checkAllowed(tenant, httpUrl(a.url));
     return run(a.session, async (s) => {
       const t0 = Date.now();
-      const mark = downloads?.mark();
+      const mark = capture?.mark();
       let r;
       try {
         r = await s.page.goto(url, { waitUntil: a.wait || 'domcontentloaded', timeout: 45000 });
       } catch (e) {
         // The URL was a download: the page stays where it was, and the download is the answer.
-        const dl = downloads && /Download is starting|net::ERR_ABORTED|NS_BINDING_ABORTED/.test(String(e?.message)) ? await downloads.since(s.id, mark, { expectMs: 3000 }) : [];
-        if (dl.length) return ok({ ...(await pageInfo(s.page)), downloads: dl.map((f) => downloads.info(f)) });
+        const dl = capture && /Download is starting|net::ERR_ABORTED|NS_BINDING_ABORTED/.test(String(e?.message)) ? await capture.since(s.id, mark, { expectMs: 3000 }) : [];
+        if (dl.length) return ok({ ...(await pageInfo(s.page)), downloads: dl.map((f) => capture.info(f)) });
         // A redirect hop the tenant's proxy refused over CONNECT (https, wss) fails the navigation in the browser:
         // say that it was the allowlist, naming host and port only.
         const denied = /TUNNEL|PROXY/i.test(String(e?.message)) ? await manager.deniedSince(tenant, t0) : [];
@@ -291,12 +293,12 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     }));
 
   tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target }, async (a) => run(a.session, async (s) => {
-    const mark = downloads?.mark();
+    const mark = capture?.mark();
     await locate(s.page, a).click({ timeout: 15000 });
     await s.page.waitForTimeout(1000);
-    const dl = downloads ? await downloads.since(s.id, mark) : [];
+    const dl = capture ? await capture.since(s.id, mark) : [];
     const w = noteWall(s, await wall(s.page));
-    return ok({ ...(await pageInfo(s.page)), ...(w ? { blocked: w } : {}), ...(dl.length ? { downloads: dl.map((f) => downloads.info(f)) } : {}) });
+    return ok({ ...(await pageInfo(s.page)), ...(w ? { blocked: w } : {}), ...(dl.length ? { downloads: dl.map((f) => capture.info(f)) } : {}) });
   }));
 
   tool('type', 'Fill a field. submit=true presses Enter.', { session: str(40), ...target, value: str(10000), submit: z.boolean().optional() }, async (a) => run(a.session, async (s) => {

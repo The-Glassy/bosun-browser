@@ -21,6 +21,8 @@
   upload PUT. It is valid 15 min, works for this tenant only (or with the tenant's Bearer token), and comes with a
   ready `curl -o` line. `inline: true` returns UTF-8 text up to 256 KB in the result instead.
 - **Event `bosun:download`** (feature set `bosun.download`) when a download finishes or is refused.
+- A tenant without downloads still learns why: `click` reports `state: refused`, "downloads are off for this token"
+  (sessions the agent opens; read-only tokens record nothing).
 
 ### Storage and limits
 
@@ -28,11 +30,15 @@
   data volume, `BROWSER_DATA/downloads/<tenant>/.in-…`. The browser streams the bytes there itself: not `/tmp`, not
   Bosun's memory.
 - **Cancelled mid-stream** past `DOWNLOAD_MAX_BYTES` (300 MB per file) or `DOWNLOAD_TENANT_QUOTA_BYTES` (1 GB per
-  tenant, running and kept). The size is checked every 250 ms, and the browser deletes what it wrote.
+  tenant, running and kept). The size is checked whenever the browser writes (the session's download directory is
+  watched) and every 250 ms, and the browser deletes what it wrote.
 - **Kept files** move to `BROWSER_DATA/downloads/<tenant>/<id>/<filename>` (0600) and outlive their session.
   - They are deleted once fetched in full, `DOWNLOAD_TTL_SEC` (1 h) after they finished, and all of them at every
     start.
   - A tenant holds at most 50, and fetches at most 4 at once.
+  - A GET whose client reads nothing for 60 s, or that takes over an hour, is cut off. A file being fetched is
+    fetched once: a second `download_get` meanwhile is refused.
+  - A delete that fails keeps the file's bytes and slot charged until the retry succeeds.
 - **Tenants:** another tenant's `download_id` answers like one that never existed, and a GET with another tenant's
   token is refused. Naming a read-only (`ephemeral`) tenant stops the service.
 
@@ -43,8 +49,10 @@
 
 ### Limits
 
-- `mime` comes from the file name's extension. The size check samples every 250 ms, so a very fast download can
-  pass the limit by what arrives in that time before it is cancelled.
+- `mime` comes from the file name's extension.
+- The limits are enforced by watching the file and cancelling; they are not a filesystem quota. A very fast download
+  can pass a limit by what arrives before the cancel lands. Bound the worst case with a quota or a volume of its own
+  for `BROWSER_DATA` (production has a dedicated volume).
 - The in-progress file is found through a private Playwright field (the download's artifact path; versions are
   pinned). Without it, the whole download directory of the session is measured, which is stricter.
 ## 0.10.2 — Bosun no longer opts itself out
