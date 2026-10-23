@@ -69,8 +69,9 @@ export async function challengeShown(page) {
     if (!CHALLENGE_SRC.test(src) || /[?&]size=invisible\b/.test(src)) continue;
     let rect = null; // the challenge, in the coordinates of the frame being looked at
     let shown = true;
-    for (let cur = f; shown && cur !== main; cur = cur.parentFrame()) {
-      const el = cur && await cur.frameElement().catch(() => null);
+    // Up to the top frame, the one without a parent (patchright hands out another object for it than mainFrame()).
+    for (let cur = f; shown && cur?.parentFrame(); cur = cur.parentFrame()) {
+      const el = await cur.frameElement().catch(() => null);
       if (!el) { shown = false; break; }
       const g = await el.evaluate((e) => {
         const r = e.getBoundingClientRect();

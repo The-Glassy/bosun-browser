@@ -175,11 +175,16 @@ test('captcha rule: a challenge inside a hidden outer frame is none; a shown one
     const page = svc.manager.sessions.get(await c.open()).page;
     const inner = `<iframe src="${fm.base}/recaptcha/api2/anchor?k=x" width="300" height="300"></iframe>`;
     const outer = (style) => `<iframe style="${style}" width="400" height="400" srcdoc='${inner}'></iframe>`;
-    await page.goto(`${fm.base}/nothing`).catch(() => {});
+    // A real page to start from (full Chromium replaces an empty 404 with its own error page: another navigation).
+    await page.goto(fm.newRoom().url);
     // Hidden outer frames; an outer frame mostly off screen with the challenge in its off-screen part; shown.
     for (const [style, want] of [['position:absolute;top:-5000px', null], ['opacity:0', null], ['visibility:hidden', null], ['position:absolute;left:-350px', null], ['', 'captcha']]) {
-      await page.setContent(`<title>t</title>${outer(style)}`);
-      await until(() => page.frames().some((f) => /recaptcha/.test(f.url())), 5000);
+      // Built through the DOM: patchright's setContent closes the page on nested srcdoc frames.
+      await page.evaluate((h) => { document.body.innerHTML = h; }, outer(style));
+      await until(() => page.frames().some((f) => /recaptcha/.test(f.url()) && !f.isDetached()), 5000);
+      // Judged once the frames have settled (patchright reports a frame before it commits).
+      if (want) await until(async () => (await wall(page)) === want, 5000).catch(() => {});
+      else await page.waitForTimeout(500);
       assert.equal(await wall(page), want, style || 'shown');
     }
     // A challenge served as the page itself (no frame): its endpoint says so; a page merely mentioning recaptcha doesn't.

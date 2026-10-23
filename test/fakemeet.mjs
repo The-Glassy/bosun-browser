@@ -169,7 +169,8 @@ export async function startFakeMeet({ tone = false } = {}) {
       if (u.pathname === '/api/leave') { r.left = true; r.over = 'left'; r.log.push(['leave', Date.now()]); }
       return json({ ok: true });
     }
-    res.writeHead(404); res.end();
+    // A body: full Chromium replaces an empty error page with its own (chrome-error://), another URL.
+    res.writeHead(404, { 'content-type': 'text/html' }); res.end('<title>Not found</title><p>not found</p>');
   });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${srv.address().port}`;
