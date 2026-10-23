@@ -74,6 +74,19 @@ test('Zoom: a live microphone whose "Mute" takes clicks and stays on is not join
   });
 });
 
+test('Zoom: a camera question coming up after a click on a live microphone\'s "Mute" does not make the microphone off', async () => {
+  await withService(async (c) => {
+    const { id, url } = fz.newRoom({ hearYou: 'both', micClick: 'asksCamera', passcode: 'p1' });
+    const r = await c.call('meeting_join', { url, profile: 'zoom' });
+    assert.equal(r.isError, true, r.text);
+    assert.match(r.text, /could not make sure the microphone is off before joining/);
+    assert.equal(fz.room(id).guest, null, 'Join was not clicked');
+    assert.ok(fz.room(id).media.some((m) => m.devices === 'declined' && /see you/.test(m.question || '')), 'the camera question was answered');
+    assert.deepEqual(used(fz.room(id)), []);
+    await c.close();
+  });
+});
+
 test('Zoom: a live microphone that mutes on "Mute" is muted, then joined', async () => {
   await withService(async (c) => {
     const { id, url } = fz.newRoom({ hearYou: 'mic', micClick: 'toggles', passcode: 'p1' });

@@ -91,13 +91,17 @@ const overlays = async (page) => {
 };
 const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha'];
 
-// A device question shown: answered "Continue without …". true if one was.
+// A device question shown: answered "Continue without …". null if none is shown, else the answer's label and whether
+// it took (clicked, and gone).
 async function declineDevices(page) {
   const b = await firstVisible(button(page, LABEL.noDevices));
-  if (!b) return false;
-  await b.click({ timeout: 2000 }).catch(() => {});
-  return true;
+  if (!b) return null;
+  const label = norm((await b.getAttribute('aria-label').catch(() => null)) || await b.innerText().catch(() => '')).trim();
+  const ok = await b.click({ timeout: 2000 }).then(() => true, () => false) && !(await b.isVisible().catch(() => false));
+  return { label, ok };
 }
+// Which device a question's answer is about ("Continue without microphone and camera": both).
+const ABOUT = { audioinput: /microphone|mikrofon|мікрофон|микрофон|audio/i, videoinput: /camera|kamera|камер|video/i };
 
 // What the browser could capture (meetings run in Chromium only): how many microphones or cameras it lists (Chromium
 // lists one, unnamed, per kind before permission is given, none when there is none) and the permission state; null
@@ -123,15 +127,18 @@ async function seen(page, kind, onLabel, offLabel) {
 // Microphone or camera verifiably off in Zoom (preview or call). Off: its control shows "turn on"; the browser has no
 // such device or its permission is denied; or clicking the control made Zoom ask for the device (a microphone Zoom
 // never got shows "Mute" with a crossed icon, and clicking it asks "Do you want people to hear you…?" instead of
-// muting): the question is answered without it. A control that shows the device on, takes clicks and neither turns
+// muting): the question is answered without it. Only a question about this device, coming up within 3 s of a click
+// that took (none was shown when it was clicked), and answered, counts. A control that shows the device on, takes clicks and neither turns
 // off nor asks is a live device: not joining (throws). Without a control, the page saying the device is missing will
 // do. The permission state "prompt" is not taken as off: Bosun's browsers grant capture on request.
 async function deviceOff(page, { what, kind, onLabel, offLabel, missing, state, when = 'before joining', then = 'not joining', timeoutMs = 15_000 }) {
   const until = Date.now() + timeoutMs;
-  let clicked = 0; // when the control was last clicked
+  let clicked = 0; // when the control last took a click
   for (;;) {
-    if (await declineDevices(page)) {
-      if (clicked) return 'not in use';
+    if (Date.now() > until) throw new Error(`could not make sure the ${what} is off ${when} (Zoom changed?); ${then}`);
+    const q = await declineDevices(page);
+    if (q) {
+      if (q.ok && clicked && Date.now() - clicked < 3000 && ABOUT[kind].test(q.label)) return 'not in use';
       await page.waitForTimeout(300);
       continue;
     }
@@ -144,8 +151,7 @@ async function deviceOff(page, { what, kind, onLabel, offLabel, missing, state, 
     const on = await firstVisible(button(page, onLabel));
     if (!on && missing.test(await pageText(page).catch(() => ''))) return 'no device';
     // One click, then time for Zoom to toggle it or ask (a second click could turn a just-muted microphone back on).
-    if (on && Date.now() - clicked > 2000 && !(await disabled(on))) { await on.click({ timeout: 3000 }).catch(() => {}); clicked = Date.now(); }
-    if (Date.now() > until) throw new Error(`could not make sure the ${what} is off ${when} (Zoom changed?); ${then}`);
+    if (on && Date.now() - clicked > 2000 && !(await disabled(on))) clicked = await on.click({ timeout: 3000 }).then(() => Date.now(), () => clicked);
     await page.waitForTimeout(300);
   }
 }

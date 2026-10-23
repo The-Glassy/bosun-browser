@@ -36,7 +36,8 @@ function launch(id, search) {
 // Name" and "Join" disabled until a name is typed. Clicking "Mute" does not toggle it: it asks "hear you" again
 // ("Use microphone" / "Continue without microphone"); "Stop Video" asks "see you" ("Use camera" / "Continue without
 // camera"; assumed, not seen live). micClick 'stuck': a live microphone whose "Mute" takes clicks and does nothing;
-// 'toggles': a live microphone that mutes. Every "Use …" click is logged as media {devices: 'used'}.
+// 'toggles': a live microphone that mutes; 'asksCamera': a live microphone whose "Mute" does nothing but bring up the
+// camera's question. Every "Use …" click is logged as media {devices: 'used'}.
 function webClient(id, r) {
   if (r.expired) {
     return `<!doctype html><meta charset="utf-8"><title>Error - Zoom</title><nav><a href="/join">Join</a> <a href="/signin">Sign In</a></nav>
@@ -108,7 +109,7 @@ if ($('devq')) { $('devNo').onclick = () => { $('devq').remove(); post('media', 
 if ($('remember')) $('input-for-name').addEventListener('input', () => { $('join').disabled = !$('input-for-name').value.trim(); });
 if (${r.web2026 || r.hearYou ? 'true' : 'false'}) pcam = false;
 if (R.hearYou) {
-  pmic = R.micClick === 'stuck' || R.micClick === 'toggles'; // without permission the microphone sends nothing
+  pmic = !!R.micClick; // without permission the microphone sends nothing
   // A question in the dialog: [title, use label, decline label]; the decline only closes it, "Use …" is logged.
   const ask = (title, use, no) => { $('hearTitle').textContent = title; $('hearUse').textContent = use; $('hearUse').hidden = false; $('hearNo').textContent = no; $('hearq').hidden = false; };
   $('hearNo').onclick = () => { $('hearq').hidden = true; post('media', { devices: 'declined', question: $('hearTitle').textContent }); };
@@ -116,6 +117,7 @@ if (R.hearYou) {
   $('devNo').onclick = () => { $('devq').remove(); post('media', { devices: 'declined' }); setTimeout(() => { $('hearq').hidden = false; }, 500); };
   $('pmic').onclick = () => {
     if (R.micClick === 'stuck') return;
+    if (R.micClick === 'asksCamera') return ask('Do you want people to see you in the meeting?', 'Use camera', 'Continue without camera');
     if (R.micClick === 'toggles') { pmic = !pmic; $('pmic').textContent = pmic ? 'Mute' : 'Unmute'; $('pmic').setAttribute('aria-label', $('pmic').textContent); return; }
     ask('Do you want people to hear you in the meeting?', 'Use microphone', 'Continue without microphone');
   };
