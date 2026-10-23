@@ -8,6 +8,7 @@ import http from 'http';
 import { spawn, spawnSync } from 'child_process';
 import { Readable } from 'stream';
 import { maskedScreenshot } from '../src/redact.mjs';
+import { driverLogsValues } from '../src/secrets.mjs';
 import { startBosun, connect, until, TOKEN, TOKEN_B } from './helpers.mjs';
 
 const TOKEN_E = 'test-token-eeeeeeeeeeeeeeee';
@@ -24,6 +25,10 @@ const PAGES = {
     <label>Notes <textarea id="notes" name="notes"></textarea></label>
     <input id="agree" type="checkbox" name="agree"><div id="box">a div</div>
     <button id="go">Log in</button></form>`,
+  // The password field is swapped for a text field with the same id as soon as anything marks it.
+  '/swap': `<title>Swap</title><input id="pw" type="password"><script>
+    const pw = document.getElementById('pw');
+    new MutationObserver(() => { const t = document.createElement('input'); t.id = 'pw'; pw.replaceWith(t); }).observe(pw, { attributes: true });</script>`,
   '/search': `<title>Search</title><form method="get" action="/echo"><input id="pw" type="password" name="q"></form>`,
 };
 
@@ -187,6 +192,14 @@ test('expiry: an unused PUT URL after 15 min, an untyped secret after 10 min; th
   assert.ok(held.every((b) => b === 0)); // the buffer is wiped, not just dropped
   assert.match((await c.call('type', { session: s, selector: '#pw', secret_id: id })).text, /no secret/);
   assert.ok(logs.some((l) => l.includes(`secret ${id} of tenant alice: expired untyped`)));
+  // Past its time it is refused at once, before any sweep, and wiped.
+  const late = await send(c, 'late-secret');
+  const lateItem = svc.secrets.items.get(late);
+  lateItem.expiresAt = Date.now() - 1;
+  const lateValue = lateItem.value;
+  assert.match((await c.call('type', { session: s, selector: '#pw', secret_id: late })).text, /no secret/);
+  assert.equal(await value(c, s, '#pw'), '');
+  assert.ok(lateValue.every((b) => b === 0));
   await c.close();
   // In memory only: a service that stops holds none, and nothing of them is in its data directory.
   const s2 = await startBosun();
@@ -313,8 +326,79 @@ test('a page that echoes the secret into its URL and title: type submit returns 
   await c.close();
 });
 
+test('a PUT that trickles is cut off at its deadline, and its slot goes', async () => {
+  const c = await client(TOKEN);
+  const x = (await c.call('secret_create')).json();
+  svc.secrets.putMaxMs = 600;
+  try {
+    const r = await new Promise((resolve) => {
+      const req = http.request(x.put_url, { method: 'PUT', headers: { 'transfer-encoding': 'chunked' } }, (res) => {
+        let t = '';
+        res.on('data', (d) => { t += d; });
+        res.on('end', () => resolve({ status: res.statusCode, text: t }));
+      });
+      req.on('error', (e) => resolve({ status: 0, error: e.code }));
+      const tick = setInterval(() => req.write('t'), 100);
+      req.on('close', () => clearInterval(tick));
+      setTimeout(() => { clearInterval(tick); req.destroy(); }, 5000);
+    });
+    assert.equal(r.status, 400, JSON.stringify(r));
+    assert.match(r.text, /took longer than 0\.6 s/);
+    assert.equal(svc.secrets.items.has(x.secret_id), false);
+  } finally { svc.secrets.putMaxMs = 60_000; }
+  await c.close();
+});
+
+test('a field swapped for another after the check gets nothing, and the secret stays unused', async () => {
+  const c = await client(TOKEN);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${base}/swap` });
+  const id = await send(c, 'swap-target-secret');
+  const r = await c.call('type', { session: s, selector: '#pw', secret_id: id });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /could not mark the field for masking .*nothing was typed|left the page before anything was typed/);
+  const page = svc.manager.sessions.get(s).page;
+  assert.equal(await page.$eval('#pw', (e) => e.type), 'text'); // the swap happened
+  assert.equal(await value(c, s, '#pw'), '');
+  assert.ok(svc.secrets.items.has(id));
+  svc.secrets.remove(svc.secrets.items.get(id));
+  await c.close();
+});
+
+test('read masks a secret as the accessibility snapshot shows it (white space collapsed)', async () => {
+  const c = await client(TOKEN);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${base}/login` });
+  const id = await send(c, '  alpha \u00ad  bravo\tcharlie  ');
+  assert.equal((await c.call('type', { session: s, selector: '#notes', secret_id: id, allow_non_password: true })).isError, false);
+  const r = await c.call('read', { session: s });
+  assert.ok(!/alpha|bravo|charlie/.test(r.text), r.text);
+  assert.match(r.text, /textbox "Notes"(?: \[[^\]]*\])*: \[masked\]/);
+  await c.close();
+});
+
+test('DEBUG with a Playwright log that prints typed text: secrets refused', async () => {
+  for (const d of ['pw:api', 'pw:*', '*', 'foo,pw:protocol', 'pw:channel*', 'x pw:api']) assert.equal(driverLogsValues(d), true, d);
+  for (const d of [undefined, '', 'pw:browser', 'express:*', 'pw:*,-pw:api,-pw:protocol,-pw:channel', '-pw:*']) assert.equal(driverLogsValues(d), false, String(d));
+  const c = await client(TOKEN);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${base}/login` });
+  const id = await send(c, 'debug-refused-secret');
+  const prev = process.env.DEBUG;
+  process.env.DEBUG = 'pw:api';
+  try {
+    assert.match((await c.call('secret_create')).text, /DEBUG turns on a Playwright log/);
+    assert.match((await c.call('type', { session: s, selector: '#pw', secret_id: id })).text, /DEBUG turns on a Playwright log/);
+  } finally {
+    if (prev === undefined) delete process.env.DEBUG; else process.env.DEBUG = prev;
+  }
+  assert.equal(await value(c, s, '#pw'), '');
+  assert.equal((await c.call('type', { session: s, selector: '#pw', secret_id: id })).isError, false);
+  await c.close();
+});
+
 test('no secret of these tests is in any tool result, PUT answer or log line; the log has id and length', () => {
-  const all = [PW, OTP, 'once-only-secret', 'expiring-secret', 'alice-only-secret', 'two\nlines', 'echo me & you/100%', 'echo+me'];
+  const all = [PW, OTP, 'once-only-secret', 'expiring-secret', 'late-secret', 'alice-only-secret', 'two\nlines', 'echo me & you/100%', 'echo+me', 'swap-target-secret', 'alpha', 'debug-refused-secret'];
   for (const text of results) for (const v of all) assert.ok(!text.includes(v), `${v} in a result: ${text}`);
   for (const line of logs) for (const v of all) assert.ok(!line.includes(v), `${v} in the log: ${line}`);
   assert.ok(logs.some((l) => /^bosun: secret s[0-9a-f]{16} of tenant alice: received, \d+ bytes$/.test(l)));

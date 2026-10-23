@@ -104,7 +104,8 @@ export function passwordTracker() {
 
 // An input Bosun types a secret into stays sensitive from then on, whatever its type or label (masked in read and
 // screenshot, cleared like a credential field): it joins the set of former password fields in the scans' world. The
-// locator may run in another world, so the element is tagged with a one-off attribute and found again by it.
+// element (handle or locator) may live in another world, so it is tagged with a one-off attribute and found again by
+// it.
 export async function markSensitive(page, l) {
   const key = crypto.randomBytes(8).toString('hex');
   await l.evaluate((el, k) => el.setAttribute('data-bosun-secret', k), key, { timeout: 15000 });
@@ -158,10 +159,14 @@ const FIELD_LINE_RE = /^(\s*- (?:textbox|searchbox|spinbutton|combobox)(?: "(?:[
 
 const unquote = (v) => { if (!v.startsWith('"')) return v; try { return JSON.parse(v); } catch { return v; } };
 
-// Mask an aria snapshot / text dump: fields with a sensitive label, fields whose value is a sensitive value, and any
-// other occurrence of a sensitive value of 3+ characters.
+// How Playwright's aria snapshot shows a value: without zero-width spaces and soft hyphens, trimmed, every run of
+// white space one space (playwright-core normalizeWhiteSpace).
+const normalized = (v) => v.replace(/[\u200b\u00ad]/g, '').trim().replace(/\s+/g, ' ');
+
+// Mask an aria snapshot / text dump: fields with a sensitive label, fields whose value is a sensitive value (as typed
+// or as the snapshot normalizes it), and any other occurrence of either of 3+ characters.
 export function maskText(text, values) {
-  const vals = new Set(values.filter(Boolean));
+  const vals = new Set(values.filter(Boolean).flatMap((v) => [v, normalized(v)]).filter(Boolean));
   let out = text.replace(LABEL_RE, '$1: [masked]');
   out = out.split('\n').map((line) => {
     const m = FIELD_LINE_RE.exec(line);

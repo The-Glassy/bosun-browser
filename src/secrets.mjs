@@ -11,13 +11,31 @@ export const SECRET_TTL_MS = 10 * 60_000; // a secret that arrived and was not t
 const SECRETS_PER_TENANT = 20; // waiting or ready, per tenant
 const SECRETS_TOTAL = 200; // and across the service
 const PUT_IDLE_MS = 30_000; // a PUT that sends nothing for this long is dropped
+const PUT_MAX_MS = 60_000; // and none may take longer (4 KB)
 const ID_RE = /^s[0-9a-f]{16}$/;
 
 const wipe = (b) => { if (b) b.fill(0); };
 
+// Whether DEBUG (the debug package's syntax: comma or space separated, * wildcards, -name excludes) turns on a
+// Playwright log that prints what is typed: pw:api logs fill("<value>"), pw:protocol and pw:channel the messages
+// that carry it. Then no secret is typed.
+const DRIVER_LOGS = ['pw:api', 'pw:protocol', 'pw:channel'];
+export function driverLogsValues(debug = process.env.DEBUG) {
+  const on = [], off = [];
+  for (const p of String(debug || '').split(/[\s,]+/).filter(Boolean)) {
+    const neg = p.startsWith('-');
+    const re = new RegExp(`^${(neg ? p.slice(1) : p).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*?')}$`);
+    (neg ? off : on).push(re);
+  }
+  return DRIVER_LOGS.some((n) => on.some((r) => r.test(n)) && !off.some((r) => r.test(n)));
+}
+export const DRIVER_LOGS_REFUSED = 'secrets are refused while DEBUG turns on a Playwright log that prints what is typed (pw:api, pw:protocol or pw:channel); the operator has to switch it off';
+
 export class Secrets {
   constructor({ log = (...a) => console.error(...a) } = {}) {
     this.log = log;
+    this.putIdleMs = PUT_IDLE_MS;
+    this.putMaxMs = PUT_MAX_MS;
     this.items = new Map(); // id -> {id, tenant, label, state: pending|receiving|ready, token, urlExpiresAt, expiresAt, value}
     this.sweeper = setInterval(() => this.sweep(), 30_000);
     this.sweeper.unref();
@@ -41,7 +59,8 @@ export class Secrets {
 
   // Same message for "never existed", "another tenant's", "already typed" and "expired", so ids can't be probed.
   find(tenant, id) {
-    const x = this.items.get(id);
+    let x = this.items.get(id);
+    if (x && this.expired(x)) { this.remove(x); x = null; }
     if (!x || x.tenant !== tenant) throw new Error(`no secret ${String(id).slice(0, 40)} (each one is deleted once typed, ${SECRET_TTL_MS / 60000} min after it arrived, or on a service restart); call secret_create again`);
     if (x.state !== 'ready') throw new Error(`secret ${x.id} has not arrived yet: PUT it first (the curl line from secret_create), then call type`);
     return x;
@@ -65,9 +84,11 @@ export class Secrets {
     if (this.items.get(x.id) === x) this.items.delete(x.id);
   }
 
+  expired(x, now = Date.now()) { return (x.state === 'pending' && now > x.urlExpiresAt) || (x.state === 'ready' && now > x.expiresAt); }
+
   sweep(now = Date.now()) {
     for (const x of [...this.items.values()]) {
-      if ((x.state === 'pending' && now > x.urlExpiresAt) || (x.state === 'ready' && now > x.expiresAt)) {
+      if (this.expired(x, now)) {
         if (x.state === 'ready') this.log(`bosun: secret ${x.id} of tenant ${x.tenant}: expired untyped`);
         this.remove(x);
       }
@@ -107,12 +128,13 @@ export class Secrets {
     x.token = null;
     if (req.headers.expect) res.writeContinue();
     const body = Buffer.alloc(SECRET_MAX_BYTES + 1); // the secret and one trailing newline, at most
-    let size = 0, why = null;
+    let size = 0, why = null, deadline = null;
     try {
       await new Promise((resolve, reject) => {
         const fail = (code, msg) => { why ??= { code, msg }; reject(new Error(msg)); };
         x.abort = () => fail(400, 'cancelled');
-        req.setTimeout(PUT_IDLE_MS, () => fail(400, 'nothing arrived for 30 s'));
+        req.setTimeout(this.putIdleMs, () => fail(400, `nothing arrived for ${this.putIdleMs / 1000} s`));
+        deadline = setTimeout(() => fail(400, `the PUT took longer than ${this.putMaxMs / 1000} s`), this.putMaxMs);
         req.on('data', (chunk) => {
           if (why) return wipe(chunk);
           if (size + chunk.length > body.length) {
@@ -151,6 +173,7 @@ export class Secrets {
         else req.socket?.destroy();
       } else if (!req.socket?.destroyed) reply(400, { error: `${msg}; call secret_create again` });
     } finally {
+      clearTimeout(deadline);
       wipe(body);
       x.abort = null;
     }

@@ -12,7 +12,7 @@ import { MIN_PERIOD_MIN } from './keepalive.mjs';
 import { meetRefusalPage } from './meetings/platforms/meet.mjs';
 import { challengeShown } from './meetings/platforms/common.mjs';
 import { BASE64_MAX_BYTES } from './uploads.mjs';
-import { SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS } from './secrets.mjs';
+import { DRIVER_LOGS_REFUSED, SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS, driverLogsValues } from './secrets.mjs';
 import { INLINE_MAX_BYTES } from './downloads.mjs';
 import { showPattern } from './allow.mjs';
 
@@ -318,15 +318,26 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     });
 
   // type with secret_id: the field is checked and marked sensitive first, then the secret is taken (deleted) and
-  // typed. Nothing returned or thrown carries it: the URL and title (a page may echo it there) and any error are
-  // masked with the value itself.
+  // typed. All three on one element (a handle): a page that swaps the field for another one after the check gets
+  // nothing typed. Nothing returned or thrown carries the secret: the URL and title (a page may echo it there) and
+  // any error are masked with the value itself.
   const NO_SECRET_TYPES = new Set(['file', 'checkbox', 'radio', 'submit', 'button', 'image', 'reset', 'hidden', 'range', 'color']);
-  async function typeSecret(s, l, a) {
+  async function typeSecret(s, loc, a) {
     secrets.find(tenant, a.secret_id); // fails before the page is touched
-    const kind = await l.evaluate((el) => (el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName === 'textarea' ? 'textarea' : `<${el.localName}>`), null, { timeout: 15000 });
+    if (driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
+    const l = await loc.elementHandle({ timeout: 15000 });
+    try {
+      return await typeSecretInto(s, l, a);
+    } finally {
+      await l.dispose().catch(() => {});
+    }
+  }
+  async function typeSecretInto(s, l, a) {
+    const kind = await l.evaluate((el) => (el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName === 'textarea' ? 'textarea' : `<${el.localName}>`));
     if (kind.startsWith('<') || NO_SECRET_TYPES.has(kind)) throw new Error(`a secret goes only into a text field (<input> or <textarea>); this element is ${kind.startsWith('<') ? kind : `<input type=${kind}>`}`);
     if (kind !== 'password' && !a.allow_non_password) throw new Error(`this field is ${kind === 'textarea' ? 'a <textarea>' : `<input type=${kind}>`}, not a password field; pass allow_non_password: true to type the secret into it anyway (an OTP or e-mail field). The secret was not used.`);
     await markSensitive(s.page, l);
+    if (!(await l.evaluate((el) => el.isConnected))) throw new Error('the field left the page before anything was typed; the secret was not used');
     const buf = secrets.take(tenant, a.secret_id);
     let value = buf.toString('utf8');
     buf.fill(0);
@@ -393,6 +404,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       { label: str(100).optional().describe('what it is, for you (e.g. "github password"); not secret') },
       async (a) => {
         if (!cfg.ws) throw new Error('secret_create needs the WebSocket service (WS_PORT): the secret comes in over an HTTP PUT on that port');
+        if (driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
         const x = secrets.create(tenant, { label: a.label ?? null });
         const where = `/secret/${x.id}?t=${x.token}`;
         const url = uploadBase ? `${uploadBase}${where}` : null;

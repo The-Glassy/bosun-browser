@@ -218,13 +218,20 @@ type { session, selector: "#password", secret_id: "s9c…", submit: true }
   more is `413`.
 - **The PUT goes where uploads go:** the MCP host and port, one request, within 15 min, for the tenant that asked.
   `PUT /secret/<id>` with the tenant's own Bearer token works instead of `?t=`; another tenant's token is `403`.
-- **Memory only.** Bosun keeps the secret in a buffer of its own: never on disk, never in a log line, an event or a
-  tool result. Log lines name the id and the length in bytes. The buffer is zeroed when the secret is typed, 10 min
-  after it arrived, or when the service stops; a restart loses every secret.
-- **Typed once.** `type` with `secret_id` takes the secret out of the store, fills the field and returns the URL and
-  title with the secret replaced by `[masked]` (also URL-encoded, for a form that submits with GET). A second `type`
+- **Memory only.** Bosun keeps the secret in a buffer of its own: never on disk, never in a log line or an event.
+  Log lines name the id and the length in bytes. The buffer is zeroed when the secret is typed, 10 min after it
+  arrived, or when the service stops; a restart loses every secret. A PUT gets 60 s in all (30 s without a byte).
+- **No driver debug logs.** Playwright's `DEBUG=pw:api` log prints what `fill` types, and `pw:protocol` /
+  `pw:channel` print the messages that carry it. While `DEBUG` turns any of them on, `secret_create` and `type` with
+  `secret_id` are refused.
+- **Typed once.** `type` with `secret_id` takes the secret out of the store and fills the field. A second `type`
   with that id gets "no secret …", the same answer as for an id that never existed or belongs to another tenant. If
-  the fill fails after the secret was taken, it is gone too: call `secret_create` again. Errors never carry it.
+  the fill fails after the secret was taken, it is gone too: call `secret_create` again. Neither the result nor an
+  error carries the value. The result's URL and title have it replaced by `[masked]` (also URL-encoded, for a form
+  that submits with GET); later results (`read`, `navigate`, `sessions`, …) return the page's URL and title as they
+  are, so a page that puts the secret there shows it to the agent from then on.
+- **One element.** The type check, the masking mark and the fill all go to the element found first. A page that
+  swaps the field for another one in between gets nothing typed.
 - **Password fields only, unless you say otherwise.** The field must be an `<input type=password>`. For an OTP, an
   e-mail address or a user name pass `allow_non_password: true`; any text `<input>` or `<textarea>` then takes it.
   Checkboxes, buttons, file inputs and non-inputs are refused. A refusal before the fill leaves the secret unused.

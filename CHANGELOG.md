@@ -15,16 +15,22 @@
   `<textarea>` needs `allow_non_password: true` (OTP and e-mail fields). Checkboxes, buttons, file inputs and
   elements that are not inputs are refused. A refusal before the fill leaves the secret unused.
 - **A field that got a secret is masked** in `read` and `screenshot` from then on, and cleared after a handoff ends
-  with Give up, whatever its type or label (it joins the set of former password fields).
+  with Give up, whatever its type or label (it joins the set of former password fields). The type check, the mark
+  and the fill go to one element: a field the page swaps for another in between gets nothing.
+- **Masking in `read` also catches a value as the accessibility snapshot shows it** (white space collapsed, trimmed,
+  no soft hyphens), for every sensitive field, not only secrets.
+- **Refused while Playwright's debug log would print the value:** `DEBUG` with `pw:api`, `pw:protocol` or
+  `pw:channel` on.
 
 ### Storage and limits
 
-- Secrets live in memory only: never on disk, never in a log line, an event, a tool result or an error. Log lines
+- Secrets live in memory only: never on disk, never in a log line, an event, the `type` result or an error. Log lines
   carry the id and the length: `bosun: secret s… of tenant alice: received, 24 bytes`, `… typed in session …`,
   `… expired untyped`.
 - A secret is deleted once typed (also when the fill then fails), 10 min after it arrived, and when the service
   stops; its buffer is zeroed. A restart loses all of them.
-- A tenant holds at most 20 secrets (waiting or not yet typed), the service 200. Over 4096 bytes is `413`, also
+- A tenant holds at most 20 secrets (waiting or not yet typed), the service 200. A PUT gets 60 s in all, 30 s
+  without a byte. An expired secret is refused at once, not only after the next sweep. Over 4096 bytes is `413`, also
   without `Content-Length`; empty and invalid UTF-8 are `400`.
 - Another tenant's `secret_id` or Bearer token is refused. Read-only (`ephemeral`) tokens get no secrets:
   `secret_create`, `type` with `secret_id` and a PUT with such a token are all refused.
