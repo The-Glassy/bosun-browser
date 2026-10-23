@@ -12,8 +12,11 @@
     matched "stop recording".
 - **Own messages.** What Bosun posted in that meeting is taken out of any chat message that carries no
   participant's name, and only the rest is judged. Nothing left means it was Bosun's own message: no event, never an
-  objection. A message that pastes the announcement and adds "please stop recording" keeps that request. A named
-  participant's message is always judged whole, even if it repeats Bosun's words.
+  objection.
+  - Posts are taken out as whole words, and each one only as often as Bosun posted it. So a short post like "No"
+    never cuts into "not", and the same words written again later are someone's.
+  - A message that pastes the announcement and adds "please stop recording" keeps that request.
+  - A named participant's message is always judged whole, even if it repeats Bosun's words.
 - **Chat text and sender:** the UI around a message is removed on Meet and Zoom before anything reads it: a leading
   time, and lines that are only the pin control, its tooltip or an icon name. A time or a control is never a
   sender. Meet's sender is read past a time on its header line. Zoom's "<name> to Everyone 10:07 AM" counts as us.
@@ -23,7 +26,11 @@
     "to opt out", "e.g.", "here in chat", "wenn ihr…", "zum Abmelden", "z. B.").
   - Everything else is judged as written, quotes included: "I want to opt out, please stop recording",
     'Please "stop recording"' and "'please don't record', thanks" are requests.
-  - Sentence ends inside quotes and in "e.g." / "z. B." don't split a message.
+  - Sentence ends inside quotes and in "e.g." / "z. B." don't split a message. Each "but"-clause is judged on its
+    own. A veto ("keep recording", "don't stop") counts only outside quotes, so a quoted "keep recording" never
+    cancels the objection next to it.
+  - Accepted: a reported quote ('Bob said "stop recording" yesterday') still stops the recording, as in 0.10.1.
+    That is the safe direction.
 
 ### Tests
 

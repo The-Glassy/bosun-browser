@@ -223,7 +223,7 @@ export class Meetings {
       announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner),
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
       createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, stopping: null, recMs: 0, file: null, deleted: false,
-      info: {}, noRecord: false, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], sentAll: new Set(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
+      info: {}, noRecord: false, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
       ac: new AbortController(), joined: deferred(), finishing: null,
     };
     this.active.set(id, m);
@@ -335,22 +335,30 @@ export class Meetings {
 
   // Posts in the chat and remembers it, so the copy that shows up in the chat panel is recognized as ours.
   async say(m, page, text) {
-    m.sentAll.add(text.trim());
+    m.echoes.set(text.trim(), (m.echoes.get(text.trim()) || 0) + 1); // how often its echo may still be taken out
     m.pendingOwn.push(text.trim());
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
     await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name });
   }
 
-  // What is left of a message once everything Bosun posted in this meeting is taken out of it (live Meet showed our
-  // announcement with no sender, inside UI text). Only for a message without a participant's name on it: a named
-  // participant's message is always judged whole. Taking out, not dropping: a message that pastes our announcement
-  // and adds "please stop recording" keeps that request.
+  // What is left of a message once Bosun's own posts are taken out of it (live Meet showed our announcement with no
+  // sender, inside UI text). Only for a message without a participant's name on it: a named participant's message is
+  // always judged whole. Taken out as whole words, and each post only as often as Bosun posted it (an echo is used up
+  // once seen), so a participant later writing the same words is heard, and a short post ("No") never cuts into a
+  // word ("not"). Taking out, not dropping: a message that pastes our announcement and adds "please stop recording"
+  // keeps the request.
   withoutOwn(m, text) {
     const flat = (t) => String(t).replace(/[‘’ʼ]/g, "'").replace(/[“”„]/g, '"');
     let rest = flat(text);
-    for (const sent of [...m.sentAll].sort((a, b) => b.length - a.length)) {
+    for (const [sent, n] of [...m.echoes].sort((a, b) => b[0].length - a[0].length)) {
+      if (n <= 0) continue;
       const words = flat(sent).trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-      if (words.length) rest = rest.replace(new RegExp(words.join('\\s+'), 'gi'), ' ');
+      if (!words.length) continue;
+      const re = new RegExp(`(?<![\\p{L}\\p{N}])${words.join('\\s+')}(?![\\p{L}\\p{N}])`, 'iu');
+      while (m.echoes.get(sent) > 0 && re.test(rest)) {
+        rest = rest.replace(re, ' ');
+        m.echoes.set(sent, m.echoes.get(sent) - 1);
+      }
     }
     return rest;
   }

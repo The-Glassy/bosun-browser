@@ -95,22 +95,28 @@ function protect(text) {
 
 // A message is judged per clause: sentences, and the parts around "but"-like contrasts, so "Bob said keep recording,
 // but I do not consent to being recorded" is an opt-out while "don't stop recording" is not.
-const CONTRAST = /\s(?:but|however|though|aber|jedoch|sondern|doch|але|проте|но|однако|ale|avšak)\s/u;
-// -> [{text, tells}]: each clause normalized; tells: it tells people what to write (then without its quoted words).
+const CONTRAST = /\s(?:but|however|though|aber|jedoch|sondern|doch|але|проте|но|однако|ale|avšak)\s/iu;
+// What makes an explanation about opting out (with TELLS and EXPLAINS): it quotes the words to use, or speaks of
+// opting out or not being recorded. "If you can write the minutes, please stop recording" is a request.
+const ABOUT = rx("opt out|abmelden|not (?:be |being )?recorded|rather not|nicht aufgenommen|nicht aufgezeichnet");
+// -> [{text, bare, told}] per clause: text normalized; bare: without its quoted words (vetoes are judged on that,
+// so a quoted "keep recording" can't cancel the objection next to it); told: an explanation of how to opt out.
 export function clauses(text) {
   return protect(text).split(/[.!?;\n\u3002]+/u)
-    .flatMap((sentence) => {
-      const bare = normalize(sentence.replace(QUOTED, ' '));
-      const told = TELLS.test(bare) && EXPLAINS.test(bare);
-      return normalize(told ? sentence.replace(QUOTED, ' ') : sentence).split(CONTRAST).map((c) => ({ text: c.trim(), told }));
+    .flatMap((sentence) => sentence.split(CONTRAST))
+    .map((part) => {
+      const bare = normalize(part.replace(QUOTED, ' '));
+      const told = TELLS.test(bare) && EXPLAINS.test(bare) && (QUOTED.test(part) || ABOUT.test(bare));
+      QUOTED.lastIndex = 0;
+      return { text: normalize(told ? part.replace(QUOTED, ' ') : part), bare, told };
     })
     .filter((c) => c.text);
 }
 
 // -> {lang, rule} for an opt-out request, else null.
 export function matchOptOut(text) {
-  for (const { text: c, told } of clauses(text)) {
-    if (told || VETO.some((v) => v.test(c))) continue;
+  for (const { text: c, bare, told } of clauses(text)) {
+    if (told || VETO.some((v) => v.test(bare))) continue;
     for (let i = 0; i < RULES.length; i++) if (RULES[i][1].test(c)) return { lang: RULES[i][0], rule: i };
   }
   return null;

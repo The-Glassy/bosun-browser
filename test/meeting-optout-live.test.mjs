@@ -38,7 +38,10 @@ test('matcher: our announcements (default EN/DE, the live custom one, the confir
     'Please, stop the recording', 'Can you stop recording please',
     // Requests that only look like instructions or quotes (review of the first fix).
     'I want to opt out, please stop recording', 'If you would please stop recording, I do not consent to being recorded', 'Please "stop recording"',
-    '"please don\'t record", thanks', "Don't stop recording.I do not consent to being recorded.", 'Can you write the summary and stop recording']) {
+    '"please don\'t record", thanks', "Don't stop recording.I do not consent to being recorded.", 'Can you write the summary and stop recording',
+    // Second review: an explanation never covers the objection next to it; a quoted veto never cancels one.
+    'To opt out, write "stop recording", but I do not consent to being recorded.', 'If you can write the minutes, please stop recording',
+    'You said "keep recording." I do not consent to being recorded.']) {
     assert.ok(matchOptOut(cleanChatText(BUBBLE(t))), t);
   }
 });
@@ -50,7 +53,7 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
     const events = [], optouts = [];
     const queue = [{ id: '1', sender: null, text: BUBBLE(echoed) }, { id: '2', sender: '10:07 AM', text: BUBBLE('Hi all') },
       { id: '3', sender: 'Alex Example', text: BUBBLE("please don't record") }];
-    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], sentAll: new Set(sentTexts), optedOut: null, state: 'recording',
+    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sentTexts.map((t) => [t, 1])), optedOut: null, state: 'recording',
       platform: { drainChat: async () => queue.splice(0) } };
     const fake = Object.assign(Object.create(Meetings.prototype), {
       now: Date.now, page: async (_m, fn) => fn(null), emit: (_m, kind, data) => events.push([kind, data]), optOut: async (_m, entry) => { optouts.push(entry); },
@@ -64,7 +67,7 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
   const ann = announcement('Glassy (notetaker)', null)[0];
   const run = async (sent, queue) => {
     const events = [], optouts = [];
-    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], sentAll: new Set(sent), optedOut: null, state: 'recording',
+    const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sent.map((t) => [t, 1])), optedOut: null, state: 'recording',
       platform: { drainChat: async () => queue.splice(0) } };
     const fake = Object.assign(Object.create(Meetings.prototype), { now: Date.now, page: async (_m, fn) => fn(null), emit: (_m, k, d) => events.push(d), optOut: async (_m, e) => { optouts.push(e); } });
     await fake.pollChat(m);
@@ -76,6 +79,13 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
   r = await run(['Не записуй'], [{ id: '1', sender: null, text: BUBBLE('Не записуй') }]);
   assert.deepEqual([r.events, r.optouts], [[], []]);
   r = await run(['Не записуй'], [{ id: '1', sender: 'Oksana', text: BUBBLE('Не записуй') }]);
+  assert.equal(r.optouts.length, 1);
+  // Our post is taken out as whole words only ("No" never cuts "not"), and each echo only once: the same words
+  // again, later and without a sender, are someone's.
+  r = await run(['No'], [{ id: '1', sender: null, text: BUBBLE('I do not consent to being recorded') }]);
+  assert.equal(r.optouts.length, 1);
+  r = await run(['Не записуй'], [{ id: '1', sender: null, text: BUBBLE('Не записуй') }, { id: '2', sender: null, text: BUBBLE('Не записуй') }]);
+  assert.equal(r.events.length, 1);
   assert.equal(r.optouts.length, 1);
 });
 
