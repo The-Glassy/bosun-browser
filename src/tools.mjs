@@ -15,11 +15,10 @@ import { BASE64_MAX_BYTES } from './uploads.mjs';
 import { DRIVER_LOGS_REFUSED, SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS, driverLogsValues } from './secrets.mjs';
 import { INLINE_MAX_BYTES } from './downloads.mjs';
 import { showPattern } from './allow.mjs';
-import { RECOVER_MS, currentCall, limitNote, runCall, timeoutMessage } from './deadline.mjs';
+import { currentCall, reserveMs, runCall, timeoutMessage } from './deadline.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
-const WAIT_SLACK_MS = 15_000; // wait_for's deadline is at least its own timeoutMs plus this
 
 // Heuristic bot-wall detection after navigation/click.
 export const MEET_REFUSED = "Google Meet refused this guest (\"You can't join this video call\"), not a captcha: use a profile signed in to Google, or a residential IP";
@@ -231,14 +230,15 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       let call = null, timer;
       try {
         if (!limitMs) return await fn(a, extra);
-        const ms = name === 'wait_for' ? Math.max(limitMs, (a.timeoutMs ?? 15000) + WAIT_SLACK_MS) : limitMs;
-        call = { name, limitMs: ms, at: Date.now() + ms, done: false, expired: false, inPage: false, queued: false };
+        call = { name, limitMs, at: Date.now() + limitMs, reserveMs: reserveMs(limitMs), done: false, expired: false, inPage: false, queued: false, state: null };
         const work = runCall(call, () => fn(a, extra));
-        // At the deadline: a page operation is cut off by the session (run), which checks the page and answers;
-        // RECOVER_MS later the call is answered regardless. Anything else is answered at once.
+        // The call is answered by its deadline. A page operation is cut off earlier by the session (run), which
+        // checks the page and usually answers first; if that check is still going on, this says how far it got.
         const late = new Promise((_, reject) => {
-          const fail = () => { call.expired = true; reject(new Error(call.queued && !call.inPage ? timeoutMessage(call, 'queued') : `${name} timed out after ${Math.round(ms / 1000)} s (${limitNote(call)})`)); };
-          timer = setTimeout(() => { if (call.inPage) timer = setTimeout(fail, RECOVER_MS); else fail(); }, ms);
+          timer = setTimeout(() => {
+            call.expired = true;
+            reject(new Error(timeoutMessage(call, call.state ?? (call.queued && !call.inPage ? 'queued' : call.inPage ? 'checking' : null))));
+          }, limitMs);
         });
         work.catch(() => {});
         return await Promise.race([work, late]);
@@ -354,10 +354,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     }
   }
   async function typeSecretInto(s, l, a) {
+    // The page the secret goes into, also for scrubbing and leaving it: s.page may change under a call that ran out
+    // of time (the tab is replaced).
+    const page = s.page;
     const kind = await l.evaluate((el) => (el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName === 'textarea' ? 'textarea' : `<${el.localName}>`));
     if (kind.startsWith('<') || NO_SECRET_TYPES.has(kind)) throw new Error(`a secret goes only into a text field (<input> or <textarea>); this element is ${kind.startsWith('<') ? kind : `<input type=${kind}>`}`);
     if (kind !== 'password' && !a.allow_non_password) throw new Error(`this field is ${kind === 'textarea' ? 'a <textarea>' : `<input type=${kind}>`}, not a password field; pass allow_non_password: true to type the secret into it anyway (an OTP or e-mail field). The secret was not used.`);
-    await markSensitive(s.page, l);
+    await markSensitive(page, l);
     if (!(await l.evaluate((el) => el.isConnected))) throw new Error('the field left the page before anything was typed; the secret was not used');
     const buf = secrets.take(tenant, a.secret_id);
     let value = buf.toString('utf8');
@@ -374,13 +377,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       if (!landed) {
         // Wherever it went (another field, text split over nodes, a canvas), the page is left: nothing on it can
         // show the secret to a later read or screenshot.
-        await scrubValue(s.page, value).catch(() => {});
-        await s.page.goto('about:blank', { timeout: 15000 });
+        await scrubValue(page, value).catch(() => {});
+        await page.goto('about:blank', { timeout: 15000 });
         throw new Error('the secret did not end up in the field that was checked (the page moved the focus or the field); Bosun left the page (about:blank) so nothing on it can show the secret, check the site before trying again');
       }
-      await markValue(s.page, value);
-      if (a.submit) { await l.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
-      const info = await pageInfo(s.page);
+      await markValue(page, value);
+      if (a.submit) { await l.press('Enter', { timeout: 15000 }); await page.waitForTimeout(1500); }
+      const info = await pageInfo(page);
       console.error(`bosun: secret ${a.secret_id} of tenant ${tenant}: typed in session ${s.id}, ${Buffer.byteLength(value)} bytes`);
       return { ...info, url: hide(info.url), title: hide(info.title), secret: 'typed and deleted' };
     } catch (e) {

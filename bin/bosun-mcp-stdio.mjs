@@ -11,6 +11,7 @@ const HANDSHAKE_MS = 15_000;
 const MAX_PENDING = 8 * 1024 * 1024; // bytes read before the socket opens, or sent and not yet flushed
 const PARENT_POLL_MS = 1000;
 const IDLE_EXIT_SEC = 3600;
+const SERVER_REQUEST_MS = 60_000; // Bosun gives up on its own requests (push events) well before this
 
 const die = (code, msg) => { process.stderr.write(`bosun-mcp-stdio: ${msg}\n`); process.exit(code); };
 const warn = (msg) => process.stderr.write(`bosun-mcp-stdio: ${msg}\n`);
@@ -71,16 +72,30 @@ function run(env = process.env) {
   // Node has no PR_SET_PDEATHSIG: the parent is polled. Its death reparents the bridge (to init or a subreaper).
   const parent = process.ppid;
   setInterval(() => { if (process.ppid !== parent) { warn(`parent process ${parent} is gone; exiting`); process.exit(0); } }, PARENT_POLL_MS).unref();
-  // Idle: no message either way for idleMs while no request waits for its answer (a long handoff_wait is not idle).
-  const waiting = new Set();
+  // Idle: no message either way for idleMs, no request waiting for its answer (the client's, such as a long
+  // handoff_wait, or the server's, such as a push event: forgotten after SERVER_REQUEST_MS) and no answer still
+  // being written to stdout.
+  const waiting = new Map(); // 'c' + id (client request) / 's' + id (server request) -> since
   let last = Date.now();
   const touch = () => { last = Date.now(); };
   if (target.idleMs > 0) {
     setInterval(() => {
-      if (!waiting.size && Date.now() - last >= target.idleMs) { warn(`idle for ${Math.round(target.idleMs / 1000)} s; exiting`); process.exit(0); }
+      for (const [k, t] of waiting) if (k[0] === 's' && Date.now() - t > SERVER_REQUEST_MS) waiting.delete(k);
+      if (waiting.size || process.stdout.writableLength > 0 || Date.now() - last < target.idleMs) return;
+      warn(`idle for ${Math.round(target.idleMs / 1000)} s; exiting`);
+      process.exit(0);
     }, Math.min(target.idleMs, 30_000)).unref();
   }
   const idOf = (m) => (m && (typeof m.id === 'string' || typeof m.id === 'number') ? JSON.stringify(m.id) : null);
+  // A request (method and id) starts waiting; an answer (id, no method) from the other side ends it.
+  const note = (msg, from) => {
+    if (!msg || typeof msg !== 'object') return;
+    const id = idOf(msg), other = from === 'c' ? 's' : 'c';
+    if (typeof msg.method === 'string') {
+      if (id !== null) waiting.set(from + id, Date.now());
+      if (msg.method === 'notifications/cancelled') waiting.delete(from + idOf({ id: msg.params?.requestId })); // its own request: may get no answer
+    } else if (id !== null) waiting.delete(other + id);
+  };
 
   ws.on('unexpected-response', (_req, res) => {
     const code = res.statusCode;
@@ -99,7 +114,7 @@ function run(env = process.env) {
     touch();
     let msg;
     try { msg = JSON.parse(data); } catch { warn('dropped a frame that is not JSON'); return; }
-    if (msg && !msg.method) waiting.delete(idOf(msg)); // a response
+    note(msg, 's');
     if (!process.stdout.write(`${JSON.stringify(msg)}\n`)) { ws.pause(); process.stdout.once('drain', () => ws.resume()); }
   });
 
@@ -120,8 +135,7 @@ function run(env = process.env) {
     if (!line.trim()) return;
     let msg;
     try { msg = JSON.parse(line); } catch { warn('dropped a line that is not JSON'); return; }
-    if (msg && typeof msg.method === 'string' && idOf(msg) !== null) waiting.add(idOf(msg)); // a request
-    if (msg?.method === 'notifications/cancelled') waiting.delete(idOf({ id: msg.params?.requestId })); // may get no answer
+    note(msg, 'c');
     send(line);
   }));
   process.stdin.on('end', () => finish());

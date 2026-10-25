@@ -14,29 +14,33 @@
 
 - **Per-call deadline.** `TOOL_TIMEOUT_SEC` (default 60, 1 to 120) for every tool, `TOOL_TIMEOUTS` per tool
   (`read=90,upload=120`); a bad value, an unknown tool or one that keeps its own limit stops the service at start.
-  A page call that runs out of time gives up its place in the session's queue. Then Bosun checks the page (it must
-  evaluate `1` within 5 s). If it answers, the session is usable as it is. If not, a new tab in the same context
-  replaces it (same session id, cookies and login, at `about:blank`), or, when none opens within 10 s, the session is
-  closed (`page-wedged`). The error says which, e.g. `read timed out after 60 s (Bosun's limit for one read call
-  (TOOL_TIMEOUT_SEC / TOOL_TIMEOUTS)) and the page stopped responding, so Bosun replaced it with a new tab in the same
-  session (cookies and login kept, now at about:blank): navigate again`.
-- A call still queued when its deadline passes is answered at once and not run. A `session_open` that times out
-  closes its session when the open completes. `wait_for` gets at least its `timeoutMs` plus 15 s. No deadline for
-  `download_wait`, `request_human`, `handoff_wait` and the meeting tools: they keep their own limits. Keepalive visits
-  and meetings are not bound by the deadline of the call that set them up.
+  Every call is answered by its deadline. A page call is cut off 8 s before it (a third of a shorter one) and the
+  page checked: it must evaluate `1` within 3 s. If it does, the session is usable as it is; what the call started
+  gets up to 20 s to stop before the session's next call runs, then its tab is replaced. If it doesn't, a new tab in
+  the same context replaces it (same session id and cookies, at `about:blank`), or, when none opens within 15 s, the
+  session is closed (`page-wedged`). The session switches to the new tab only after the old one is closed, so
+  nothing the cut-off call still does reaches it. The error says which, e.g. `read timed out after 60 s (Bosun's
+  limit for one read call (TOOL_TIMEOUT_SEC / TOOL_TIMEOUTS)) and the page stopped responding, so Bosun replaced it
+  with a new tab in the same session (cookies kept, now at about:blank): navigate again`.
+- A call still queued with too little of its time left is answered at once and not run. A `session_open` that times
+  out closes its session when the open completes. `wait_for` has 75 s unless `TOOL_TIMEOUTS` names it. No deadline
+  for `download_wait`, `request_human`, `handoff_wait` and the meeting tools: they keep their own limits. Keepalive
+  visits and meetings are not bound by the deadline of the call that set them up.
 - **The stdio bridge exits 0 when its parent process dies** (polled every second; Node has no `PR_SET_PDEATHSIG`),
   when stdin closes or stdout breaks (EPIPE), and after `BOSUN_IDLE_EXIT_SEC` (default 3600, `0` = never) with no
-  traffic while no request waits for its answer. Each says why on stderr.
+  traffic, no request waiting for its answer (either side's) and nothing left to write to stdout. Each says why on
+  stderr.
 
 ### Tests
 
-- test/deadline.test.mjs, on all three engines: a renderer in an endless loop (the read times out, the page is
-  replaced, the same session navigates again); a click that waits for an element that never comes (timed out, the
-  page answers, the read queued behind it is answered at its own deadline, the next call runs at once); `wait_for`'s
-  longer limit; a `session_open` that times out leaves no session; config validation. On 0.12.0 the endless-loop read
-  hangs until the test's own 40 s limit.
+- test/deadline.test.mjs, on all three engines: a renderer in an endless loop (the read is answered by its
+  deadline, the tab replaced, the same session navigates again); a click that waits for an element that never comes
+  (answered at 4 s, the page answers; a call queued behind it is answered at its own deadline without running; the
+  next call runs only once the click has stopped); `wait_for`'s 75 s; a `session_open` that times out leaves no
+  session; config validation. On 0.12.0 the endless-loop read hangs until the test's own 40 s limit.
 - test/policy.test.mjs: a bridge whose parent is killed while another process holds its stdin exits (on 0.12.0 it
-  stays); the idle exit, also not while `wait_for` runs; stdout closed.
+  stays); the idle exit, not while `wait_for` runs, a server request waits for the client's answer, or an 8 MB
+  answer waits for a slow reader; stdout closed.
 
 ## 0.12.0 — type a secret without it passing through the agent
 

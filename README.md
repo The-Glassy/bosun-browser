@@ -42,10 +42,9 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - Sessions are **ephemeral** (wiped on close) or use a named **persistent profile** of the tenant (stays logged in;
   no RAM while idle). A session belongs to the connection that opened it: other connections can't see, use or close
   it, and it is closed when that connection goes away or after `IDLE_TIMEOUT_SEC` without use.
-- **Every call ends within its deadline** (60 s by default, at most 120 s). A call that runs out gets a clear error,
-  and the calls queued behind it on that session go ahead. Bosun then checks the page: if it still answers, the
-  session is usable as it is; if it doesn't, Bosun replaces it with a new tab in the same session (cookies and login
-  kept, at `about:blank`). See [Per-call deadline](#per-call-deadline).
+- **Every call is answered within its deadline** (60 s by default, at most 120 s), with a clear error when it runs
+  out. Bosun checks the page: if it still answers, the session is usable as it is; if it doesn't, Bosun replaces it
+  with a new tab in the same session (cookies kept, at `about:blank`). See [Per-call deadline](#per-call-deadline).
 - `navigate` and `keepalive_set` accept only `http://` and `https://` URLs (no `file:`, `data:`, `javascript:`,
   `about:`, `chrome:`, `view-source:`, `blob:`, `ftp:` …).
 - **Bot-wall detection** after navigation/click (Cloudflare challenge pages, CAPTCHA iframes, "access denied" texts).
@@ -138,20 +137,24 @@ Every tool call is answered within its deadline: `TOOL_TIMEOUT_SEC` (60 s), or t
 `TOOL_TIMEOUTS`, at most 120 s. Before 0.13 a page that stopped answering (a renderer stuck in a script, say) could
 hold a `read` for as long as the agent was willing to wait, and every later call on that session waited behind it.
 
-When a page call runs out of time:
+A page call is cut off 8 s before its deadline (a third of a deadline under 24 s). Then Bosun asks the page to
+evaluate `1`:
 
-1. The call gives up its place in the session's queue, so the calls behind it run.
-2. Bosun asks the page to evaluate `1`. If it answers within 5 s, the error says `the page still responds and the
-   session is usable`. What the call started may still finish in the page.
-3. If it doesn't, Bosun opens a new tab in the same browser context and closes the stuck one. The session keeps its
-   id, cookies and login; the new tab is at `about:blank`, so navigate again. The error says so. If no new tab opens
-   within 10 s, the session is closed (`page-wedged`).
+- **It answers within 3 s.** The error says `the page still responds and the session is usable`. If what the call
+  started is still running (a click waiting for its element), the session's next call waits for it to stop, at most
+  20 s. After that the tab is replaced, as below, to stop it. Two calls never act on the page at once.
+- **It doesn't.** Bosun opens a new tab in the same browser context and closes the stuck one; then the session uses
+  the new tab, at `about:blank`, so navigate again. The session keeps its id and its cookies. A site that keeps its
+  login in `sessionStorage` is logged out. If no new tab opens within 15 s, the session is closed (`page-wedged`).
+  Firefox (camoufox) takes about 5 s to open a tab next to a stuck one, so there the answer may come while the tab
+  is still being replaced; it says so, and the next call waits for it.
 
-The answer comes at the deadline plus the time of that check (at most 20 s more). A call still waiting behind
-others when its deadline passes is answered at once and never runs. A `session_open` that times out closes the
-session it was opening as soon as that open finishes, so no session is left that the agent doesn't know about.
-`wait_for` gets at least its own `timeoutMs` plus 15 s. These tools keep their own limits and have no deadline:
-`download_wait`, `request_human`, `handoff_wait` and the meeting tools.
+A call still waiting behind others when too little of its time is left is answered at once and never runs. A
+`session_open` that times out closes the session it was opening as soon as that open finishes, so no session is left
+that the agent doesn't know about. `wait_for` (which waits up to 60 s by itself) gets at least 75 s unless
+`TOOL_TIMEOUTS` names it. These tools keep their own limits and have no deadline: `download_wait`,
+`request_human`, `handoff_wait` and the meeting tools. Keepalive visits and meetings are never cut off by the
+deadline of the call that set them up.
 
 ### Engines
 
@@ -707,8 +710,8 @@ The bridge ends when its client is gone, also when its stdin stays open because 
 
 - stdin ends or closes, or stdout is closed (nobody reads the answers);
 - its parent process exits (checked every second; Node has no `PR_SET_PDEATHSIG`);
-- `BOSUN_IDLE_EXIT_SEC` (3600; `0` = never) pass with no message either way and no request waiting for its answer.
-  A long `handoff_wait` is not idle.
+- `BOSUN_IDLE_EXIT_SEC` (3600; `0` = never) pass with no message either way, no request waiting for its answer (the
+  client's, such as a long `handoff_wait`, or the server's) and no answer still being written to stdout.
 
 Exit codes: `0` for those, `1` connection failed or lost, `2` bad configuration (missing variable, a non-ws URL,
 credentials in the URL, a bad `BOSUN_IDLE_EXIT_SEC`), `3` token refused. The bridge needs only Node and the `ws`

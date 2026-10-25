@@ -339,3 +339,48 @@ test('bridge: exits 0 when nobody reads its stdout any more', async () => {
     assert.equal(await b.exited, 0);
   } finally { b.p.kill(); }
 });
+
+// A stand-in server: what the bridge sends it and a way to send frames back.
+async function fakeServer() {
+  const { WebSocketServer } = await import('ws');
+  const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise((r) => wss.on('listening', r));
+  const got = [];
+  let sock = null;
+  wss.on('connection', (s) => { sock = s; s.on('message', (d) => got.push(JSON.parse(d))); });
+  return { url: `ws://127.0.0.1:${wss.address().port}`, got, send: (m) => sock.send(JSON.stringify(m)), connected: () => !!sock, close: () => new Promise((r) => { for (const c of wss.clients) c.terminate(); wss.close(r); }) };
+}
+
+test('bridge: not idle while the server waits for the client to answer its request', async () => {
+  const srv = await fakeServer();
+  const b = bridge({ BOSUN_URL: srv.url, BOSUN_TOKEN: TOKEN_E, BOSUN_IDLE_EXIT_SEC: '1' });
+  try {
+    await until(srv.connected, 10000);
+    srv.send({ jsonrpc: '2.0', id: 'push-1', method: 'push/event', params: {} });
+    await until(() => b.lines.length === 1, 5000);
+    await new Promise((r) => setTimeout(r, 2500)); // the client takes its time to answer
+    assert.equal(b.p.exitCode, null, 'still running');
+    b.send({ jsonrpc: '2.0', id: 'push-1', result: {} });
+    await until(() => srv.got.some((m) => m.id === 'push-1' && m.result), 5000);
+    assert.equal(await b.exited, 0); // then idle
+  } finally { b.p.kill(); await srv.close(); }
+});
+
+test('bridge: not idle while an answer is still being written to a slow stdout', async () => {
+  const srv = await fakeServer();
+  const b = bridge({ BOSUN_URL: srv.url, BOSUN_TOKEN: TOKEN_E, BOSUN_IDLE_EXIT_SEC: '1' });
+  try {
+    await until(srv.connected, 10000);
+    b.p.stdout.pause(); // the client stops reading
+    const big = 'x'.repeat(8 * 1024 * 1024);
+    b.send({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: {} });
+    await until(() => srv.got.some((m) => m.id === 7), 5000);
+    srv.send({ jsonrpc: '2.0', id: 7, result: { content: [{ type: 'text', text: big }] } });
+    await new Promise((r) => setTimeout(r, 3000));
+    assert.equal(b.p.exitCode, null, 'still running with the answer unread');
+    b.p.stdout.resume();
+    await until(() => b.lines.length === 1, 10000);
+    assert.equal(JSON.parse(b.lines[0]).result.content[0].text.length, big.length); // whole
+    assert.equal(await b.exited, 0);
+  } finally { b.p.kill(); await srv.close(); }
+});
