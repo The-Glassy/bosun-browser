@@ -8,7 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import { loadConfig } from '../src/config.mjs';
 import { EPHEMERAL_TOOLS } from '../src/tools.mjs';
-import { startBosun, startPageServer, connect, TOKEN, TOKEN_B } from './helpers.mjs';
+import { startBosun, startPageServer, connect, until, TOKEN, TOKEN_B } from './helpers.mjs';
 
 const BRIDGE = new URL('../bin/bosun-mcp-stdio.mjs', import.meta.url).pathname;
 const GOOD = 'x'.repeat(24);
@@ -198,6 +198,7 @@ test('bridge: missing or unsafe configuration exits 2', async () => {
     [{ BOSUN_URL: svc.wsUrl }, /BOSUN_TOKEN is not set/],
     [{ BOSUN_URL: svc.wsUrl.replace('ws:', 'http:'), BOSUN_TOKEN: TOKEN_E }, /must be ws:\/\/ or wss:\/\//],
     [{ BOSUN_URL: `${svc.wsUrl}/?token=${TOKEN_E}`, BOSUN_TOKEN: TOKEN_E }, /must not carry credentials/],
+    [{ BOSUN_URL: svc.wsUrl, BOSUN_TOKEN: TOKEN_E, BOSUN_IDLE_EXIT_SEC: '5m' }, /BOSUN_IDLE_EXIT_SEC must be a whole number of seconds/],
   ]) {
     const b = bridge(env);
     assert.equal(await b.exited, 2, re.source);
@@ -270,4 +271,71 @@ test('bridge: a server that never completes the handshake times out; stdin EOF b
     assert.ok(Date.now() - t0 < 20000);
     assert.match(hung.stderr(), /failed/);
   } finally { for (const s of socks) s.destroy(); srv.close(); }
+});
+
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+// Production, 2026-10-24: a bridge outlived its claude by 28 h (ppid 1) and kept the host's deploy waiting. Here, as
+// there, another process (the holder) keeps the write end of the bridge's stdin open, so it never sees EOF; then its
+// parent is killed.
+test('bridge: exits when its parent dies, even with stdin still open', async () => {
+  const code = `import { spawn } from 'child_process';
+    const c = spawn(process.execPath, [${JSON.stringify(BRIDGE)}], { stdio: ['pipe', 'inherit', 'inherit'], env: process.env });
+    const h = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', c.stdin, 'ignore'] });
+    c.stdin.write(${JSON.stringify(JSON.stringify(INIT))} + '\\n');
+    process.stderr.write('bridge ' + c.pid + ' holder ' + h.pid + '\\n');
+    setInterval(() => {}, 1000);`;
+  const parent = spawn(process.execPath, ['--input-type=module', '-e', code], { env: { PATH: process.env.PATH, BOSUN_URL: svc.wsUrl, BOSUN_TOKEN: TOKEN_E }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '', out = '';
+  parent.stderr.on('data', (d) => { stderr += d; });
+  parent.stdout.on('data', (d) => { out += d; });
+  let pid = null, holder = null;
+  try {
+    const m = await until(() => /bridge (\d+) holder (\d+)/.exec(stderr), 10000);
+    pid = Number(m[1]); holder = Number(m[2]);
+    await until(() => out.includes('"serverInfo"'), 20000); // connected and answering
+    parent.kill('SIGKILL');
+    await until(() => !alive(pid), 10000);
+    await until(() => stderr.includes('is gone'), 2000);
+    assert.match(stderr, /bosun-mcp-stdio: parent process \d+ is gone; exiting/);
+    assert.ok(alive(holder), 'the holder still keeps its stdin open');
+    assert.ok(!stderr.includes(TOKEN_E));
+  } finally {
+    parent.kill('SIGKILL');
+    for (const p of [pid, holder]) if (p && alive(p)) process.kill(p, 'SIGKILL');
+  }
+});
+
+test('bridge: exits after BOSUN_IDLE_EXIT_SEC without traffic, but not while a request waits for its answer', async () => {
+  const b = bridge({ BOSUN_URL: svc.wsUrl, BOSUN_TOKEN: TOKEN_E, BOSUN_IDLE_EXIT_SEC: '1' });
+  try {
+    b.send(INIT);
+    await b.reply(1);
+    b.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    b.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'session_open', arguments: {} } });
+    const session = JSON.parse((await b.reply(2)).result.content[0].text).session;
+    // Nothing goes either way for 3 s while wait_for waits: not idle.
+    b.send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'wait_for', arguments: { session, selector: '#never', timeoutMs: 3000 } } });
+    const waited = await b.reply(3);
+    assert.ok(waited.result.isError);
+    assert.match(waited.result.content[0].text, /Timeout 3000ms exceeded/);
+    const t0 = Date.now();
+    assert.equal(await b.exited, 0);
+    assert.ok(Date.now() - t0 < 4000);
+    assert.match(b.stderr(), /bosun-mcp-stdio: idle for 1 s; exiting/);
+  } finally { b.p.kill(); }
+});
+
+test('bridge: exits 0 when nobody reads its stdout any more', async () => {
+  const b = bridge({ BOSUN_URL: svc.wsUrl, BOSUN_TOKEN: TOKEN_E });
+  try {
+    b.send(INIT);
+    await b.reply(1);
+    b.p.stdout.destroy();
+    for (let i = 0; i < 20 && b.p.exitCode === null; i++) {
+      b.send({ jsonrpc: '2.0', id: 100 + i, method: 'ping' });
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(await b.exited, 0);
+  } finally { b.p.kill(); }
 });

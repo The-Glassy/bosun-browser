@@ -9,10 +9,13 @@ import { createEngines, claimProfile, unclaimProfile, recordProfileUse } from '.
 import { NOT_ALLOWED, PROFILES_REFUSED, policyOf } from './auth.mjs';
 import { allowFor, allowsUrl } from './allow.mjs';
 import { startTenantProxy } from './proxy.mjs';
+import { currentCall, timeoutMessage } from './deadline.mjs';
 
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
 const CLOSE_DEADLINE_MS = 10_000; // default; manager.closeDeadlineMs
 const NOTE_POLL_MS = 500;
+const PROBE_MS = 5_000; // a page that doesn't evaluate 1 this fast after a call ran out of time counts as wedged
+const NEW_PAGE_MS = 10_000; // opening the replacement page
 
 // Where a navigation landed, without query and fragment (a challenge page reloads itself with fresh tokens).
 export const urlKey = (u) => { try { const x = new URL(u); return x.origin + x.pathname; } catch { return String(u); } };
@@ -50,6 +53,14 @@ export async function terminate(dir) {
     if (!pids.length) return true;
   }
   return false;
+}
+
+// Password fields are noted as a page loads: by an init script of the context ('init', set up at open), or for
+// engines without one in Bosun's world, on every navigation of every frame ('navigate').
+async function trackPasswords(page, tracker) {
+  if (tracker !== 'navigate') return;
+  page.on('framenavigated', (f) => { f.evaluate(passwordTracker).catch(() => {}); });
+  await installTracker(page);
 }
 
 // FIFO of async jobs with a bound on queued work. Jobs never overlap.
@@ -199,30 +210,22 @@ export class SessionManager {
         }
         if (def.tracker === 'init') await ctx.addInitScript(passwordTracker);
         const page = ctx.pages()[0] || await ctx.newPage();
-        if (def.tracker === 'navigate') {
-          page.on('framenavigated', (f) => { f.evaluate(passwordTracker).catch(() => {}); });
-          await installTracker(page);
-        }
+        await trackPasswords(page, def.tracker);
         if (this.closing) throw new Error('service is shutting down');
         if (this.goneOwners.has(owner)) throw new Error('connection closed'); // owner left while we were launching
         if (profileDir) recordProfileUse(profileDir, { engine: def.name, headless: this.cfg.headless });
         const s = {
-          id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, dir, tmpDir,
+          id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, tracker: def.tracker, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
           navs: [], ctxErrors: [], wallSeen: null, // recent main-frame navigations {t, at: origin+path}, "context destroyed" failures, last bot check seen (bot-check loops)
           dlDir, // null: the context refuses downloads
         };
         this.sessions.set(s.id, s);
-        page.on('framenavigated', (f) => {
-          if (f !== page.mainFrame()) return;
-          s.navs.push({ t: Date.now(), at: urlKey(f.url()) });
-          if (s.navs.length > 100) s.navs.shift();
-        });
+        this.watchPage(s, page);
         if (dlDir || (agent && this.downloads)) this.downloads.watch(s);
-        page.on('close', () => this.dispose(s, 'page-closed'));
-        page.on('crash', () => this.dispose(s, 'page-crashed'));
         ctx.on('close', () => this.dispose(s, 'context-closed'));
-        ctx.on('page', (extra) => { if (ctx.pages().length > this.cfg.maxPagesPerSession) extra.close().catch(() => {}); });
+        // Popups over the cap are closed; not the page that replaces a wedged one.
+        ctx.on('page', (extra) => { if (!s.replacing && ctx.pages().length > this.cfg.maxPagesPerSession) extra.close().catch(() => {}); });
         return s;
       } catch (e) {
         if (ctx) await Promise.race([ctx.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
@@ -249,6 +252,50 @@ export class SessionManager {
   }
 
   list(owner) { return [...this.sessions.values()].filter((s) => s.owner === owner); }
+
+  // The session's page: its main-frame navigations (bot-check loops), and its close or crash ending the session.
+  // Only while it is the session's page: one replaced after a timeout closes without closing the session.
+  watchPage(s, page) {
+    page.on('framenavigated', (f) => {
+      if (f !== page.mainFrame() || s.page !== page) return;
+      s.navs.push({ t: Date.now(), at: urlKey(f.url()) });
+      if (s.navs.length > 100) s.navs.shift();
+    });
+    page.on('close', () => { if (s.page === page) this.dispose(s, 'page-closed'); });
+    page.on('crash', () => { if (s.page === page) this.dispose(s, 'page-crashed'); });
+  }
+
+  // After a call ran out of time: does the page still answer? If not, it is replaced by a new page in the same
+  // context (cookies and login kept), or, when that fails too, the session is closed. Returns 'responsive',
+  // 'replaced' or 'closed'.
+  async recover(s) {
+    if (s.disposed) return 'closed';
+    const alive = await Promise.race([s.page.evaluate(() => 1).then(() => true, () => false), sleep(PROBE_MS).then(() => false)]);
+    if (alive) return 'responsive';
+    if (s.disposed) return 'closed';
+    const old = s.page;
+    let page = null;
+    s.replacing = true;
+    try {
+      const opening = s.ctx.newPage();
+      page = await Promise.race([opening.catch(() => null), sleep(NEW_PAGE_MS).then(() => null)]);
+      if (!page) opening.then((p) => p.close().catch(() => {}), () => {}); // a late one is not left behind
+      else if (s.disposed) { await page.close().catch(() => {}); page = null; }
+      else await Promise.race([trackPasswords(page, s.tracker), sleep(PROBE_MS)]);
+    } finally { s.replacing = false; }
+    if (!page || s.disposed) {
+      console.error(`bosun: session ${s.id} (${s.engine}): page stopped responding and no new one opened; closing the session`);
+      await this.dispose(s, 'page-wedged');
+      return 'closed';
+    }
+    s.page = page;
+    this.watchPage(s, page);
+    s.navs.length = 0; s.ctxErrors.length = 0; s.wallSeen = null;
+    // Closing the wedged page also ends what is still waiting on it (the call that ran out of time).
+    old.close({ runBeforeUnload: false }).catch(() => {});
+    console.error(`bosun: session ${s.id} (${s.engine}): page stopped responding after a call ran out of time; replaced it`);
+    return 'replaced';
+  }
 
   // The tenant's host allowlist, or null when it has none (then nothing is restricted).
   allowList(tenant) { return allowFor(this.cfg, tenant); }
@@ -288,17 +335,23 @@ export class SessionManager {
 
   // Every page action and observation goes through here: serialized per session, refused during a handoff, and
   // discarded if a handoff began while it ran.
+  // Inside a tool call with a deadline (deadline.mjs), the operation is cut off when it runs out: its place in the
+  // queue is given up after the page was checked (recover), so the calls behind it are not held up.
   async run(owner, id, fn) {
     const s = this.get(owner, id);
     if (s.handoff) throw new Error(HANDOFF_ACTIVE);
+    const call = currentCall();
+    if (call) call.queued = true;
     return s.queue.run(async () => {
       if (s.disposed) throw new Error(`session ${id} was closed (${s.closeReason})`);
       if (s.handoff) throw new Error(HANDOFF_ACTIVE);
+      if (call && (call.expired || Date.now() >= call.at)) throw new Error(timeoutMessage(call, 'queued'));
+      if (call) call.inPage = true;
       const gen = s.gen;
       s.busy++;
       s.lastUsed = Date.now();
       try {
-        const r = await fn(s);
+        const r = call ? await this.within(s, fn(s), call) : await fn(s);
         if (s.gen !== gen || s.handoff) throw new Error(HANDOFF_ACTIVE);
         return r;
       } catch (e) {
@@ -309,6 +362,21 @@ export class SessionManager {
         s.lastUsed = Date.now();
       }
     });
+  }
+
+  // The operation's result, or a timeout error once call.at has passed (after recover has checked the page).
+  async within(s, work, call) {
+    let timer;
+    const late = new Promise((r) => { timer = setTimeout(r, Math.max(0, call.at - Date.now())); });
+    try {
+      const won = await Promise.race([work.then((v) => ({ v })), late.then(() => null)]);
+      if (won) return won.v;
+    } finally { clearTimeout(timer); }
+    work.catch(() => {}); // it may still fail later, once nobody waits for it
+    call.expired = true;
+    const state = await this.recover(s).catch(() => 'closed');
+    console.error(`bosun: session ${s.id}: ${call.name} ran out of time (${Math.round(call.limitMs / 1000)} s); page ${state}`);
+    throw new Error(timeoutMessage(call, state));
   }
 
   // Starts (or returns the active) handoff. Queues behind in-flight operations, so nothing the agent started can

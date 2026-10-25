@@ -15,9 +15,11 @@ import { BASE64_MAX_BYTES } from './uploads.mjs';
 import { DRIVER_LOGS_REFUSED, SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS, driverLogsValues } from './secrets.mjs';
 import { INLINE_MAX_BYTES } from './downloads.mjs';
 import { showPattern } from './allow.mjs';
+import { RECOVER_MS, currentCall, limitNote, runCall, timeoutMessage } from './deadline.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
+const WAIT_SLACK_MS = 15_000; // wait_for's deadline is at least its own timeoutMs plus this
 
 // Heuristic bot-wall detection after navigation/click.
 export const MEET_REFUSED = "Google Meet refused this guest (\"You can't join this video call\"), not a captcha: use a profile signed in to Google, or a residential IP";
@@ -195,7 +197,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.12.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.13.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -217,14 +219,30 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     return r;
   });
 
-  // Every tool: bounded concurrency per connection, sanitized errors. A tool the policy doesn't allow is registered
-  // as a stub that only refuses (its handler is never wired up) and is left out of tools/list below.
+  // Every tool: bounded concurrency per connection, sanitized errors, and a deadline (deadline.mjs; not for the tools
+  // that keep their own limits). A tool the policy doesn't allow is registered as a stub that only refuses (its
+  // handler is never wired up) and is left out of tools/list below.
   const tool = (name, desc, shape, fn) => {
     if (ephemeral && !EPHEMERAL_TOOLS.has(name)) return server.tool(name, NOT_ALLOWED, {}, async () => { throw new Error(`${name}: ${NOT_ALLOWED}`); });
+    const limitMs = cfg.toolTimeouts?.get(name) ?? null;
     return server.tool(name, desc, shape, async (a, extra) => {
       if (conn.inflight >= cfg.maxInflight) throw new Error(`too many concurrent requests on this connection (max ${cfg.maxInflight})`);
       conn.inflight++;
-      try { return await fn(a, extra); } catch (e) { throw new Error(cleanError(e)); } finally { conn.inflight--; }
+      let call = null, timer;
+      try {
+        if (!limitMs) return await fn(a, extra);
+        const ms = name === 'wait_for' ? Math.max(limitMs, (a.timeoutMs ?? 15000) + WAIT_SLACK_MS) : limitMs;
+        call = { name, limitMs: ms, at: Date.now() + ms, done: false, expired: false, inPage: false, queued: false };
+        const work = runCall(call, () => fn(a, extra));
+        // At the deadline: a page operation is cut off by the session (run), which checks the page and answers;
+        // RECOVER_MS later the call is answered regardless. Anything else is answered at once.
+        const late = new Promise((_, reject) => {
+          const fail = () => { call.expired = true; reject(new Error(call.queued && !call.inPage ? timeoutMessage(call, 'queued') : `${name} timed out after ${Math.round(ms / 1000)} s (${limitNote(call)})`)); };
+          timer = setTimeout(() => { if (call.inPage) timer = setTimeout(fail, RECOVER_MS); else fail(); }, ms);
+        });
+        work.catch(() => {});
+        return await Promise.race([work, late]);
+      } catch (e) { throw new Error(cleanError(e)); } finally { clearTimeout(timer); if (call) call.done = true; conn.inflight--; }
     });
   };
 
@@ -234,7 +252,10 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     async (a) => {
       if (ephemeral && a.profile !== undefined) throw new Error(PROFILES_REFUSED);
       if (ephemeral && a.engine && a.engine !== cfg.engine) throw new Error(`engine ${a.engine} is ${NOT_ALLOWED}; use the default (${cfg.engine})`);
+      const call = currentCall();
       const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine, downloads: true });
+      // The agent was told this open timed out: a session it never learned about is not left open.
+      if (call?.expired) { await manager.dispose(s, 'open-timed-out'); throw new Error('session_open timed out'); }
       return ok({ session: s.id, profile: a.profile || 'ephemeral', engine: s.engine });
     });
 
