@@ -145,7 +145,8 @@ evaluate `1`:
   20 s. After that the tab is replaced, as below, to stop it. Two calls never act on the page at once.
 - **It doesn't.** Bosun opens a new tab in the same browser context and closes the stuck one; then the session uses
   the new tab, at `about:blank`, so navigate again. The session keeps its id and its cookies. A site that keeps its
-  login in `sessionStorage` is logged out. If no new tab opens within 15 s, the session is closed (`page-wedged`).
+  login in `sessionStorage` is logged out. The session is closed instead (`page-wedged`) when no new tab opens within
+  15 s, when the new tab goes away first, or when the cut-off call still hasn't stopped 3 s after its tab closed.
   Firefox (camoufox) takes about 5 s to open a tab next to a stuck one, so there the answer may come while the tab
   is still being replaced; it says so, and the next call waits for it.
 

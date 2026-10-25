@@ -230,8 +230,11 @@ export class SessionManager {
         this.watchPage(s, page);
         if (dlDir || (agent && this.downloads)) this.downloads.watch(s);
         ctx.on('close', () => this.dispose(s, 'context-closed'));
-        // Popups over the cap are closed; not the page that replaces a wedged one.
-        ctx.on('page', (extra) => { if (!s.replacing && ctx.pages().length > this.cfg.maxPagesPerSession) extra.close().catch(() => {}); });
+        // Popups over the cap are closed; not the page that replaces a wedged one (recover).
+        ctx.on('page', (extra) => {
+          if (s.replacing) { s.replacing--; return; }
+          if (ctx.pages().length > this.cfg.maxPagesPerSession) extra.close().catch(() => {});
+        });
         return s;
       } catch (e) {
         if (ctx) await Promise.race([ctx.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
@@ -288,37 +291,45 @@ export class SessionManager {
     } else call.state = 'checking';
     if (s.disposed) return 'closed';
     const old = s.page;
-    let page = null;
-    s.replacing = true;
+    const bounded = (p, ms = CLOSE_SETTLE_MS) => Promise.race([Promise.resolve(p).catch(() => {}), sleep(ms)]);
+    const retire = () => { s.retiring = old; return bounded(old.close({ runBeforeUnload: false })); };
+    const wedged = async (why) => {
+      console.error(`bosun: session ${s.id} (${s.engine}): ${why}; closing the session`);
+      await this.dispose(s, 'page-wedged');
+      return 'closed';
+    };
+    let page = null, lost = false;
+    s.replacing = 1; // the ctx 'page' listener lets the first new page through: this one
     try {
       const opening = s.ctx.newPage();
       const opened = (ms) => Promise.race([opening.catch(() => null), sleep(ms).then(() => null)]);
       page = await opened(NEW_PAGE_FIRST_MS);
-      if (!page) {
-        // Firefox may open no new tab while the stuck one's content process is busy (about 5 s, measured): close that
-        // one first.
-        s.retiring = old;
-        await Promise.race([old.close({ runBeforeUnload: false }).catch(() => {}), sleep(CLOSE_SETTLE_MS)]);
-        page = await opened(NEW_PAGE_MS - NEW_PAGE_FIRST_MS);
-      }
+      // Firefox may open no new tab while the stuck one's content process is busy (about 5 s, measured): close that
+      // one first.
+      if (!page) { await retire(); page = await opened(NEW_PAGE_MS - NEW_PAGE_FIRST_MS); }
       if (!page) opening.then((p) => p.close().catch(() => {}), () => {}); // a late one is not left behind
-      else if (s.disposed) { await page.close().catch(() => {}); page = null; }
-      else await Promise.race([trackPasswords(page, s.tracker), sleep(PROBE_MS)]);
-    } finally { s.replacing = false; }
-    if (!page || s.disposed) {
-      console.error(`bosun: session ${s.id} (${s.engine}): page stopped responding and no new one opened; closing the session`);
-      await this.dispose(s, 'page-wedged');
-      return 'closed';
-    }
-    // Closing the old tab ends what still waits on it; until then it stays s.page, so nothing the call does
-    // meanwhile reaches the new one.
-    s.retiring = old;
-    await Promise.race([old.close({ runBeforeUnload: false }).catch(() => {}), sleep(CLOSE_SETTLE_MS)]);
-    await Promise.race([settled, sleep(CLOSE_SETTLE_MS)]);
-    if (s.disposed) { await page.close().catch(() => {}); return 'closed'; }
+    } finally { s.replacing = 0; }
+    if (!page) return wedged('page stopped responding and no new one opened');
+    // From now on, the new tab going away before it is the session's page fails the replacement.
+    page.once('close', () => { lost = true; });
+    page.once('crash', () => { lost = true; });
+    const drop = async (why) => { await bounded(page.close()); return s.disposed ? 'closed' : wedged(why); };
+    if (s.disposed) return drop('closed while replacing the page');
+    await bounded(trackPasswords(page, s.tracker), PROBE_MS);
+    // Closing the old tab ends what still waits on it. Until the call has stopped, the old tab stays s.page, so
+    // nothing it still does reaches the new one; a call that doesn't stop even then closes the session.
+    if (!old.isClosed()) await retire();
+    const stopped = await Promise.race([settled.then(() => true), sleep(CLOSE_SETTLE_MS).then(() => false)]);
+    if (s.disposed) return drop('closed while replacing the page');
+    if (!stopped) return drop(`${call.name} did not stop after its tab was closed`);
+    if (lost || page.isClosed()) return drop('the new tab went away before it was used');
     s.page = page;
     this.watchPage(s, page);
+    if (page.isClosed()) { await this.dispose(s, 'page-closed'); return 'closed'; }
     s.navs.length = 0; s.ctxErrors.length = 0; s.wallSeen = null;
+    // Popups opened meanwhile beyond the cap (the replacement was let through) are closed, newest first.
+    const extra = s.ctx.pages().filter((p) => p !== page && p !== old && !p.isClosed());
+    while (extra.length > this.cfg.maxPagesPerSession - 1) extra.pop().close().catch(() => {});
     console.error(`bosun: session ${s.id} (${s.engine}): replaced the tab after ${call.name} ran out of time`);
     return 'replaced';
   }

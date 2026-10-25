@@ -4,7 +4,9 @@
 // Bearer, never in the URL and never printed), BOSUN_IDLE_EXIT_SEC (default 3600, 0 = never). Exit codes: 0 stdin
 // ended or closed, stdout closed, the parent process gone, or idle; 1 connection failed or lost, 2 bad
 // configuration, 3 authentication refused.
-import WebSocket from 'ws';
+// The parent as it was at start, before anything is loaded: a parent that dies while ws loads is still noticed.
+const PARENT = process.ppid;
+const { default: WebSocket } = await import('ws');
 
 const MAX_LINE = 2 * 1024 * 1024; // bytes; Bosun's maxPayload: a longer message would get the connection closed
 const HANDSHAKE_MS = 15_000;
@@ -70,8 +72,9 @@ function run(env = process.env) {
     setTimeout(() => { ws.terminate(); process.exit(0); }, 2000).unref();
   };
   // Node has no PR_SET_PDEATHSIG: the parent is polled. Its death reparents the bridge (to init or a subreaper).
-  const parent = process.ppid;
-  setInterval(() => { if (process.ppid !== parent) { warn(`parent process ${parent} is gone; exiting`); process.exit(0); } }, PARENT_POLL_MS).unref();
+  const parentGone = () => { warn(`parent process ${PARENT} is gone; exiting`); process.exit(0); };
+  if (process.ppid !== PARENT) parentGone();
+  setInterval(() => { if (process.ppid !== PARENT) parentGone(); }, PARENT_POLL_MS).unref();
   // Idle: no message either way for idleMs, no request waiting for its answer (the client's, such as a long
   // handoff_wait, or the server's, such as a push event: forgotten after SERVER_REQUEST_MS) and no answer still
   // being written to stdout.
@@ -87,9 +90,10 @@ function run(env = process.env) {
     }, Math.min(target.idleMs, 30_000)).unref();
   }
   const idOf = (m) => (m && (typeof m.id === 'string' || typeof m.id === 'number') ? JSON.stringify(m.id) : null);
-  // A request (method and id) starts waiting; an answer (id, no method) from the other side ends it.
+  // A JSON-RPC 2.0 request (method and id) starts waiting; an answer (id, no method) from the other side ends it.
+  // Anything else gets no answer, so it doesn't count.
   const note = (msg, from) => {
-    if (!msg || typeof msg !== 'object') return;
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg) || msg.jsonrpc !== '2.0') return;
     const id = idOf(msg), other = from === 'c' ? 's' : 'c';
     if (typeof msg.method === 'string') {
       if (id !== null) waiting.set(from + id, Date.now());

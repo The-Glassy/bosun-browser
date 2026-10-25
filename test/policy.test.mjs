@@ -384,3 +384,16 @@ test('bridge: not idle while an answer is still being written to a slow stdout',
     assert.equal(await b.exited, 0);
   } finally { b.p.kill(); await srv.close(); }
 });
+
+test('bridge: a request that is not JSON-RPC 2.0 gets no answer and does not keep it from idling', async () => {
+  const srv = await fakeServer();
+  const b = bridge({ BOSUN_URL: srv.url, BOSUN_TOKEN: TOKEN_E, BOSUN_IDLE_EXIT_SEC: '1' });
+  try {
+    await until(srv.connected, 10000);
+    b.send({ method: 'ping', id: 7 }); // no "jsonrpc": "2.0"
+    await until(() => srv.got.length === 1, 5000);
+    const t0 = Date.now();
+    assert.equal(await b.exited, 0);
+    assert.ok(Date.now() - t0 < 4000);
+  } finally { b.p.kill(); await srv.close(); }
+});
