@@ -14,6 +14,7 @@ const MAX_PENDING = 8 * 1024 * 1024; // bytes read before the socket opens, or s
 const PARENT_POLL_MS = 1000;
 const IDLE_EXIT_SEC = 3600;
 const SERVER_REQUEST_MS = 60_000; // Bosun gives up on its own requests (push events) well before this
+const CLIENT_REQUEST_MS = 2 * 3600_000; // longer than any call Bosun answers (handoff_wait: 30 min); one never answered expires
 
 const die = (code, msg) => { process.stderr.write(`bosun-mcp-stdio: ${msg}\n`); process.exit(code); };
 const warn = (msg) => process.stderr.write(`bosun-mcp-stdio: ${msg}\n`);
@@ -76,14 +77,14 @@ function run(env = process.env) {
   if (process.ppid !== PARENT) parentGone();
   setInterval(() => { if (process.ppid !== PARENT) parentGone(); }, PARENT_POLL_MS).unref();
   // Idle: no message either way for idleMs, no request waiting for its answer (the client's, such as a long
-  // handoff_wait, or the server's, such as a push event: forgotten after SERVER_REQUEST_MS) and no answer still
-  // being written to stdout.
+  // handoff_wait, or the server's, such as a push event; forgotten after CLIENT_REQUEST_MS / SERVER_REQUEST_MS) and
+  // no answer still being written to stdout.
   const waiting = new Map(); // 'c' + id (client request) / 's' + id (server request) -> since
   let last = Date.now();
   const touch = () => { last = Date.now(); };
   if (target.idleMs > 0) {
     setInterval(() => {
-      for (const [k, t] of waiting) if (k[0] === 's' && Date.now() - t > SERVER_REQUEST_MS) waiting.delete(k);
+      for (const [k, t] of waiting) if (Date.now() - t > (k[0] === 's' ? SERVER_REQUEST_MS : CLIENT_REQUEST_MS)) waiting.delete(k);
       if (waiting.size || process.stdout.writableLength > 0 || Date.now() - last < target.idleMs) return;
       warn(`idle for ${Math.round(target.idleMs / 1000)} s; exiting`);
       process.exit(0);

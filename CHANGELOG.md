@@ -19,8 +19,8 @@
   gets up to 20 s to stop before the session's next call runs, then its tab is replaced. If it doesn't, a new tab in
   the same context replaces it (same session id and cookies, at `about:blank`). The session switches to the new tab
   only after the old one is closed and the cut-off call has stopped, so nothing that call still does reaches it.
-  The session is closed instead (`page-wedged`) when no new tab opens within 15 s, the new tab goes away first, or
-  the call hasn't stopped 3 s after its tab closed. Popups over `MAX_PAGES_PER_SESSION` opened meanwhile are closed. The error says which, e.g. `read timed out after 60 s (Bosun's
+  The session is closed instead (`page-wedged`) when no new tab opens within 15 s, the stuck tab doesn't close, the
+  new tab goes away first, or the call hasn't stopped 3 s after its tab closed. Popups over `MAX_PAGES_PER_SESSION` opened meanwhile are closed. The error says which, e.g. `read timed out after 60 s (Bosun's
   limit for one read call (TOOL_TIMEOUT_SEC / TOOL_TIMEOUTS)) and the page stopped responding, so Bosun replaced it
   with a new tab in the same session (cookies kept, now at about:blank): navigate again`.
 - A call still queued with too little of its time left is answered at once and not run. A `session_open` that times
