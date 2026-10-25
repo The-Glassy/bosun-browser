@@ -9,10 +9,19 @@ import { createEngines, claimProfile, unclaimProfile, recordProfileUse } from '.
 import { NOT_ALLOWED, PROFILES_REFUSED, policyOf } from './auth.mjs';
 import { allowFor, allowsUrl } from './allow.mjs';
 import { startTenantProxy } from './proxy.mjs';
+import { currentCall, timeoutMessage } from './deadline.mjs';
 
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
 const CLOSE_DEADLINE_MS = 10_000; // default; manager.closeDeadlineMs
 const NOTE_POLL_MS = 500;
+// After a call ran out of time (deadline.mjs): a page that doesn't evaluate 1 this fast counts as wedged; what the
+// call started gets this long to stop on a page that still answers before the tab is replaced to stop it; opening
+// the replacement tab; what the call started gets this long to fail once its tab is closed.
+const PROBE_MS = 3_000;
+const SETTLE_MS = 20_000;
+const NEW_PAGE_MS = 15_000;
+const NEW_PAGE_FIRST_MS = 8_000; // then the stuck tab is closed first, and the rest of NEW_PAGE_MS waited
+const CLOSE_SETTLE_MS = 3_000;
 
 // Where a navigation landed, without query and fragment (a challenge page reloads itself with fresh tokens).
 export const urlKey = (u) => { try { const x = new URL(u); return x.origin + x.pathname; } catch { return String(u); } };
@@ -50,6 +59,14 @@ export async function terminate(dir) {
     if (!pids.length) return true;
   }
   return false;
+}
+
+// Password fields are noted as a page loads: by an init script of the context ('init', set up at open), or for
+// engines without one in Bosun's world, on every navigation of every frame ('navigate').
+async function trackPasswords(page, tracker) {
+  if (tracker !== 'navigate') return;
+  page.on('framenavigated', (f) => { f.evaluate(passwordTracker).catch(() => {}); });
+  await installTracker(page);
 }
 
 // FIFO of async jobs with a bound on queued work. Jobs never overlap.
@@ -199,30 +216,22 @@ export class SessionManager {
         }
         if (def.tracker === 'init') await ctx.addInitScript(passwordTracker);
         const page = ctx.pages()[0] || await ctx.newPage();
-        if (def.tracker === 'navigate') {
-          page.on('framenavigated', (f) => { f.evaluate(passwordTracker).catch(() => {}); });
-          await installTracker(page);
-        }
+        await trackPasswords(page, def.tracker);
         if (this.closing) throw new Error('service is shutting down');
         if (this.goneOwners.has(owner)) throw new Error('connection closed'); // owner left while we were launching
         if (profileDir) recordProfileUse(profileDir, { engine: def.name, headless: this.cfg.headless });
         const s = {
-          id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, ctx, page, browser, dir, tmpDir,
+          id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, tracker: def.tracker, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
           navs: [], ctxErrors: [], wallSeen: null, // recent main-frame navigations {t, at: origin+path}, "context destroyed" failures, last bot check seen (bot-check loops)
           dlDir, // null: the context refuses downloads
         };
         this.sessions.set(s.id, s);
-        page.on('framenavigated', (f) => {
-          if (f !== page.mainFrame()) return;
-          s.navs.push({ t: Date.now(), at: urlKey(f.url()) });
-          if (s.navs.length > 100) s.navs.shift();
-        });
+        this.watchPage(s, page);
         if (dlDir || (agent && this.downloads)) this.downloads.watch(s);
-        page.on('close', () => this.dispose(s, 'page-closed'));
-        page.on('crash', () => this.dispose(s, 'page-crashed'));
         ctx.on('close', () => this.dispose(s, 'context-closed'));
-        ctx.on('page', (extra) => { if (ctx.pages().length > this.cfg.maxPagesPerSession) extra.close().catch(() => {}); });
+        // Popups over the cap are closed; while a wedged page is replaced, afterwards (recover).
+        ctx.on('page', (extra) => { if (!s.replacing && ctx.pages().length > this.cfg.maxPagesPerSession) extra.close().catch(() => {}); });
         return s;
       } catch (e) {
         if (ctx) await Promise.race([ctx.close().catch(() => {}), sleep(CLOSE_DEADLINE_MS)]);
@@ -249,6 +258,78 @@ export class SessionManager {
   }
 
   list(owner) { return [...this.sessions.values()].filter((s) => s.owner === owner); }
+
+  // The session's page: its main-frame navigations (bot-check loops), and its close or crash ending the session.
+  // Only while it is the session's page: one being replaced after a timeout (s.retiring) closes without closing the
+  // session.
+  watchPage(s, page) {
+    page.on('framenavigated', (f) => {
+      if (f !== page.mainFrame() || s.page !== page) return;
+      s.navs.push({ t: Date.now(), at: urlKey(f.url()) });
+      if (s.navs.length > 100) s.navs.shift();
+    });
+    const mine = () => s.page === page && s.retiring !== page;
+    page.on('close', () => { if (mine()) this.dispose(s, 'page-closed'); });
+    page.on('crash', () => { if (mine()) this.dispose(s, 'page-crashed'); });
+  }
+
+  // After a call ran out of time, before the session's next operation may run: what the call started must have
+  // stopped (settled), or its tab must be gone. A page that still answers keeps it up to SETTLE_MS; then, or at once
+  // when the page doesn't answer, the tab is replaced by a new one in the same context (cookies kept), and only once
+  // the old tab is closed and the call stopped (or CLOSE_SETTLE_MS passed) does s.page point to the new one. If no
+  // new tab opens, the session is closed. Sets call.state as it goes; returns 'responsive', 'replaced' or 'closed'.
+  async recover(s, settled, call) {
+    if (s.disposed) return 'closed';
+    const probe = s.page.evaluate(() => 1).then(() => true, () => false);
+    if (await Promise.race([probe, sleep(PROBE_MS).then(() => false)])) {
+      call.state = 'responsive';
+      if (await Promise.race([settled.then(() => true), sleep(SETTLE_MS).then(() => false)])) return 'responsive';
+      console.error(`bosun: session ${s.id} (${s.engine}): ${call.name} kept running ${SETTLE_MS / 1000} s after its deadline; replacing the tab to stop it`);
+    } else call.state = 'checking';
+    if (s.disposed) return 'closed';
+    const old = s.page;
+    const bounded = (p, ms = CLOSE_SETTLE_MS) => Promise.race([Promise.resolve(p).catch(() => {}), sleep(ms)]);
+    const retire = () => { s.retiring = old; return bounded(old.close({ runBeforeUnload: false })); };
+    const wedged = async (why) => {
+      console.error(`bosun: session ${s.id} (${s.engine}): ${why}; closing the session`);
+      await this.dispose(s, 'page-wedged');
+      return 'closed';
+    };
+    let page = null, lost = false;
+    s.replacing = true;
+    try {
+      const opening = s.ctx.newPage();
+      // The new tab going away before it is the session's page fails the replacement.
+      opening.then((p) => { p.once('close', () => { lost = true; }); p.once('crash', () => { lost = true; }); }, () => {});
+      const opened = (ms) => Promise.race([opening.catch(() => null), sleep(ms).then(() => null)]);
+      page = await opened(NEW_PAGE_FIRST_MS);
+      // Firefox may open no new tab while the stuck one's content process is busy (about 5 s, measured): close that
+      // one first.
+      if (!page) { await retire(); page = await opened(NEW_PAGE_MS - NEW_PAGE_FIRST_MS); }
+      if (!page) opening.then((p) => p.close().catch(() => {}), () => {}); // a late one is not left behind
+    } finally { s.replacing = false; }
+    if (!page) return wedged('page stopped responding and no new one opened');
+    const drop = async (why) => { await bounded(page.close()); return s.disposed ? 'closed' : wedged(why); };
+    if (s.disposed) return drop('closed while replacing the page');
+    await bounded(trackPasswords(page, s.tracker), PROBE_MS);
+    // Closing the old tab ends what still waits on it. Until the call has stopped, the old tab stays s.page, so
+    // nothing it still does reaches the new one; a call that doesn't stop even then closes the session.
+    if (!old.isClosed()) await retire();
+    if (!old.isClosed()) return drop('the stuck tab did not close');
+    const stopped = await Promise.race([settled.then(() => true), sleep(CLOSE_SETTLE_MS).then(() => false)]);
+    if (s.disposed) return drop('closed while replacing the page');
+    if (!stopped) return drop(`${call.name} did not stop after its tab was closed`);
+    if (lost || page.isClosed()) return drop('the new tab went away before it was used');
+    s.page = page;
+    this.watchPage(s, page);
+    if (page.isClosed()) { await this.dispose(s, 'page-closed'); return 'closed'; }
+    s.navs.length = 0; s.ctxErrors.length = 0; s.wallSeen = null;
+    // Popups opened meanwhile beyond the cap (the replacement was let through) are closed, newest first.
+    const extra = s.ctx.pages().filter((p) => p !== page && p !== old && !p.isClosed());
+    while (extra.length > this.cfg.maxPagesPerSession - 1) extra.pop().close().catch(() => {});
+    console.error(`bosun: session ${s.id} (${s.engine}): replaced the tab after ${call.name} ran out of time`);
+    return 'replaced';
+  }
 
   // The tenant's host allowlist, or null when it has none (then nothing is restricted).
   allowList(tenant) { return allowFor(this.cfg, tenant); }
@@ -288,17 +369,24 @@ export class SessionManager {
 
   // Every page action and observation goes through here: serialized per session, refused during a handoff, and
   // discarded if a handoff began while it ran.
+  // Inside a tool call with a deadline (deadline.mjs), the operation is cut off before it runs out, the page is
+  // checked (recover), and only then does the queue move on.
   async run(owner, id, fn) {
     const s = this.get(owner, id);
     if (s.handoff) throw new Error(HANDOFF_ACTIVE);
+    const call = currentCall();
+    if (call) call.queued = true;
     return s.queue.run(async () => {
       if (s.disposed) throw new Error(`session ${id} was closed (${s.closeReason})`);
       if (s.handoff) throw new Error(HANDOFF_ACTIVE);
+      // Too little of its time left to run and still check the page: not run at all.
+      if (call && (call.expired || Date.now() >= call.at - call.reserveMs)) throw new Error(timeoutMessage(call, 'queued'));
+      if (call) call.inPage = true;
       const gen = s.gen;
       s.busy++;
       s.lastUsed = Date.now();
       try {
-        const r = await fn(s);
+        const r = call ? await this.within(s, fn(s), call) : await fn(s);
         if (s.gen !== gen || s.handoff) throw new Error(HANDOFF_ACTIVE);
         return r;
       } catch (e) {
@@ -309,6 +397,24 @@ export class SessionManager {
         s.lastUsed = Date.now();
       }
     });
+  }
+
+  // The operation's result, or a timeout error: the operation is cut off call.reserveMs before the deadline, which
+  // leaves time to check the page (recover) before the call is answered. The session's queue moves on only after
+  // recover, so nothing the operation started overlaps the next one.
+  async within(s, work, call) {
+    let timer;
+    const late = new Promise((r) => { timer = setTimeout(r, Math.max(0, call.at - call.reserveMs - Date.now())); });
+    try {
+      const won = await Promise.race([work.then((v) => ({ v })), late.then(() => null)]);
+      if (won) return won.v;
+    } finally { clearTimeout(timer); }
+    call.expired = true;
+    const settled = work.then(() => {}, () => {}); // it may still fail later, once nobody waits for it
+    const state = await this.recover(s, settled, call).catch(() => 'closed');
+    call.state = state;
+    console.error(`bosun: session ${s.id}: ${call.name} ran out of time (${Math.round(call.limitMs / 1000)} s); page ${state}`);
+    throw new Error(timeoutMessage(call, state));
   }
 
   // Starts (or returns the active) handoff. Queues behind in-flight operations, so nothing the agent started can

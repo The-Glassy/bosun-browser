@@ -15,6 +15,7 @@ import { BASE64_MAX_BYTES } from './uploads.mjs';
 import { DRIVER_LOGS_REFUSED, SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS, driverLogsValues } from './secrets.mjs';
 import { INLINE_MAX_BYTES } from './downloads.mjs';
 import { showPattern } from './allow.mjs';
+import { currentCall, reserveMs, runCall, timeoutMessage } from './deadline.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
@@ -195,7 +196,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.12.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.13.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -217,14 +218,31 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     return r;
   });
 
-  // Every tool: bounded concurrency per connection, sanitized errors. A tool the policy doesn't allow is registered
-  // as a stub that only refuses (its handler is never wired up) and is left out of tools/list below.
+  // Every tool: bounded concurrency per connection, sanitized errors, and a deadline (deadline.mjs; not for the tools
+  // that keep their own limits). A tool the policy doesn't allow is registered as a stub that only refuses (its
+  // handler is never wired up) and is left out of tools/list below.
   const tool = (name, desc, shape, fn) => {
     if (ephemeral && !EPHEMERAL_TOOLS.has(name)) return server.tool(name, NOT_ALLOWED, {}, async () => { throw new Error(`${name}: ${NOT_ALLOWED}`); });
+    const limitMs = cfg.toolTimeouts?.get(name) ?? null;
     return server.tool(name, desc, shape, async (a, extra) => {
       if (conn.inflight >= cfg.maxInflight) throw new Error(`too many concurrent requests on this connection (max ${cfg.maxInflight})`);
       conn.inflight++;
-      try { return await fn(a, extra); } catch (e) { throw new Error(cleanError(e)); } finally { conn.inflight--; }
+      let call = null, timer;
+      try {
+        if (!limitMs) return await fn(a, extra);
+        call = { name, limitMs, at: Date.now() + limitMs, reserveMs: reserveMs(limitMs), done: false, expired: false, inPage: false, queued: false, state: null };
+        const work = runCall(call, () => fn(a, extra));
+        // The call is answered by its deadline. A page operation is cut off earlier by the session (run), which
+        // checks the page and usually answers first; if that check is still going on, this says how far it got.
+        const late = new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            call.expired = true;
+            reject(new Error(timeoutMessage(call, call.state ?? (call.queued && !call.inPage ? 'queued' : call.inPage ? 'checking' : null))));
+          }, limitMs);
+        });
+        work.catch(() => {});
+        return await Promise.race([work, late]);
+      } catch (e) { throw new Error(cleanError(e)); } finally { clearTimeout(timer); if (call) call.done = true; conn.inflight--; }
     });
   };
 
@@ -234,7 +252,10 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     async (a) => {
       if (ephemeral && a.profile !== undefined) throw new Error(PROFILES_REFUSED);
       if (ephemeral && a.engine && a.engine !== cfg.engine) throw new Error(`engine ${a.engine} is ${NOT_ALLOWED}; use the default (${cfg.engine})`);
+      const call = currentCall();
       const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine, downloads: true });
+      // The agent was told this open timed out: a session it never learned about is not left open.
+      if (call?.expired) { await manager.dispose(s, 'open-timed-out'); throw new Error('session_open timed out'); }
       return ok({ session: s.id, profile: a.profile || 'ephemeral', engine: s.engine });
     });
 
@@ -333,10 +354,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     }
   }
   async function typeSecretInto(s, l, a) {
+    // The page the secret goes into, also for scrubbing and leaving it: s.page may change under a call that ran out
+    // of time (the tab is replaced).
+    const page = s.page;
     const kind = await l.evaluate((el) => (el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName === 'textarea' ? 'textarea' : `<${el.localName}>`));
     if (kind.startsWith('<') || NO_SECRET_TYPES.has(kind)) throw new Error(`a secret goes only into a text field (<input> or <textarea>); this element is ${kind.startsWith('<') ? kind : `<input type=${kind}>`}`);
     if (kind !== 'password' && !a.allow_non_password) throw new Error(`this field is ${kind === 'textarea' ? 'a <textarea>' : `<input type=${kind}>`}, not a password field; pass allow_non_password: true to type the secret into it anyway (an OTP or e-mail field). The secret was not used.`);
-    await markSensitive(s.page, l);
+    await markSensitive(page, l);
     if (!(await l.evaluate((el) => el.isConnected))) throw new Error('the field left the page before anything was typed; the secret was not used');
     const buf = secrets.take(tenant, a.secret_id);
     let value = buf.toString('utf8');
@@ -353,13 +377,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       if (!landed) {
         // Wherever it went (another field, text split over nodes, a canvas), the page is left: nothing on it can
         // show the secret to a later read or screenshot.
-        await scrubValue(s.page, value).catch(() => {});
-        await s.page.goto('about:blank', { timeout: 15000 });
+        await scrubValue(page, value).catch(() => {});
+        await page.goto('about:blank', { timeout: 15000 });
         throw new Error('the secret did not end up in the field that was checked (the page moved the focus or the field); Bosun left the page (about:blank) so nothing on it can show the secret, check the site before trying again');
       }
-      await markValue(s.page, value);
-      if (a.submit) { await l.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
-      const info = await pageInfo(s.page);
+      await markValue(page, value);
+      if (a.submit) { await l.press('Enter', { timeout: 15000 }); await page.waitForTimeout(1500); }
+      const info = await pageInfo(page);
       console.error(`bosun: secret ${a.secret_id} of tenant ${tenant}: typed in session ${s.id}, ${Buffer.byteLength(value)} bytes`);
       return { ...info, url: hide(info.url), title: hide(info.title), secret: 'typed and deleted' };
     } catch (e) {

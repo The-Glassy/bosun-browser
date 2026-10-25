@@ -2,6 +2,7 @@
 import { isLoopbackHost, parsePolicies, parseTokens } from './auth.mjs';
 import { parseTenantAllow } from './allow.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
+import { parseToolTimeouts } from './deadline.mjs';
 
 function int(env, name, def, min, max) {
   const raw = env[name];
@@ -34,6 +35,8 @@ export function loadConfig(env = process.env) {
     maxInflight: int(env, 'MAX_INFLIGHT', 8, 1, 1000), // concurrent tool calls per connection
     maxPagesPerSession: int(env, 'MAX_PAGES_PER_SESSION', 5, 1, 100),
     maxDomNodes: int(env, 'MAX_DOM_NODES', 60000, 100, 10_000_000),
+    // Per-call deadline of each tool, ms (src/deadline.mjs): TOOL_TIMEOUT_SEC for all, TOOL_TIMEOUTS per tool.
+    toolTimeouts: parseToolTimeouts(env),
     engine: env.ENGINE || 'chromium',
     camoufoxOs: env.CAMOUFOX_OS || null, // null: the host's OS
     keepalive: env.KEEPALIVE !== '0', // run scheduled keepalive visits (configured with keepalive_set)
