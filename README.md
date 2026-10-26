@@ -504,14 +504,15 @@ whatever it likes. Teams is not supported yet. Each platform lives in one file u
 (`meet.mjs`, `zoom.mjs`) behind a small interface, and the meeting flow around it is shared.
 
 ```jsonc
-meeting_join({ "url": "https://meet.google.com/abc-defg-hij" })   // name, announce_text, max_wait_admit_min (10),
-                                                                   // profile, engine, leave_on_optout (true)
+meeting_join({ "url": "https://meet.google.com/abc-defg-hij" })   // name, announce_text, announce ("chat" | "host" | "none"),
+                                                                   // max_wait_admit_min (10), profile, engine, leave_on_optout (true)
 meeting_join({ "url": "https://us02web.zoom.us/j/81234567890?pwd=…", "profile": "zoom" })
 //  -> { "meeting_id": "m1a2b3c4d5e6", "platform": "zoom", "state": "waiting", "joined_as": "account", ... }
 meeting_join({ "url": "https://meet.google.com/abc-defg-hij", "profile": "google", "dry_run": true })
 //  -> { "dry_run": true, "state": "lobby", "lobby": "account", "join_button": "Ask to join without microphone & camera",
 //       "microphone": "on (no device found)", "camera": "no device", "challenge": false, "page": "…/meet/abc-defg-hij", ... }
-meeting_status({ "meeting_id": "m1a2b3c4d5e6" })   // joining | waiting | admitted | recording | ended, participants, recording_seconds
+meeting_status({ "meeting_id": "m1a2b3c4d5e6" })   // joining | waiting | admitted | recording | ended, participants, recording_seconds,
+                                                   // announce: { mode, sent_to: everyone | host | none | failed, reason, failures }
 meeting_chat_read({ "meeting_id": "…", "since": 0 })      meeting_chat_send({ "meeting_id": "…", "text": "…" })
 meeting_stop_recording({ "meeting_id": "…", "delete": true })   meeting_leave({ "meeting_id": "…" })
 meeting_recording_delete({ "meeting_id": "…" })
@@ -570,10 +571,23 @@ meeting_recording_delete({ "meeting_id": "…" })
      and for Zoom whether the profile is signed in. Use it to check a link or a profile before a meeting.
      [docs/MEETING-BOT-REFERENCES.md](docs/MEETING-BOT-REFERENCES.md) compares the flows with other open-source bots.
 4. Once admitted (Zoom: computer audio joined first, since without it nothing is heard, then microphone and
-   camera checked off again), Bosun opens the chat and **posts the announcement first**. On Zoom the chat is set to
-   Everyone first, and the announcement has to show up in the chat, not marked as private. If Zoom allows chat with
-   the host only, or the message doesn't show up, Bosun leaves without recording. Only then does recording start. The
-   default text is in English and German: *"Hi, I'm Glassy, an AI notetaker. I'm recording audio for notes. If you'd
+   camera checked off again), Bosun opens the chat and **posts the announcement first**, then starts recording. Who
+   is told depends on `announce`:
+   - **`"chat"` (default): everyone.** On Zoom the chat is set to Everyone (or "Meeting Group Chat", a meeting with
+     continuous meeting chat), and the announcement has to show up in the chat, not marked as private. If the chat
+     can't reach everyone (Zoom allows chat with the host only, Meet's chat is turned off, the message doesn't show
+     up), Bosun tells the host instead (Zoom's "Host and co-hosts"; Meet has no chat to the host alone). If that
+     fails too, Bosun **records anyway**: `meeting_status` shows `announce.sent_to: "failed"`. Anything short of
+     everyone sends `bosun:meeting-announce` with `sent_to`, `reason` and every attempt's error.
+   - **`"host"`: the host only**, on Zoom.
+   - **`"none"`: nobody.** Recording starts without any message. Use it only when the meeting owner told you so: the
+     caller is then responsible for everyone knowing they are recorded.
+
+   In every mode the chat is watched and an objection stops and deletes the recording. `announce.reason` says why
+   the announcement didn't reach everyone: `chat-restricted` (the chat can't be addressed to everyone),
+   `chat-unavailable` (no chat), `sent-privately`, `not-sent` (still in the box), `not-confirmed` (it never showed
+   up as Bosun's), and for the host `host-unreachable`. Later messages (`meeting_chat_send`, the opt-out
+   confirmation) go where the announcement went. The default text is in English and German: *"Hi, I'm Glassy, an AI notetaker. I'm recording audio for notes. If you'd
    rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the
    recording."* With `MEETING_OWNER` set it says whose notetaker it is.
 5. While in the call:
@@ -602,9 +616,9 @@ admits almost no anonymous browser guests at all.
 
 The meeting runs in a session of its own, so it outlives the agent's connection. It counts against `MAX_SESSIONS`.
 Events use the MCPL feature set **`bosun.meeting`** (tags `bosun:meeting-chat`, `bosun:meeting-optout`,
-`bosun:meeting-ended`); host recipes that list `enabledFeatureSets` need to add it (or `bosun.*`).
+`bosun:meeting-announce`, `bosun:meeting-ended`); host recipes that list `enabledFeatureSets` need to add it (or `bosun.*`).
 
-**Consent.** Recording starts only after the announcement. No slash commands are needed: a plain-language request
+**Consent.** Recording starts only after the announcement was tried (or, with `announce: "none"`, without one). No slash commands are needed: a plain-language request
 not to be recorded is enough, in English, German, Ukrainian, Russian or Slovak (`please don't record`, `stop
 recording`, `bitte nicht aufnehmen`, `не записуй`, `не записывай`, `nenahrávaj`, …).
 - **What happens:** Bosun **stops the recording and deletes the file at once**, posts "Recording stopped and

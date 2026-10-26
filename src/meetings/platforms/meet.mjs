@@ -11,7 +11,8 @@
 //   state(page)           'lobby' | 'waiting' | 'admitted' | 'denied' | 'refused' | 'removed' | 'ended' | 'unknown'
 //   afterAdmit(page)      optional: what has to happen once in the call before the chat (Zoom joins computer audio)
 //   messages              optional: {refused, invalid, signIn, captcha} texts for those outcomes
-//   openChat(page), sendChat(page, text)
+//   openChat(page), sendChat(page, text, {selfName, to})  to: 'everyone' | 'host'; a message not posted throws a
+//                         chatError (common.mjs) whose code says why
 //   watchChat(page, key)  install a MutationObserver that queues new chat messages; drainChat(page, key) -> [{id, sender, text}]
 //   participants(page)    number of people in the call (incl. the bot), or null if the page doesn't show it
 //   leave(page)
@@ -21,7 +22,7 @@
 // Ukrainian and Russian, so a UI that comes up in another of those languages works too. Markers are labels, roles
 // and texts a person sees; a run against real Meet that fails here is fixed here.
 
-import { norm, any, pageText as textOutside, visible, button, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, chatError, DIALOGS, HEADINGS } from './common.mjs';
 
 const JOIN_LABELS = ['ask to join', 'join now', 'join', 'ask to join anyway', 'join anyway', 'join the call now', 'trotzdem teilnehmen', 'teilnahme erbitten', 'teilnahme anfragen', 'teilnehmen anfragen', 'jetzt teilnehmen', 'teilnehmen', 'beitreten',
   'požiadať o pripojenie', 'pripojiť sa', 'pripojiť sa teraz', 'попросити приєднатися', 'попросити дозволу приєднатися', 'приєднатися', 'приєднатися зараз',
@@ -272,13 +273,18 @@ export const meet = {
 
   async openChat(page) {
     if (await visible(page.getByRole('textbox', { name: LABEL.chatInput }))) return;
-    await button(page, LABEL.chat).first().click({ timeout: 10_000 });
-    await page.getByRole('textbox', { name: LABEL.chatInput }).first().waitFor({ state: 'visible', timeout: 10_000 });
+    await button(page, LABEL.chat).first().click({ timeout: 10_000 }).catch(() => { throw chatError('chat-unavailable', 'no chat button in the Meet toolbar'); });
+    await page.getByRole('textbox', { name: LABEL.chatInput }).first().waitFor({ state: 'visible', timeout: 10_000 })
+      .catch(() => { throw chatError('chat-unavailable', 'the Meet chat panel did not open'); });
   },
 
-  async sendChat(page, text) {
+  // Meet's chat goes to everyone; there is no message to the host alone.
+  async sendChat(page, text, { to = 'everyone' } = {}) {
+    if (to === 'host') throw chatError('host-unreachable', "Google Meet's chat has no way to write to the host alone");
     await this.openChat(page);
     const box = page.getByRole('textbox', { name: LABEL.chatInput }).first();
+    // The host turned chat off for participants: the box is there, disabled.
+    if (await disabled(box)) throw chatError('chat-restricted', 'the Meet chat is turned off for participants (the host allows no chat messages)');
     await box.fill(text, { timeout: 5000 });
     await box.press('Enter', { timeout: 5000 });
   },

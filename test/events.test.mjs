@@ -3,7 +3,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 import { startBosun, connect, until, sleep, TOKEN_B } from './helpers.mjs';
-import { FEATURE_SET, NEEDS_HUMAN, WATCH_SET, WATCH_CHANGED, MEETING_SET, MEETING_TAGS, DOWNLOAD_SET } from '../src/events.mjs';
+import { FEATURE_SET, NEEDS_HUMAN, WATCH_SET, WATCH_CHANGED, MEETING_SET, MEETING_TAGS, DOWNLOAD_SET, MANIFEST } from '../src/events.mjs';
 
 let svc;
 before(async () => { svc = await startBosun({ KEEPALIVE: '0' }); });
@@ -166,7 +166,7 @@ test('watch-changed goes out under bosun.watch only: a host that enabled just bo
   await c.close();
 });
 
-test('meeting events go out under bosun.meeting: chat, opt-out, and the end with a resource_link to the recording', async () => {
+test('meeting events go out under bosun.meeting: chat, opt-out, an announcement that fell short, and the end with a resource_link to the recording', async () => {
   svc.events.pending.clear();
   const c = await host();
   await c.grant({ enabled: [MEETING_SET], effectiveCapabilities: ['pushEvents'] });
@@ -175,8 +175,10 @@ test('meeting events go out under bosun.meeting: chat, opt-out, and the end with
   await svc.events.meeting('optout', { ...base, sender: 'Alex Example', text: 'please do not record', left: true });
   const recording = { path: '/data/recordings/alice/m0123456789ab.ogg', uri: 'file:///data/recordings/alice/m0123456789ab.ogg', bytes: 4096, mime_type: 'audio/ogg', seconds: 60 };
   await svc.events.meeting('ended', { ...base, reason: 'left', duration_s: 61, recording, bytes: 4096 });
-  await until(() => c.pushes.length === 3);
-  const [chat, optout, ended] = c.pushes;
+  const failures = [{ to: 'everyone', reason: 'chat-restricted', error: "the Zoom chat can't be sent to everyone" }, { to: 'host', reason: 'host-unreachable', error: 'no Host and co-hosts' }];
+  await svc.events.meeting('announce', { ...base, platform: 'zoom', mode: 'chat', sent_to: 'failed', reason: 'chat-restricted', error: failures[0].error, failures });
+  await until(() => c.pushes.length === 4);
+  const [chat, optout, ended, announce] = c.pushes;
   for (const p of c.pushes) assert.equal(p.featureSet, MEETING_SET);
   assert.deepEqual(chat.tags, [MEETING_TAGS.chat, 'bosun:meeting=m0123456789ab', 'bosun:platform=meet']);
   assert.deepEqual(chat.origin, { server: 'bosun', source: 'meeting', meeting_id: 'm0123456789ab', platform: 'meet', sender: 'Alex Example', text: 'Hello' });
@@ -185,5 +187,9 @@ test('meeting events go out under bosun.meeting: chat, opt-out, and the end with
   assert.equal(ended.tags[0], MEETING_TAGS.ended);
   assert.deepEqual(ended.origin.recording, recording);
   assert.deepEqual(ended.payload.content[1], { type: 'resource_link', uri: recording.uri, name: 'm0123456789ab.ogg', mimeType: 'audio/ogg', size: 4096 });
+  assert.deepEqual(announce.tags, [MEETING_TAGS.announce, 'bosun:meeting=m0123456789ab', 'bosun:platform=zoom']);
+  assert.deepEqual([announce.origin.mode, announce.origin.sent_to, announce.origin.reason, announce.origin.failures], ['chat', 'failed', 'chat-restricted', failures]);
+  assert.match(announce.payload.content[0].text, /could not be posted in the chat \(chat-restricted: .*\)\. Bosun records anyway/);
+  assert.ok(MANIFEST.featureSets[MEETING_SET].tagOntology.tags[MEETING_TAGS.announce]);
   await c.close();
 });

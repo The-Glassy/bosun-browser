@@ -21,9 +21,11 @@ function launch(id, search) {
 // passcode (the meeting has one; the preview asks for it unless the link carried it), noDevices (no mic/camera
 // controls in the preview, "Cannot detect your camera"/"microphone"), recordedNotice (a "This meeting is being
 // recorded" dialog once in), bigChallenge (a visible reCAPTCHA in the preview), title (the meeting's topic shown in
-// the call), recipient (the chat starts addressed to this person; "Everyone" is in its menu unless hostOnly),
+// the call), recipient (the chat starts addressed to this person; "Everyone" is in its menu unless hostOnly, "Host
+// and co-hosts" unless noHost; "Meeting Group Chat" is continuous meeting chat's public recipient, like "Everyone"),
 // enterNewline (Enter adds a line break; the Send button sends), hideRecipient (no recipient control shown: messages
-// go to `recipient` anyway, marked "(Privately)"), dropSends (the chat box clears but nothing is posted), askPasscode (the preview asks for the passcode even
+// go to `recipient` anyway, marked "(Privately)"), dropSends (the chat box clears but nothing is posted; a recipient's
+// label: only messages to that recipient are dropped), askPasscode (the preview asks for the passcode even
 // though the link carried one). web2026: the preview as live Zoom showed it on 2026-10-23: first the question "Do you
 // want people to see you in the meeting?" ("Use microphone and camera" / "Continue without microphone and camera")
 // over everything, an empty "Your Name" field even for a signed-in account, "Remember my name for future meetings",
@@ -131,13 +133,13 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
   <aside id="panel" class="chat-container" hidden>
     <div id="msgs" class="chat-container__chat-list"></div>
     <div class="chat-receiver-list"${r.hideRecipient ? ' hidden' : ''}><button id="to" class="chat-receiver-list__receiver">${esc(r.recipient || 'Everyone')}</button>
-      <div role="menu" id="toMenu" hidden>${r.hostOnly ? '' : '<div role="menuitem" tabindex="0" id="toAll">Everyone</div>'}<div role="menuitem" tabindex="0">Host and co-hosts</div></div></div>
+      <div role="menu" id="toMenu" hidden>${r.hostOnly ? '' : '<div role="menuitem" tabindex="0" id="toAll">Everyone</div>'}${r.noHost ? '' : '<div role="menuitem" tabindex="0">Host and co-hosts</div>'}</div></div>
     <div id="box" class="tiptap ProseMirror" contenteditable="true" aria-label="Type message here ..."></div>
     <button id="send" aria-label="send">Send</button>
   </aside>
 </div>
 <script>
-const R = ${JSON.stringify({ decoyMenu: r.decoyMenu || null, menuHide: r.menuHide || null, tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: !!r.dropSends, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null, audioJoined: r.audioJoined || null })};
+const R = ${JSON.stringify({ decoyMenu: r.decoyMenu || null, menuHide: r.menuHide || null, tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: r.dropSends || false, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null, audioJoined: r.audioJoined || null })};
 const id = ${JSON.stringify(id)}, $ = (x) => document.getElementById(x);
 const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });
@@ -198,7 +200,7 @@ $('recOk').onclick = () => { $('recDlg').hidden = true; };
 $('chatBtn').onclick = () => { $('panel').hidden = !$('panel').hidden; $('chatBtn').setAttribute('aria-label', $('panel').hidden ? 'open the chat panel' : 'close the chat panel'); };
 $('leave').onclick = () => { $('leaveMenu').hidden = false; };
 $('leaveConfirm').onclick = () => post('leave', {});
-const sendBox = () => { const t = $('box').innerText.trim(); $('box').textContent = ''; if (t && !R.dropSends) post('chat', { text: t, to: $('to').textContent }); };
+const sendBox = () => { const t = $('box').innerText.trim(); $('box').textContent = ''; if (t && R.dropSends !== true && R.dropSends !== $('to').textContent) post('chat', { text: t, to: $('to').textContent }); };
 $('box').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !R.enterNewline) { e.preventDefault(); sendBox(); } });
 $('send').onclick = sendBox;
 $('to').onclick = () => { $('toMenu').hidden = !$('toMenu').hidden; };
@@ -228,8 +230,8 @@ async function poll() {
       const item = document.createElement('div');
       item.className = 'chat-item-container';
       // liveChat: our own messages under our name with the recipient and a time ("Glassy (notetaker) to Everyone
-      // 10:07 AM"), and each bubble with a time and its menu control inside.
-      const sender = m.self ? (R.liveChat ? m.sender + ' to Everyone 10:07 AM' : 'Me') : (R.liveChat ? m.sender + ' 10:07 AM' : m.sender);
+      // 10:07 AM", "… to Host and co-hosts …"), and each bubble with a time and its menu control inside.
+      const sender = m.self ? (R.liveChat ? m.sender + ' to ' + (m.to || 'Everyone') + ' 10:07 AM' : 'Me') : (R.liveChat ? m.sender + ' 10:07 AM' : m.sender);
       if (sender !== prev) { const h = document.createElement('div'); h.className = 'chat-item__sender'; h.textContent = sender; item.append(h); }
       prev = sender;
       const d = document.createElement('div');
@@ -238,7 +240,7 @@ async function poll() {
       d.textContent = m.text;
       if (R.liveChat) { const t = document.createElement('div'); t.textContent = '10:07 AM'; const b = document.createElement('button'); b.setAttribute('aria-label', 'more'); b.textContent = 'more_vert'; d.append(t, b); }
       item.append(d);
-      if (m.to && m.to !== 'Everyone') { const p = document.createElement('span'); p.textContent = '(Privately)'; item.append(p); }
+      if (m.to && m.to !== 'Everyone' && m.to !== 'Meeting Group Chat') { const p = document.createElement('span'); p.textContent = '(Privately)'; item.append(p); }
       $('msgs').append(item);
     }
     if (R.tone && audio && !toned) { toned = true; const c = new AudioContext(); const o = c.createOscillator(); o.frequency.value = 440; o.connect(c.destination); o.start(); }

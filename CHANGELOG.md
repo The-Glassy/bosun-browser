@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.13.1 — record when the chat reaches only the host, or nobody
+
+### Fixed
+
+- **A Zoom meeting ended after 4 s without recording** (Zoom 84902286757 as a guest, 2026-10-26): "the Zoom chat
+  can't be sent to everyone (recipient: Meeting Group Chat)". Bosun left whenever the announcement could not reach
+  everyone. "Meeting Group Chat" is how Zoom labels everyone when a meeting has continuous meeting chat; it now
+  counts as everyone, and the announcement still has to show up in the chat as Bosun's.
+
+### Added
+
+- **`meeting_join` `announce`: `"chat"` (default), `"host"` or `"none"`.**
+  - `"chat"`: to everyone. Where the chat can't reach everyone (Zoom allows chat with the host only, Meet's chat is
+    turned off, the message never shows up), the host is told instead: Zoom's "Host and co-hosts"; Meet has no chat
+    to the host alone. If that fails too, Bosun records anyway instead of leaving.
+  - `"host"`: to the host only (Zoom).
+  - `"none"`: no announcement; for when the meeting owner said so. The caller is responsible for consent.
+  - In every mode the chat is watched and an objection stops and deletes the recording.
+- **`meeting_status` `announce`**: `{ mode, sent_to: everyone | host | none | failed }`, plus `reason` and
+  `failures: [{ to, reason, error }]` when it fell short. Reasons: `chat-restricted`, `chat-unavailable`,
+  `sent-privately`, `not-sent`, `not-confirmed`, `host-unreachable`. `chat_error` when the chat panel didn't open.
+  The meeting's `reason` and `error` stay about how it ended; a chat problem no longer ends it.
+- **`bosun:meeting-announce`** (feature set `bosun.meeting`) when the announcement reached less than the mode asked
+  for: origin carries `mode`, `sent_to`, `reason`, `error` and `failures`.
+- Later posts (`meeting_chat_send`, the opt-out confirmation) go where the announcement went; with `"host"` they
+  never go to everyone, even when the announcement failed. A `meeting_chat_send` sent while the announcement is
+  still going out waits for it.
+- Bosun's own Zoom messages headed "… to Host and co-hosts", "… to Host" or "… to Meeting Group Chat" are
+  recognized as its own (only "… to Everyone" was), so they don't come back as chat events.
+
+### Tests
+
+- Zoom stand-in: host-only chat (announced to "Host and co-hosts", recorded, an event, chat and opt-out
+  confirmation to the host); "Everyone Else" and a private recipient with no way to the host (recorded,
+  `sent_to: failed`); "Meeting Group Chat" as everyone, and falling back to the host when it drops Bosun's messages;
+  `announce: "host"` and `"none"` (no message, an objection still deletes), `"host"` with no host to choose (failed,
+  and `meeting_chat_send` doesn't fall back to everyone); own messages headed with those recipients; dropped sends to everyone and the host;
+  Zoom's recipient labels. Meet stand-in: chat turned off by the host (recorded, `failed`, an event) and
+  `announce: "none"`. The `bosun:meeting-announce` event's shape.
+
 ## 0.13.0 — a deadline on every call; the stdio bridge ends with its client
 
 ### Fixed

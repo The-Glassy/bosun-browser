@@ -8,7 +8,7 @@
 // and labels are also matched in German and Ukrainian (some Russian). These markers were written from Zoom's web
 // client as documented and seen in screenshots, and tested against a local stand-in (test/fakezoom.mjs), not yet
 // against live Zoom: a run against real Zoom that fails here is fixed here.
-import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, chatError, DIALOGS, HEADINGS } from './common.mjs';
 
 const TEXT = {
   // The waiting room, or a meeting the host has not started yet (Zoom lets you in when it starts).
@@ -73,8 +73,13 @@ const NAME_FIELD = 'input#input-for-name, input#inputname, input[aria-label="You
 const PASSCODE_FIELD = 'input#input-for-pwd, input[aria-label*="passcode" i], input[placeholder*="passcode" i], input[aria-label*="kenncode" i], input[placeholder*="kenncode" i]';
 // The chat's recipient ("To: Everyone" / a person / "Host and co-hosts") and its Send button.
 const CHAT_RECIPIENT = '[class*="receiver-list__receiver"], [class*="chat-receiver"] button, [class*="chat-to"] button, button[aria-label^="send to" i], button[aria-label^="chat with" i]';
-// Zoom's own label for the public recipient, exactly (a participant named "Everyone Else" is not it).
-const EVERYONE = /^(?:to:?\s*)?(?:everyone|everyone in (?:the )?meeting|alle|alle im meeting|jeder|всі|усі|всім|усім|всі учасники|все|всем|все участники)$/i;
+// Zoom's own label for the public recipient, exactly (a participant named "Everyone Else" is not it). "Meeting Group
+// Chat": a meeting with continuous meeting chat (live Zoom, 2026-10-26) posts to everyone through the meeting's group chat.
+const EVERYONE = /^(?:to:?\s*)?(?:everyone|everyone in (?:the )?meeting|meeting group chat|alle|alle im meeting|jeder|meeting-gruppenchat|всі|усі|всім|усім|всі учасники|все|всем|все участники)$/i;
+// Zoom's label for the host (and co-hosts) as one recipient, exactly: where the host allows chat with the host only.
+const HOSTS = /^(?:to:?\s*)?(?:(?:the )?hosts? (?:and|&) co-?hosts?|host|hosts? und co-?hosts?|організатор(?:и)? (?:і|й|та) співорганізатор(?:и|ам)?|организатор(?:ы)? и соорганизатор(?:ы|ам)?)$/i;
+// The recipient in a message's sender line ("Glassy Smartie to Host and co-hosts 10:07 AM"): everyone or the host group.
+const TO_GROUP = '\\s+(?:to|an|для)\\s+(?:everyone|meeting group chat|alle|meeting-gruppenchat|всіх|всех|(?:the )?hosts? (?:and|&) co-?hosts?|host|hosts? und co-?hosts?|організатор\\S* (?:і|й|та) співорганізатор\\S*|организатор\\S* и соорганизатор\\S*)(?![\\p{L}\\p{N}]).*$';
 // How Zoom marks a message that went to one person only.
 const PRIVATELY = any('\\(privately\\)', 'direct message', '\\(privat\\)', 'direktnachricht', 'приватно', 'особисто', 'лично');
 const SEND = any('^send$', '^send message$', '^senden$', '^nachricht senden$', '^надіслати$', '^отправить$');
@@ -490,32 +495,47 @@ export const zoom = {
     if (await chatBox(page)) return;
     await overlays(page);
     const b = await firstVisible(button(page, LABEL.chat));
-    if (!b) throw new Error('no chat button in the Zoom toolbar (chat disabled by the host, or Zoom changed)');
+    if (!b) throw chatError('chat-unavailable', 'no chat button in the Zoom toolbar (chat disabled by the host, or Zoom changed)');
     await b.click({ timeout: 10_000 });
     for (let i = 0; i < 40 && !(await chatBox(page)); i++) await page.waitForTimeout(250);
-    if (!(await chatBox(page))) throw new Error('the Zoom chat panel did not open');
+    if (!(await chatBox(page))) throw chatError('chat-unavailable', 'the Zoom chat panel did not open');
   },
 
-  // The chat goes to everyone: a recipient control showing someone else (a person, "Host and co-hosts") is switched
-  // to Everyone, or the message is not sent. Without a recipient control (chat to everyone only) it is sent.
-  async toEveryone(page) {
+  // The chat goes to `to`: 'everyone', or 'host' (Zoom's "Host and co-hosts"). A recipient control showing someone
+  // else is switched (its menu opened, unless it is open already), or the message is not sent. Without a recipient
+  // control the chat goes to everyone only: fine for everyone, and no way to write to the host alone.
+  async recipient(page, to = 'everyone') {
+    const want = to === 'host' ? HOSTS : EVERYONE;
     const r = await firstVisible(page.locator(CHAT_RECIPIENT));
-    if (!r || EVERYONE.test(norm(await r.innerText().catch(() => '')).trim())) return;
-    await r.click({ timeout: 3000 }).catch(() => {});
-    const opt = await firstVisible(page.getByRole('menuitem', { name: EVERYONE })) || await firstVisible(page.getByRole('option', { name: EVERYONE }))
-      || await firstVisible(page.getByRole('menuitemradio', { name: EVERYONE }));
+    if (!r) {
+      if (to === 'host') throw chatError('host-unreachable', 'the Zoom chat has no recipient control: no way to write to the host alone');
+      return;
+    }
+    const label = async () => norm(await r.innerText().catch(() => '')).trim();
+    if (want.test(await label())) return;
+    const option = async () => await firstVisible(page.getByRole('menuitem', { name: want })) || await firstVisible(page.getByRole('option', { name: want }))
+      || firstVisible(page.getByRole('menuitemradio', { name: want }));
+    let opt = await option();
+    if (!opt) {
+      await r.click({ timeout: 3000 }).catch(() => {});
+      for (let i = 0; i < 5 && !(opt = await option()); i++) await page.waitForTimeout(200);
+    }
     if (opt) await opt.click({ timeout: 3000 }).catch(() => {});
     await page.waitForTimeout(200);
-    const now = norm(await r.innerText().catch(() => '')).trim();
-    if (!EVERYONE.test(now)) throw new Error(`the Zoom chat can't be sent to everyone (recipient: ${now.slice(0, 60) || 'unknown'}); the host may allow chat with the host only`);
+    const now = await label();
+    if (want.test(now)) return;
+    await page.keyboard.press('Escape').catch(() => {}); // the menu, if it is still open
+    const shown = now.slice(0, 60) || 'unknown';
+    if (to === 'host') throw chatError('host-unreachable', `the Zoom chat can't be sent to the host (recipient: ${shown}; no "Host and co-hosts" to choose)`);
+    throw chatError('chat-restricted', `the Zoom chat can't be sent to everyone (recipient: ${shown}); the host may allow chat with the host only`);
   },
 
   // Enter sends unless the account set Enter to a new line: a message still in the box is sent with the Send button.
-  // Sent means a new message from Bosun ("Me", or its name) with this text shows up in the chat, not marked private;
-  // otherwise this throws (the announcement must have gone out to everyone before recording starts).
-  async sendChat(page, text, { selfName = null } = {}) {
+  // Sent means a new message from Bosun ("Me", or its name) with this text shows up in the chat, and (to everyone) not
+  // marked private; otherwise this throws with a code (chatError) saying why.
+  async sendChat(page, text, { selfName = null, to = 'everyone' } = {}) {
     await this.openChat(page);
-    await this.toEveryone(page);
+    await this.recipient(page, to);
     const box = await chatBox(page);
     const before = await this.posted(page, text, selfName);
     await box.fill(text, { timeout: 5000 });
@@ -527,17 +547,17 @@ export const zoom = {
       const send = await firstVisible(button(page, SEND));
       if (send) await send.click({ timeout: 3000 }).catch(() => {});
       for (let i = 0; i < 8 && await left(); i++) await page.waitForTimeout(150);
-      if (await left()) throw new Error('the Zoom chat message was not sent (still in the chat box)');
+      if (await left()) throw chatError('not-sent', 'the Zoom chat message was not sent (still in the chat box)');
     }
     for (let i = 0; i < 40; i++) {
       const now = await this.posted(page, text, selfName);
       if (now.count > before.count) {
-        if (now.private) throw new Error('the Zoom chat message went to one person only, not to everyone');
+        if (now.private && to !== 'host') throw chatError('sent-privately', 'the Zoom chat message went to one person only, not to everyone');
         return;
       }
       await page.waitForTimeout(250);
     }
-    throw new Error('the Zoom chat message did not show up in the chat as sent by Bosun');
+    throw chatError('not-confirmed', 'the Zoom chat message did not show up in the chat as sent by Bosun');
   },
 
   // Bosun's own chat messages reading exactly `text` (sender "Me"/"You" or selfName; texts compared as norm() does),
@@ -565,7 +585,7 @@ export const zoom = {
   // As meet.mjs: new chat messages are queued in the page under a random, non-enumerable key. Zoom groups consecutive
   // messages of one sender under one name, so a message without a name of its own takes the last one seen above it.
   async watchChat(page, key) {
-    await page.evaluate(({ key, MSG, SENDER, ITEM }) => {
+    await page.evaluate(({ key, MSG, SENDER, ITEM, TO }) => {
       if (window[key]) return;
       const q = [];
       const seen = new Map(); // id -> text queued last
@@ -579,7 +599,7 @@ export const zoom = {
           const named = item?.querySelector(SENDER) || null;
           let sender = named ? (named.innerText || named.textContent || '').trim() : null;
           if (!sender && item?.getAttribute('aria-label')) sender = item.getAttribute('aria-label').split(/ to | an | для /)[0].trim() || null;
-          sender = (sender || last || '').replace(/\s+to\s+(?:everyone|alle|всіх|всех).*$/i, '').trim().slice(0, 80) || null;
+          sender = (sender || last || '').replace(new RegExp(TO, 'iu'), '').trim().slice(0, 80) || null;
           last = sender;
           const text = (el.innerText || el.textContent || '').trim().slice(0, 2000);
           // Zoom's message ids where it has them; else sender, text and position among equal messages.
@@ -599,7 +619,7 @@ export const zoom = {
       Object.defineProperty(window, key, { value: { q, scan }, enumerable: false });
       new MutationObserver(scan).observe(document.body, { childList: true, subtree: true, characterData: true });
       scan();
-    }, { key, MSG: CHAT_MESSAGE, SENDER: CHAT_SENDER, ITEM: CHAT_ITEM });
+    }, { key, MSG: CHAT_MESSAGE, SENDER: CHAT_SENDER, ITEM: CHAT_ITEM, TO: TO_GROUP });
   },
 
   async drainChat(page, key) {
@@ -632,4 +652,4 @@ export const zoom = {
   },
 };
 
-export const _test = { TEXT, LABEL, norm };
+export const _test = { TEXT, LABEL, norm, EVERYONE, HOSTS, TO_GROUP };
