@@ -1,6 +1,10 @@
 // Helpers shared by the meeting platforms: text matching, the visible page text outside what participants control,
 // buttons, overlays, and the "microphone/camera verifiably off" check.
 
+// A chat message that could not be posted, with why as a code: chat-restricted (not to everyone), chat-unavailable (no
+// chat, or turned off), host-unreachable (no way to write to the host alone), sent-privately, not-sent, not-confirmed.
+export const chatError = (code, message) => Object.assign(new Error(message), { code });
+
 export const norm = (s) => String(s || '').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ');
 export const any = (...parts) => new RegExp(parts.join('|'), 'i');
 

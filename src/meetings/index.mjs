@@ -1,8 +1,9 @@
 // Meetings (PoC): Bosun joins a video meeting as a notetaker (a guest, or with a signed-in profile), says so in the chat, records the
 // meeting's audio to a file and leaves again. Transcription is not done here; it happens after the meeting, from the
-// recording. Consent: everyone in the chat is told before recording starts, every chat message reaches the agent as
-// an event, and a clear request not to be recorded (any of five languages, see optout.mjs) stops the recording and
-// deletes the file at once.
+// recording. Consent: the chat is told before recording starts (announce: everyone, else the host where the host allows
+// chat with the host only; or, when the caller says so, the host only or nobody), every chat message reaches the agent
+// as an event, and a clear request not to be recorded (any of five languages, see optout.mjs) stops the recording and
+// deletes the file at once, whatever the announcement mode.
 //
 // A meeting runs in a session of its own (owner meeting:<id>, so it outlives the agent's connection), in a browser
 // process of its own whose audio goes to a private PulseAudio server (audio.mjs). Platforms (platforms/*.mjs) hold
@@ -21,6 +22,7 @@ import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
 
 export const ID_RE = /^m[0-9a-f]{12}$/;
+export const ANNOUNCE_MODES = ['chat', 'host', 'none'];
 export const PLATFORMS = [meet, zoom];
 const POLL_MS = 1000;
 const ALONE_MS = 120_000; // alone in the call this long while nobody else has been there yet: leave
@@ -81,6 +83,7 @@ const sleep = (ms, signal) => new Promise((r) => {
   const t = setTimeout(() => { signal?.removeEventListener('abort', onAbort); r(); }, ms);
   signal?.addEventListener('abort', onAbort, { once: true });
 });
+const oneLine = (e) => String(e?.message || e).split('\n')[0].slice(0, 300);
 const deferred = () => { let resolve; const p = new Promise((r) => { resolve = r; }); return { p, resolve }; };
 
 // Recordings older than `days` (by modification time) are deleted, except those still being written.
@@ -215,7 +218,8 @@ export class Meetings {
 
   // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
   // meeting could not be joined (denied, not a meeting page, no audio, ...).
-  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec = null }) {
+  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, announce = 'chat', maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec = null }) {
+    if (!ANNOUNCE_MODES.includes(announce)) throw new Error(`announce must be one of ${ANNOUNCE_MODES.join(', ')}`);
     const checked = await this.check(tenant, { url, profile, engine });
     const { platform, eng } = checked;
     url = checked.url;
@@ -225,10 +229,11 @@ export class Meetings {
       id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, leaveOnOptOut,
       aloneLeaveMs: aloneLeaveSec !== null ? aloneLeaveSec * 1000 : this.aloneLeaveMs, othersSeen: false,
       announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner),
+      announceMode: announce, announced: { sent_to: null, failures: [] }, chatTo: announce === 'host' ? 'host' : 'everyone', chatError: null,
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
       createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, stopping: null, recMs: 0, file: null, deleted: false,
       info: {}, noRecord: false, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
-      ac: new AbortController(), joined: deferred(), finishing: null,
+      ac: new AbortController(), joined: deferred(), announceDone: deferred(), finishing: null,
     };
     this.active.set(id, m);
     m.task = this.run(m).catch((e) => this.finish(m, 'error', e));
@@ -287,15 +292,17 @@ export class Meetings {
     transition(m, 'admitted');
     m.admittedAt = this.now();
     m.joined.resolve();
-    // Consent first: the chat hears about the recording before it starts.
+    // Consent first: the chat hears about the recording before it starts. The chat is watched in every announce mode.
     await this.page(m, async (p) => {
       if (platform.afterAdmit) await platform.afterAdmit(p); // Zoom: computer audio joined, mic and camera off
       m.participants = await platform.participants(p);
       if (m.participants > 1) m.othersSeen = true; // someone else was here: leaving after alone_leave_sec once they go
-      await platform.openChat(p);
+      // A chat that won't open (turned off by the host) is no reason to leave; the announcement then says why it failed.
+      await platform.openChat(p).catch((e) => { m.chatError = oneLine(e); });
       await platform.watchChat(p, m.chatKey);
-      for (const t of m.announce) await this.say(m, p, t);
     });
+    await this.announce(m);
+    if (m.state === 'ended' || signal.aborted) return;
     await this.pollChat(m); // an objection that arrived meanwhile counts before anything is recorded
     if (m.state === 'ended' || signal.aborted) return;
     if (!m.optedOut && !m.noRecord) this.startRecording(m);
@@ -342,13 +349,45 @@ export class Meetings {
     }
   }
 
-  // Posts in the chat and remembers it, so the copy that shows up in the chat panel is recognized as ours.
-  async say(m, page, text) {
+  // The announcement, by mode: 'chat' to everyone, or to the host where the chat can't reach everyone; 'host' to the
+  // host only; 'none' to nobody (the caller answers for it). Recording goes ahead whatever came of it: m.announced says
+  // where it went (sent_to everyone | host | none | failed) and why not further (failures: [{to, reason, error}]), and
+  // an outcome short of the mode asked for is a bosun:meeting-announce event. Later posts (meeting_chat_send, the
+  // opt-out confirmation) go where the announcement went.
+  async announce(m) {
+    try { await this.sendAnnouncement(m); } finally { m.announceDone.resolve(); }
+  }
+
+  async sendAnnouncement(m) {
+    const a = m.announced;
+    if (m.announceMode === 'none') { a.sent_to = 'none'; return; }
+    const targets = m.announceMode === 'host' ? ['host'] : ['everyone', 'host'];
+    for (const to of targets) {
+      try {
+        await this.page(m, async (p) => { for (const t of m.announce) await this.say(m, p, t, { to }); });
+        a.sent_to = m.chatTo = to;
+        break;
+      } catch (e) {
+        if (m.state === 'ended' || m.ac.signal.aborted) return;
+        a.failures.push({ to, reason: e?.code || 'send-failed', error: oneLine(e) });
+      }
+    }
+    a.sent_to ??= 'failed';
+    if (a.sent_to !== targets[0]) {
+      const first = a.failures[0];
+      this.emit(m, 'announce', { mode: m.announceMode, sent_to: a.sent_to, reason: first.reason, error: first.error, failures: a.failures });
+    }
+  }
+
+  // Posts in the chat (to: everyone, or the host) and remembers it, so the copy that shows up in the chat panel is
+  // recognized as ours.
+  async say(m, page, text, { to = m.chatTo } = {}) {
     const e = m.echoes.get(text.trim()) || { count: 0, until: 0, norm: normalize(text) };
     m.echoes.set(text.trim(), { ...e, count: e.count + 1, until: this.now() + ECHO_MS }); // see withoutOwn
     m.pendingOwn.push(text.trim());
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
-    await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name });
+    await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name, to });
+    m.chatError = null; // the chat works after all
   }
 
   // What is left of a message once Bosun's own posts are taken out of it (live Meet shows our messages with no sender,
@@ -462,12 +501,13 @@ export class Meetings {
     if (m.finishing) return m.finishing;
     m.finishing = (async () => {
       m.reason = reason;
-      if (error) m.error = typeof error === 'string' ? error : String(error?.message || error).split('\n')[0].slice(0, 300);
+      if (error) m.error = typeof error === 'string' ? error : oneLine(error);
       const wasIn = !!m.admittedAt;
       if (m.state !== 'ended') m.state = 'ended';
       m.endedAt = this.now();
       m.ac.abort();
       m.joined.resolve();
+      m.announceDone.resolve();
       const rec = m.rec;
       if (rec) { m.rec = null; m.recMs += this.now() - rec.startedAt; m.stopping = rec; await rec.stop().catch(() => {}); }
       else if (m.stopping) await m.stopping.stop().catch(() => {});
@@ -504,6 +544,8 @@ export class Meetings {
       recording: m.file ? { path: m.file, bytes } : m.deleted ? 'deleted' : null,
       ...(m.recError ? { recording_error: m.recError } : {}),
       ...(m.optedOut ? { opted_out: { sender: m.optedOut.sender, at: m.optedOut.at } } : {}),
+      announce: { mode: m.announceMode, sent_to: m.announced.sent_to, ...(m.announced.failures.length ? { reason: m.announced.failures[0].reason, failures: m.announced.failures } : {}) },
+      ...(m.chatError ? { chat_error: m.chatError } : {}),
       chat_messages: m.chatSeq, joined_at: iso(m.createdAt), admitted_at: iso(m.admittedAt), ended_at: iso(m.endedAt),
     };
   }
@@ -521,6 +563,8 @@ export class Meetings {
   async chatSend(tenant, id, text) {
     const m = this.get(tenant, id);
     if (m.state !== 'admitted' && m.state !== 'recording') throw new Error(`meeting ${id} is ${m.state}; chat is available once admitted`);
+    await m.announceDone.p; // where the announcement went decides where this goes
+    if (m.state === 'ended') throw new Error(`meeting ${id} is ended`);
     await this.page(m, (p) => this.say(m, p, text));
     return { sent: true };
   }

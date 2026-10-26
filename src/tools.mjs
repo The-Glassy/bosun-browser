@@ -9,6 +9,7 @@ import { urlKey, httpUrl, HANDOFF_ACTIVE } from './sessions.mjs';
 export { httpUrl };
 import { MANIFEST, mcplConnection } from './events.mjs';
 import { MIN_PERIOD_MIN } from './keepalive.mjs';
+import { ANNOUNCE_MODES } from './meetings/index.mjs';
 import { meetRefusalPage } from './meetings/platforms/meet.mjs';
 import { challengeShown } from './meetings/platforms/common.mjs';
 import { BASE64_MAX_BYTES } from './uploads.mjs';
@@ -196,7 +197,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.13.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.13.1' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -584,23 +585,25 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const meetings = manager.meetings;
   if (meetings) {
     const mid = { meeting_id: z.string().max(20) };
-    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom refuses most guests). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or everyone else has left (after alone_leave_sec, default 30; 2 min while nobody else has joined yet); then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting. dry_run=true only checks the lobby (nothing is joined).',
+    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom refuses most guests). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. announce: "chat" (default) posts to everyone; where the host allows chat with the host only, to the host instead; if neither works it records anyway and says so (meeting_status announce.sent_to "failed", a bosun:meeting-announce event). "host" posts to the host only. "none" posts nothing and records without any announcement: use it only when the meeting owner told you so; you are then responsible for everyone knowing they are recorded. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or everyone else has left (after alone_leave_sec, default 30; 2 min while nobody else has joined yet); then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. Transcription is up to you, after the meeting. dry_run=true only checks the lobby (nothing is joined).',
       { url: z.string().max(2048).url().describe('https://meet.google.com/abc-defg-hij or https://zoom.us/j/<id>?pwd=… (any *.zoom.us, /w/ and /wc/ links too)'), name: str(60).optional().describe('display name for a guest (default "Glassy (notetaker)"); a signed-in profile joins under the account name'),
-        announce_text: str(1000).optional(), max_wait_admit_min: z.number().int().min(1).max(60).optional(),
+        announce_text: str(1000).optional(),
+        announce: z.enum(ANNOUNCE_MODES).optional().describe('who is told about the recording in the chat before it starts: "chat" (default: everyone, else the host), "host" (the host only), "none" (nobody; only when the meeting owner told you so). Opt-outs in the chat are heard in every mode'),
+        max_wait_admit_min: z.number().int().min(1).max(60).optional(),
         profile: z.string().regex(TENANT_RE).optional().describe('join with an existing Bosun profile signed in to Google (Meet) or Zoom (gets refused far less often than an anonymous guest)'),
         engine: z.enum(cfg.engines).optional().describe('chromium (default) or patchright; camoufox is not supported for meetings'),
         leave_on_optout: z.boolean().optional(),
         alone_leave_sec: z.number().int().min(5).max(3600).optional().describe('leave this long after everyone else left (default 30); before anyone else has joined, Bosun waits 2 min'),
         dry_run: z.boolean().optional().describe('only load the meeting page (same profile, engine and devices) and report what Bosun sees: lobby kind, the join button it would click, microphone/camera, a shown captcha; joins nothing') },
       async (a) => ok(a.dry_run ? await meetings.inspect(tenant, { url: a.url, profile: a.profile, engine: a.engine }) : await meetings.join(tenant, {
-        url: a.url, name: a.name || 'Glassy (notetaker)', announceText: a.announce_text, maxWaitAdmitMin: a.max_wait_admit_min ?? 10,
+        url: a.url, name: a.name || 'Glassy (notetaker)', announceText: a.announce_text, announce: a.announce ?? 'chat', maxWaitAdmitMin: a.max_wait_admit_min ?? 10,
         profile: a.profile, engine: a.engine, leaveOnOptOut: a.leave_on_optout ?? true, aloneLeaveSec: a.alone_leave_sec ?? null,
       })));
-    tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), platform (meet, zoom), joined_as (account, guest), participants if visible, recorded seconds; without meeting_id all your meetings.',
+    tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), platform (meet, zoom), joined_as (account, guest), participants if visible, recorded seconds, announce {mode, sent_to: everyone|host|none|failed, reason and failures when it fell short}; without meeting_id all your meetings.',
       { meeting_id: z.string().max(20).optional() }, async (a) => ok(meetings.status(tenant, a.meeting_id)));
     tool('meeting_chat_read', 'Chat messages of a meeting seen so far (others\' messages; since = last seq you have).', { ...mid, since: z.number().int().min(0).optional() },
       async (a) => ok(meetings.chatRead(tenant, a.meeting_id, a.since ?? 0)));
-    tool('meeting_chat_send', 'Post a message in the meeting chat.', { ...mid, text: z.string().min(1).max(1000) },
+    tool('meeting_chat_send', 'Post a message in the meeting chat (to whom the announcement went: everyone, or the host).', { ...mid, text: z.string().min(1).max(1000) },
       async (a) => ok(await meetings.chatSend(tenant, a.meeting_id, a.text)));
     tool('meeting_stop_recording', 'Stop recording (delete=true, default: also delete the file). The meeting goes on unrecorded.', { ...mid, delete: z.boolean().optional() },
       async (a) => ok(await meetings.stopRecordingTool(tenant, a.meeting_id, a.delete ?? true)));

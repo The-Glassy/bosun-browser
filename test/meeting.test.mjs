@@ -18,7 +18,7 @@ after(async () => { await fake.close(); });
 async function withService(fn, { env = {}, meetings = {}, audioOpts = {} } = {}) {
   const audio = fakeAudio(audioOpts);
   const svc = await startBosun({ KEEPALIVE: '0', ...env }, { meetings: { audio, platformFor: (u) => (u.startsWith(fake.base) ? meet : null), pollMs: 200, ...meetings } });
-  const ev = { chat: [], optout: [], ended: [] };
+  const ev = { chat: [], optout: [], ended: [], announce: [] };
   for (const k of Object.keys(ev)) svc.events.on(`meeting-${k}`, (e) => ev[k].push(e));
   try { return await fn(svc, ev, audio); } finally { await svc.stop(); }
 }
@@ -105,6 +105,40 @@ test('chat: every message from others is an event (own messages are not), readab
     await sleep(800);
     assert.equal((await status(c, id)).state, 'recording');
     await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('announce: chat turned off by the host (Meet has no chat to the host alone): recorded anyway, announce failed and an event; "none": nothing posted, objections still heard', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    fake.open(code);
+    fake.set(code, { chatOff: true });
+    const id = (await c.call('meeting_join', { url })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    const s = await status(c, id);
+    assert.equal(s.error, undefined);
+    assert.deepEqual([s.announce.mode, s.announce.sent_to, s.announce.reason], ['chat', 'failed', 'chat-restricted']);
+    assert.deepEqual(s.announce.failures.map((f) => [f.to, f.reason]), [['everyone', 'chat-restricted'], ['host', 'host-unreachable']]);
+    assert.match(s.announce.failures[0].error, /chat is turned off for participants/);
+    assert.equal(fake.room(code).chat.length, 0);
+    assert.equal(audio.recorders.length, 1);
+    assert.deepEqual([ev.announce.length, ev.announce[0].meeting_id, ev.announce[0].sent_to, ev.announce[0].reason], [1, id, 'failed', 'chat-restricted']);
+    await c.call('meeting_leave', { meeting_id: id });
+    // announce "none": no message; the chat is still watched, and an objection stops and deletes the recording.
+    const n = fake.newRoom();
+    fake.open(n.code);
+    const nid = (await c.call('meeting_join', { url: n.url, announce: 'none' })).json().meeting_id;
+    await until(async () => (await status(c, nid)).state === 'recording', 15_000);
+    assert.deepEqual((await status(c, nid)).announce, { mode: 'none', sent_to: 'none' });
+    assert.equal(fake.room(n.code).chat.length, 0);
+    const file = (await status(c, nid)).recording.path;
+    fake.say(n.code, 'Alex Example', "please don't record");
+    await until(() => ev.optout.length === 1, 5000);
+    assert.equal(fs.existsSync(file), false);
+    assert.deepEqual(fake.room(n.code).chat.filter((m) => m.self).map((m) => m.text), [CONFIRM_DELETED]);
+    assert.equal(ev.announce.length, 1); // "none" is what was asked for
     await c.close();
   });
 });

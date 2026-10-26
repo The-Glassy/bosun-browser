@@ -15,7 +15,7 @@ export const NEEDS_HUMAN = 'bosun:needs-human';
 export const WATCH_SET = 'bosun.watch';
 export const WATCH_CHANGED = 'bosun:watch-changed';
 export const MEETING_SET = 'bosun.meeting';
-export const MEETING_TAGS = { chat: 'bosun:meeting-chat', optout: 'bosun:meeting-optout', ended: 'bosun:meeting-ended' };
+export const MEETING_TAGS = { chat: 'bosun:meeting-chat', optout: 'bosun:meeting-optout', ended: 'bosun:meeting-ended', announce: 'bosun:meeting-announce' };
 export const DOWNLOAD_SET = 'bosun.download';
 export const DOWNLOAD = 'bosun:download';
 export const MANIFEST = {
@@ -39,13 +39,14 @@ export const MANIFEST = {
       },
     },
     [MEETING_SET]: {
-      description: 'Push events from a meeting Bosun attends as a notetaker (meeting_join): every chat message, a participant opting out of the recording (recording stopped and deleted), and the end of the meeting with a reference to the audio recording.',
+      description: 'Push events from a meeting Bosun attends as a notetaker (meeting_join): every chat message, a participant opting out of the recording (recording stopped and deleted), an announcement that reached fewer people than asked (the host only, or nobody), and the end of the meeting with a reference to the audio recording.',
       uses: ['pushEvents'],
       tagOntology: {
         tags: {
           [MEETING_TAGS.chat]: { desc: 'a chat message in the meeting (origin: meeting_id, sender, text)' },
           [MEETING_TAGS.optout]: { desc: 'someone asked not to be recorded; the recording was stopped and deleted' },
           [MEETING_TAGS.ended]: { desc: 'Bosun left the meeting; origin carries duration and the recording (if any)' },
+          [MEETING_TAGS.announce]: { desc: 'the recording announcement reached only the host, or could not be posted (origin: mode, sent_to host|failed, reason, error); Bosun records anyway' },
         },
         keyed: { 'bosun:meeting': { open: true }, 'bosun:platform': { values: ['meet', 'zoom'] } },
       },
@@ -89,10 +90,11 @@ export function watchEvent({ profile, label, old, new: now, url }) {
   };
 }
 
-// Meeting events -> push/event params. kind: chat | optout | ended; data goes into origin.
+// Meeting events -> push/event params. kind: chat | optout | announce | ended; data goes into origin.
 export function meetingEvent(kind, { meeting_id, platform, ...data }) {
   const text = kind === 'chat' ? `Meeting ${meeting_id} chat — ${data.sender || 'someone'}: ${data.text}`
     : kind === 'optout' ? `Meeting ${meeting_id}: ${data.sender || 'someone'} asked not to be recorded ("${data.text}"). The recording was stopped and deleted${data.left ? ' and Bosun left the meeting' : ''}.`
+    : kind === 'announce' ? `Meeting ${meeting_id}: the recording announcement ${data.sent_to === 'host' ? 'went to the host only' : 'could not be posted in the chat'} (${data.reason}: ${data.error}). Bosun records anyway; a request not to be recorded in the chat still stops it.`
     : `Meeting ${meeting_id} ended for Bosun (${data.reason}) after ${data.duration_s} s.${data.recording ? ` Recording: ${data.recording.bytes} bytes, ${data.recording.path}.` : ' No recording.'}`;
   const content = [{ type: 'text', text }];
   if (kind === 'ended' && data.recording) {
@@ -181,7 +183,7 @@ export class EventBus extends EventEmitter {
     return this.publish(e.tenant, needsHumanEvent(e));
   }
 
-  // From the meeting manager: kind chat | optout | ended, e = {tenant, meeting_id, platform, ...}.
+  // From the meeting manager: kind chat | optout | announce | ended, e = {tenant, meeting_id, platform, ...}.
   meeting(kind, { tenant, ...e }) {
     this.emit(`meeting-${kind}`, { tenant, ...e });
     return this.publish(tenant, meetingEvent(kind, e));

@@ -38,8 +38,9 @@ const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 // control's tooltip, icon names and label inside the message element; Bosun's own messages carry no sender at all,
 // others' sit under a plain header line with the name.
 // liveChat 'twice': each of Bosun's own messages is rendered twice, as sent and again under a new id once confirmed
-// (live Meet, 2026-10-23 11:14: the second copy came through as a chat event from "someone").
-function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false }) {
+// (live Meet, 2026-10-23 11:14: the second copy came through as a chat event from "someone"). chatOff: the host
+// turned chat off for participants (the message box is shown, disabled).
+function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false, chatOff = false }) {
   const L = UI[lang];
   const de = lang === 'de';
   const joinButtons = elsewhere
@@ -75,7 +76,7 @@ ${live ? `<div role="alert"><h2><span aria-hidden="true">error</span>${esc(L.noC
 <div id="pending" hidden></div>
 <div id="call" hidden><div id="topic">${esc(title || '')}</div><div id="tiles"></div><div id="captions" class="caption-text"></div>
   <div role="toolbar"><button aria-label="${esc(L.chat)}">chat</button><button aria-label="${esc(L.leave)}">leave</button></div>
-  <aside id="panel" hidden><div role="list" id="msgs"></div><textarea aria-label="${esc(L.send)}"></textarea></aside></div>
+  <aside id="panel" hidden><div role="list" id="msgs"></div><textarea aria-label="${esc(L.send)}"${chatOff ? ' disabled' : ''}></textarea></aside></div>
 <div id="over" hidden><h1 id="overText"></h1></div>
 <script>
 const L = ${JSON.stringify(L)}, TOGGLES = ${JSON.stringify(toggles)};
