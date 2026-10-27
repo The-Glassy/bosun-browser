@@ -7,7 +7,7 @@ import fs from 'fs';
 import http from 'http';
 import path from 'path';
 import { loadConfig } from '../src/config.mjs';
-import { Macros, checkArgs, checkMacro, onSite, parseMacroSource, resolveStep, riskyIn } from '../src/macros.mjs';
+import { Macros, checkArgs, checkMacro, onSite, parseMacroSource, resolveStep, riskyIn, runMacro } from '../src/macros.mjs';
 import { parseHostPattern } from '../src/allow.mjs';
 import { startBosun, connect, tmpDir, TOKEN } from './helpers.mjs';
 
@@ -32,6 +32,11 @@ function serverA() {
           await fetch('/up?name=' + encodeURIComponent(file.name), { method: 'POST', body: await file.text() });
           document.getElementById('st').textContent = 'Uploaded: ' + file.name;
         };</script>`);
+    }
+    if (u.pathname === '/late') { // a password field and a "Buy now" button that show up after a second
+      return html(res, `<title>Late</title><p>loading</p><script>setTimeout(() => {
+        document.body.insertAdjacentHTML('beforeend', '<input id="lpw" type="password"><button id="lb">Buy now</button>');
+      }, 1000);</script>`);
     }
     if (u.pathname === '/up') {
       let body = '';
@@ -58,7 +63,12 @@ function serverA() {
     res.end();
   });
 }
-const serverB = () => http.createServer((req, res) => html(res, '<title>Elsewhere</title><p>off the site</p>'));
+const pressedOnB = [];
+const serverB = () => http.createServer((req, res) => {
+  if (req.url.startsWith('/pressed')) { pressedOnB.push(req.url); res.end('ok'); return; }
+  html(res, `<title>Elsewhere</title><p>off the site</p><input id="q" autofocus>
+    <script>addEventListener('keydown', () => fetch('/pressed'));</script>`);
+});
 
 let A, B, svc, c;
 before(async () => {
@@ -181,6 +191,40 @@ test('onSite: about:blank is no page, error pages and other hosts or ports are o
   for (const u of ['https://plaud.ai.evil.example/', 'http://127.0.0.1:4849/', 'chrome-error://chromewebdata/', 'data:text/html,x', 'https://evil.example/?https://web.plaud.ai']) assert.equal(onSite(p, u), false, u);
 });
 
+// A page side that records what the runner asks of it.
+const fakeOps = (over = {}) => {
+  const calls = [];
+  return {
+    calls,
+    allowed: () => null, limitOf: (t) => (t === 'assert' ? 1500 : 60000), url: () => 'https://a.example/',
+    watch: () => ({ seen: () => null, stop() {} }), failure: async () => ({ url: 'https://a.example/' }),
+    step: async (tool, args, limitMs, _signal, hooks) => { calls.push({ tool, args, limitMs, hooks }); return { content: [{ type: 'text', text: '{}' }] }; },
+    assert: async (c, limitMs, hooks) => { calls.push({ tool: 'assert', c, limitMs, hooks }); },
+    ...over,
+  };
+};
+
+test('runMacro: assert gets the wait_for deadline; every step the guard, click and type the vet; cancelled runs say not_run', async () => {
+  const m = { ...checkMacro({ name: 'u', site: ['a.example'], steps: [{ tool: 'assert', text: 'x', timeoutMs: 60000 }, { tool: 'click', text: 'Go' }, { tool: 'type', selector: '#q', value: 'v' }, { tool: 'press', key: 'Enter' }] }), version: 1 };
+  const ops = fakeOps();
+  const { result } = await runMacro(m, { args: {}, ops });
+  assert.equal(result.ok, true);
+  assert.equal(ops.calls[0].limitMs, 1500); // TOOL_TIMEOUTS wait_for, not the assert's own 60 s
+  assert.equal(ops.calls[0].c.timeoutMs, 500); // and the wait ends before that: 1500 - 500 reserve - 500
+  for (const c of ops.calls) assert.equal(typeof c.hooks.guard, 'function', c.tool);
+  assert.deepEqual(ops.calls.map((c) => [c.tool, typeof c.hooks.vet]), [['assert', 'undefined'], ['click', 'function'], ['type', 'function'], ['press', 'object']]);
+  // The guard refuses a page off the site, and one the step navigated off of before acting.
+  assert.throws(() => ops.calls[3].hooks.guard({ page: { url: () => 'https://b.example/' } }), /the page is at b\.example, outside this macro's site/);
+  const ab = new AbortController();
+  ab.abort();
+  const cancelled = (await runMacro(m, { args: {}, ops: fakeOps(), signal: ab.signal })).result;
+  assert.deepEqual(cancelled.steps.map((x) => x.status), ['not_run', 'not_run', 'not_run', 'not_run']);
+  assert.match(cancelled.failure.error, /cancelled/);
+  const late = (await runMacro(m, { args: {}, ops: fakeOps(), maxMs: 500 })).result;
+  assert.equal(late.steps[0].status, 'not_run');
+  assert.match(late.failure.error, /time ran out \(timeout_sec 1\)/);
+});
+
 test('BROWSER_MACRO_SOURCE: only a read-only tenant reads another tenant\'s macros', () => {
   const env = { BROWSER_TOKENS: 'me:aaaaaaaaaaaaaaaaaaaa,swarm:bbbbbbbbbbbbbbbbbbbb', BROWSER_TOKEN_POLICIES: 'swarm=ephemeral' };
   assert.deepEqual([...loadConfig({ ...env, BROWSER_MACRO_SOURCE: 'swarm=me' }).macroSource], [['swarm', 'me']]);
@@ -273,6 +317,7 @@ test('a failing assert stops the run with the step, the error, the URL, the page
   assert.equal(out.ok, false);
   assert.deepEqual(out.steps.map((x) => x.status), ['ok', 'failed_optional', 'ok', 'failed', 'not_run']);
   assert.match(out.steps[1].error, /Timeout|waiting for/i);
+  assert.doesNotMatch(r.text, /Call log/); // errors as the tools give them: no Playwright call log
   assert.equal(out.failure.step, 4);
   assert.equal(out.failure.tool, 'assert');
   assert.match(out.failure.error, /assert failed: text "Transcript ready" is not visible within 500 ms/);
@@ -361,6 +406,56 @@ test('a secret goes in only through a secret_id param, typed by the type handler
   const pw = (await c.call('macro_run', { name: 'pw-arg', session: s, args: { p: 'hunter2' } })).json();
   assert.equal(pw.failure.step, 2);
   assert.match(pw.failure.error, /refused: this is a password field; in a macro it takes only secret_id/);
+  await c.call('session_close', { session: s });
+});
+
+test('a step queued behind a navigation off the site is not run there', async () => {
+  assert.equal((await c.call('macro_save', { name: 'queued', site: [A.host], steps: [
+    { tool: 'navigate', url: `${A.base}/app` },
+    { tool: 'wait_for', text: 'never', timeoutMs: 1500, optional: true },
+    { tool: 'press', key: 'x' },
+  ] })).isError, false);
+  const s = await c.open();
+  pressedOnB.length = 0;
+  const run = c.call('macro_run', { name: 'queued', session: s });
+  await new Promise((r) => setTimeout(r, 1400)); // the macro's step 1 is done and step 2 holds the session
+  const nav = await c.call('navigate', { session: s, url: `${B.base}/` }); // queued behind step 2
+  assert.equal(nav.json().title, 'Elsewhere');
+  const out = (await run).json();
+  assert.equal(out.ok, false);
+  assert.equal(out.failure.step, 3);
+  assert.match(out.failure.error, new RegExp(`the page (is at|went to) ${B.host.replace(/\./g, '\\.')}, outside this macro's site`));
+  assert.equal(out.steps[2].status, 'failed');
+  assert.deepEqual(pressedOnB, []); // the key never reached the page off the site
+  await c.call('session_close', { session: s });
+});
+
+test('click and type look at the element they act on, and refuse when they cannot (late elements too)', async () => {
+  assert.equal((await c.call('macro_save', { name: 'late-pw', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/late` }, { tool: 'type', selector: '#lpw', value: 'plain' }] })).isError, false);
+  assert.equal((await c.call('macro_save', { name: 'late-buy', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/late` }, { tool: 'click', selector: '#lb' }] })).isError, false);
+  assert.equal((await c.call('macro_save', { name: 'gone', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/late` }, { tool: 'click', selector: '#never', optional: true }] })).isError, false);
+  const s = await c.open();
+  const page = () => [...svc.manager.sessions.values()].find((x) => x.id === s).page;
+  const pw = (await c.call('macro_run', { name: 'late-pw', session: s })).json();
+  assert.match(pw.failure.error, /refused: this is a password field/);
+  assert.equal(await page().evaluate(() => document.getElementById('lpw').value), '');
+  const buy = (await c.call('macro_run', { name: 'late-buy', session: s })).json();
+  assert.match(buy.failure.error, /refused: the element says "Buy now"/);
+  const gone = (await c.call('macro_run', { name: 'gone', session: s })).json();
+  assert.equal(gone.steps[1].status, 'failed_optional'); // no element: nothing clicked, the run goes on
+  await c.call('session_close', { session: s });
+});
+
+test('the run cap bounds a long step', async () => {
+  assert.equal((await c.call('macro_save', { name: 'long', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/app` }, { tool: 'wait_for', text: 'never', timeoutMs: 60000 }, { tool: 'press', key: 'x' }] })).isError, false);
+  const s = await c.open();
+  const t0 = Date.now();
+  const out = (await c.call('macro_run', { name: 'long', session: s, timeout_sec: 10 }, { timeout: 120_000 })).json();
+  assert.ok(Date.now() - t0 < 10_000 + 5_000, `took ${Date.now() - t0} ms`); // plus the failure report
+  assert.equal(out.failure.step, 2);
+  assert.match(out.failure.error, /Timeout \d+ms exceeded/); // the wait itself ended in time: no tab was replaced
+  assert.equal(out.failure.url, `${A.base}/app`);
+  assert.equal(out.steps[2].status, 'not_run');
   await c.call('session_close', { session: s });
 });
 

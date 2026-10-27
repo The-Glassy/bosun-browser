@@ -9,6 +9,7 @@ import path from 'path';
 import { z } from 'zod';
 import { allowsUrl, parseHostPattern, showPattern } from './allow.mjs';
 import { TENANT_RE } from './auth.mjs';
+import { reserveMs } from './deadline.mjs';
 
 export const MACRO_NAME_RE = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 const PARAM_RE = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/;
@@ -23,7 +24,6 @@ export const MAX_DOC_BYTES = 256 * 1024;
 export const RUN_DEFAULT_SEC = 300;
 export const RUN_MAX_SEC = 900;
 export const STEP_TOOLS = ['navigate', 'click', 'type', 'select', 'press', 'wait_for', 'upload', 'download_wait', 'read', 'screenshot', 'assert'];
-const ASSERT_WAIT_MS = 5000; // default wait of an assert step
 
 // What a step may not do without confirm_risky at save time: pay, buy, order, check out, delete an account.
 // Matched against every string of a step (and, when it runs, against the text of the element a click hits).
@@ -278,15 +278,18 @@ export const onSite = (patterns, url) => isBlank(url) || allowsUrl(patterns, url
 const hostOf = (u) => { try { return new URL(u).host || u.slice(0, 60); } catch { return String(u).slice(0, 60); } };
 
 // Runs macro m (a stored version) step by step. ops is the page side, given by tools.mjs:
-//   allowed(tool) -> null | why not;  step(tool, args, limitMs, signal) -> MCP result of that tool;
-//   limitOf(tool) -> ms | null;  assert(cond, limitMs);  element(target, limitMs) -> {label, kind} of the element;
+//   allowed(tool) -> null | why not;  limitOf(tool) -> ms | null (the tool's deadline);
+//   step(tool, args, limitMs, signal, hooks) -> MCP result of that tool;  assert(cond, limitMs, hooks);
 //   url() -> current URL;  watch(isOff) -> {seen() -> first off-site URL navigated to, stop()};
-//   failure(why) -> {url, title, a11y, screenshot} (best effort);  progress(done, total, message).
+//   failure() -> {url, title, page, screenshot} (best effort);  progress(done, total, message).
+// hooks (deadline.mjs withDeadline): guard(s), run in the session's queue right before each page operation of the
+// step, refuses a page off the site; vet(handle), run by click and type on the element they act on.
 // Returns { result (JSON-able), images: [{step, data}] }.
 export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SEC * 1000, signal, ops }) {
   const values = checkArgs(m, args);
   const patterns = m.site.map(parseHostPattern);
   const off = (u) => !onSite(patterns, u);
+  const sites = m.site.join(', ');
   const resolved = m.steps.map((st) => resolveStep(st, values));
   const res = { macro: m.name, version: m.version, ok: true, steps: [] };
   // Refusals that hold whatever the page shows: a tool this token may not use, a navigate off the site, risky text
@@ -296,7 +299,7 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
     const st = r.step;
     const why = ops.allowed(st.tool);
     if (why) fail(`step ${i + 1} (${st.tool}): ${why}`);
-    if (st.tool === 'navigate' && off(st.url)) fail(`step ${i + 1} (navigate): ${hostOf(st.url)} is not in this macro's site (${m.site.join(', ')})`);
+    if (st.tool === 'navigate' && off(st.url)) fail(`step ${i + 1} (navigate): ${hostOf(st.url)} is not in this macro's site (${sites})`);
     const risky = riskyIn(stepText(st));
     if (risky && !m.confirm_risky) fail(`step ${i + 1} (${st.tool}): refused, "${risky}" (the args make it a step that may pay, buy, order, check out or delete an account; the macro was not saved with confirm_risky)`);
   }
@@ -316,15 +319,28 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
     res.steps.push(rec);
     if (!r.step) { Object.assign(rec, { status: 'skipped', reason: `param ${r.missing.join(', ')} not given` }); continue; }
     const st = r.step;
-    if (signal?.aborted) { failure = { step: n, tool, error: 'the run was cancelled (the MCP request was cancelled or timed out on the client)', fatal: true, noPage: true }; break; }
-    const left = end - Date.now();
-    if (left < 1000) { failure = { step: n, tool, error: `the run's time ran out (timeout_sec ${Math.round(maxMs / 1000)})`, fatal: true }; break; }
+    const stop = signal?.aborted ? 'the run was cancelled (the MCP request was cancelled or timed out on the client)'
+      : end - Date.now() < 1000 ? `the run's time ran out (timeout_sec ${Math.round(maxMs / 1000)})` : null;
+    if (stop) {
+      rec.status = 'not_run';
+      failure = { step: n, tool, error: stop, noPage: !!signal?.aborted };
+      break;
+    }
     let w = null;
     try {
-      const here = ops.url();
-      if (st.tool !== 'navigate' && off(here)) throw Object.assign(new Error(`the page is at ${hostOf(here)}, outside this macro's site (${m.site.join(', ')})`), { fatal: true });
+      if (st.tool !== 'navigate') {
+        const here = ops.url();
+        if (off(here)) throw refusal(`the page is at ${hostOf(here)}, outside this macro's site (${sites})`);
+      }
       w = ops.watch(off);
-      const out = await runStep(st, { ops, left, signal, confirmRisky: m.confirm_risky, pending });
+      // Checked again in the session's queue, right before each page operation of the step: the page may have
+      // moved since (another call on the session, a page that navigates by itself).
+      const guard = (s) => {
+        const seen = w.seen();
+        if (seen) throw refusal(`the page went to ${hostOf(seen)}, outside this macro's site (${sites})`);
+        if (st.tool !== 'navigate' && off(s.page.url())) throw refusal(`the page is at ${hostOf(s.page.url())}, outside this macro's site (${sites})`);
+      };
+      const out = await runStep(st, { ops, end, signal, guard, confirmRisky: m.confirm_risky, pending });
       Object.assign(rec, out.rec);
       if (out.read !== undefined) reads.push({ step: n, ...(st.as ? { as: st.as } : {}), text: out.read });
       if (out.downloads) {
@@ -334,7 +350,7 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
       if (out.image) images.push({ step: n, data: out.image });
     } catch (e) {
       rec.error = String(e?.message || e).slice(0, 1000);
-      if (e?.fatal || !st.optional) failure = { step: n, tool, error: rec.error, fatal: !!e?.fatal, noPage: !!e?.noPage };
+      if (e?.fatal || !st.optional) failure = { step: n, tool, error: rec.error };
     } finally {
       const seen = w?.seen();
       w?.stop();
@@ -342,8 +358,8 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
       let now = null;
       try { now = ops.url(); } catch {}
       const away = seen ?? (now && off(now) ? now : null);
-      if (away && !(failure && failure.step === n)) failure = { step: n, tool, error: `the page went to ${hostOf(away)}, outside this macro's site (${m.site.join(', ')}); the run stopped`, fatal: true };
-      else if (away && failure) failure.error += `; the page went to ${hostOf(away)}, outside this macro's site`;
+      if (away && !failure) failure = { step: n, tool, error: `the page went to ${hostOf(away)}, outside this macro's site (${sites}); the run stopped` };
+      else if (away && !failure.error.includes(hostOf(away))) failure.error += `; the page went to ${hostOf(away)}, outside this macro's site`;
       rec.ms = Date.now() - t0;
     }
     if (failure) { rec.status = 'failed'; break; }
@@ -355,7 +371,7 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
   if (downloads.length) res.downloads = downloads;
   if (failure) {
     res.ok = false;
-    const { noPage, fatal, ...f } = failure;
+    const { noPage, ...f } = failure;
     res.failure = { ...f, ...(noPage ? {} : await ops.failure().catch(() => ({}))) };
     if (res.failure.screenshot) { images.push({ step: failure.step, data: res.failure.screenshot, failure: true }); res.failure.screenshot = 'attached (image after this text)'; }
     res.next = 'fix the step (macro_get, then macro_save a new version) or the page state, and run again';
@@ -363,34 +379,63 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
   return { result: res, images };
 }
 
+// An error that stops the run even in an optional step.
+const refusal = (msg) => Object.assign(new Error(msg), { fatal: true });
 const json = (r) => { const t = r?.content?.find((c) => c.type === 'text')?.text; try { return JSON.parse(t); } catch { return t ?? null; } };
 
-// One step; returns { rec (what to report), read?, downloads?, image? } or throws.
-async function runStep(st, { ops, left, signal, confirmRisky, pending }) {
+// Runs in the page, on the element a click or type step is about to act on: what it says, and its kind.
+function describe(el) {
+  return {
+    label: [el.innerText, el.value, el.getAttribute('aria-label'), el.title].filter((x) => typeof x === 'string' && x).join(' ').slice(0, 500),
+    kind: el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName,
+  };
+}
+
+// One step; returns { rec (what to report), read?, downloads?, image? } or throws. Every page operation gets what is
+// left of the run at most, and the step's tool deadline at most.
+async function runStep(st, { ops, end, signal, guard, confirmRisky, pending }) {
   const { tool, optional, note, as, ...a } = st;
-  const limit = (name) => Math.min(ops.limitOf(name) ?? left, left);
+  const limit = (name) => {
+    const ms = Math.min(ops.limitOf(name) ?? Infinity, end - Date.now());
+    if (ms < 1000) throw refusal(`the run's time ran out`);
+    return ms;
+  };
+  // A wait of the step's own ends before its deadline cuts it off: a cut-off wait would keep the page busy (and
+  // the session's next call waiting) for the rest of it.
+  const within = (ms, wait) => Math.max(1, Math.min(wait, ms - reserveMs(ms) - 500));
   if (tool === 'assert') {
-    await ops.assert(a, Math.min(left, (a.timeoutMs ?? ASSERT_WAIT_MS) + 15_000));
+    const ms = limit('assert');
+    await ops.assert({ ...a, timeoutMs: within(ms, a.timeoutMs ?? 5000) }, ms, { guard });
     return { rec: {} };
   }
-  if (tool === 'click' && !confirmRisky) {
-    // What the element says, not only how the step finds it: a selector can point at a "Buy now" button.
-    const el = await ops.element(a, Math.min(left, 20_000)).catch(() => null);
-    const risky = riskyIn(el?.label);
-    if (risky) throw Object.assign(new Error(`refused: the element says "${risky}" (a macro that may pay, buy, order, check out or delete an account needs confirm_risky at save time)`), { fatal: true });
-  }
-  if (tool === 'type' && a.value !== undefined) {
-    // A password goes into a macro only by secret_id: never stored in it, nor passed through the agent as an arg.
-    const el = await ops.element(a, Math.min(left, 20_000)).catch(() => null);
-    if (el?.kind === 'password') throw Object.assign(new Error('refused: this is a password field; in a macro it takes only secret_id: "{{param}}" (a param of type secret_id)'), { fatal: true });
+  if (tool === 'wait_for') {
+    const ms = limit('wait_for');
+    await ops.step(tool, { ...a, timeoutMs: within(ms, a.timeoutMs ?? 15000) }, ms, signal, { guard });
+    return { rec: {} };
   }
   if (tool === 'download_wait') {
     const took = pending.shift() ?? null; // already in the run's downloads
-    const r = took ?? json(await ops.step(tool, { timeoutMs: Math.min(a.timeoutMs ?? 30000, Math.max(0, left - 1000)) }, null, signal));
+    const ms = limit('download_wait');
+    const r = took ?? json(await ops.step(tool, { timeoutMs: Math.min(a.timeoutMs ?? 30000, Math.max(0, ms - 1000)) }, ms, signal, { guard }));
     if (r?.state !== 'ready') throw new Error(r?.state === 'none' || !r?.state ? 'no download finished in time' : `download ${r.state}${r.reason ? `: ${r.reason}` : ''}`);
     return { rec: { download_id: r.download_id, filename: r.filename }, ...(took ? {} : { downloads: [r] }) };
   }
-  const r = await ops.step(tool, a, limit(tool), signal);
+  // The element a click or type acts on is looked at first, in the same operation (tools.mjs onTarget); if that
+  // fails, nothing is done.
+  let vet = null;
+  if (tool === 'click' && !confirmRisky) {
+    // What the element says, not only how the step finds it: a selector can point at a "Buy now" button.
+    vet = async (h) => {
+      const risky = riskyIn((await h.evaluate(describe)).label);
+      if (risky) throw refusal(`refused: the element says "${risky}" (a macro that may pay, buy, order, check out or delete an account needs confirm_risky at save time)`);
+    };
+  } else if (tool === 'type' && a.value !== undefined) {
+    // A password goes into a macro only by secret_id: never stored in it, nor passed through the agent as an arg.
+    vet = async (h) => {
+      if ((await h.evaluate(describe)).kind === 'password') throw refusal('refused: this is a password field; in a macro it takes only secret_id: "{{param}}" (a param of type secret_id)');
+    };
+  }
+  const r = await ops.step(tool, a, limit(tool), signal, { guard, vet });
   if (tool === 'screenshot') return { rec: {}, image: r.content.find((c) => c.type === 'image')?.data };
   if (tool === 'read') {
     // "url: …\ntitle: …\nchars: N[ (truncated to M)]\n\n<text>": the step reports the head, reads get the text.

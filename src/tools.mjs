@@ -87,6 +87,17 @@ function locate(p, t) {
 const str = (n) => z.string().max(n);
 const target = { ref: str(20).optional().describe('element ref from read (e.g. "e12")'), role: str(40).optional(), name: str(1000).optional(), selector: str(2000).optional(), text: str(1000).optional() };
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
+// Runs act on the element l finds. In a macro step (macros.mjs) the call's vet looks at that element first, and the
+// action goes to the very element it passed (a handle), in the same page operation.
+async function onTarget(l, act) {
+  const vet = currentCall()?.vet;
+  if (!vet) return act(l);
+  const h = await l.elementHandle({ timeout: 15000 });
+  try {
+    await vet(h);
+    return await act(h);
+  } finally { await h.dispose().catch(() => {}); }
+}
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
 // Runs in the page: drags the files of input i onto el (dragenter, dragover, drop, dragleave). true when the page
@@ -310,7 +321,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target }, async (a) => run(a.session, async (s) => {
     const mark = capture?.mark();
-    await locate(s.page, a).click({ timeout: 15000 });
+    await onTarget(locate(s.page, a), (t) => t.click({ timeout: 15000 }));
     await s.page.waitForTimeout(1000);
     const dl = capture ? await capture.since(s.id, mark) : [];
     const w = noteWall(s, await wall(s.page));
@@ -326,8 +337,10 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       return run(a.session, async (s) => {
         const l = locate(s.page, a);
         if (a.secret_id !== undefined) return ok(await typeSecret(s, l, a));
-        await l.fill(a.value, { timeout: 15000 });
-        if (a.submit) { await l.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
+        await onTarget(l, async (t) => {
+          await t.fill(a.value, { timeout: 15000 });
+          if (a.submit) { await t.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
+        });
         return ok(await pageInfo(s.page));
       });
     });
@@ -610,7 +623,9 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   // to the tool.
   const macros = manager.macros;
   if (macros) {
-    // The page side of a run (macros.mjs runMacro) in one session of this connection.
+    // The page side of a run (macros.mjs runMacro) in one session of this connection. Errors come out as the tools'
+    // do (cleanError: no Playwright call log, which can quote the page), keeping err.fatal.
+    const clean = (e) => { throw Object.assign(new Error(cleanError(e)), { fatal: !!e?.fatal }); };
     const macroOps = (session, extra) => {
       const progressToken = extra?._meta?.progressToken;
       const page = () => {
@@ -618,12 +633,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         if (s.handoff) throw new Error(HANDOFF_ACTIVE);
         return s.page;
       };
-      const step = async (name, args, limitMs, signal) => {
+      // One step: the handler of its tool, its arguments parsed by that tool's schema, under limitMs (the tool's
+      // deadline or what is left of the run), with the step's guard and vet (deadline.mjs withDeadline).
+      const step = async (name, args, limitMs, signal, hooks) => {
         const h = handlers.get(name);
         const r = h.schema.safeParse({ ...args, session });
         if (!r.success) throw new Error(`invalid step: ${r.error.issues.map((i) => `${i.path.join('.') || name}: ${i.message}`).join('; ')}`);
-        const go = () => h.fn(r.data, { signal });
-        return limitMs ? withDeadline(name, limitMs, go) : go();
+        return withDeadline(name, limitMs, () => h.fn(r.data, { signal }), hooks).catch(clean);
       };
       return {
         allowed: (name) => (name === 'assert' || handlers.has(name) ? null : `${name} is not available for this token`),
@@ -638,7 +654,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
           p.on('framenavigated', on);
           return { seen: () => seen, stop: () => p.off('framenavigated', on) };
         },
-        assert: (c, limitMs) => withDeadline('assert', limitMs, () => run(session, async (s) => {
+        assert: (c, limitMs, hooks) => withDeadline('assert', limitMs, () => run(session, async (s) => {
           const t = c.timeoutMs ?? 5000;
           const failed = (what) => (e) => { throw e?.name === 'TimeoutError' ? new Error(`assert failed: ${what} within ${t} ms`) : e; };
           if (c.url_contains !== undefined) {
@@ -650,13 +666,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
           if (c.selector !== undefined) await s.page.locator(c.selector).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`no visible element matches selector ${c.selector}`));
           if (c.text !== undefined) await s.page.getByText(c.text).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`text "${c.text}" is not visible`));
           return true;
-        })),
-        // The element a click or type step targets: what it says (visible text, value, aria-label, title) and its
-        // kind (an <input>'s type, else its tag).
-        element: (t, limitMs) => withDeadline('element', limitMs, () => run(session, (s) => locate(s.page, t).evaluate((el) => ({
-          label: [el.innerText, el.value, el.getAttribute('aria-label'), el.title].filter((x) => typeof x === 'string' && x).join(' ').slice(0, 500),
-          kind: el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName,
-        }), null, { timeout: 5000 }))),
+        }), hooks).catch(clean),
         // Where the run stopped: URL, title and the start of the a11y snapshot (masked as read masks it), and a
         // screenshot (masked as screenshot masks it).
         async failure() {
