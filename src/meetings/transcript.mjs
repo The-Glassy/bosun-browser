@@ -78,15 +78,19 @@ export class TranscriptUsage {
     this.dirty = true;
   }
 
+  // Written by rename. A write that fails stays due and is tried again in 30 s (also when no stream runs any more).
   save() {
     if (!this.dirty) return;
-    this.dirty = false;
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
       const tmp = `${this.file}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify(this.state), { mode: 0o600 });
       fs.renameSync(tmp, this.file);
-    } catch (e) { console.error(`bosun: live transcript usage not saved (${e.code || e.message})`); }
+      this.dirty = false;
+    } catch (e) {
+      console.error(`bosun: live transcript usage not saved (${e.code || e.message}); trying again in 30 s`);
+      if (!this.retry) { this.retry = setTimeout(() => { this.retry = null; this.save(); }, 30_000); this.retry.unref?.(); }
+    }
   }
 }
 
@@ -139,8 +143,12 @@ export class LiveTranscript {
       this.buffer.push({ buf, at: this.pos });
       this.pos += CHUNK_BYTES / BYTES_PER_SEC;
     }
-    // Down for longer than BUFFER_SEC: the oldest audio goes (that stretch gets no transcript).
-    while (this.buffer.length > (BUFFER_SEC * BYTES_PER_SEC) / CHUNK_BYTES) this.buffer.shift();
+    // Down (or too slow) for longer than BUFFER_SEC: the oldest audio goes, and that stretch gets no transcript. A session
+    // that already had audio would now get it with a hole, and its word times would be off: it is replaced, and the next
+    // one starts at the first chunk kept.
+    let gap = false;
+    while (this.buffer.length > (BUFFER_SEC * BYTES_PER_SEC) / CHUNK_BYTES) { this.buffer.shift(); gap = true; }
+    if (gap && this.state === 'live' && this.sessionSent) return this.dropped(this.ws, 'stalled', `ElevenLabs fell more than ${BUFFER_SEC} s behind`);
     this.flush();
   }
 

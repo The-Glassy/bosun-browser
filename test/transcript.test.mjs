@@ -332,6 +332,34 @@ test('NODE_DEBUG set: no connection with the key (Node would log its headers)', 
   } finally { delete process.env.NODE_DEBUG; }
 });
 
+test('a usage file that could not be written stays due and is written later', () => {
+  const dir = tmpDir();
+  const file = path.join(dir, 'sub', 'u.json');
+  fs.writeFileSync(path.join(dir, 'sub'), 'not a directory'); // the write fails (ENOTDIR)
+  const u = new TranscriptUsage({ file, tz: 'Europe/Vienna', capMin: 60 });
+  u.add('alice', 30);
+  u.save();
+  assert.equal(u.dirty, true);
+  clearTimeout(u.retry); u.retry = null;
+  fs.rmSync(path.join(dir, 'sub'));
+  u.save();
+  assert.equal(u.dirty, false);
+  assert.equal(new TranscriptUsage({ file, tz: 'Europe/Vienna', capMin: 60 }).used('alice'), 30);
+});
+
+test('audio that falls more than 20 s behind on a live session: that session is replaced, so word times stay right', async () => {
+  el.st.stall = true;
+  const n = el.conns.length;
+  const b = live(source(silence(120), { speed: 40 }), { limits: { unsentBytes: 64 * 1024, stallMs: 1e9 } });
+  try {
+    await until(() => el.conns.length >= n + 1 && el.conns.at(-1).stalled, 5000);
+    el.st.stall = false;
+    // The socket holds what it may and never counts as stuck (no stall limit here), but the buffer overflows: a new session.
+    await until(() => el.conns.length >= n + 2, 10_000);
+    assert.match(b.t.lastError, /fell more than 20 s behind/);
+  } finally { el.st.stall = false; await b.t.stop('left'); }
+});
+
 test('a tenant named __proto__ is counted and capped like any other', () => {
   const file = path.join(tmpDir(), 'u.json');
   const u = new TranscriptUsage({ file, tz: 'Europe/Vienna', capMin: 1 });

@@ -701,8 +701,10 @@ export class Meetings {
       // speaking, or handed to the one that took over if that one mutes after itself; otherwise (stopped meanwhile, or
       // taken over by one that leaves the microphone alone) it is muted again right here.
       const own = async () => {
-        if ((m.speech === u && !u.ending) || (m.speech && m.speech !== u && m.speech.autoMute)) { m.speechUnmuted = true; return; }
-        await m.platform.setMic(p, false).catch(() => { if (!m.speech) m.speechUnmuted = true; });
+        m.speechUnmuted = true;
+        if ((m.speech === u && !u.ending) || (m.speech && m.speech !== u && m.speech.autoMute)) return;
+        if (!m.speech) await this.muteAgain(m, p); // its result is out already: meeting_status shows a failure
+        else m.speechUnmuted = false; // the one speaking now handles the microphone itself (auto_mute false)
       };
       try { r = await m.platform.setMic(p, true); } catch (e) { if (e.clicked) await own(); throw e; }
       if (r.changed) await own();
@@ -764,18 +766,11 @@ export class Meetings {
     u.state = state;
     if (m.speech === u) m.speech = null;
     // The last utterance mutes again what speaking turned on; one followed by another (interrupt) leaves it to that one.
-    // Up to three tries; one that fails keeps it owned (the next utterance tries again) and is reported.
     let muteError = null;
     if (u.autoMute && m.speechUnmuted && !m.speech && (m.state === 'admitted' || m.state === 'recording')) {
-      for (let i = 0; i < 3; i++) {
-        if (i) await sleep(500);
-        if (m.speech || (m.state !== 'admitted' && m.state !== 'recording')) break;
-        const tried = this.page(m, (p) => m.platform.setMic(p, false)).then(() => null, (e) => oneLine(e));
-        muteError = await Promise.race([tried, sleep(10_000).then(() => 'muting again took longer than 10 s')]);
-        if (!muteError) break;
-      }
-      if (!muteError) m.speechUnmuted = false;
-      m.muteError = muteError;
+      const tried = this.page(m, (p) => this.muteAgain(m, p)).catch((e) => oneLine(e));
+      muteError = await Promise.race([tried, sleep(30_000).then(() => 'muting again took longer than 30 s')]);
+      if (muteError) m.muteError = muteError;
     }
     const played = u.startedAt ? Math.round((this.now() - u.startedAt) / 10) / 100 : 0;
     const r = {
@@ -785,6 +780,21 @@ export class Meetings {
     if (u.startedAt) this.emit(m, 'speech', r);
     u.finish(r);
     return r;
+  }
+
+  // Mutes again what speaking turned on, inside a page operation: up to three tries. One that fails keeps it owned (the
+  // next utterance tries again) and is reported (m.muteError, meeting_status). Returns the error or null.
+  async muteAgain(m, p) {
+    let err = null;
+    for (let i = 0; i < 3; i++) {
+      if (i) await p.waitForTimeout(500).catch(() => {});
+      if (m.speech || (m.state !== 'admitted' && m.state !== 'recording')) return null;
+      err = await m.platform.setMic(p, false).then(() => null, (e) => oneLine(e));
+      if (!err) break;
+    }
+    if (!err) m.speechUnmuted = false;
+    m.muteError = err;
+    return err;
   }
 
   // Barge-in: the utterance playing now stops at once (and the microphone is muted again, if speaking turned it on).
