@@ -38,7 +38,7 @@ function live(src, opts = {}) {
   const ev = { partial: [], final: [], stopped: [] };
   const t = new LiveTranscript({
     apiKey: el.key, baseUrl: el.base, source: src, tenant: 'alice', usage: opts.usage || usage(), retryMs: 50, partials: opts.partials ?? true, limits: opts.limits,
-    on: { partial: (s) => ev.partial.push({ ...s, t: Date.now() }), final: (s) => ev.final.push(s), stopped: (s) => ev.stopped.push(s) },
+    on: { partial: (s) => ev.partial.push({ ...s, t: Date.now() }), final: (s) => ev.final.push({ ...s, t: Date.now() }), stopped: (s) => ev.stopped.push(s) },
   });
   return { t: t.start(), ev };
 }
@@ -217,6 +217,10 @@ test('a timestamped copy that comes late, or before its committed_transcript, ma
       await sleep(3000);
       assert.equal(ev.final.length, 2, `${k}: ${JSON.stringify(ev.final.map((f) => [f.seq, f.text, f.end_s]))}`);
       assert.deepEqual(ev.final.map((f) => f.seq), [1, 2]);
+      // A partial is numbered as the segment its final will be, also while the one before waits for its copy.
+      assert.equal(ev.partial[0].seq, 1, k);
+      assert.equal(ev.partial.filter((p) => p.t < ev.final[1].t).at(-1).seq, 2, `${k}: partials of the second segment are #2`);
+      assert.deepEqual([...new Set(ev.partial.map((p) => p.seq))], [1, 2], k);
       assert.ok(ev.final[1].start_s >= ev.final[0].end_s, `${k}: times go forward ${JSON.stringify(ev.final)}`);
     } finally { el.st[k] = k === 'stampFirst' ? false : 0; await t.stop('left'); }
   }
@@ -239,6 +243,21 @@ test('a server that never starts the session, or stops reading the audio, is giv
     el.st.stall = false;
     await until(() => el.conns.length >= m + 2 && b.t.status().state === 'live', 10_000);
   } finally { el.st.stall = false; await b.t.stop('left'); }
+});
+
+test('errors after sessions that lasted never add up to giving up', async () => {
+  const { t, ev } = live(source(silence(120)), { limits: { shortSessionMs: 200 } });
+  try {
+    for (let i = 0; i < 11; i++) {
+      await until(() => t.status().state === 'live', 5000);
+      await sleep(300);
+      el.fail('resource_exhausted', 'busy');
+      await until(() => t.status().state !== 'live', 2000);
+    }
+    await until(() => t.status().state === 'live', 5000);
+    assert.equal(ev.stopped.length, 0);
+    assert.ok(t.failures <= 1, `failures ${t.failures}`);
+  } finally { await t.stop('left'); }
 });
 
 test('a tenant named __proto__ is counted and capped like any other', () => {

@@ -347,19 +347,12 @@ export const meet = {
   },
 
   // In the call the microphone button is named after what it does ("Turn on microphone (ctrl + d)" while muted).
-  micState: (page) => controlState(page, LABEL.micOff, LABEL.micOn),
+  micState: (page) => controlState(page, LABEL.micOff, LABEL.micOn, revealToolbar),
   setMic: (page, on) => setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Meet', open: revealToolbar }),
-  handState: (page) => controlState(page, LABEL.handUp, LABEL.handDown),
-  // Without a hand button in sight (a narrow window moves it under "More options"), Meet's shortcut, once.
-  async setHand(page, on) {
-    let pressed = false;
-    let moved = false;
-    const open = async (p) => {
-      if (!moved) { moved = true; return revealToolbar(p); }
-      if (!pressed) { pressed = true; await p.keyboard.press('Control+Alt+KeyH').catch(() => {}); }
-    };
-    return setControl(page, { onLabel: LABEL.handUp, offLabel: LABEL.handDown, on, what: 'raised hand', site: 'Meet', open });
-  },
+  handState: (page) => controlState(page, LABEL.handUp, LABEL.handDown, revealToolbar),
+  // Only through the button, whose name says the hand's state: Meet's shortcut toggles blindly (it would lower a hand
+  // that is already up).
+  setHand: (page, on) => setControl(page, { onLabel: LABEL.handUp, offLabel: LABEL.handDown, on, what: 'raised hand', site: 'Meet', open: revealToolbar }),
 
   async leave(page) {
     const b = button(page, LABEL.leave);

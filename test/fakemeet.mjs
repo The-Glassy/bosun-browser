@@ -255,7 +255,7 @@ export function fakeAudio({ openMs = 0, stopMs = 0 } = {}) {
   const recorders = [], captures = [], players = [];
   const stats = { opened: 0, closed: 0 };
   let queued = Buffer.alloc(0);
-  return {
+  const audio = {
     recorders,
     captures,
     players,
@@ -309,7 +309,8 @@ export function fakeAudio({ openMs = 0, stopMs = 0 } = {}) {
           if (input.file) finish(wavSeconds(p.bytes) ?? 1);
           p.write = (b) => { p.bytes = Buffer.concat([p.bytes, b]); };
           p.end = () => finish(p.bytes.length / (input.pcm.rate * input.pcm.channels * 2));
-          p.stop = async () => { clearTimeout(t); p.stopped = true; done(false); };
+          // hang: a player whose end is never reported (an ffmpeg that won't die).
+          p.stop = async () => { clearTimeout(t); p.stopped = true; if (!audio.hangPlayers) done(false); };
           players.push(p);
           return p;
         },
@@ -317,4 +318,5 @@ export function fakeAudio({ openMs = 0, stopMs = 0 } = {}) {
       };
     },
   };
+  return audio;
 }

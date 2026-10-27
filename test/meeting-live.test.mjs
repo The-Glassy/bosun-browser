@@ -287,25 +287,34 @@ test('barge-in: meeting_stop_speaking cuts it off and mutes; interrupt replaces 
     assert.equal(audio.players[0].stopped, true);
     assert.deepEqual(media(code, 'mic'), [true, false]);
     assert.deepEqual((await c.call('meeting_stop_speaking', { meeting_id: id })).json(), { meeting_id: id, stopped: false });
+    // A player that never reports its end: the stop still answers, and the microphone is muted again.
+    audio.hangPlayers = true;
+    await c.call('meeting_speak', { meeting_id: id, text: long });
+    const hung = (await c.call('meeting_stop_speaking', { meeting_id: id })).json();
+    assert.equal(hung.state, 'interrupted');
+    assert.equal(media(code, 'mic').at(-1), false);
+    assert.equal((await status(c, id)).speaking, undefined);
+    audio.hangPlayers = false;
+    const k = media(code, 'mic').length;
 
     // interrupt: the new one takes over the microphone (no mute in between) and mutes it after.
     await c.call('meeting_speak', { meeting_id: id, text: long });
     const b = (await c.call('meeting_speak', { meeting_id: id, text: 'Sorry, shorter.', interrupt: true, wait: true })).json();
     assert.equal(b.state, 'done');
     assert.equal(audio.players[1].stopped, true);
-    assert.deepEqual(media(code, 'mic'), [true, false, true, false]);
-    await until(() => ev.speech.length === 3);
-    assert.deepEqual(ev.speech.map((e) => e.state), ['interrupted', 'interrupted', 'done']);
+    assert.deepEqual(media(code, 'mic').slice(k), [true, false]);
+    await until(() => ev.speech.length === 4);
+    assert.deepEqual(ev.speech.map((e) => e.state), ['interrupted', 'interrupted', 'interrupted', 'done']);
 
     // Interrupted while the first one is still being synthesized: the microphone is still muted again at the end.
     el.st.ttsDelayMs = 800;
     const slow = c.call('meeting_speak', { meeting_id: id, text: 'Slow to synthesize.' });
-    await until(() => media(code, 'mic').length === 5, 5000);
+    await until(() => media(code, 'mic').length === k + 3, 5000);
     el.st.ttsDelayMs = 0;
     const fast = (await c.call('meeting_speak', { meeting_id: id, text: 'Fast.', interrupt: true, wait: true })).json();
     assert.equal(fast.state, 'done');
     await slow;
-    await until(() => ev.speech.length >= 4, 5000).catch(() => {});
+    await until(() => ev.speech.length >= 6, 5000).catch(() => {});
     await sleep(600);
     assert.equal(media(code, 'mic').at(-1), false, `mic ${JSON.stringify(media(code, 'mic'))}`);
     assert.equal((await status(c, id)).speaking, undefined);

@@ -172,10 +172,11 @@ export async function revealToolbar(page) {
 }
 
 // A two-state control in the call (the microphone, a raised hand): 'on' while onLabel is shown (the button would turn
-// it off), 'off' while offLabel is, null when neither is visible.
-export async function controlState(page, onLabel, offLabel) {
+// it off), 'off' while offLabel is, null when neither is visible. reveal: tried once when neither is (a faded toolbar).
+export async function controlState(page, onLabel, offLabel, reveal = null) {
   if (await firstVisible(button(page, onLabel))) return 'on';
   if (await firstVisible(button(page, offLabel))) return 'off';
+  if (reveal) { await reveal(page); return controlState(page, onLabel, offLabel); }
   return null;
 }
 

@@ -834,8 +834,8 @@ Chat text is kept only in memory, for the last 50 meetings.
   `bosun:meeting-speech` says when an utterance ended (`done`, `interrupted`, `failed`).
 - **Barge-in:** `meeting_stop_speaking` stops it at once (and mutes again). A second `meeting_speak` while one plays
   is refused unless `interrupt: true`, which replaces it.
-- **`meeting_mute { on }`** and **`meeting_raise_hand { on }`** on Meet (the toolbar's microphone and hand buttons;
-  the hand by Ctrl+Alt+H where the button isn't shown) and Zoom (Mute/Unmute; the hand in the Reactions menu). On
+- **`meeting_mute { on }`** and **`meeting_raise_hand { on }`** on Meet (the toolbar's microphone and hand buttons,
+  whose names say their state) and Zoom (Mute/Unmute; the hand in the Reactions menu). On
   Zoom a profile that never gave Zoom the microphone can't unmute: `meeting_speak` then says so.
 - **Latency:** from the call to the first sound in the call about 0.35 s plus the synthesis of the first sentence
   (Supertonic: about 1–1.3 s for a short one on a busy CPU). Start with a short sentence for a quick answer.

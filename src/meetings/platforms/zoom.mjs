@@ -649,7 +649,7 @@ export const zoom = {
   // The toolbar's "Mute" / "Unmute". Bosun joined without giving Zoom the microphone, so the first unmute makes Zoom ask
   // "Do you want people to hear you…?": the agent asked to be heard, so "Use microphone" (and nothing with the camera).
   // A question that can't be answered that way is answered without it again, and the unmute fails.
-  micState: (page) => controlState(page, LABEL.micOff, LABEL.micOn),
+  micState: (page) => controlState(page, LABEL.micOff, LABEL.micOn, revealToolbar),
   async setMic(page, on) {
     const answer = on ? async (p) => { const b = await firstVisible(button(p, LABEL.useMic)); if (b) await b.click({ timeout: 2000 }).catch(() => {}); } : null;
     try {

@@ -667,7 +667,7 @@ export class Meetings {
     const prev = m.speech;
     if (prev && !interrupt) throw new Error(`already speaking (utterance ${prev.id}); meeting_stop_speaking first, or pass interrupt: true`);
     const t0 = this.now();
-    const u = { id: `u${++m.speechSeq}`, state: 'preparing', player: null, autoMute, cancelled: false, seconds: 0 };
+    const u = { id: `u${++m.speechSeq}`, state: 'preparing', player: null, autoMute, cancelled: false, seconds: 0, t0: this.now() };
     u.finished = new Promise((r) => { u.finish = r; });
     m.speech = u;
     // The previous utterance stops without muting: this one takes the microphone over (m.speechUnmuted: whether
@@ -685,9 +685,11 @@ export class Meetings {
       return { file: f.file, format, seconds };
     })();
     // The microphone goes on while the first audio is prepared.
+    // Speaking owns the unmute only when it saw the microphone off (then also an unmute that half-worked is muted again).
     const mic = autoMute ? this.page(m, async (p) => {
-      if (await m.platform.micState(p) === 'on') return;
-      m.speechUnmuted = true; // before the click: an unmute that half-worked is still muted again
+      const before = await m.platform.micState(p);
+      if (before === 'on') return;
+      if (before === 'off') m.speechUnmuted = true;
       await m.platform.setMic(p, true);
     }) : Promise.resolve(null);
     const [a, b] = await Promise.allSettled([first, mic]);
@@ -726,21 +728,23 @@ export class Meetings {
       ...(error ? { error: `cut short, the rest could not be synthesized: ${oneLine(error)}` } : {}),
     };
     if (!wait) return started;
-    const end = await u.finished;
-    return { ...started, ...end, speaking: false };
+    const end = await Promise.race([u.finished, sleep((u.seconds + 30) * 1000).then(() => null)]);
+    return end ? { ...started, ...end, speaking: false } : { ...started, error: 'still not over 30 s after it should have ended' };
   }
 
   // An utterance is over (played, interrupted, failed): the microphone is muted again if speaking turned it on, and
   // bosun:meeting-speech says how it ended.
-  async endUtterance(m, u, state, error, { t0, tail = false } = {}) {
-    if (u.state === 'done' || u.state === 'interrupted' || u.state === 'failed') return u.finished;
+  async endUtterance(m, u, state, error, { t0 = u.t0, tail = false } = {}) {
+    if (u.ending) return u.finished;
+    u.ending = true;
     if (tail) await sleep(SPEECH_TAIL_MS);
     u.state = state;
     if (m.speech === u) m.speech = null;
     // The last utterance mutes again what speaking turned on; one followed by another (interrupt) leaves it to that one.
     if (u.autoMute && m.speechUnmuted && !m.speech && (m.state === 'admitted' || m.state === 'recording')) {
       m.speechUnmuted = false;
-      await this.page(m, (p) => m.platform.setMic(p, false)).catch((e) => { m.muteError = oneLine(e); });
+      const muted = this.page(m, (p) => m.platform.setMic(p, false)).then(() => true, (e) => { m.muteError = oneLine(e); return true; });
+      if (!(await Promise.race([muted, sleep(10_000).then(() => false)]))) m.muteError = 'muting again took longer than 10 s';
     }
     const played = u.startedAt ? Math.round((this.now() - u.startedAt) / 10) / 100 : 0;
     const r = { utterance_id: u.id, state, played_s: Math.min(played, Math.round(u.seconds * 100) / 100 || played), ...(error ? { error: oneLine(error) } : {}), total_ms: this.now() - t0 };
@@ -756,7 +760,9 @@ export class Meetings {
     if (!u) return { meeting_id: id, stopped: false };
     u.cancelled = true;
     await u.player?.stop();
-    const r = await u.finished;
+    // Ended here too, should the player never report its end; the answer waits for the microphone at most 12 s.
+    this.endUtterance(m, u, 'interrupted', null);
+    const r = await Promise.race([u.finished, sleep(12_000).then(() => ({ utterance_id: u.id, state: 'interrupted', error: 'the microphone was still being muted' }))]);
     return { meeting_id: id, stopped: true, ...r };
   }
 

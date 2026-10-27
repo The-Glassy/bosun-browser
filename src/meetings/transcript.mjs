@@ -91,10 +91,10 @@ export class TranscriptUsage {
 // final(seg), stopped({reason, error})}. Stops by itself at the tenant's daily cap (reason daily-cap), on an error
 // that a new connection would not fix (reason error), or when the audio ends (reason audio-ended).
 export class LiveTranscript {
-  // limits (tests): {startMs, unsentBytes, stallMs}.
+  // limits (tests): {startMs, unsentBytes, stallMs, shortSessionMs}.
   constructor({ apiKey, baseUrl, source, tenant, usage, on, partials = true, now = Date.now, retryMs = 1000, limits = {} }) {
     Object.assign(this, { apiKey, baseUrl, source, tenant, usage, on, partials, now, retryMs });
-    this.limits = { startMs: START_MS, unsentBytes: MAX_UNSENT_BYTES, stallMs: STALL_MS, ...limits };
+    this.limits = { startMs: START_MS, unsentBytes: MAX_UNSENT_BYTES, stallMs: STALL_MS, shortSessionMs: SHORT_SESSION_MS, ...limits };
     this.url = realtimeUrl(baseUrl);
     this.state = 'connecting'; // connecting | live | reconnecting | stopped
     this.reason = null; this.error = null;
@@ -184,7 +184,7 @@ export class LiveTranscript {
       try { m = JSON.parse(String(data)); } catch { return; }
       if (m.message_type === 'session_started') {
         clearTimeout(this.startTimer);
-        started = this.now();
+        started = this.sessionStartedAt = this.now();
         this.sessions++;
         this.session = m.session_id || null;
         // Zero retention applied: the session's config says logging is off, and no warning said otherwise.
@@ -198,8 +198,7 @@ export class LiveTranscript {
     // Closed after a session: opened again at once, unless the session was short (then it counts as a failure).
     ws.on('close', (code) => {
       if (!started) return this.dropped(ws, 'error', `the connection closed before the session started (${code})`);
-      const short = this.now() - started < SHORT_SESSION_MS;
-      if (!short && ws === this.ws) this.failures = 0; // a session that lasted: the count of failures in a row starts over
+      const short = this.now() - started < this.limits.shortSessionMs;
       this.dropped(ws, short ? 'closed' : null, `closed after ${Math.round((this.now() - started) / 1000)} s (${code})`);
     });
     ws.on('error', (e) => this.dropped(ws, 'error', String(e?.message || e).slice(0, 200)));
@@ -213,7 +212,9 @@ export class LiveTranscript {
       // not a second segment: plain texts and copies are paired by their order, never by their text.
       case 'committed_transcript': {
         if (this.stampedAhead > 0) { this.stampedAhead--; return; }
-        const c = { text: String(m.text || '').trim(), end: this.sentPos(), fell: false };
+        // The segment's number is taken now: partials that come before its copy belong to the next one.
+        const text = String(m.text || '').trim();
+        const c = { text, end: this.sentPos(), fell: false, seq: text ? ++this.seq : null };
         c.timer = setTimeout(() => this.commitFallback(c), FINAL_WAIT_MS);
         this.commits.push(c);
         // Copies that never come: plain texts already made into finals don't pile up.
@@ -225,7 +226,7 @@ export class LiveTranscript {
         if (!c) { this.stampedAhead++; return this.final(m); }
         if (c.fell) return; // its final was made without it
         clearTimeout(c.timer);
-        return this.final(m);
+        return this.final(m, { seq: c.seq });
       }
       case 'warning':
         if (/zero retention/i.test(m.warning || '')) this.zeroRetention = false;
@@ -267,11 +268,11 @@ export class LiveTranscript {
       if (x.fell) continue;
       clearTimeout(x.timer);
       x.fell = true;
-      this.final({ text: x.text }, { end: x.end });
+      this.final({ text: x.text }, { end: x.end, seq: x.seq });
     }
   }
 
-  final(m, { end: plainEnd = null } = {}) {
+  final(m, { end: plainEnd = null, seq = null } = {}) {
     const lp = this.lastPartial;
     clearTimeout(lp.timer); lp.timer = null; lp.queued = null; lp.text = '';
     const text = String(m.text || '').trim();
@@ -285,7 +286,7 @@ export class LiveTranscript {
     const lag = sent ? (this.now() - sent[1]) / 1000 : null;
     if (lag !== null) { this.lags.push(lag); if (this.lags.length > 200) this.lags.shift(); }
     const seg = {
-      seq: ++this.seq, start_s: round(start), end_s: round(end), text, final: true,
+      seq: seq ?? ++this.seq, start_s: round(start), end_s: round(end), text, final: true,
       ...(m.language_code ? { lang: m.language_code } : {}), ...(speakers.length === 1 ? { speaker: speakers[0] } : {}),
       at: new Date(this.now()).toISOString(), ...(lag !== null ? { lag_s: round(lag) } : {}),
     };
@@ -301,6 +302,9 @@ export class LiveTranscript {
     if (ws !== this.ws || this.state === 'stopped') return;
     this.ws = null;
     clearTimeout(this.startTimer);
+    // A session that lasted: the count of failures in a row starts over, whether it ended by an error or a close.
+    if (this.sessionStartedAt && this.now() - this.sessionStartedAt >= this.limits.shortSessionMs) this.failures = 0;
+    this.sessionStartedAt = null;
     try { ws.terminate(); } catch {}
     if (this.commits.length) this.commitFallback(this.commits.at(-1));
     this.commits = []; this.stampedAhead = 0; // a new connection starts its own pairing
