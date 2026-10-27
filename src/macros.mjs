@@ -398,41 +398,55 @@ const refusal = (msg) => Object.assign(new Error(msg), { fatal: true });
 const json = (r) => { const t = r?.content?.find((c) => c.type === 'text')?.text; try { return JSON.parse(t); } catch { return t ?? null; } };
 
 // Runs in the page, on the element a click, type, select or upload step is about to act on: the risky words (risky:
-// RISKY_RE's source) in what it says, or in what the control a click on it reaches says (a click on an icon inside
-// a "Buy now" button is a click on that button; one on a label, on its control), every field whole; the kind of the
-// control a fill goes to (Playwright follows a <label>, or an element inside one, to its control); and the URL of
-// the document it is in (a frame may be elsewhere).
+// RISKY_RE's source) in what it says, or in what the controls a click on it reaches say (a click on an icon inside a
+// "Buy now" button is a click on that button; one on a label, on its control); the kind of the control a fill goes
+// to (Playwright follows a <label>, or an element inside one, to its control); and the URL of the document it is in
+// (a frame may be elsewhere).
 function describe(el, risky) {
   let c = el;
   if (!['input', 'textarea', 'select'].includes(c.localName) && !c.isContentEditable) {
     const label = c.localName === 'label' ? c : c.closest('label');
     if (label?.control) c = label.control;
   }
-  // Every control the click reaches on its way up (through shadow roots too), not only the nearest one. Text is read
-  // in full from the element and from controls; from a label or an element with onclick, which may wrap a whole
-  // form, only when it is short (a button's worth).
-  const CONTROL = 'button, a[href], summary, input, select, textarea, [role=button], [role=link], [role=menuitem], [role=tab], [role=checkbox], [role=switch], [role=option]';
-  const fields = [];
-  // Its name as assistive technology has it, roughly: text, value, aria-label, aria-labelledby, title, alt; with its
-  // text, also the alt and aria-label of what is inside (an <img alt="Buy now"> in a button).
-  const said = (x, text) => {
-    const root = x.getRootNode?.();
-    const byId = (id) => (root?.getElementById ? root.getElementById(id) : null) ?? x.ownerDocument.getElementById(id); // a shadow root first
-    const by = (x.getAttribute?.('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => byId(id)?.textContent);
-    fields.push(x.value, x.getAttribute?.('aria-label'), x.title, x.getAttribute?.('alt'), ...by);
-    if (text) fields.push(x.innerText, ...[...(x.querySelectorAll?.('[alt], [aria-label], [title]') ?? [])].slice(0, 50).flatMap((y) => [y.getAttribute('alt'), y.getAttribute('aria-label'), y.title]));
+  const byId = (x, id) => { const r = x.getRootNode?.(); return (r?.getElementById ? r.getElementById(id) : null) ?? x.ownerDocument.getElementById(id); };
+  // What x says, roughly its accessible name and more: every text node, alt, aria-label, title, value and
+  // placeholder in it, its shadow roots included, plus what aria-labelledby points at (in order). Read generously:
+  // text that is hidden or not slotted counts too. As one string with the pieces spaced, and run together (a word
+  // split over two spans).
+  const said = (x) => {
+    const parts = [];
+    let budget = 5000;
+    const walk = (n) => {
+      if (budget-- <= 0) return;
+      if (n.nodeType === 3) { parts.push(n.data); return; }
+      if (n.nodeType === 1) {
+        if (n.localName === 'script' || n.localName === 'style') return;
+        for (const k of ['alt', 'aria-label', 'title', 'placeholder']) { const v = n.getAttribute(k); if (v) parts.push(v); }
+        if ((n.localName === 'input' || n.localName === 'button' || n.localName === 'option') && typeof n.value === 'string' && n.value) parts.push(n.value);
+        for (const id of (n.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)) { const t = byId(n, id)?.textContent; if (t) parts.push(t); }
+        if (n.shadowRoot) walk(n.shadowRoot);
+      } else if (n.nodeType !== 11) return;
+      for (const k of n.childNodes) walk(k);
+    };
+    walk(x);
+    const labelledby = (x.getAttribute?.('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => byId(x, id)?.textContent ?? '').join(' ');
+    return [parts.join(' '), parts.join(''), labelledby];
   };
-  said(el, true);
-  if (c !== el) said(c, true);
+  const fields = [...said(el), ...(c === el ? [] : said(c))];
+  // Every control the click reaches on its way up (through shadow roots too), not only the nearest one. A label or
+  // an element with onclick may wrap a whole form: what it says counts only when it is short (a button's worth).
+  const CONTROL = 'button, a[href], summary, input, select, textarea, [role=button], [role=link], [role=menuitem], [role=tab], [role=checkbox], [role=switch], [role=option]';
   for (let x = el.parentElement ?? el.getRootNode?.()?.host; x; x = x.parentElement ?? x.getRootNode?.()?.host) {
     const control = x.matches(CONTROL);
     if (!control && !x.matches('label, [onclick]')) continue;
-    said(x, control || String(x.innerText ?? '').length <= 200);
-    if (x.localName === 'label' && x.control) said(x.control, true);
+    const xs = said(x);
+    if (control || xs[0].length <= 200) fields.push(...xs);
+    else fields.push(...[x.getAttribute('aria-label'), x.title].filter(Boolean));
+    if (x.localName === 'label' && x.control) fields.push(...said(x.control));
   }
   const re = new RegExp(risky, 'i');
   return {
-    risky: fields.filter((x) => typeof x === 'string' && x).map((x) => re.exec(x)?.[0]).find(Boolean) ?? null,
+    risky: fields.filter((x) => typeof x === 'string' && x).map((x) => re.exec(x.replace(/\s+/g, ' '))?.[0]).find(Boolean) ?? null,
     kind: c.localName === 'input' ? String(c.type || 'text').toLowerCase() : c.localName,
     doc: String(el.ownerDocument?.location?.href ?? ''),
   };

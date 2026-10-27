@@ -32,6 +32,8 @@ function serverA() {
         <button id="ab"><img alt="Buy now" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></button>
         <span id="lbl" hidden>Checkout</span><button id="lb2" aria-labelledby="lbl">→</button>
         <div id="sh"></div><script>document.getElementById('sh').attachShadow({ mode: 'open' }).innerHTML = '<span id="slbl">Buy now</span><button id="sgo" aria-labelledby="slbl">→</button>';</script>
+        <button id="sd"><x-label id="xl"></x-label></button><script>document.getElementById('xl').attachShadow({ mode: 'open' }).innerHTML = '<b>Buy</b> now';</script>
+        <span id="v1" hidden>Delete</span><span id="v2" hidden>account</span><button id="split" aria-labelledby="v1 v2">×</button>
         <button id="lt" aria-label="Buy now">${'all the details you could want '.repeat(30)}</button>
         <button id="nav" onclick='location.href = ${JSON.stringify(q('away'))}'>Attach</button>
         <script>document.getElementById('f').onchange = async (e) => {
@@ -389,9 +391,9 @@ test('risky at run time: a selector that hits a "Buy now" button, and risky text
   assert.equal(out.failure.step, 2);
   assert.match(out.failure.error, /refused: the element says "Buy now"/);
   // What the click reaches counts: an icon inside a "Buy now" button, a label longer than anything a person reads.
-  for (const sel of ['#icon', '#nicon', '#lt', '#ab', '#lb2', '#sgo']) {
+  for (const sel of ['#icon', '#nicon', '#lt', '#ab', '#lb2', '#sgo', '#sd', '#split']) {
     assert.equal((await c.call('macro_save', { name: 'sneaky2', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/app` }, { tool: 'click', selector: sel }] })).isError, false);
-    assert.match((await c.call('macro_run', { name: 'sneaky2', session: s })).json().failure.error, /refused: the element says "(Buy now|Checkout)"/, sel);
+    assert.match((await c.call('macro_run', { name: 'sneaky2', session: s })).json().failure.error, /refused: the element says "(Buy now|Checkout|Delete account)"/, sel);
   }
   // upload clicks what is not a file input: the same check.
   const f = (await c.call('upload_create', { filename: 'x.txt', content_base64: Buffer.from('x').toString('base64') })).json().file_id;
