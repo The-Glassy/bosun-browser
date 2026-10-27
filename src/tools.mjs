@@ -137,7 +137,7 @@ const TAGS = ('a abbr address area article aside audio b bdi bdo blockquote body
 // what our in-page code reads).
 const tagOf = (n) => (typeof n === 'string' && TAGS.includes(n) ? n : typeof n === 'string' && n.includes('-') ? 'custom element' : 'element');
 const HIDDEN = { self: 'display: none', visibility: 'visibility: hidden', size: 'zero size' };
-const hiddenWhy = (w) => (w?.by === 'ancestor' ? `inside a display: none <${tagOf(w.tag)}>` : HIDDEN[w?.by] ?? null);
+const hiddenWhy = (w) => (w?.by === 'ancestor' ? `inside a display: none <${tagOf(w.tag)}>` : Object.hasOwn(HIDDEN, String(w?.by)) ? HIDDEN[w.by] : null);
 
 // Runs in the page: what an element is (tag, whole id and class: they are masked before they are cut short) and why
 // it is not shown (by: self, ancestor (tag), visibility or size).
@@ -202,8 +202,12 @@ async function locate(p, t, { hidden = false, until = Date.now() + FIND_MS } = {
           const i = await p.evaluate(pick, [hs, ...anchors, t.nth ?? 0]).catch(() => {
             throw new Error('nth, after and before work on the page itself (the matches and the text in one frame)');
           });
-          if (typeof i === 'number') chosen = hs[i];
-          else count = i.left;
+          // On chromium the page can change what pick runs on (Array.prototype.sort, say): only an index or a count in
+          // range is taken from it, never anything that would end up in an error as it came.
+          const ok = (n, max) => Number.isSafeInteger(n) && n >= 0 && n <= max;
+          if (ok(i, hs.length - 1)) chosen = hs[i];
+          else if (ok(i?.left, hs.length)) count = i.left;
+          else throw new Error('nth, after and before: the page gave an answer that makes no sense; use another target');
         }
       } finally {
         for (const h of held) if (h !== chosen) await h.dispose().catch(() => {});

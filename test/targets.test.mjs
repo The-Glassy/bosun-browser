@@ -6,7 +6,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'http';
-import { startBosun, connect, TOKEN } from './helpers.mjs';
+import { startBosun, connect, ENGINE, TOKEN } from './helpers.mjs';
 
 const html = (res, body) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(body); };
 const ICON = (id) => `<svg width="16" height="16"><use href="#icon-${id}"></use></svg>`;
@@ -53,6 +53,7 @@ function server() {
           document.getElementById('xb').attachShadow({ mode: 'open' }).innerHTML = '<button onclick="document.getElementById(\\'log\\').textContent += \\'B;\\'">B</button>';
           let n = 0; const t = setInterval(() => { document.getElementById('churn').insertAdjacentHTML('afterbegin', '<button>Churn</button>'); if (++n > 400) clearInterval(t); }, 20);
           setTimeout(() => { document.getElementById('late').style.display = ''; }, 8000);
+          if (location.search.includes('tamper')) Array.prototype.sort = function () { return [{ left: document.getElementById('pw').value }]; };
         </script>`);
     }
     if (u.pathname === '/export') {
@@ -222,5 +223,19 @@ test('select: a hidden <select> takes the option', async () => {
   const byRole = await c.call('select', { session: s, role: 'combobox', value: 'Alpha' });
   assert.equal(byRole.isError, false, byRole.text);
   assert.match(await log(s), /sel:b;sel:a;/);
+  await c.call('session_close', { session: s });
+});
+
+test('nth: what the page answers about the matches is checked; a page that rewrites Array.prototype.sort gets no secret out', async () => {
+  const s = await c.open();
+  // The page replaces Array.prototype.sort in its own world. On chromium Bosun's page code runs there too.
+  await c.call('navigate', { session: s, url: `${base}/more?tamper=1` });
+  assert.equal((await c.call('type', { session: s, selector: '#pw', value: 'hunter42' })).isError, false);
+  const r = await c.call('click', { session: s, role: 'button', name: 'Ord', nth: 0 });
+  assert.doesNotMatch(r.text, /hunt/);
+  // chromium: refused as it came; patchright and camoufox run that code in a world of its own, which the page can't
+  // reach: the click just works.
+  if (ENGINE === 'chromium') assert.match(r.text, /the page gave an answer that makes no sense/);
+  else assert.equal(r.isError, false, r.text);
   await c.call('session_close', { session: s });
 });
