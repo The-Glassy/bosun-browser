@@ -275,6 +275,17 @@ test('a partial still waiting for its turn when its segment is committed is drop
   await t.stop('left');
 });
 
+test('a committed text still waiting for its copy when the transcript stops is kept (not when discarded)', async () => {
+  for (const discard of [false, true]) {
+    const ev = { final: [] };
+    const t = new LiveTranscript({ apiKey: el.key, baseUrl: el.base, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { final: (s) => ev.final.push(s) } });
+    t.onMessage({ message_type: 'committed_transcript', text: 'Last words before the end.' });
+    await t.stop('ended', null, { discard });
+    assert.deepEqual(t.since(0).map((f) => [f.seq, f.text]), discard ? [] : [[1, 'Last words before the end.']], `discard ${discard}`);
+    assert.equal(ev.final.length, discard ? 0 : 1);
+  }
+});
+
 test('NODE_DEBUG set: no connection with the key (Node would log its headers)', async () => {
   const n = el.conns.length;
   process.env.NODE_DEBUG = 'net';

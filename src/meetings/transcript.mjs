@@ -324,8 +324,10 @@ export class LiveTranscript {
   }
 
   // Ends the stream and the audio capture. reason: left | opted-out | stopped | daily-cap | error | audio-ended ...
-  async stop(reason, error = null) {
+  // Text ElevenLabs already committed becomes a final, unless discard (an opt-out or a deletion forgets it anyway).
+  async stop(reason, error = null, { discard = false } = {}) {
     if (this.state === 'stopped') return this.stopping;
+    if (!discard && this.commits.length) this.commitFallback(this.commits.at(-1));
     this.state = 'stopped';
     this.reason = reason;
     this.error = error;

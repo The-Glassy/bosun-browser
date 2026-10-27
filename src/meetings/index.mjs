@@ -370,9 +370,9 @@ export class Meetings {
   async stopTranscript(m, reason, { clear = false } = {}) {
     const t = m.transcript;
     if (!t) return false;
-    if (clear) t.clear();
     const was = t.state !== 'stopped';
-    await t.stop(reason);
+    await t.stop(reason, null, { discard: clear });
+    if (clear) t.clear();
     return was;
   }
 
@@ -692,10 +692,13 @@ export class Meetings {
     const mic = autoMute ? this.page(m, async (p) => {
       if (u.ending) return;
       let r;
-      try { r = await m.platform.setMic(p, true); } catch (e) { if (e.clicked) m.speechUnmuted = true; throw e; }
-      if (!r.changed) return;
-      if (u.ending && !m.speech) await m.platform.setMic(p, false).catch(() => { m.speechUnmuted = true; });
-      else m.speechUnmuted = true;
+      // A click that turned it on (also one whose check then failed) is owned; ended meanwhile: muted again right here.
+      const own = async () => {
+        if (u.ending && !m.speech) await m.platform.setMic(p, false).catch(() => { m.speechUnmuted = true; });
+        else m.speechUnmuted = true;
+      };
+      try { r = await m.platform.setMic(p, true); } catch (e) { if (e.clicked) await own(); throw e; }
+      if (r.changed) await own();
     }) : Promise.resolve(null);
     const [a, b] = await Promise.allSettled([first, mic]);
     const prepMs = this.now() - t0;
@@ -726,10 +729,11 @@ export class Meetings {
       }
       u.player.end();
     }
-    // Playback that doesn't end when it should (ffmpeg stuck) is cut off, and the microphone muted again.
+    // Playback that doesn't end when it should (ffmpeg stuck) is cut off, and the microphone muted again. Counted from
+    // now, when all of it is written: waiting for the synthesis paused the audio, so what played so far isn't known.
     if (!u.ending) {
       u.watchdog = setTimeout(() => { if (!u.ending) { u.cancelled = true; u.player.stop(); this.endUtterance(m, u, 'failed', new Error('playback did not end in time')); } },
-        Math.max(0, u.seconds * 1000 + this.speechGraceMs - (this.now() - u.startedAt)));
+        u.seconds * 1000 + this.speechGraceMs);
       u.watchdog.unref?.();
     }
     const started = {
