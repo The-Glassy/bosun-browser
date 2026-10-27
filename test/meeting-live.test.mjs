@@ -324,6 +324,14 @@ test('barge-in: meeting_stop_speaking cuts it off and mutes; interrupt replaces 
     await c.call('meeting_speak', { meeting_id: id, text: 'Still here.', wait: true });
     assert.equal(media(code, 'mic').at(-1), true);
     assert.deepEqual((await c.call('meeting_mute', { meeting_id: id, on: true })).json(), { meeting_id: id, muted: true });
+    // An utterance with auto_mute false that takes over from one that unmuted: the microphone is the agent's again, and
+    // the next one with auto_mute finds it on and leaves it on.
+    await c.call('meeting_speak', { meeting_id: id, text: long });
+    await c.call('meeting_speak', { meeting_id: id, text: 'Manual.', auto_mute: false, interrupt: true, wait: true });
+    assert.equal(media(code, 'mic').at(-1), true);
+    await c.call('meeting_speak', { meeting_id: id, text: 'Auto.', wait: true });
+    assert.equal(media(code, 'mic').at(-1), true);
+    await c.call('meeting_mute', { meeting_id: id, on: true });
     // auto_mute false: played into a muted microphone, nothing touched.
     const n = media(code, 'mic').length;
     await c.call('meeting_speak', { meeting_id: id, text: 'Muted.', auto_mute: false, wait: true });

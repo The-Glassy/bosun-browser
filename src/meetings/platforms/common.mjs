@@ -180,22 +180,26 @@ export async function controlState(page, onLabel, offLabel) {
 }
 
 // Clicks the control until it shows the wanted state and returns {state, changed: whether it clicked}, or throws (with
-// clicked: whether it clicked before giving up). One click, then up to a second
+// clicked: whether it clicked before giving up). A click that timed out counts as one: it may still have landed. One click, then up to a second
 // for the page to show the change (a second click too early would undo the first). open(page): makes the control
 // visible where it sits in a menu; called while no control is shown. answer(page): called on every round, for a
 // question the site asks in between (Zoom asking for the microphone).
 export async function setControl(page, { onLabel, offLabel, on, what, site, open = null, answer = null, timeoutMs = 6000 }) {
   const want = on ? 'on' : 'off';
   const until = Date.now() + timeoutMs;
-  let clicked = 0;
+  let clicked = 0, clicks = 0;
   for (;;) {
     if (answer) await answer(page);
     const s = await controlState(page, onLabel, offLabel);
-    if (s === want) return { state: want, changed: clicked > 0 };
+    if (s === want) return { state: want, changed: clicks > 0 };
     if (!s && open) await open(page);
     const b = s ? await firstVisible(button(page, s === 'on' ? onLabel : offLabel)) : null;
-    if (b && Date.now() - clicked > 1000 && !(await disabled(b))) clicked = await b.click({ timeout: 3000 }).then(() => Date.now(), () => clicked);
-    if (Date.now() > until) throw Object.assign(new Error(s ? `could not turn the ${what} ${want} in ${site} (its control did not change)` : `no ${what} control found in ${site}`), { clicked: clicked > 0 });
+    if (b && Date.now() - clicked > 1000 && !(await disabled(b))) {
+      clicks++;
+      await b.click({ timeout: 3000 }).catch(() => {});
+      clicked = Date.now();
+    }
+    if (Date.now() > until) throw Object.assign(new Error(s ? `could not turn the ${what} ${want} in ${site} (its control did not change)` : `no ${what} control found in ${site}`), { clicked: clicks > 0 });
     await page.waitForTimeout(150);
   }
 }

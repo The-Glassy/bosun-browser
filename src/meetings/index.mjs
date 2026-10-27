@@ -371,8 +371,9 @@ export class Meetings {
     const t = m.transcript;
     if (!t) return false;
     const was = t.state !== 'stopped';
-    await t.stop(reason, null, { discard: clear });
-    if (clear) t.clear();
+    const stopping = t.stop(reason, null, { discard: clear }); // takes no more text at once
+    if (clear) t.clear(); // gone before the capture has ended
+    await stopping;
     return was;
   }
 
@@ -675,6 +676,7 @@ export class Meetings {
     // The previous utterance stops without muting: this one takes the microphone over (m.speechUnmuted: whether
     // speaking turned it on, so that the last utterance mutes it again).
     if (prev) { prev.cancelled = true; await prev.player?.stop(); }
+    if (!autoMute) m.speechUnmuted = false; // the agent handles the microphone itself now
     const pieces = text ? splitSpeech(text) : null;
     const first = (async () => {
       if (text) return synthesizeWav(this.cfg, { text: pieces[0], backend, voice, lang });

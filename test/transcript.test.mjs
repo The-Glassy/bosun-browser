@@ -286,6 +286,19 @@ test('a committed text still waiting for its copy when the transcript stops is k
   }
 });
 
+test('many copies late: plain texts made into finals and dropped from the queue still swallow their copies', async () => {
+  const ev = { final: [] };
+  const t = new LiveTranscript({ apiKey: el.key, baseUrl: el.base, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { final: (s) => ev.final.push(s) } });
+  for (let i = 1; i <= 60; i++) t.onMessage({ message_type: 'committed_transcript', text: `Segment ${i}.` });
+  await sleep(1700); // all made into finals without their copies
+  for (let i = 1; i <= 60; i++) t.onMessage({ message_type: 'committed_transcript_with_timestamps', text: `Segment ${i}.`, words: [] });
+  t.onMessage({ message_type: 'committed_transcript', text: 'Segment 61.' });
+  t.onMessage({ message_type: 'committed_transcript_with_timestamps', text: 'Segment 61.', words: [] });
+  assert.deepEqual(ev.final.map((f) => f.seq), Array.from({ length: 61 }, (_, i) => i + 1));
+  assert.equal(ev.final.at(-1).text, 'Segment 61.');
+  await t.stop('left');
+});
+
 test('NODE_DEBUG set: no connection with the key (Node would log its headers)', async () => {
   const n = el.conns.length;
   process.env.NODE_DEBUG = 'net';

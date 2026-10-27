@@ -112,6 +112,7 @@ export class LiveTranscript {
     this.lastPartial = { text: '', at: 0, timer: null, queued: null };
     this.commits = []; // committed_transcript waiting for its timestamped copy, in order
     this.stampedAhead = 0; // copies that came before their committed_transcript
+    this.evicted = 0; // finals made without their copy and no longer in commits
     this.ws = null; this.session = null; this.sessionBase = 0; this.sessions = 0; this.failures = 0;
     this.zeroRetention = null; this.warnings = [];
     this.streamedSec = 0;
@@ -224,11 +225,12 @@ export class LiveTranscript {
         const c = { text, end: this.sentPos(), fell: false, seq: text ? ++this.seq : null };
         c.timer = setTimeout(() => this.commitFallback(c), FINAL_WAIT_MS);
         this.commits.push(c);
-        // Copies that never come: plain texts already made into finals don't pile up.
-        while (this.commits.length > 50 && this.commits[0].fell) this.commits.shift();
+        // Copies that never come: plain texts already made into finals don't pile up (counted, for their late copies).
+        while (this.commits.length > 50 && this.commits[0].fell) { this.commits.shift(); this.evicted++; }
         return;
       }
       case 'committed_transcript_with_timestamps': {
+        if (this.evicted > 0) { this.evicted--; return; } // the copy of a final made long ago
         const c = this.commits.shift();
         if (!c) { this.stampedAhead++; return this.final(m); }
         if (c.fell) return; // its final was made without it
@@ -314,7 +316,7 @@ export class LiveTranscript {
     this.sessionStartedAt = null;
     try { ws.terminate(); } catch {}
     if (this.commits.length) this.commitFallback(this.commits.at(-1));
-    this.commits = []; this.stampedAhead = 0; // a new connection starts its own pairing
+    this.commits = []; this.stampedAhead = 0; this.evicted = 0; // a new connection starts its own pairing
     if (kind && FATAL.has(kind)) return this.stop('error', `${kind}: ${error}`);
     if (kind) { this.failures++; this.lastError = `${kind}: ${error}`; }
     if (this.failures > MAX_RETRIES) return this.stop('error', this.lastError || 'ElevenLabs kept closing the connection');
