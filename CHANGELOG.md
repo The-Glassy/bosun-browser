@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.14.1 — clicks that find the visible element
+
+### Fixed
+
+- **`click` (and `type`, `select`, `upload`, `screenshot`) by `role`, `selector` or `text` takes the first visible
+  match**, not the first one in the page. On Plaud's recording page the selectors
+  `xpath=//*[normalize-space(text())='Share']/parent::*//button` and `text=Share >> xpath=following::button[1]` hit
+  the `<button>`s of the closed share popover next to Share. The export icon is not a `<button>` element (a `<div>`
+  that the accessibility tree calls a button), so these selectors never matched it. Bosun then waited 15 s for a hidden button and failed with
+  `elementHandle.click: Timeout 15000ms exceeded`. A `ref` click worked because it named the visible element.
+  `read { selector }`, `wait_for`, a macro's `assert` and a keepalive's `logged_in_check` go by the first visible
+  match too.
+- **Errors say why nothing was clicked**: nothing matches; N elements matched and none is visible (the first one's
+  tag, id and classes, and why it is hidden); an `after`/`before` text isn't on the page; the element is covered by
+  another one (named) or disabled. Before, these were all a bare Playwright timeout.
+
+### Added
+
+- **`nth`, `after`, `before`** on any target given by `role`, `selector` or `text`, in tool calls and in macro steps,
+  for icon buttons with no name: `{ role: "button", after: "Share" }` is the first button after Share,
+  `{ …, nth: 1 }` the next one, `nth: -1` the last match, `before` counts back from a text. See README › Finding
+  elements.
+- `examples/plaud-import.json` exports the transcript the way Plaud's page works now: the export icon after Share,
+  "Export transcript", then the dialog's Export button.
+
 ## 0.14.0 — macros
 
 ### Added
