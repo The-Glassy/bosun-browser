@@ -12,7 +12,8 @@ import { startBosun, startPageServer, connect, tmpDir } from './helpers.mjs';
 
 const SERVER = new URL('../src/server.mjs', import.meta.url).pathname;
 
-const MEETING_TOOLS = ['meeting_join', 'meeting_status', 'meeting_chat_read', 'meeting_chat_send', 'meeting_stop_recording', 'meeting_leave', 'meeting_recording_delete'];
+const MEETING_TOOLS = ['meeting_join', 'meeting_status', 'meeting_chat_read', 'meeting_chat_send', 'meeting_stop_recording', 'meeting_leave', 'meeting_recording_delete',
+  'meeting_transcript', 'meeting_speak', 'meeting_stop_speaking', 'meeting_mute', 'meeting_raise_hand'];
 
 test('FEATURES_MEETINGS defaults to on and is a 0/1 switch', () => {
   assert.equal(loadConfig({}).features.meetings, true);

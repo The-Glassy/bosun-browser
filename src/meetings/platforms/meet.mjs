@@ -15,6 +15,8 @@
 //                         chatError (common.mjs) whose code says why
 //   watchChat(page, key)  install a MutationObserver that queues new chat messages; drainChat(page, key) -> [{id, sender, text}]
 //   participants(page)    number of people in the call (incl. the bot), or null if the page doesn't show it
+//   setMic(page, on), setHand(page, on)  the call's microphone, the raised hand: -> {state: 'on' | 'off', changed}, or
+//                         throws (common.mjs setControl)
 //   leave(page)
 //
 // Meet's markup changes without notice and its language follows the account, the browser and the hl parameter. The
@@ -22,7 +24,7 @@
 // Ukrainian and Russian, so a UI that comes up in another of those languages works too. Markers are labels, roles
 // and texts a person sees; a run against real Meet that fails here is fixed here.
 
-import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, chatError, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, chatError, setControl, revealToolbar, DIALOGS, HEADINGS } from './common.mjs';
 
 const JOIN_LABELS = ['ask to join', 'join now', 'join', 'ask to join anyway', 'join anyway', 'join the call now', 'trotzdem teilnehmen', 'teilnahme erbitten', 'teilnahme anfragen', 'teilnehmen anfragen', 'jetzt teilnehmen', 'teilnehmen', 'beitreten',
   'požiadať o pripojenie', 'pripojiť sa', 'pripojiť sa teraz', 'попросити приєднатися', 'попросити дозволу приєднатися', 'приєднатися', 'приєднатися зараз',
@@ -85,6 +87,9 @@ const LABEL = {
   chat: any('^chat with everyone$', '^chat mit allen$', '^open chat$', '^chat öffnen$', '^chat$', '^chatovať so všetkými$', '^чат з усіма$', '^чат со всеми$', '^чат$'),
   chatInput: any('send a message', 'nachricht senden', 'nachricht an alle', 'odoslať správu', 'надіслати повідомлення', 'отправить сообщение'),
   leave: any('^leave call$', '^anruf verlassen$', '^leave meeting$', '^besprechung verlassen$', '^opustiť hovor$', '^вийти з дзвінка$', '^покинуть звонок$'),
+  // The call's hand control, named with its shortcut ("Raise hand (ctrl + alt + h)" / "Lower hand (ctrl + alt + h)").
+  handDown: any('^raise hand', '^hand heben', '^zdvihnúť ruku', '^підняти руку', '^поднять руку'), // the hand is down
+  handUp: any('^lower hand', '^hand senken', '^spustiť ruku', '^опустити руку', '^опустить руку'), // the hand is up
 };
 const NAME_LABELS = ['Your name', 'Ihr Name', 'Dein Name', 'Vaše meno', 'Ваше ім’я', "Ваше ім'я", 'Ваше имя'];
 // The lobby asking a guest for a name ("What's your name?" / "Wie heißen Sie?" ...).
@@ -340,6 +345,12 @@ export const meet = {
     const n = await page.evaluate(() => new Set([...document.querySelectorAll('[data-participant-id]')].map((e) => e.getAttribute('data-participant-id'))).size).catch(() => 0);
     return n || null;
   },
+
+  // In the call the microphone button is named after what it does ("Turn on microphone (ctrl + d)" while muted).
+  setMic: (page, on) => setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Meet', open: revealToolbar }),
+  // Only through the button, whose name says the hand's state: Meet's shortcut toggles blindly (it would lower a hand
+  // that is already up).
+  setHand: (page, on) => setControl(page, { onLabel: LABEL.handUp, offLabel: LABEL.handDown, on, what: 'raised hand', site: 'Meet', open: revealToolbar }),
 
   async leave(page) {
     const b = button(page, LABEL.leave);

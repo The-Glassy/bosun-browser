@@ -8,7 +8,7 @@
 // and labels are also matched in German and Ukrainian (some Russian). These markers were written from Zoom's web
 // client as documented and seen in screenshots, and tested against a local stand-in (test/fakezoom.mjs), not yet
 // against live Zoom: a run against real Zoom that fails here is fixed here.
-import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, chatError, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, chatError, setControl, revealToolbar, DIALOGS, HEADINGS } from './common.mjs';
 
 const TEXT = {
   // The waiting room, or a meeting the host has not started yet (Zoom lets you in when it starts).
@@ -56,6 +56,12 @@ const LABEL = {
   participants: any('participants?\\b', 'particpants', 'teilnehmer', 'учасник', 'участник'),
   leave: any('^leave$', '^leave meeting$', '^verlassen$', '^meeting verlassen$', '^вийти$', '^вийти з конференції$', '^покинути конференцію$', '^выйти$', '^выйти из конференции$'),
   leaveConfirm: any('^leave meeting$', '^meeting verlassen$', '^вийти з конференції$', '^покинути конференцію$', '^выйти из конференции$'),
+  // Zoom asking for the microphone ("Do you want people to hear you…?"), answered yes only when the agent unmutes to speak.
+  useMic: any('^use microphone$', '^mikrofon verwenden$', '^mikrofon benutzen$', '^використовувати мікрофон$', '^использовать микрофон$'),
+  // The raised hand sits in the toolbar's "Reactions" menu (or under "More" in a narrow window).
+  handDown: any('^raise hand$', '^hand heben$', '^підняти руку$', '^поднять руку$'), // the hand is down
+  handUp: any('^lower hand$', '^hand senken$', '^опустити руку$', '^опустить руку$'), // the hand is up
+  reactions: any('^reactions?$', '^react$', '^reaktionen$', '^реакції$', '^реакции$', '^more$', '^mehr$', '^більше$', '^ещё$', '^еще$'),
   launch: any('^launch meeting$', '^meeting (?:starten|eröffnen)$', '^запустити конференцію$', '^запустить конференцию$'),
   fromBrowser: any('join from (?:your|the) browser', '(?:über|vom|mit) (?:ihrem |dem )?browser (?:aus )?(?:beitreten|teilnehmen)', 'приєднатися (?:з|через) браузер', 'войти из браузера', 'присоединиться из браузера'),
   // The web client's device questions, "Do you want people to see you in the meeting?" and "Do you want people to hear
@@ -638,6 +644,34 @@ export const zoom = {
     const label = `${await b.getAttribute('aria-label').catch(() => '') || ''} ${await b.innerText().catch(() => '')}`;
     const n = label.match(/\d+/);
     return n ? Number(n[0]) : null;
+  },
+
+  // The toolbar's "Mute" / "Unmute". Bosun joined without giving Zoom the microphone, so the first unmute makes Zoom ask
+  // "Do you want people to hear you…?": the agent asked to be heard, so "Use microphone" (and nothing with the camera).
+  // A question that can't be answered that way is answered without it again, and the unmute fails.
+  async setMic(page, on) {
+    const answer = on ? async (p) => { const b = await firstVisible(button(p, LABEL.useMic)); if (b) await b.click({ timeout: 2000 }).catch(() => {}); } : null;
+    try {
+      return await setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Zoom', answer, open: revealToolbar, timeoutMs: 10_000 });
+    } catch (e) {
+      if (on && await declineDevices(page)) throw new Error('Zoom did not take the microphone when unmuting (it asked for one and offered no "Use microphone"); nothing can be said');
+      throw e;
+    }
+  },
+  // Opens the menu holding the hand (every 2 s at most, so an open menu isn't closed again), and closes it after.
+  async setHand(page, on) {
+    let openedAt = 0;
+    const open = async (p) => {
+      if (Date.now() - openedAt < 2000) return;
+      if (!(await firstVisible(button(p, LABEL.reactions)))) await revealToolbar(p);
+      const b = await firstVisible(button(p, LABEL.reactions));
+      if (b) openedAt = await b.click({ timeout: 3000 }).then(() => Date.now(), () => 0);
+    };
+    try {
+      return await setControl(page, { onLabel: LABEL.handUp, offLabel: LABEL.handDown, on, what: 'raised hand', site: 'Zoom', open });
+    } finally {
+      if (openedAt) await page.keyboard.press('Escape').catch(() => {});
+    }
   },
 
   async leave(page) {

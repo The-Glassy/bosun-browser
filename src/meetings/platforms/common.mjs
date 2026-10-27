@@ -163,3 +163,43 @@ export async function ensureOff(page, { what, onLabel, offLabel, missing, text, 
     await page.waitForTimeout(300);
   }
 }
+
+// A call's toolbar that faded out (Zoom's after a few seconds without the mouse moving) comes back on a mouse move.
+export async function revealToolbar(page) {
+  const v = page.viewportSize() || { width: 1280, height: 720 };
+  await page.mouse.move(v.width / 2 + Math.round(Math.random() * 40 - 20), v.height - 60 - Math.round(Math.random() * 20)).catch(() => {});
+  await page.waitForTimeout(200);
+}
+
+// A two-state control in the call (the microphone, a raised hand): 'on' while onLabel is shown (the button would turn
+// it off), 'off' while offLabel is, null when neither is visible.
+export async function controlState(page, onLabel, offLabel) {
+  if (await firstVisible(button(page, onLabel))) return 'on';
+  if (await firstVisible(button(page, offLabel))) return 'off';
+  return null;
+}
+
+// Clicks the control until it shows the wanted state and returns {state, changed: whether it clicked}, or throws (with
+// clicked: whether it clicked before giving up). A click that timed out counts as one: it may still have landed. One click, then up to a second
+// for the page to show the change (a second click too early would undo the first). open(page): makes the control
+// visible where it sits in a menu; called while no control is shown. answer(page): called on every round, for a
+// question the site asks in between (Zoom asking for the microphone).
+export async function setControl(page, { onLabel, offLabel, on, what, site, open = null, answer = null, timeoutMs = 6000 }) {
+  const want = on ? 'on' : 'off';
+  const until = Date.now() + timeoutMs;
+  let clicked = 0, clicks = 0;
+  for (;;) {
+    if (answer) await answer(page);
+    const s = await controlState(page, onLabel, offLabel);
+    if (s === want) return { state: want, changed: clicks > 0 };
+    if (!s && open) await open(page);
+    const b = s ? await firstVisible(button(page, s === 'on' ? onLabel : offLabel)) : null;
+    if (b && Date.now() - clicked > 1000 && !(await disabled(b))) {
+      clicks++;
+      await b.click({ timeout: 3000 }).catch(() => {});
+      clicked = Date.now();
+    }
+    if (Date.now() > until) throw Object.assign(new Error(s ? `could not turn the ${what} ${want} in ${site} (its control did not change)` : `no ${what} control found in ${site}`), { clicked: clicks > 0 });
+    await page.waitForTimeout(150);
+  }
+}

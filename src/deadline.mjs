@@ -12,7 +12,8 @@ export const TIMED_TOOLS = ['session_open', 'session_close', 'navigate', 'read',
   'keepalive_remove', 'macro_save', 'macro_list', 'macro_get', 'macro_delete'];
 // macro_run has a cap of its own for the whole run (timeout_sec); each of its steps gets the deadline of its tool.
 export const OWN_LIMIT_TOOLS = ['download_wait', 'request_human', 'handoff_wait', 'meeting_join', 'meeting_status', 'meeting_chat_read',
-  'meeting_chat_send', 'meeting_stop_recording', 'meeting_leave', 'meeting_recording_delete', 'macro_run'];
+  'meeting_chat_send', 'meeting_stop_recording', 'meeting_leave', 'meeting_recording_delete', 'meeting_transcript', 'meeting_speak', 'meeting_stop_speaking',
+  'meeting_mute', 'meeting_raise_hand', 'macro_run'];
 // wait_for waits up to 60 s by itself: unless TOOL_TIMEOUTS names it, its deadline is at least this.
 export const WAIT_FOR_MIN_SEC = 75;
 // A page operation is cut off this long before the deadline (a third of a shorter one), to check the page and

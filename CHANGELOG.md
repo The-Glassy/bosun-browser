@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.15.0 — taking part in a call: live transcript and speaking
+
+### Added
+
+- **Live transcript of a meeting** (`meeting_join { live_transcript: true }`, off by default). The meeting audio is
+  streamed to ElevenLabs Scribe v2 Realtime (`wss://api.elevenlabs.io/v1/speech-to-text/realtime`, model
+  `scribe_v2_realtime`, PCM 16 kHz, VAD commits after 1 s of silence, language detected per segment). See README ›
+  Live transcript and speaking, DESIGN §9b.
+  - `bosun:meeting-transcript` events (feature set `bosun.meeting`): `meeting_id`, `seq`, `start_s`, `end_s`, `text`,
+    `final`, `lang`, `speaker` if ElevenLabs gives one. Partials at most twice a second, carrying the `seq` of
+    their final; `transcript_partials: false` sends finals only. Sent only to connections there at the time, never
+    queued.
+  - `meeting_transcript { meeting_id, since }`: the finals so far.
+  - Same consent as the recording: it starts after the announcement, which then says "This call is recorded and
+    transcribed live". An opt-out in the chat stops recording and transcript at once and forgets the transcript;
+    `meeting_stop_recording` and `meeting_recording_delete` stop it too.
+  - `enable_logging=false` (zero retention) is always requested. ElevenLabs applies it only on enterprise and trial
+    plans and otherwise answers with a warning: `meeting_status` → `live_transcript.zero_retention` says which.
+  - `LIVE_TRANSCRIPT_DAILY_MIN` (default 180) per tenant and day: joins are refused once it is used up, and a running
+    stream stops with `bosun:meeting-transcript-stopped` (`daily-cap`). Errors that a new connection would not fix
+    stop it too (`error`); dropped connections are opened again with up to 20 s of audio kept.
+  - Cost: $0.39 per hour of audio.
+- **Speaking in a meeting:** `meeting_speak { text | audio_file_id, voice, lang, backend, auto_mute, interrupt,
+  wait }`. Text goes through the local Supertonic service (`TTS_URL`, default backend) or ElevenLabs
+  (`backend: "elevenlabs"`, `eleven_flash_v2_5`, a voice id); the audio plays into the browser's microphone.
+  - The microphone is unmuted for it and muted again after; the join still starts muted.
+  - Text is synthesized a sentence at a time, so the first sentence plays while the rest is synthesized.
+  - `meeting_stop_speaking` cuts it off (barge-in). `bosun:meeting-speech` says when an utterance ended.
+- **`meeting_mute { on }`** and **`meeting_raise_hand { on }`** for Meet and Zoom's web client.
+- Config: `ELEVENLABS_API_KEY` (kept in the service only: removed from its environment at start, so no browser
+  inherits it), `ELEVENLABS_BASE_URL` (`https://*.elevenlabs.io` only), `ELEVENLABS_VOICE`, `TTS_URL`, `TTS_VOICE`,
+  `LIVE_TRANSCRIPT_DAILY_MIN`.
+
+### Changed
+
+- **The meeting browser has a microphone now.** Chromium ignores PulseAudio monitor sources, so before 0.15 it saw no
+  microphone at all (Meet: "Microphone not found"). The silent `bosun_mic` monitor is now remapped into a real source,
+  `bosun_mic_src`. Joining is unchanged: the microphone is switched off and checked before Bosun joins, and on Zoom
+  "Use microphone" is still never clicked in the lobby, only on the first unmute.
+
+### Measured
+
+- Speaking (Linux, PulseAudio, chromium and patchright, `test/meeting-voice.test.mjs`): from the call to the first
+  sound in the page's `getUserMedia` 0.31–0.38 s plus the synthesis of the first sentence. Supertonic on the
+  production host (busy CPU) takes 1.0–1.3 s for a short sentence ("Hi Misha, this is Glassy."), about 3 s for a
+  60-character one, which the split brings down to the first piece.
+- Live transcript with ElevenLabs for real, through Chromium, PulseAudio and ffmpeg: a final arrives about 1.3 s after
+  its last word (1 s of that is the VAD pause), the first partial about 2 s after speech starts.
+
 ## 0.14.1 — clicks that find the visible element
 
 ### Fixed

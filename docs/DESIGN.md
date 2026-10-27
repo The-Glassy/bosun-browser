@@ -111,7 +111,8 @@ Namespace = server name: `browser:`. Declared as an ontology on the feature sets
 Implemented so far: `bosun:needs-human` from keepalive (0.4.0, feature set `bosun.handoff`, see README › Keeping
 logins alive) and `bosun:watch-changed` from a keepalive visit's watch (0.5.0, feature set `bosun.watch`, see
 README › Watching a value); `bosun:meeting-chat`, `bosun:meeting-optout` and `bosun:meeting-ended` from meetings
-(0.6.0, feature set `bosun.meeting`, see README › Meetings (PoC)), and `bosun:meeting-announce` (0.13.1); the server's namespace is `bosun:`.
+(0.6.0, feature set `bosun.meeting`, see README › Meetings (PoC)), `bosun:meeting-announce` (0.13.1), and
+`bosun:meeting-transcript`, `bosun:meeting-transcript-stopped`, `bosun:meeting-speech` (0.15.0, §9b); the server's namespace is `bosun:`.
 - `browser:needs-human`, `browser:human-done`, `browser:handoff-timeout`
 - `browser:download-finished` (with a bulk content reference, §19), `browser:download-failed`
 - `browser:watch-changed`
@@ -191,6 +192,49 @@ download). A macro stores such a flow once, per tenant, and `macro_run` replays 
 - **Not done (follow-up): recording** (`macro_record_start/stop`, turning the agent's own calls in a session into a
   draft). A recorded `click { ref }` must become role+name at record time, which the a11y snapshot gives only for
   elements with a role and a unique name (Plaud's "Generate" is a bare `div`), and it hooks every tool call.
+
+## 9b. Live transcript and speaking in meetings (0.15.0)
+
+Goal: the agent takes part in a call: it hears it as a live transcript and can speak into it. Bosun provides only
+the mechanism; when to speak (or raise a hand) is decided by the agent, never by Bosun.
+
+**Audio.** Each meeting already had a private PulseAudio server (sinks `bosun_out`, the meeting, and `bosun_mic`).
+- **Hearing:** a second ffmpeg reads `bosun_out.monitor` as raw PCM s16le 16 kHz mono (the recorder's ffmpeg is left
+  alone, so a failing stream can't cost the recording). `src/meetings/transcript.mjs` sends it in 250 ms chunks to
+  ElevenLabs Scribe v2 Realtime (`wss://api.elevenlabs.io/v1/speech-to-text/realtime`, `model_id=scribe_v2_realtime`,
+  `audio_format=pcm_16000`, `commit_strategy=vad`, `vad_silence_threshold_secs=1`, `include_timestamps`,
+  `include_language_detection`, `enable_logging=false`; no `language_code`, so a uk/ru/en/de/sk mix works).
+- **Speaking:** Chromium lists no PulseAudio monitor sources as microphones, so `bosun_mic`'s monitor is remapped
+  (`module-remap-source`) into `bosun_mic_src`, the browser's microphone (before 0.15 the browser had no microphone at
+  all: Meet said "Microphone not found"). ffmpeg plays into `bosun_mic`; it is silent otherwise.
+
+**Transcript.** Segments are numbered (`seq`); partials carry the seq their final will get. Times are seconds of
+audio since the transcript started, from the words' timestamps plus the audio sent before the current connection.
+Events go only to connections attached at the time (`EventBus.meetingLive`): a 20-event pending queue per tenant
+would otherwise lose chat and opt-out events to transcript text. `meeting_transcript` has every final (in memory, with
+the meeting; up to 5000). Reconnects: up to 20 s of audio is buffered; the first chunk carries the last ≤ 50
+characters as `previous_text`; fatal errors (auth, quota, terms, invalid request) stop it; others retry with backoff,
+8 failures in a row at most (a session that closes within 10 s counts as one).
+
+**Consent.** The transcript is part of the recording: it starts in the same place (after the announcement, which
+then says "recorded and transcribed live"), and everything that stops or deletes the recording stops it (opt-out:
+both at once, `Promise.all`), and deleting forgets its text. Zero retention is requested on every connection;
+ElevenLabs grants it only to enterprise and trial plans and otherwise says so in a `warning`, which is reported
+(`zero_retention: false`).
+
+**Cost cap.** Minutes are counted per tenant and local day in `BROWSER_DATA/live-transcript-usage.json`
+(`LIVE_TRANSCRIPT_DAILY_MIN`, 180). The money cap is ElevenLabs' own (dashboard).
+
+**Speaking.** `meeting_speak` splits text into pieces (sentences; a long first sentence at its first comma; later
+ones grouped up to 160 characters), synthesizes the first, and starts one ffmpeg player on stdin while unmuting in
+parallel; the remaining pieces are synthesized and written into the same player while it plays. A local Supertonic on
+a busy CPU synthesizes at about real time, so time to first audio is the first piece's synthesis, not the whole text's.
+The microphone is unmuted through the platform's toolbar control (`setMic`), and muted again 0.4 s after the audio
+ends, only if speaking turned it on. Zoom: a microphone Zoom never got makes Zoom ask "Do you want people to hear you?"
+on unmute; since the agent asked to be heard, "Use microphone" is answered then (the lobby still declines it).
+
+**Not done.** Streaming TTS (audio while a piece is still being synthesized); speaker labels (realtime Scribe gives
+none for one mixed track); echo of Bosun's own voice in the transcript can't happen (the meeting doesn't play it back).
 
 ## 10. Deployment
 
