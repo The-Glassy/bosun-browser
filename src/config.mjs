@@ -3,6 +3,7 @@ import { isLoopbackHost, parsePolicies, parseTokens } from './auth.mjs';
 import { parseTenantAllow } from './allow.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
 import { parseToolTimeouts } from './deadline.mjs';
+import { parseMacroSource } from './macros.mjs';
 
 function int(env, name, def, min, max) {
   const raw = env[name];
@@ -101,6 +102,8 @@ export function loadConfig(env = process.env) {
   for (const t of cfg.downloadAllow.keys()) {
     if (cfg.policies.get(t) === 'ephemeral') throw new Error(`BROWSER_TENANT_DOWNLOAD_ALLOW names tenant "${t}", whose policy is ephemeral (read-only tokens cannot download)`);
   }
+  // A read-only tenant that runs the macros of another tenant (BROWSER_MACRO_SOURCE=swarm=me).
+  cfg.macroSource = parseMacroSource(env, cfg.tokens, cfg.policies);
   // Session cap of each tenant with policy "ephemeral".
   cfg.ephemeralMaxSessions = int(env, 'BROWSER_EPHEMERAL_MAX_SESSIONS', Math.min(2, cfg.maxSessionsPerTenant), 1, cfg.maxSessionsPerTenant);
 

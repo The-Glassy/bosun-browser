@@ -56,7 +56,7 @@ Non-goals (v1)
 | `browser.vault` | tools | list credential names, fill_credential (values never returned) |
 | `browser.downloads` | tools, push, content refs | download events as bulk content references (§19) |
 | `browser.watch` | tools, push | watch a page/selector for change; event on change (e.g. price) |
-| `browser.macros` | tools | record/run deterministic step sequences without a model in between |
+| `browser.macros` | tools | save/run deterministic step sequences without a model in between (0.14.0, §9a; recording not yet) |
 
 A host disables any set whose `uses` it lacks; capability grants decide authority (§6.4). Plain-MCP clients get the
 tools only (no push), and handoff then returns "waiting for human" until done/timeout.
@@ -132,6 +132,48 @@ README › Watching a value); `bosun:meeting-chat`, `bosun:meeting-optout` and `
 - Downloads go to a tenant dir and are referenced, never inlined.
 - Web content is untrusted (prompt injection). The server doesn't execute model-supplied JS unless `evaluate` is granted.
 - Audit log per tenant: tool calls (no secret values), URLs, handoffs.
+
+## 9a. Macros (0.14.0)
+
+Agents repeat the same multi-step flows (Plaud: import a file through a chooser, reload, generate, export,
+download). A macro stores such a flow once, per tenant, and `macro_run` replays it without a model between steps.
+
+- **Document.** `{name, description, site, params, steps, confirm_risky, risky_steps, version, created_by,
+  created_at}`, versioned (last 20 kept), in `BROWSER_DATA/macros/<tenant>/<name>.json`, one file per macro written
+  by rename. Plain files rather than a database: the data volume already survives restarts and is snapshotted with
+  the profiles, and a macro is small and read whole.
+- **Steps are tool calls**, minus `session` and `ref`. Each step is run by the very handler registered for that
+  tool on this connection (`handlers` in `tools.mjs`), its arguments parsed by that tool's own schema, under that
+  tool's deadline (`withDeadline`, the same code path as a direct call). So the policy of the token, the host
+  allowlist and its proxy, bot-check detection, masking, the downloads allowlist and the secret and upload rules
+  hold for a macro step exactly as they do for the tool, and a tool the token may not call is missing from
+  `handlers` and refused before the run starts. The alternative, a second interpreter of page actions inside the
+  macro module, would have to be kept in step with every tool by hand.
+- **No refs, no code.** Refs (`e12`) come from one `read` and mean nothing in the next run; a step names its
+  element by role+name, selector or text. There is no `evaluate` step. `assert` (text / selector / url_contains) is
+  the one step that is not a tool; it only waits for something to be visible.
+- **Params** fill `{{name}}` in any string. `file_id` and `secret_id` params go only into `upload` file ids and
+  `type` secret_id, and those fields take nothing but such a param: ids are used once, and a macro never stores a
+  secret. A step that uses an optional param that was not given is skipped.
+- **Site.** Each macro names its hosts (no `*`). Checked before the run (every `navigate` URL, after the args are
+  filled in), before each step (the page must be on the site or `about:blank`), and during each step: a listener on
+  the tab's main-frame navigations notes the first one off the site, so a redirect out and back is still seen.
+  Off the site the run stops after the step, also an optional one. This is a check after the fact, not a block:
+  the tab may have loaded the page outside (within the tenant's allowlist, which the proxy enforces) before the run
+  stops; no further step acts on it. Blocking it outright would need request interception in every engine.
+- **Risky steps.** A word list (pay, buy, purchase, submit/place order, checkout, delete account, and German
+  equivalents) is matched against every string of every step at save time (refused without `confirm_risky`), again
+  after the args are filled in, and against the visible text / value / aria-label / title of the element a `click`
+  hits. A list is crude; it catches the obvious cases a macro should not do by accident, not an adversarial page.
+- **Time.** Each step: its tool's deadline. The run: `timeout_sec` (default 300, max 900); the failure report
+  (read + screenshot) may add up to 40 s. A progress notification after every step keeps a client with
+  `resetTimeoutOnProgress` from timing out; a cancelled request stops the run before the next step.
+- **Read-only tenants** list, get and run (`EPHEMERAL_TOOLS`), but cannot save or delete. Since a tenant has one
+  policy, a read-only tenant has no macros of its own: `BROWSER_MACRO_SOURCE=<read-only>=<tenant>` points it at a
+  full tenant's macros. Only a read-only tenant may be pointed elsewhere, so it is never unclear where a save goes.
+- **Not done (follow-up): recording** (`macro_record_start/stop`, turning the agent's own calls in a session into a
+  draft). A recorded `click { ref }` must become role+name at record time, which the a11y snapshot gives only for
+  elements with a role and a unique name (Plaud's "Generate" is a bare `div`), and it hooks every tool call.
 
 ## 10. Deployment
 

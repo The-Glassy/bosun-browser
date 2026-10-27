@@ -23,6 +23,7 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
   `keepalive_set` / `keepalive_list` / `keepalive_remove`, `secret_create`, `upload_create` / `upload` (unless `FEATURES_UPLOADS=0`),
   `download_wait` / `downloads` / `download_get` (tenants with download hosts),
+  `macro_save` / `macro_list` / `macro_get` / `macro_delete` / `macro_run`,
   and (unless `FEATURES_MEETINGS=0`) `meeting_join` /
   `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
   `meeting_leave` / `meeting_recording_delete`.
@@ -39,6 +40,9 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 - **Typing secrets** without them passing through the agent: the agent's shell pipes the password into a one-time
   URL on the MCP port (`sops … | curl -T - …`), and `type { secret_id }` fills it in. It is kept in memory only,
   typed once, and goes into password fields unless the call allows others. See [Typing secrets](#typing-secrets).
+- **Macros:** a multi-step flow on a site saved once (`macro_save`) and rerun with one call (`macro_run`), with
+  parameters, file uploads, secrets by id, downloads and asserts; it runs only on the hosts it names, and steps that
+  pay, buy or delete an account need an explicit confirmation. See [Macros](#macros).
 - Sessions are **ephemeral** (wiped on close) or use a named **persistent profile** of the tenant (stays logged in;
   no RAM while idle). A session belongs to the connection that opened it: other connections can't see, use or close
   it, and it is closed when that connection goes away or after `IDLE_TIMEOUT_SEC` without use.
@@ -90,6 +94,7 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `BROWSER_TOKEN` | – | token for tenant `default` (16+ chars) |
 | `BROWSER_TOKENS` | – | more tenants: `alice:<token>,bob:<token>` |
 | `BROWSER_TOKEN_POLICIES` | – (all `full`) | per-tenant policy: `swarm=ephemeral` (see [Read-only tokens for subagents](#read-only-tokens-for-subagents)) |
+| `BROWSER_MACRO_SOURCE` | – | `swarm=me`: the read-only tenant `swarm` lists, gets and runs the macros of tenant `me` (see [Macros](#macros)) |
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
 | `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist, enforced by a per-tenant forward proxy: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
 | `FEATURES_MEETINGS` | `1` | `0` = the meeting tools are not listed and their handlers not wired |
@@ -345,6 +350,92 @@ download_get { download_id, inline: true }   # UTF-8 text up to 256 KB comes bac
     by what arrives before the cancel lands. Give `BROWSER_DATA` a quota or a volume of its own for a hard bound.
   - A tenant that is not named sees why in `click`: `downloads are off for this token`.
   - A download a person starts during a handoff is kept for the agent like any other.
+
+## Macros
+
+An agent that keeps repeating the same flow on a site (Plaud: "Add audio" → "Import audio" → pick the file →
+load the list again → "Generate" → "Generate now" → export → download) saves it once as a **macro** and reruns it
+with one call. No model runs between the steps.
+
+```text
+macro_save { name: "plaud-import", site: ["web.plaud.ai", "*.plaud.ai"],
+             params: { audio: { type: "file_id" }, file_name: { type: "string" } },
+             steps: [ { tool: "navigate", url: "https://web.plaud.ai/" },
+                      { tool: "click", text: "Add audio" },
+                      { tool: "upload", text: "Import audio", file_id: "{{audio}}" }, … ] }
+  -> { saved: "plaud-import", version: 1, steps: 16, … }
+macro_run { name: "plaud-import", session, args: { audio: "f3a…", file_name: "Standup" }, timeout_sec: 900 }
+  -> { ok: true, steps: [ { step: 1, tool: "navigate", status: "ok", ms: 1302 }, … ],
+       reads: [ { step: 12, as: "summary", text: "…" } ], downloads: [ { download_id: "d4c…", filename: "Standup.txt", … } ] }
+```
+
+The whole Plaud flow is in [examples/plaud-import.json](examples/plaud-import.json) (written from the UI, not run
+against Plaud by the tests).
+
+**A macro** is a per-tenant JSON document: `name` (lowercase letters, digits, `.` `_` `-`), `description`, `site`
+(the hosts it may run on, patterns as in `BROWSER_TENANT_ALLOW`, `*` not allowed), `params`
+(`{ name: { type: string | number | file_id | secret_id, required?, default?, description? } }`) and up to 100
+`steps`. `macro_save` with a name that exists saves a new version; the last 20 are kept, and `macro_get` and
+`macro_run` take `version`. `created_by` (default: the tenant) and `created_at` are stored with each version.
+`macro_list` shows the latest version of each, `macro_delete` removes all of them.
+
+**Steps** use the page tools' own vocabulary, without `session`: each `{ tool, …that tool's arguments, optional?,
+note? }`.
+
+| tool | arguments |
+|---|---|
+| `navigate` | `url`, `wait?` |
+| `click` | `role` (+`name`), `selector` or `text` — no `ref`: refs change with every `read` |
+| `type` | the element, `value` or `secret_id: "{{param}}"`, `submit?`, `allow_non_password?` |
+| `select` | the element, `value` |
+| `press` | `key` |
+| `wait_for` | `text` or `selector`, `timeoutMs?` |
+| `upload` | the element, `file_id: "{{param}}"` or `files`, `method?` |
+| `download_wait` | `timeoutMs?` |
+| `read` | `mode?`, `selector?`, `maxChars?`, `as?` (a name for the text in `reads`) |
+| `screenshot` | the element?, `fullPage?` |
+| `assert` | `text`, `selector` and/or `url_contains`, `timeoutMs?` (default 5000): fails the step unless all hold |
+
+- Any string may hold `{{param}}`. A step that names a param the run wasn't given (one that is not required) is
+  skipped, so an optional param switches its steps on and off.
+- `optional: true`: the step's failure is noted (`failed_optional`) and the run goes on.
+- Nothing else: no script, no `evaluate`, no code. Each step runs through the same handler as the tool of that
+  name, so everything the tool checks applies: the host allowlist, bot-check detection, masking, the downloads
+  allowlist, the upload and secret rules, and the token's policy.
+
+**`macro_run { name, session, args, version?, dry_run?, timeout_sec? }`** runs the steps in order in the session.
+
+- Each step has its tool's deadline (`TOOL_TIMEOUT_SEC` / `TOOL_TIMEOUTS`; `assert` that of `wait_for`), and the
+  whole run `timeout_sec` (default 300, at most 900). A run longer than your MCP client's request timeout (60 s in
+  the SDK) needs that timeout raised, or a `progressToken`: Bosun sends a progress notification after every step,
+  which a client with `resetTimeoutOnProgress` counts as a sign of life. A cancelled request stops the run before
+  its next step.
+- The answer: `ok`, every step's `status` (`ok`, `failed_optional`, `skipped`, `failed`, `not_run`) and time,
+  `reads` (the `read` steps' text), `downloads` (fetch them with `download_get`) and the `screenshot` steps' images.
+  A `download_wait` step also takes a download that the `click` before it already reported.
+- On failure (`isError`): `failure { step, tool, error, url, title, page (the start of the a11y snapshot, masked as
+  in read), screenshot (attached as an image, masked) }`, to fix the macro and save a new version.
+- `dry_run: true` checks the args and returns the steps as they would run, without a session or the page.
+
+**Safety.**
+
+- **Site.** A `navigate` to a host outside `site` is refused before the first step runs (also when an arg made the
+  URL). A step that starts on a page outside it is not run. Any navigation of the tab outside it while a step runs,
+  a redirect that comes back included, stops the run after that step, even an `optional` one. `about:blank` counts
+  as no page. The tenant's host allowlist still applies on top, enforced by its proxy.
+- **Secrets** go in only as a `{{param}}` of type `secret_id`, in `type`'s `secret_id`: a stored macro never holds
+  one, nor a `file_id` (both are used once). A `secret_id` or `file_id` param can't go into any other field.
+- **Risky steps.** A step whose text (any of its strings, after the args are filled in) says pay, buy, purchase,
+  submit or place order, checkout or delete account (also: kaufen, bezahlen, zahlungspflichtig, kostenpflichtig
+  bestellen, Konto löschen) is refused unless the macro was saved with `confirm_risky: true`. A `click` is also
+  checked against what the element it hits says (text, value, `aria-label`, `title`), so a selector can't point at
+  a "Buy now" button unnoticed. `macro_list` and `macro_save` show `confirm_risky` and the risky steps.
+- **Storage.** `BROWSER_DATA/macros/<tenant>/<name>.json` (0600), all kept versions in one file, written
+  atomically; it survives restarts and upgrades with the data volume. Per tenant at most 200 macros of 256 KB each.
+- **Read-only tokens** (policy `ephemeral`) may `macro_list`, `macro_get` and `macro_run` but not save or delete,
+  and their steps hold to their policy (no `upload`, `download_wait` or `secret_id`). They have no macros of their
+  own: `BROWSER_MACRO_SOURCE=swarm=me` lets the read-only tenant `swarm` list, get and run those of tenant `me`, in
+  its own sessions, under its own allowlist.
 
 ## Handoff
 
@@ -691,7 +782,8 @@ BROWSER_EPHEMERAL_MAX_SESSIONS=2             # default
 With policy `ephemeral` the server enforces, not just hides:
 
 - `tools/list` shows only `session_open`, `session_close`, `navigate`, `read`, `click`, `type`, `select`, `press`,
-  `back`, `wait_for`, `screenshot` and `sessions`. Any other tool answers `not allowed for this token`, whatever its
+  `back`, `wait_for`, `screenshot`, `sessions`, `macro_list`, `macro_get` and `macro_run` (a macro's steps hold
+  to the same set; its macros are those of `BROWSER_MACRO_SOURCE`, see [Macros](#macros)). Any other tool answers `not allowed for this token`, whatever its
   arguments; its handler is never wired up for the connection.
 - `session_open` refuses `profile` ("profiles are not allowed for this token") and any engine but the default
   (`ENGINE`, which startup checked, so a session never installs a browser). The session manager enforces both for
@@ -865,7 +957,7 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
 ## Roadmap
 
 M1 meetings beyond the PoC (Teams, speaker separation), tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
-references, watching pages outside keepalive visits · M3 macros.
+references, watching pages outside keepalive visits · M3 recording macros from an agent's own calls (`macro_record_start/stop`).
 
 ## License
 

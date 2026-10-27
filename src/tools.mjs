@@ -16,7 +16,8 @@ import { BASE64_MAX_BYTES } from './uploads.mjs';
 import { DRIVER_LOGS_REFUSED, SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS, driverLogsValues } from './secrets.mjs';
 import { INLINE_MAX_BYTES } from './downloads.mjs';
 import { showPattern } from './allow.mjs';
-import { currentCall, reserveMs, runCall, timeoutMessage } from './deadline.mjs';
+import { currentCall, withDeadline } from './deadline.mjs';
+import { MAX_SITES, MAX_STEPS, RUN_DEFAULT_SEC, RUN_MAX_SEC, runMacro } from './macros.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
@@ -185,7 +186,9 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
 
 // The tools a token with policy "ephemeral" may call: ephemeral sessions and page tools. No profiles, keepalive,
 // meetings or handoff.
-export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for', 'screenshot', 'sessions']);
+// Macros: list, get and run (the steps are held to the same set), but not save or delete.
+export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for', 'screenshot', 'sessions',
+  'macro_list', 'macro_get', 'macro_run']);
 
 export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn = { inflight: 0 }, uploadBase = null }) {
   const ephemeral = policy === 'ephemeral';
@@ -197,7 +200,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.13.1' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.14.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -221,29 +224,19 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   // Every tool: bounded concurrency per connection, sanitized errors, and a deadline (deadline.mjs; not for the tools
   // that keep their own limits). A tool the policy doesn't allow is registered as a stub that only refuses (its
-  // handler is never wired up) and is left out of tools/list below.
+  // handler is never wired up) and is left out of tools/list below. The handlers this token may call, with their
+  // argument schemas, are also kept in handlers: a macro step runs the same code as the tool.
+  const handlers = new Map();
   const tool = (name, desc, shape, fn) => {
     if (ephemeral && !EPHEMERAL_TOOLS.has(name)) return server.tool(name, NOT_ALLOWED, {}, async () => { throw new Error(`${name}: ${NOT_ALLOWED}`); });
+    handlers.set(name, { fn, schema: z.object(shape) });
     const limitMs = cfg.toolTimeouts?.get(name) ?? null;
     return server.tool(name, desc, shape, async (a, extra) => {
       if (conn.inflight >= cfg.maxInflight) throw new Error(`too many concurrent requests on this connection (max ${cfg.maxInflight})`);
       conn.inflight++;
-      let call = null, timer;
       try {
-        if (!limitMs) return await fn(a, extra);
-        call = { name, limitMs, at: Date.now() + limitMs, reserveMs: reserveMs(limitMs), done: false, expired: false, inPage: false, queued: false, state: null };
-        const work = runCall(call, () => fn(a, extra));
-        // The call is answered by its deadline. A page operation is cut off earlier by the session (run), which
-        // checks the page and usually answers first; if that check is still going on, this says how far it got.
-        const late = new Promise((_, reject) => {
-          timer = setTimeout(() => {
-            call.expired = true;
-            reject(new Error(timeoutMessage(call, call.state ?? (call.queued && !call.inPage ? 'queued' : call.inPage ? 'checking' : null))));
-          }, limitMs);
-        });
-        work.catch(() => {});
-        return await Promise.race([work, late]);
-      } catch (e) { throw new Error(cleanError(e)); } finally { clearTimeout(timer); if (call) call.done = true; conn.inflight--; }
+        return limitMs ? await withDeadline(name, limitMs, () => fn(a, extra)) : await fn(a, extra);
+      } catch (e) { throw new Error(cleanError(e)); } finally { conn.inflight--; }
     });
   };
 
@@ -610,6 +603,116 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     tool('meeting_leave', 'Leave the meeting; the recording is finished and kept (bosun:meeting-ended).', mid, async (a) => ok(await meetings.leave(tenant, a.meeting_id)));
     tool('meeting_recording_delete', `Delete a meeting's recording (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
       async (a) => ok(await meetings.deleteRecording(tenant, a.meeting_id)));
+  }
+
+  // Macros: step sequences saved by this tenant (a read-only tenant: by the tenant BROWSER_MACRO_SOURCE names), each
+  // step run by the handler of its tool above, so this token's policy, allowlists and limits apply to it as they do
+  // to the tool.
+  const macros = manager.macros;
+  if (macros) {
+    // The page side of a run (macros.mjs runMacro) in one session of this connection.
+    const macroOps = (session, extra) => {
+      const progressToken = extra?._meta?.progressToken;
+      const page = () => {
+        const s = manager.get(owner, session);
+        if (s.handoff) throw new Error(HANDOFF_ACTIVE);
+        return s.page;
+      };
+      const step = async (name, args, limitMs, signal) => {
+        const h = handlers.get(name);
+        const r = h.schema.safeParse({ ...args, session });
+        if (!r.success) throw new Error(`invalid step: ${r.error.issues.map((i) => `${i.path.join('.') || name}: ${i.message}`).join('; ')}`);
+        const go = () => h.fn(r.data, { signal });
+        return limitMs ? withDeadline(name, limitMs, go) : go();
+      };
+      return {
+        allowed: (name) => (name === 'assert' || handlers.has(name) ? null : `${name} is not available for this token`),
+        limitOf: (name) => cfg.toolTimeouts?.get(name === 'assert' ? 'wait_for' : name) ?? null,
+        step,
+        url: () => page().url(),
+        // The first main-frame navigation off the site while a step runs (a redirect that comes back is still seen).
+        watch(isOff) {
+          const p = page();
+          let seen = null;
+          const on = (f) => { if (!seen && f === p.mainFrame() && isOff(f.url())) seen = f.url(); };
+          p.on('framenavigated', on);
+          return { seen: () => seen, stop: () => p.off('framenavigated', on) };
+        },
+        assert: (c, limitMs) => withDeadline('assert', limitMs, () => run(session, async (s) => {
+          const t = c.timeoutMs ?? 5000;
+          const failed = (what) => (e) => { throw e?.name === 'TimeoutError' ? new Error(`assert failed: ${what} within ${t} ms`) : e; };
+          if (c.url_contains !== undefined) {
+            for (const end = Date.now() + t; !s.page.url().includes(c.url_contains);) {
+              if (Date.now() >= end) throw new Error(`assert failed: the URL does not contain "${c.url_contains}" within ${t} ms`);
+              await sleep(200);
+            }
+          }
+          if (c.selector !== undefined) await s.page.locator(c.selector).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`no visible element matches selector ${c.selector}`));
+          if (c.text !== undefined) await s.page.getByText(c.text).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`text "${c.text}" is not visible`));
+          return true;
+        })),
+        // The element a click or type step targets: what it says (visible text, value, aria-label, title) and its
+        // kind (an <input>'s type, else its tag).
+        element: (t, limitMs) => withDeadline('element', limitMs, () => run(session, (s) => locate(s.page, t).evaluate((el) => ({
+          label: [el.innerText, el.value, el.getAttribute('aria-label'), el.title].filter((x) => typeof x === 'string' && x).join(' ').slice(0, 500),
+          kind: el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName,
+        }), null, { timeout: 5000 }))),
+        // Where the run stopped: URL, title and the start of the a11y snapshot (masked as read masks it), and a
+        // screenshot (masked as screenshot masks it).
+        async failure() {
+          const out = {};
+          try {
+            const r = await step('read', { mode: 'a11y', maxChars: 4000 }, 20_000).catch(() => step('read', { mode: 'text', maxChars: 4000 }, 20_000));
+            const text = r.content[0].text;
+            const [head, body] = [text.slice(0, text.indexOf('\n\n')), text.slice(text.indexOf('\n\n') + 2)];
+            for (const line of head.split('\n')) { const m = /^(url|title): (.*)$/.exec(line); if (m) out[m[1]] = m[2]; }
+            out.page = body;
+          } catch (e) { out.page_error = cleanError(e); }
+          try { out.screenshot = (await step('screenshot', {}, 20_000)).content.find((c) => c.type === 'image')?.data; } catch {}
+          return out;
+        },
+        progress: progressToken === undefined ? null
+          : (done, total, message) => extra.sendNotification({ method: 'notifications/progress', params: { progressToken, progress: done, total, message } }).catch(() => {}),
+      };
+    };
+
+    const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {role+name | selector | text} (no ref); type {target, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. Any string may use {{param}}; a step that uses a param not given is skipped.`;
+    tool('macro_save', `Save a multi-step flow on a site as a macro to rerun with macro_run (saving an existing name makes a new version; the last 20 are kept). site: the hosts it may run on (e.g. ["web.plaud.ai", "*.plaud.ai"]); a page outside them stops the run. params: {name: {type: string|number|file_id|secret_id, required?, default?, description?}}; a secret or file goes in only as a {{param}} of type secret_id / file_id, never stored. ${stepsHelp} A step whose text says pay, buy, purchase, submit/place order, checkout or delete account is refused unless confirm_risky: true.`,
+      { name: str(64).describe('lowercase letters, digits, . _ -'), description: str(2000).optional(), site: z.array(str(300)).min(1).max(MAX_SITES),
+        params: z.record(z.string().max(40), z.record(z.string(), z.unknown())).optional(), steps: z.array(z.record(z.string(), z.unknown())).min(1).max(MAX_STEPS),
+        confirm_risky: z.boolean().optional().describe('allow steps that may pay, buy, order, check out or delete an account'), created_by: str(100).optional().describe('who saved it (default: the tenant)') },
+      async (a) => {
+        const v = macros.save(tenant, a, { createdBy: a.created_by || tenant });
+        return ok({ saved: v.name, version: v.version, steps: v.steps.length, site: v.site, params: v.params, confirm_risky: v.confirm_risky, ...(v.risky_steps.length ? { risky_steps: v.risky_steps } : {}), next: `macro_run { name: "${v.name}", session, args }` });
+      });
+    tool('macro_list', 'List your macros (latest version of each): name, version, description, site, params (type, ? = optional), number of steps, confirm_risky and the risky steps.', {},
+      async () => ok(macros.list(tenant)));
+    tool('macro_get', 'A macro in full (steps and all), the latest version or version.', { name: str(64), version: z.number().int().min(1).optional() },
+      async (a) => ok(macros.get(tenant, a.name, a.version)));
+    tool('macro_delete', 'Delete a macro with all its versions.', { name: str(64) }, async (a) => ok(macros.delete(tenant, a.name)));
+    tool('macro_run', `Run a macro in session, step by step; each step works like the tool of that name and has its deadline, the whole run at most timeout_sec (default ${RUN_DEFAULT_SEC}, up to ${RUN_MAX_SEC}; raise your MCP client's request timeout above that, or send a progressToken: Bosun reports progress after every step). Returns per-step status, reads (the read steps' text), downloads (download_id to fetch with download_get) and screenshots (images). On failure: the step, its error, the URL, the start of the page's a11y snapshot and a screenshot, so you can fix the macro and save a new version. A page outside the macro's site stops the run. dry_run: check args and show the steps as they would run, without touching the page.`,
+      { name: str(64), session: str(40).optional().describe('required unless dry_run'), args: z.record(z.string().max(40), z.union([z.string().max(10000), z.number()])).optional(),
+        version: z.number().int().min(1).optional(), dry_run: z.boolean().optional(), timeout_sec: z.number().int().min(10).max(RUN_MAX_SEC).optional() },
+      async (a, extra) => {
+        const m = macros.get(tenant, a.name, a.version);
+        let s = null;
+        if (!a.dry_run) {
+          if (!a.session) throw new Error('give session (or dry_run: true)');
+          s = manager.get(owner, a.session); // an unknown session fails before anything runs
+          // Two runs in one tab would take turns step by step, each on the page the other left.
+          if (s.macroRun) throw new Error(`macro ${s.macroRun} is running in session ${s.id}; wait for it to finish`);
+          s.macroRun = m.name;
+        }
+        let out;
+        try {
+          out = await runMacro(m, { args: a.args ?? {}, dryRun: !!a.dry_run, maxMs: (a.timeout_sec ?? RUN_DEFAULT_SEC) * 1000, signal: extra?.signal, ops: macroOps(a.session, extra) });
+        } finally { if (s) s.macroRun = null; }
+        const { result, images } = out;
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 1) }, ...images.map((im) => ({ type: 'image', data: im.data, mimeType: 'image/jpeg' }))],
+          ...(result.ok ? {} : { isError: true }),
+        };
+      });
   }
 
   tool('sessions', 'List your open sessions.', {}, async () => ok(manager.list(owner).map((s) => (

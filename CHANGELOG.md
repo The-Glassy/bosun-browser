@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.14.0 — macros
+
+### Added
+
+- **Macros: save a multi-step site flow once, rerun it with one call.** New tools `macro_save`, `macro_list`,
+  `macro_get`, `macro_delete` and `macro_run`. See README › Macros, DESIGN §9a.
+  - A macro is a per-tenant, named, versioned JSON document: `site` (the hosts it may run on), `params` (`string`,
+    `number`, `file_id`, `secret_id`; `{{param}}` in any string) and up to 100 steps in the page tools' vocabulary
+    (`navigate`, `click`, `type`, `select`, `press`, `wait_for`, `upload`, `download_wait`, `read`, `screenshot`)
+    plus `assert { text | selector | url_contains }`, each optionally `optional`. No refs, no script.
+  - Each step runs through the handler of its tool, with that tool's checks and deadline; the run has a cap of its
+    own (`timeout_sec`, default 300, max 900), progress notifications per step, and stops when the request is
+    cancelled.
+  - `macro_run` answers with every step's status and time, the `read` steps' text, the downloads and the
+    screenshots; on failure with the step, its error, the URL and title, the start of the page's a11y snapshot and
+    a screenshot (both masked). `dry_run` shows the steps as they would run.
+  - Safety: a navigate outside `site` is refused, a navigation off it stops the run; secrets and files go in only as
+    `secret_id` / `file_id` params, never stored; steps that may pay, buy, order, check out or delete an account
+    (also a `click` whose element says so) are refused unless saved with `confirm_risky: true`, which `macro_list`
+    shows.
+  - Stored in `BROWSER_DATA/macros/<tenant>/<name>.json` (0600, last 20 versions), kept across restarts.
+  - Read-only (`ephemeral`) tokens may list, get and run, not save or delete; `BROWSER_MACRO_SOURCE=swarm=me` lets
+    the read-only tenant `swarm` use the macros of tenant `me`. Their steps hold to the read-only policy.
+- `examples/plaud-import.json`: the Plaud import → generate → export flow as a macro.
+
+### Changed
+
+- The per-call deadline is one function (`withDeadline` in `src/deadline.mjs`) used by the tools and by macro
+  steps; behaviour is unchanged.
+
+### Tests
+
+- `test/macros.test.mjs`: validation (refs, sessions, unknown fields, undeclared params, stored ids, `*` sites,
+  risky words), args and templates, the site check, `BROWSER_MACRO_SOURCE`, the store (versions, 0600, a restart);
+  and runs through the MCP tools against a local Plaud-like flow: upload through a file chooser, a param,
+  re-navigate, generate, assert, read and a download fetched with `download_get`; a failing assert and its failure
+  payload; a click that leaves the site and a navigate outside it; a risky element behind a selector and risky
+  text from args; a read-only token (list/get/run, no save/delete, no upload step); a secret_id param.
+
 ## 0.13.1 — record when the chat reaches only the host, or nobody
 
 ### Fixed
