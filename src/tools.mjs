@@ -128,21 +128,23 @@ function pick([els, afters, befores, nth]) {
 // Runs in the page: what an element is (tag, whole id and class: they are masked before they are cut short) and why
 // it is not shown.
 function sketch(el) {
+  // Only the names HTML and SVG define: a custom or unknown element's name is the page's own text.
+  const kind = (x) => (!x.localName.includes('-') && !(x instanceof HTMLUnknownElement) && (x instanceof HTMLElement || (x instanceof SVGElement && x.constructor !== SVGElement)) ? x.localName : x.localName.includes('-') ? 'custom element' : 'element');
   let why = null;
   for (let x = el; x && x.nodeType === 1; x = x.parentElement ?? x.getRootNode?.()?.host) {
-    if (getComputedStyle(x).display === 'none') { why = x === el ? 'display: none' : `inside a display: none <${x.localName}>`; break; }
+    if (getComputedStyle(x).display === 'none') { why = x === el ? 'display: none' : `inside a display: none <${kind(x)}>`; break; }
   }
   if (!why && getComputedStyle(el).visibility !== 'visible') why = 'visibility: hidden';
   if (!why) { const r = el.getBoundingClientRect(); if (!r.width || !r.height) why = 'zero size'; }
-  return { tag: el.localName, id: el.id, cls: typeof el.className === 'string' ? el.className : '', why };
+  return { tag: kind(el), id: el.id, cls: typeof el.className === 'string' ? el.className : '', why };
 }
 
-// What an error may say about an element of the page: its tag, id and first classes, masked as read masks them (an
-// id or class can hold what was typed into a password or OTP field) before they are cut short; just its tag if that
-// can't be checked.
-async function safeTag(page, { tag, id, cls }) {
+// What an error may say about an element of the page: its tag (one HTML or SVG defines), id and first classes, the
+// last two masked as read masks them (an id or class can hold what was typed into a password or OTP field) before
+// they are cut short; just its tag if that can't be checked, or once the call is over.
+async function safeTag(page, { tag, id, cls }, call) {
   let values;
-  try { values = await sensitiveValues(page); } catch { return `<${tag}>`; }
+  try { stillOn(call); values = await sensitiveValues(page); } catch { return `<${tag}>`; }
   const m = (v) => maskText(String(v ?? ''), values);
   const c = m(cls).trim().split(/\s+/).filter(Boolean).slice(0, 3).join(' ');
   return `<${tag}${id ? ` id="${m(id).slice(0, 40)}"` : ''}${c ? ` class="${c.slice(0, 60)}"` : ''}>`;
@@ -197,7 +199,7 @@ async function locate(p, t, { hidden = false, until = Date.now() + FIND_MS } = {
     }
     stillOn(call);
     if (hidden && !ordinal && await matches(p, t).count()) return matches(p, t).first();
-    if (Date.now() >= until) { stillOn(call); throw new Error(await whyNone(p, t, missing, count)); }
+    if (Date.now() >= until) { stillOn(call); throw new Error(await whyNone(p, t, missing, count, call)); }
     await sleep(Math.min(200, Math.max(0, until - Date.now())));
   }
 }
@@ -205,9 +207,11 @@ async function locate(p, t, { hidden = false, until = Date.now() + FIND_MS } = {
 // Runs fn on what locate finds, and lets go of a handle it picked. retry: once more if that element left the page
 // before fn acted on it (the page re-rendered it), while there is time.
 async function withTarget(p, t, opts, fn, { retry = false } = {}) {
+  const call = stepCall() ?? currentCall();
   for (;;) {
     const l = await locate(p, t, opts);
     try {
+      stillOn(call); // found only after the call was cut off: not acted on
       return await fn(l);
     } catch (e) {
       if (!(retry && l.asElement && /not attached to the DOM/i.test(e?.message) && Date.now() < opts.until)) throw e;
@@ -215,16 +219,18 @@ async function withTarget(p, t, opts, fn, { retry = false } = {}) {
   }
 }
 
-async function whyNone(p, t, missing, count) {
+async function whyNone(p, t, missing, count, call) {
   const secs = `${Math.round(FIND_MS / 1000)} s`;
   if (missing) return `${missing} within ${secs}`;
   const all = matches(p, t, { all: true });
   const n = await all.count();
+  stillOn(call);
   const shown = await all.filter({ visible: true }).count();
   if (!n) return `nothing matches ${show(t)} within ${secs}`;
   if (!shown) {
+    stillOn(call);
     const first = await all.first().evaluate(sketch, null, { timeout: 2000 }).catch(() => null);
-    return `${show(t)} matched ${n} element${n > 1 ? 's' : ''}, none visible within ${secs}${first ? ` (the first is ${await safeTag(p, first)}${first.why ? `, ${first.why}` : ''})` : ''}`;
+    return `${show(t)} matched ${n} element${n > 1 ? 's' : ''}, none visible within ${secs}${first ? ` (the first is ${await safeTag(p, first, call)}${first.why ? `, ${first.why}` : ''})` : ''}`;
   }
   const where = [t.after && `after "${t.after}"`, t.before && `before "${t.before}"`].filter(Boolean).join(' and ');
   return `${show(t)}: ${count ?? shown} visible match${(count ?? shown) === 1 ? '' : 'es'}${where ? ` ${where}` : ''}, so nth ${t.nth ?? 0} is not there${n > shown ? ` (${n - shown} more hidden)` : ''}`;
@@ -233,6 +239,8 @@ async function whyNone(p, t, missing, count) {
 // Runs in the page: why a click on el cannot happen: it is disabled, or another element covers its middle (the one
 // a click there would hit; its tag, id and classes).
 function blocker(el) {
+  // Only the names HTML and SVG define: a custom or unknown element's name is the page's own text.
+  const kind = (x) => (!x.localName.includes('-') && !(x instanceof HTMLUnknownElement) && (x instanceof HTMLElement || (x instanceof SVGElement && x.constructor !== SVGElement)) ? x.localName : x.localName.includes('-') ? 'custom element' : 'element');
   if (!el.isConnected) return { why: 'it left the page' };
   if (el.disabled || el.closest('fieldset:disabled') || el.getAttribute('aria-disabled') === 'true') return { why: 'it is disabled' };
   const r = el.getBoundingClientRect();
@@ -242,7 +250,7 @@ function blocker(el) {
   while (hit?.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
   const holds = (a, b) => { for (let n = b; n; n = n.parentNode ?? n.host ?? null) if (n === a) return true; return false; };
   if (!hit || holds(el, hit)) return null;
-  return { covered: { tag: hit.localName, id: hit.id, cls: typeof hit.className === 'string' ? hit.className : '' } };
+  return { covered: { tag: kind(hit), id: hit.id, cls: typeof hit.className === 'string' ? hit.className : '' } };
 }
 
 // click(opts) on el (a locator or a handle) by until, with Playwright's waits for it to be clickable. One that times
@@ -256,7 +264,7 @@ async function clicking(page, el, click, until) {
     stillOn(call); // a call that is over looks no further
     const b = await el.evaluate(blocker, null, { timeout: 2000 }).catch(() => null);
     stillOn(call);
-    const why = b?.why ?? (b?.covered ? `it is covered by ${await safeTag(page, b.covered)}, which would get the click` : null);
+    const why = b?.why ?? (b?.covered ? `it is covered by ${await safeTag(page, b.covered, call)}, which would get the click` : null);
     throw new Error(`the element did not become clickable within ${Math.round(FIND_MS / 1000)} s${why ? `: ${why}` : ' (it stayed hidden, moving or disabled)'}`);
   }
 }
@@ -622,7 +630,12 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   tool('select', 'Choose an option in a <select>.', { session: str(40), ...target, value: str(1000) }, async (a) => run(a.session, async (s) => {
     const until = Date.now() + FIND_MS;
-    await withTarget(s.page, a, { until, hidden: true }, (l) => onTarget(l, (t, call) => t.selectOption({ label: a.value }, { timeout: left(until) }).catch(async () => { await recheck(call); return t.selectOption(a.value, { timeout: left(until) }); }),
+    await withTarget(s.page, a, { until, hidden: true }, (l) => onTarget(l, async (t, call) => {
+      // A hidden <select> (one a custom dropdown stands in for) takes the option all the same, once it is enabled.
+      const force = !(await t.isVisible());
+      if (force && !(await t.isEnabled())) throw new Error('this <select> is hidden and disabled');
+      return t.selectOption({ label: a.value }, { timeout: left(until), force }).catch(async () => { await recheck(call); return t.selectOption(a.value, { timeout: left(until), force }); });
+    },
       { until, ready: (h) => h.waitForElementState('enabled', { timeout: left(until) }) }));
     return ok(await pageInfo(s.page));
   }));
