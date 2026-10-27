@@ -409,44 +409,51 @@ function describe(el, risky) {
     if (label?.control) c = label.control;
   }
   const byId = (x, id) => { const r = x.getRootNode?.(); return (r?.getElementById ? r.getElementById(id) : null) ?? x.ownerDocument.getElementById(id); };
-  // What x says, roughly its accessible name and more: every text node, alt, aria-label, title, value and
-  // placeholder in it, its shadow roots included, plus what aria-labelledby points at (in order). Read generously:
-  // text that is hidden or not slotted counts too. As one string with the pieces spaced, and run together (a word
-  // split over two spans).
-  const said = (x) => {
-    const parts = [];
-    let budget = 5000;
+  const MAX_NODES = 50_000;
+  let over = false;
+  // What x says, generously (hidden or unslotted text counts too): its text nodes as one stream (spaced, and run
+  // together for a word split over two spans), its shadow roots included; every alt, aria-label, title, value and
+  // placeholder in it, each on its own; and what aria-labelledby points at, read the same way, in order. A tree too
+  // large to read whole is not read in part: over.
+  const said = (x, seen = new Set()) => {
+    const text = [], attrs = [];
+    let nodes = 0;
     const walk = (n) => {
-      if (budget-- <= 0) return;
-      if (n.nodeType === 3) { parts.push(n.data); return; }
+      if (++nodes > MAX_NODES) { over = true; return; }
+      if (n.nodeType === 3) { text.push(n.data); return; }
       if (n.nodeType === 1) {
         if (n.localName === 'script' || n.localName === 'style') return;
-        for (const k of ['alt', 'aria-label', 'title', 'placeholder']) { const v = n.getAttribute(k); if (v) parts.push(v); }
-        if ((n.localName === 'input' || n.localName === 'button' || n.localName === 'option') && typeof n.value === 'string' && n.value) parts.push(n.value);
-        for (const id of (n.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)) { const t = byId(n, id)?.textContent; if (t) parts.push(t); }
+        for (const k of ['alt', 'aria-label', 'title', 'placeholder']) { const v = n.getAttribute(k); if (v) attrs.push(v); }
+        if ((n.localName === 'input' || n.localName === 'button' || n.localName === 'option') && typeof n.value === 'string' && n.value) attrs.push(n.value);
+        const refs = (n.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => byId(n, id)).filter((r) => r && !seen.has(r));
+        if (refs.length) {
+          const named = refs.map((r) => { seen.add(r); return said(r, seen); });
+          attrs.push(named.map((v) => v[0]).join(' '), ...named.flat());
+        }
         if (n.shadowRoot) walk(n.shadowRoot);
       } else if (n.nodeType !== 11) return;
-      for (const k of n.childNodes) walk(k);
+      for (const k of n.childNodes) { if (over) return; walk(k); }
     };
     walk(x);
-    const labelledby = (x.getAttribute?.('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => byId(x, id)?.textContent ?? '').join(' ');
-    return [parts.join(' '), parts.join(''), labelledby];
+    return [text.join(' '), text.join(''), ...attrs];
   };
   const fields = [...said(el), ...(c === el ? [] : said(c))];
-  // Every control the click reaches on its way up (through shadow roots too), not only the nearest one. A label or
-  // an element with onclick may wrap a whole form: what it says counts only when it is short (a button's worth).
+  // Every control the click reaches on its way up the composed tree (a slotted element's slot first, then parents
+  // and shadow hosts), not only the nearest one. A label or an element with onclick may wrap a whole form: what it
+  // says counts only when it is short (a button's worth); otherwise only its own aria-label and title.
   const CONTROL = 'button, a[href], summary, input, select, textarea, [role=button], [role=link], [role=menuitem], [role=tab], [role=checkbox], [role=switch], [role=option]';
-  for (let x = el.parentElement ?? el.getRootNode?.()?.host; x; x = x.parentElement ?? x.getRootNode?.()?.host) {
+  const up = (x) => x.assignedSlot ?? x.parentElement ?? x.getRootNode?.()?.host ?? null;
+  for (let x = up(el); x; x = up(x)) {
     const control = x.matches(CONTROL);
     if (!control && !x.matches('label, [onclick]')) continue;
-    const xs = said(x);
-    if (control || xs[0].length <= 200) fields.push(...xs);
+    if (control || String(x.textContent ?? '').length <= 200) fields.push(...said(x));
     else fields.push(...[x.getAttribute('aria-label'), x.title].filter(Boolean));
     if (x.localName === 'label' && x.control) fields.push(...said(x.control));
   }
   const re = new RegExp(risky, 'i');
   return {
     risky: fields.filter((x) => typeof x === 'string' && x).map((x) => re.exec(x.replace(/\s+/g, ' '))?.[0]).find(Boolean) ?? null,
+    over,
     kind: c.localName === 'input' ? String(c.type || 'text').toLowerCase() : c.localName,
     doc: String(el.ownerDocument?.location?.href ?? ''),
   };
@@ -489,7 +496,9 @@ async function runStep(st, { ops, end, signal, guard, off, sites, confirmRisky, 
     if (off(d.doc)) throw refusal(`the element is in a document at ${hostOf(d.doc)}, outside this macro's site (${sites})`);
     // What the element says, not only how the step finds it: a selector can point at a "Buy now" button. upload
     // clicks too, when the element is not a file input.
-    const risky = (tool === 'click' || tool === 'upload') && !confirmRisky ? d.risky : null;
+    const clicks = (tool === 'click' || tool === 'upload') && !confirmRisky;
+    if (clicks && d.over) throw refusal('refused: the element (or a control around it) is too large to check for words that pay, buy, order, check out or delete an account; target a smaller element, or save the macro with confirm_risky');
+    const risky = clicks ? d.risky : null;
     if (risky) throw refusal(`refused: the element says "${risky}" (a macro that may pay, buy, order, check out or delete an account needs confirm_risky at save time)`);
     // A password goes into a macro only by secret_id: never stored in it, nor passed through the agent as an arg.
     if (tool === 'type' && a.value !== undefined && d.kind === 'password') throw refusal('refused: this is a password field; in a macro it takes only secret_id: "{{param}}" (a param of type secret_id)');

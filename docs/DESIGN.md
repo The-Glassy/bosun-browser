@@ -170,8 +170,10 @@ download). A macro stores such a flow once, per tenant, and `macro_run` replays 
 - **Risky steps.** A word list (pay, buy, purchase, submit/place order, checkout, delete account, and German
   equivalents) is matched against every string of every step at save time (refused without `confirm_risky`), again
   after the args are filled in, and against what the element a `click` (or an `upload`'s click) hits says, and
-  every control around it: all text, alt, aria-label, title, value and placeholder inside it, shadow roots
-  included, and aria-labelledby joined in order (generous on purpose: hidden text counts too). The element is resolved to a handle, waited for until it can be clicked (a trial click), vetted, and then
+  every control around it on the composed tree (slots, shadow hosts): the text inside it as one stream, shadow
+  roots included; each alt, aria-label, title, value and placeholder on its own; aria-labelledby read the same way
+  and joined in order. Generous on purpose: hidden text counts too. An element too large to read whole (50,000
+  nodes) is refused rather than read in part. The element is resolved to a handle, waited for until it can be clicked (a trial click), vetted, and then
   that handle is clicked, so there is no wait between check and click. If it can't be vetted, nothing is clicked.
   `type` with a `value` works the same way. It checks the control Playwright fills (a `<label>` leads to its
   control), refuses a password field, and looks again after the fill (a field that became a password field is

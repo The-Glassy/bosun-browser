@@ -34,6 +34,9 @@ function serverA() {
         <div id="sh"></div><script>document.getElementById('sh').attachShadow({ mode: 'open' }).innerHTML = '<span id="slbl">Buy now</span><button id="sgo" aria-labelledby="slbl">→</button>';</script>
         <button id="sd"><x-label id="xl"></x-label></button><script>document.getElementById('xl').attachShadow({ mode: 'open' }).innerHTML = '<b>Buy</b> now';</script>
         <span id="v1" hidden>Delete</span><span id="v2" hidden>account</span><button id="split" aria-labelledby="v1 v2">×</button>
+        <button id="tt">Delete <span title="permanently">account</span></button>
+        <x-btn id="xb"><i id="slotted">→</i></x-btn><script>document.getElementById('xb').attachShadow({ mode: 'open' }).innerHTML = '<button aria-label="Buy now"><slot></slot></button>';</script>
+        <x-label id="xlab"></x-label><button id="byshadow" aria-labelledby="xlab">→</button><script>document.getElementById('xlab').attachShadow({ mode: 'open' }).innerHTML = 'Buy now';</script>
         <button id="lt" aria-label="Buy now">${'all the details you could want '.repeat(30)}</button>
         <button id="nav" onclick='location.href = ${JSON.stringify(q('away'))}'>Attach</button>
         <script>document.getElementById('f').onchange = async (e) => {
@@ -42,6 +45,7 @@ function serverA() {
           document.getElementById('st').textContent = 'Uploaded: ' + file.name;
         };</script>`);
     }
+    if (u.pathname === '/huge') return html(res, `<title>Huge</title><button id="huge"><svg>${'<g></g>'.repeat(60000)}</svg>Delete account</button>`);
     if (u.pathname === '/slow') { // typing takes 1.5 s (a busy input handler); Enter is reported
       return html(res, `<title>Slow</title><input id="si" oninput="for (const e = Date.now() + 1500; Date.now() < e;);">
         <script>addEventListener('keydown', (e) => { if (e.key === 'Enter') fetch('/up?name=enter', { method: 'POST' }); });</script>`);
@@ -391,9 +395,9 @@ test('risky at run time: a selector that hits a "Buy now" button, and risky text
   assert.equal(out.failure.step, 2);
   assert.match(out.failure.error, /refused: the element says "Buy now"/);
   // What the click reaches counts: an icon inside a "Buy now" button, a label longer than anything a person reads.
-  for (const sel of ['#icon', '#nicon', '#lt', '#ab', '#lb2', '#sgo', '#sd', '#split']) {
-    assert.equal((await c.call('macro_save', { name: 'sneaky2', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/app` }, { tool: 'click', selector: sel }] })).isError, false);
-    assert.match((await c.call('macro_run', { name: 'sneaky2', session: s })).json().failure.error, /refused: the element says "(Buy now|Checkout|Delete account)"/, sel);
+  for (const sel of ['#icon', '#nicon', '#lt', '#ab', '#lb2', '#sgo', '#sd', '#split', '#tt', '#slotted', '#byshadow', '#huge']) {
+    assert.equal((await c.call('macro_save', { name: 'sneaky2', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/${sel === '#huge' ? 'huge' : 'app'}` }, { tool: 'click', selector: sel }] })).isError, false);
+    assert.match((await c.call('macro_run', { name: 'sneaky2', session: s })).json().failure.error, sel === '#huge' ? /refused: the element \(or a control around it\) is too large to check/ : /refused: the element says "(Buy now|Checkout|Delete account)"/, sel);
   }
   // upload clicks what is not a file input: the same check.
   const f = (await c.call('upload_create', { filename: 'x.txt', content_base64: Buffer.from('x').toString('base64') })).json().file_id;
