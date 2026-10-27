@@ -125,18 +125,26 @@ function pick([els, afters, befores, nth]) {
   return k >= 0 && k < idx.length ? idx[k] : { left: idx.length };
 }
 
+// The element names an error may show: HTML's and SVG's own (a page can name its elements anything, a password
+// included).
+const TAGS = ('a abbr address area article aside audio b bdi bdo blockquote body br button canvas caption cite code col colgroup data '
+  + 'datalist dd del details dfn dialog div dl dt em embed fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hgroup hr '
+  + 'html i iframe img input ins kbd label legend li main map mark menu meter nav object ol optgroup option output p picture pre '
+  + 'progress q s samp search section select slot small source span strong sub summary sup table tbody td template textarea tfoot th '
+  + 'thead time tr u ul var video svg g path use rect circle ellipse line polyline polygon text tspan image foreignObject').split(' ');
+
 // Runs in the page: what an element is (tag, whole id and class: they are masked before they are cut short) and why
 // it is not shown.
-function sketch(el) {
-  // Only the names HTML and SVG define: a custom or unknown element's name is the page's own text.
-  const kind = (x) => (!x.localName.includes('-') && !(x instanceof HTMLUnknownElement) && (x instanceof HTMLElement || (x instanceof SVGElement && x.constructor !== SVGElement)) ? x.localName : x.localName.includes('-') ? 'custom element' : 'element');
+function sketch(el, tags) {
+  // Only names from TAGS: any other element's name is the page's own text.
+  const kind = (x) => (tags.includes(x.localName) ? x.localName : x.localName.includes('-') ? 'custom element' : 'element');
   let why = null;
   for (let x = el; x && x.nodeType === 1; x = x.parentElement ?? x.getRootNode?.()?.host) {
     if (getComputedStyle(x).display === 'none') { why = x === el ? 'display: none' : `inside a display: none <${kind(x)}>`; break; }
   }
   if (!why && getComputedStyle(el).visibility !== 'visible') why = 'visibility: hidden';
   if (!why) { const r = el.getBoundingClientRect(); if (!r.width || !r.height) why = 'zero size'; }
-  return { tag: kind(el), id: el.id, cls: typeof el.className === 'string' ? el.className : '', why };
+  return { tag: kind(el), id: el.id, cls: el.getAttribute('class') ?? '', why };
 }
 
 // What an error may say about an element of the page: its tag (one HTML or SVG defines), id and first classes, the
@@ -229,7 +237,7 @@ async function whyNone(p, t, missing, count, call) {
   if (!n) return `nothing matches ${show(t)} within ${secs}`;
   if (!shown) {
     stillOn(call);
-    const first = await all.first().evaluate(sketch, null, { timeout: 2000 }).catch(() => null);
+    const first = await all.first().evaluate(sketch, TAGS, { timeout: 2000 }).catch(() => null);
     return `${show(t)} matched ${n} element${n > 1 ? 's' : ''}, none visible within ${secs}${first ? ` (the first is ${await safeTag(p, first, call)}${first.why ? `, ${first.why}` : ''})` : ''}`;
   }
   const where = [t.after && `after "${t.after}"`, t.before && `before "${t.before}"`].filter(Boolean).join(' and ');
@@ -238,9 +246,9 @@ async function whyNone(p, t, missing, count, call) {
 
 // Runs in the page: why a click on el cannot happen: it is disabled, or another element covers its middle (the one
 // a click there would hit; its tag, id and classes).
-function blocker(el) {
-  // Only the names HTML and SVG define: a custom or unknown element's name is the page's own text.
-  const kind = (x) => (!x.localName.includes('-') && !(x instanceof HTMLUnknownElement) && (x instanceof HTMLElement || (x instanceof SVGElement && x.constructor !== SVGElement)) ? x.localName : x.localName.includes('-') ? 'custom element' : 'element');
+function blocker(el, tags) {
+  // Only names from TAGS: any other element's name is the page's own text.
+  const kind = (x) => (tags.includes(x.localName) ? x.localName : x.localName.includes('-') ? 'custom element' : 'element');
   if (!el.isConnected) return { why: 'it left the page' };
   if (el.disabled || el.closest('fieldset:disabled') || el.getAttribute('aria-disabled') === 'true') return { why: 'it is disabled' };
   const r = el.getBoundingClientRect();
@@ -250,7 +258,7 @@ function blocker(el) {
   while (hit?.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
   const holds = (a, b) => { for (let n = b; n; n = n.parentNode ?? n.host ?? null) if (n === a) return true; return false; };
   if (!hit || holds(el, hit)) return null;
-  return { covered: { tag: kind(hit), id: hit.id, cls: typeof hit.className === 'string' ? hit.className : '' } };
+  return { covered: { tag: kind(hit), id: hit.id, cls: hit.getAttribute('class') ?? '' } };
 }
 
 // click(opts) on el (a locator or a handle) by until, with Playwright's waits for it to be clickable. One that times
@@ -262,7 +270,7 @@ async function clicking(page, el, click, until) {
   } catch (e) {
     if (e?.name !== 'TimeoutError') throw e;
     stillOn(call); // a call that is over looks no further
-    const b = await el.evaluate(blocker, null, { timeout: 2000 }).catch(() => null);
+    const b = await el.evaluate(blocker, TAGS, { timeout: 2000 }).catch(() => null);
     stillOn(call);
     const why = b?.why ?? (b?.covered ? `it is covered by ${await safeTag(page, b.covered, call)}, which would get the click` : null);
     throw new Error(`the element did not become clickable within ${Math.round(FIND_MS / 1000)} s${why ? `: ${why}` : ' (it stayed hidden, moving or disabled)'}`);
@@ -630,13 +638,23 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   tool('select', 'Choose an option in a <select>.', { session: str(40), ...target, value: str(1000) }, async (a) => run(a.session, async (s) => {
     const until = Date.now() + FIND_MS;
+    const cc = stepCall() ?? currentCall();
+    // A hidden <select> (one a custom dropdown stands in for) takes the option all the same, once it is enabled. Looked
+    // at before a macro step's last checks (ready), so nothing but the selection comes after them.
+    let force = null;
+    const probe = async (h) => {
+      force = !(await h.isVisible());
+      if (force && !(await h.isEnabled())) throw new Error('this <select> is hidden and disabled');
+    };
     await withTarget(s.page, a, { until, hidden: true }, (l) => onTarget(l, async (t, call) => {
-      // A hidden <select> (one a custom dropdown stands in for) takes the option all the same, once it is enabled.
-      const force = !(await t.isVisible());
-      if (force && !(await t.isEnabled())) throw new Error('this <select> is hidden and disabled');
-      return t.selectOption({ label: a.value }, { timeout: left(until), force }).catch(async () => { await recheck(call); return t.selectOption(a.value, { timeout: left(until), force }); });
-    },
-      { until, ready: (h) => h.waitForElementState('enabled', { timeout: left(until) }) }));
+      if (force === null) await probe(t);
+      stillOn(cc);
+      return t.selectOption({ label: a.value }, { timeout: left(until), force }).catch(async () => {
+        await recheck(call);
+        stillOn(cc);
+        return t.selectOption(a.value, { timeout: left(until), force });
+      });
+    }, { until, ready: async (h) => { await h.waitForElementState('enabled', { timeout: left(until) }); await probe(h); } }));
     return ok(await pageInfo(s.page));
   }));
 
