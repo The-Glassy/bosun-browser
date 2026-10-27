@@ -154,6 +154,8 @@ export class LiveTranscript {
         return;
       }
       this.stallSince = null;
+      // The tenant's allowance is shared by its meetings: a chunk is sent only if it still fits.
+      if (this.usage.left(this.tenant) < this.buffer[0].buf.length / BYTES_PER_SEC) { this.stop('daily-cap'); return; }
       const { buf, at } = this.buffer.shift();
       const first = !this.sessionSent;
       if (first) { this.sessionSent = true; this.sessionBase = at; }

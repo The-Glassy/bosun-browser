@@ -107,7 +107,9 @@ document.querySelector('[aria-label="' + L.leave + '"]').onclick = () => post('l
 // In the call: the microphone as the lobby left it, a hand to raise (also Ctrl+Alt+H), and an ear on the microphone.
 let callMic = null, hand = false, played = 0, ear = null;
 const micLabel = () => $('callMic').setAttribute('aria-label', (callMic ? L.micOff : L.micOn) + ' (ctrl + d)');
-$('callMic').onclick = () => { callMic = !callMic; micLabel(); post('media', { mic: callMic }); };
+// micStuckOn (room option, read from the state): the call's microphone won't turn off again.
+let micStuckOn = false;
+$('callMic').onclick = () => { if (callMic && micStuckOn) return; callMic = !callMic; micLabel(); post('media', { mic: callMic }); };
 const toggleHand = () => { hand = !hand; $('hand').setAttribute('aria-label', (hand ? 'Lower hand' : 'Raise hand') + ' (ctrl + alt + h)'); post('media', { hand }); };
 $('hand').onclick = toggleHand;
 document.addEventListener('keydown', (e) => { if (e.ctrlKey && e.altKey && e.code === 'KeyH') toggleHand(); });
@@ -159,6 +161,7 @@ async function poll() {
       g.append(d);
       $('msgs').append(g);
     }
+    micStuckOn = !!s.micStuckOn;
     if (callMic === null) { callMic = mic; micLabel(); listen().catch((e) => post('heard', { error: String(e) })); }
     if (s.play && s.play.n !== played) { played = s.play.n; const a = new Audio('/fixture/' + s.play.name + '.wav'); a.play().then(() => post('media', { playing: s.play.name, at: Date.now() }), (e) => post('media', { playError: String(e) })); }
     if (s.tone && !toned) { toned = true; const c = new AudioContext(); const o = c.createOscillator(); o.frequency.value = 440; o.connect(c.destination); o.start(); }
@@ -195,7 +198,7 @@ export async function startFakeMeet({ tone = false } = {}) {
       if (r.phase === 'pending' && Date.now() >= r.refuseAt) r.phase = 'refused';
       const view = r.over ? 'over' : ['waiting', 'denied', 'refused', 'pending'].includes(r.phase) ? r.phase : r.phase === 'admitted' ? 'call' : 'lobby';
       const chat = r.chat.map((m) => (m.fillAt && Date.now() < m.fillAt ? { ...m, text: '' } : m));
-      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone, caption: r.caption || null, play: r.play || null });
+      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone, caption: r.caption || null, play: r.play || null, micStuckOn: !!r.micStuckOn });
     }
     if (/^\/fixture\/[a-z0-9-]+\.wav$/.test(u.pathname)) {
       const f = path.join(path.dirname(new URL(import.meta.url).pathname), 'fixtures', path.basename(u.pathname));

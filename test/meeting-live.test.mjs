@@ -404,6 +404,25 @@ test('stopped while the text is still being synthesized: the microphone is muted
   }, { meetings: { speechGraceMs: 500 } });
 });
 
+test('a microphone that will not mute again: reported in the result, the event and the status; the next utterance tries again', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    const { id, code } = await admitted(c, { live: false });
+    fake.set(code, { micStuckOn: true });
+    const r = (await c.call('meeting_speak', { meeting_id: id, text: 'Hello.', wait: true })).json();
+    assert.equal(r.state, 'done');
+    assert.match(r.mute_error, /^the microphone may still be on: could not turn the microphone off in Meet/);
+    assert.match(ev.speech.at(-1).mute_error, /may still be on/);
+    assert.match((await status(c, id)).mute_error, /may still be on/);
+    fake.set(code, { micStuckOn: false });
+    const r2 = (await c.call('meeting_speak', { meeting_id: id, text: 'Again.', wait: true })).json();
+    assert.equal(r2.mute_error, undefined);
+    assert.equal(media(code, 'mic').at(-1), false);
+    assert.equal((await status(c, id)).mute_error, undefined);
+    await c.close();
+  });
+});
+
 test('Meet: meeting_raise_hand raises and lowers the hand; leaving while speaking stops the audio', async () => {
   await withService(async (svc, ev, audio) => {
     const c = await connect(svc);

@@ -157,6 +157,13 @@ test('the daily cap: minutes are counted per tenant and day, survive a restart, 
   // The next local day starts from zero (Vienna midnight is 23:00 UTC in winter).
   now = Date.parse('2026-10-27T23:00:01Z');
   assert.equal(again.used('alice'), 0);
+  // Two streams of one tenant share the allowance: together they never send more than it.
+  const shared = new TranscriptUsage({ file: path.join(dir, 's.json'), tz: 'Europe/Vienna', capMin: 1 });
+  shared.add('alice', 50);
+  const x = live(source(silence(30), { speed: 8 }), { usage: shared }), y = live(source(silence(30), { speed: 8 }), { usage: shared });
+  await until(() => x.ev.stopped.length && y.ev.stopped.length, 10_000);
+  assert.ok(shared.used('alice') <= 60, `used ${shared.used('alice')}`);
+  assert.ok(shared.used('alice') >= 59.5, `used ${shared.used('alice')}`);
   // A tenant whose cap is used up gets no connection at all.
   const before = el.conns.length;
   const full = new TranscriptUsage({ file: path.join(dir, 'x.json'), tz: 'Europe/Vienna', capMin: 1 });

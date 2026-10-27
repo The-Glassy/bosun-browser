@@ -612,6 +612,7 @@ export class Meetings {
       ...(m.chatError ? { chat_error: m.chatError } : {}),
       ...(m.live ? { live_transcript: m.transcript ? m.transcript.status() : { state: m.transcriptError ? 'unavailable' : m.state === 'ended' || m.noRecord ? 'off' : 'not-started', ...(m.transcriptError ? { error: m.transcriptError } : {}) } } : {}),
       ...(m.speech ? { speaking: { utterance_id: m.speech.id, state: m.speech.state, ...(m.speech.seconds ? { duration_s: m.speech.seconds } : {}) } } : {}),
+      ...(m.muteError && m.state !== 'ended' ? { mute_error: `the microphone may still be on: ${m.muteError}` } : {}),
       chat_messages: m.chatSeq, joined_at: iso(m.createdAt), admitted_at: iso(m.admittedAt), ended_at: iso(m.endedAt),
     };
   }
@@ -763,13 +764,24 @@ export class Meetings {
     u.state = state;
     if (m.speech === u) m.speech = null;
     // The last utterance mutes again what speaking turned on; one followed by another (interrupt) leaves it to that one.
+    // Up to three tries; one that fails keeps it owned (the next utterance tries again) and is reported.
+    let muteError = null;
     if (u.autoMute && m.speechUnmuted && !m.speech && (m.state === 'admitted' || m.state === 'recording')) {
-      m.speechUnmuted = false;
-      const muted = this.page(m, (p) => m.platform.setMic(p, false)).then(() => true, (e) => { m.muteError = oneLine(e); return true; });
-      if (!(await Promise.race([muted, sleep(10_000).then(() => false)]))) m.muteError = 'muting again took longer than 10 s';
+      for (let i = 0; i < 3; i++) {
+        if (i) await sleep(500);
+        if (m.speech || (m.state !== 'admitted' && m.state !== 'recording')) break;
+        const tried = this.page(m, (p) => m.platform.setMic(p, false)).then(() => null, (e) => oneLine(e));
+        muteError = await Promise.race([tried, sleep(10_000).then(() => 'muting again took longer than 10 s')]);
+        if (!muteError) break;
+      }
+      if (!muteError) m.speechUnmuted = false;
+      m.muteError = muteError;
     }
     const played = u.startedAt ? Math.round((this.now() - u.startedAt) / 10) / 100 : 0;
-    const r = { utterance_id: u.id, state, played_s: Math.min(played, Math.round(u.seconds * 100) / 100 || played), ...(error ? { error: oneLine(error) } : {}), total_ms: this.now() - t0 };
+    const r = {
+      utterance_id: u.id, state, played_s: Math.min(played, Math.round(u.seconds * 100) / 100 || played), ...(error ? { error: oneLine(error) } : {}),
+      ...(muteError ? { mute_error: `the microphone may still be on: ${muteError}` } : {}), total_ms: this.now() - t0,
+    };
     if (u.startedAt) this.emit(m, 'speech', r);
     u.finish(r);
     return r;
@@ -805,6 +817,7 @@ export class Meetings {
     this.inCall(m, on ? 'muting' : 'unmuting');
     const r = await this.page(m, (p) => m.platform.setMic(p, !on));
     m.speechUnmuted = false; // the agent decides now: speaking leaves the microphone as it is
+    m.muteError = null;
     return { meeting_id: id, muted: r.state === 'off' };
   }
 

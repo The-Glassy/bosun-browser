@@ -102,7 +102,7 @@ export function meetingEvent(kind, { meeting_id, platform, ...data }) {
   const text = kind === 'chat' ? `Meeting ${meeting_id} chat — ${data.sender || 'someone'}: ${data.text}`
     : kind === 'transcript' ? `Meeting ${meeting_id} ${data.final ? 'said' : 'is saying'} (#${data.seq}, ${data.start_s}-${data.end_s} s${data.speaker ? `, ${data.speaker}` : ''}): ${data.text}`
     : kind === 'transcript-stopped' ? `Meeting ${meeting_id}: the live transcript stopped (${data.reason}${data.error ? `: ${data.error}` : ''}); the meeting goes on.`
-    : kind === 'speech' ? `Meeting ${meeting_id}: utterance ${data.utterance_id} ${data.state} after ${data.played_s} s${data.error ? ` (${data.error})` : ''}.`
+    : kind === 'speech' ? `Meeting ${meeting_id}: utterance ${data.utterance_id} ${data.state} after ${data.played_s} s${data.error ? ` (${data.error})` : ''}.${data.mute_error ? ` Not muted again: ${data.mute_error}.` : ''}`
     : kind === 'optout' ? `Meeting ${meeting_id}: ${data.sender || 'someone'} asked not to be recorded ("${data.text}"). The recording was stopped and deleted${data.left ? ' and Bosun left the meeting' : ''}.`
     : kind === 'announce' ? `Meeting ${meeting_id}: the recording announcement ${data.sent_to === 'host' ? 'went to the host only' : 'could not be posted in the chat'} (${data.reason}: ${data.error}). Bosun records anyway; a request not to be recorded in the chat still stops it.`
     : `Meeting ${meeting_id} ended for Bosun (${data.reason}) after ${data.duration_s} s.${data.recording ? ` Recording: ${data.recording.bytes} bytes, ${data.recording.path}.` : ' No recording.'}`;
