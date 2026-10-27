@@ -162,6 +162,24 @@ test('meeting_stop_recording stops the transcript too; meeting_recording_delete 
   });
 });
 
+test('a recorder that dies stops the live transcript too (its text is kept)', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    const { id } = await admitted(c);
+    audio.say(tonePcm(2));
+    await until(async () => (await c.call('meeting_transcript', { meeting_id: id })).json().segments.length === 1, 15_000);
+    await audio.recorders[0].kill(); // ffmpeg died ("No space left on device")
+    await until(() => ev['transcript-stopped'].length === 1, 5000);
+    assert.equal(ev['transcript-stopped'][0].reason, 'recording-failed');
+    assert.equal(audio.captures[0].stopped, true);
+    const s = await status(c, id);
+    assert.equal(s.state, 'admitted');
+    assert.equal(s.live_transcript.state, 'stopped');
+    assert.equal((await c.call('meeting_transcript', { meeting_id: id })).json().segments.length, 1);
+    await c.close();
+  });
+});
+
 test('meeting_recording_delete before admission: the meeting never records or streams once admitted', async () => {
   await withService(async (svc, ev, audio) => {
     const c = await connect(svc);

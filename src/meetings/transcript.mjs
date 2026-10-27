@@ -250,16 +250,18 @@ export class LiveTranscript {
   }
 
   // The open segment's text so far, at most every PARTIAL_MS (the newest one wins), never twice the same.
+  // A partial belongs to the open segment (seq + 1) when it comes, and keeps that number while it waits for its turn.
   partial(text) {
-    if (!this.partials || !text || text === this.lastPartial.text) return;
     const lp = this.lastPartial;
-    lp.queued = text;
+    const seq = this.seq + 1;
+    if (!this.partials || !text || (text === lp.text && lp.textSeq === seq)) return;
+    lp.queued = text; lp.queuedSeq = seq;
     const send = () => {
       lp.timer = null;
       if (this.state === 'stopped' || lp.queued === null) return;
-      const t = lp.queued; lp.queued = null;
-      lp.text = t; lp.at = this.now();
-      this.on.partial?.({ seq: this.seq + 1, start_s: round(this.segStart), end_s: round(this.sentPos()), text: t, final: false });
+      const t = lp.queued, q = lp.queuedSeq; lp.queued = null;
+      lp.text = t; lp.textSeq = q; lp.at = this.now();
+      this.on.partial?.({ seq: q, start_s: round(this.segStart), end_s: round(this.sentPos()), text: t, final: false });
     };
     const wait = PARTIAL_MS - (this.now() - lp.at);
     if (wait <= 0 && !lp.timer) send();
@@ -282,8 +284,10 @@ export class LiveTranscript {
   }
 
   final(m, { end: plainEnd = null, seq = null } = {}) {
-    const lp = this.lastPartial;
-    clearTimeout(lp.timer); lp.timer = null; lp.queued = null; lp.text = '';
+    // Only this segment's waiting partial goes (the next one's, should it be waiting already, stays).
+    const lp = this.lastPartial, fseq = seq ?? this.seq + 1;
+    if (lp.queuedSeq === fseq) { clearTimeout(lp.timer); lp.timer = null; lp.queued = null; }
+    if (lp.textSeq === fseq) lp.text = '';
     const text = String(m.text || '').trim();
     const words = Array.isArray(m.words) ? m.words.filter((w) => w.type === 'word' && Number.isFinite(w.start) && Number.isFinite(w.end)) : [];
     const start = words.length ? this.sessionBase + words[0].start : this.segStart;

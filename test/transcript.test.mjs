@@ -286,6 +286,19 @@ test('a committed text still waiting for its copy when the transcript stops is k
   }
 });
 
+test('a final waiting for its copy leaves the next segment\'s waiting partial alone', async () => {
+  const ev = { partial: [], final: [] };
+  const t = new LiveTranscript({ apiKey: el.key, baseUrl: el.base, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { partial: (s) => ev.partial.push(s), final: (s) => ev.final.push(s) } });
+  t.onMessage({ message_type: 'committed_transcript', text: 'First.' });
+  t.onMessage({ message_type: 'partial_transcript', text: 'Second' }); // sent at once, #2
+  t.onMessage({ message_type: 'partial_transcript', text: 'Second one' }); // waits for its turn, #2
+  t.onMessage({ message_type: 'committed_transcript_with_timestamps', text: 'First.', words: [] });
+  await sleep(700);
+  assert.deepEqual(ev.final.map((f) => [f.seq, f.text]), [[1, 'First.']]);
+  assert.deepEqual(ev.partial.map((p) => [p.seq, p.text]), [[2, 'Second'], [2, 'Second one']]);
+  await t.stop('left');
+});
+
 test('many copies late: plain texts made into finals and dropped from the queue still swallow their copies', async () => {
   const ev = { final: [] };
   const t = new LiveTranscript({ apiKey: el.key, baseUrl: el.base, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { final: (s) => ev.final.push(s) } });

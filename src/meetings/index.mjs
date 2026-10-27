@@ -342,11 +342,13 @@ export class Meetings {
     transition(m, 'recording');
     m.rec.exited.then(() => {
       if (m.rec?.file !== m.file || m.state !== 'recording') return;
-      // The recorder died on its own (ffmpeg error): the meeting goes on without recording.
+      // The recorder died on its own (ffmpeg error): the meeting goes on without recording, and without the live
+      // transcript, which only runs with the recording (the text so far is kept, like the file).
       m.recMs += this.now() - m.rec.startedAt;
       m.recError = m.rec.error() || 'recorder exited';
       m.rec = null;
       transition(m, 'admitted');
+      this.stopTranscript(m, 'recording-failed').catch(() => {});
     });
   }
 
@@ -694,10 +696,12 @@ export class Meetings {
     const mic = autoMute ? this.page(m, async (p) => {
       if (u.ending) return;
       let r;
-      // A click that turned it on (also one whose check then failed) is owned; ended meanwhile: muted again right here.
+      // A click that turned it on (also one whose check then failed) is owned by this utterance while it is the one
+      // speaking, or handed to the one that took over if that one mutes after itself; otherwise (stopped meanwhile, or
+      // taken over by one that leaves the microphone alone) it is muted again right here.
       const own = async () => {
-        if (u.ending && !m.speech) await m.platform.setMic(p, false).catch(() => { m.speechUnmuted = true; });
-        else m.speechUnmuted = true;
+        if ((m.speech === u && !u.ending) || (m.speech && m.speech !== u && m.speech.autoMute)) { m.speechUnmuted = true; return; }
+        await m.platform.setMic(p, false).catch(() => { if (!m.speech) m.speechUnmuted = true; });
       };
       try { r = await m.platform.setMic(p, true); } catch (e) { if (e.clicked) await own(); throw e; }
       if (r.changed) await own();

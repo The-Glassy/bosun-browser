@@ -51,7 +51,7 @@ export const MANIFEST = {
           [MEETING_TAGS.ended]: { desc: 'Bosun left the meeting; origin carries duration and the recording (if any)' },
           [MEETING_TAGS.announce]: { desc: 'the recording announcement reached only the host, or could not be posted (origin: mode, sent_to host|failed, reason, error); Bosun records anyway' },
           [MEETING_TAGS.transcript]: { desc: 'live transcript text (origin: meeting_id, seq, start_s, end_s, text, final, lang, speaker if known); partials (final false) carry the seq their final will have' },
-          [MEETING_TAGS['transcript-stopped']]: { desc: 'the live transcript stopped while the meeting goes on (origin: reason daily-cap|error|opted-out|stopped|audio-ended, error)' },
+          [MEETING_TAGS['transcript-stopped']]: { desc: 'the live transcript stopped while the meeting goes on (origin: reason daily-cap|error|opted-out|stopped|recording-failed|audio-ended, error)' },
           [MEETING_TAGS.speech]: { desc: 'an utterance of meeting_speak ended (origin: utterance_id, state done|interrupted|failed, played_s)' },
         },
         keyed: { 'bosun:meeting': { open: true }, 'bosun:platform': { values: ['meet', 'zoom'] } },
