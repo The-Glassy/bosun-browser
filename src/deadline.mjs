@@ -9,9 +9,10 @@ export const MAX_TIMEOUT_SEC = 120;
 // the limits they have (their own timeoutMs / timeoutSec, the meeting's own deadlines).
 export const TIMED_TOOLS = ['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for',
   'screenshot', 'sessions', 'secret_create', 'upload_create', 'upload', 'downloads', 'download_get', 'keepalive_set', 'keepalive_list',
-  'keepalive_remove'];
+  'keepalive_remove', 'macro_save', 'macro_list', 'macro_get', 'macro_delete'];
+// macro_run has a cap of its own for the whole run (timeout_sec); each of its steps gets the deadline of its tool.
 export const OWN_LIMIT_TOOLS = ['download_wait', 'request_human', 'handoff_wait', 'meeting_join', 'meeting_status', 'meeting_chat_read',
-  'meeting_chat_send', 'meeting_stop_recording', 'meeting_leave', 'meeting_recording_delete'];
+  'meeting_chat_send', 'meeting_stop_recording', 'meeting_leave', 'meeting_recording_delete', 'macro_run'];
 // wait_for waits up to 60 s by itself: unless TOOL_TIMEOUTS names it, its deadline is at least this.
 export const WAIT_FOR_MIN_SEC = 75;
 // A page operation is cut off this long before the deadline (a third of a shorter one), to check the page and
@@ -41,11 +42,36 @@ export function parseToolTimeouts(env) {
 }
 
 // The tool call being served, in its async context: { name, limitMs, at (deadline, ms since epoch), reserveMs, done,
-// expired, queued, inPage, state (what the check of the page found so far) }.
+// expired, queued, inPage, state (what the check of the page found so far), guard, vet (macro steps) }.
 const scope = new AsyncLocalStorage();
 export const runCall = (call, fn) => scope.run(call, fn);
 // Only while the call is still running: work it started that outlives it (a timer, a background visit) is not bound.
 export const currentCall = () => { const c = scope.getStore(); return c && !c.done ? c : null; };
+// The macro step (a call with hooks) this runs in, also once it is over: work it started that outlives it must
+// still be checked, and refused (tools.mjs recheck), never run unchecked.
+export const stepCall = () => { const c = scope.getStore(); return c?.guard || c?.vet ? c : null; };
+
+// Runs fn as one call named name that is answered within limitMs, whatever the browser does. A page operation in it
+// is cut off earlier by its session (sessions.mjs run), which checks the page and usually answers first; if that
+// check is still going on, the answer says how far it got. hooks: what a macro step adds (macros.mjs): guard(),
+// run in the session's queue right before each page operation of the call and again right before an element is
+// acted on; vet(handle), run by click, type, select and upload on the element they are about to act on (tools.mjs
+// onTarget).
+export async function withDeadline(name, limitMs, fn, hooks = {}) {
+  const call = { name, limitMs, at: Date.now() + limitMs, reserveMs: reserveMs(limitMs), done: false, expired: false, inPage: false, queued: false, state: null, guard: hooks.guard ?? null, vet: hooks.vet ?? null };
+  let timer;
+  try {
+    const work = runCall(call, fn);
+    const late = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        call.expired = true;
+        reject(new Error(timeoutMessage(call, call.state ?? (call.queued && !call.inPage ? 'queued' : call.inPage ? 'checking' : null))));
+      }, limitMs);
+    });
+    work.catch(() => {});
+    return await Promise.race([work, late]);
+  } finally { clearTimeout(timer); call.done = true; }
+}
 
 const secs = (ms) => `${Math.round(ms / 1000)} s`;
 export const limitNote = (call) => `Bosun's limit for one ${call.name} call (TOOL_TIMEOUT_SEC / TOOL_TIMEOUTS)`;

@@ -1,0 +1,27 @@
+{
+ "name": "plaud-import",
+ "description": "Import an audio file into Plaud (web.plaud.ai), generate the transcript and summary, read the summary and export the transcript as a file. Run it in a session with a profile signed in to Plaud, with timeout_sec 900 (generating takes minutes). The tenant needs Plaud's export host in BROWSER_TENANT_DOWNLOAD_ALLOW. Labels as Plaud's web app showed them in October 2026: check the steps against a read of the page before the first run.",
+ "site": ["web.plaud.ai", "*.plaud.ai"],
+ "params": {
+  "audio": { "type": "file_id", "description": "the recording, from upload_create" },
+  "file_name": { "type": "string", "description": "its name as Plaud lists it: the uploaded filename without the extension" }
+ },
+ "steps": [
+  { "tool": "navigate", "url": "https://web.plaud.ai/" },
+  { "tool": "assert", "text": "Add audio", "timeoutMs": 15000, "note": "a profile that is not signed in lands on the login page and stops here" },
+  { "tool": "click", "text": "Add audio" },
+  { "tool": "upload", "text": "Import audio", "file_id": "{{audio}}", "method": "chooser", "note": "Import audio opens the file chooser" },
+  { "tool": "wait_for", "text": "{{file_name}}", "timeoutMs": 60000, "note": "the upload is done once the file shows up in the list" },
+  { "tool": "navigate", "url": "https://web.plaud.ai/", "note": "the list offers Generate for the new file only after it is loaded again" },
+  { "tool": "click", "text": "{{file_name}}" },
+  { "tool": "click", "selector": "div:text-is(\"Generate\")", "note": "a div, not a button" },
+  { "tool": "click", "text": "Generate now" },
+  { "tool": "wait_for", "text": "Summary", "timeoutMs": 60000 },
+  { "tool": "wait_for", "selector": "text=/Transcript|Transkript/", "timeoutMs": 60000, "optional": true, "note": "a long recording takes longer; the read below still gets what is there" },
+  { "tool": "read", "mode": "text", "maxChars": 40000, "as": "summary" },
+  { "tool": "click", "text": "Export" },
+  { "tool": "click", "text": "Transcript", "note": "what to export; Plaud offers the summary and the transcript" },
+  { "tool": "click", "text": "TXT", "optional": true, "note": "the format, where Plaud asks for one" },
+  { "tool": "download_wait", "timeoutMs": 120000 }
+ ]
+}

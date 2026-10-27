@@ -16,7 +16,8 @@ import { BASE64_MAX_BYTES } from './uploads.mjs';
 import { DRIVER_LOGS_REFUSED, SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS, driverLogsValues } from './secrets.mjs';
 import { INLINE_MAX_BYTES } from './downloads.mjs';
 import { showPattern } from './allow.mjs';
-import { currentCall, reserveMs, runCall, timeoutMessage } from './deadline.mjs';
+import { currentCall, stepCall, withDeadline } from './deadline.mjs';
+import { MAX_SITES, MAX_STEPS, RUN_DEFAULT_SEC, RUN_MAX_SEC, runMacro } from './macros.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
@@ -86,6 +87,31 @@ function locate(p, t) {
 const str = (n) => z.string().max(n);
 const target = { ref: str(20).optional().describe('element ref from read (e.g. "e12")'), role: str(40).optional(), name: str(1000).optional(), selector: str(2000).optional(), text: str(1000).optional() };
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
+// A macro step's checks (deadline.mjs stepCall: guard, vet), before it acts on the page; h: the element it acts
+// on. A step whose call is over (it ran out of time, and its handler is still going) does nothing more.
+async function recheck(call, h) {
+  if (!call) return;
+  const over = () => { if (call.expired || call.done) throw new Error(`${call.name} ran out of time; nothing more is done on the page`); };
+  over();
+  if (h) await call.vet?.(h);
+  over(); // also when it ran out while the element was looked at
+  call.guard?.();
+}
+
+// Runs act on the element l finds. In a macro step the element is resolved to a handle first and made ready (ready:
+// the action's own waits), then the call's vet looks at it and its guard at the page, and only then does the action
+// go to that very element: nothing waits in between, so what was checked is what is acted on.
+async function onTarget(l, act, { ready = null } = {}) {
+  const call = stepCall();
+  if (!call) return act(l, null);
+  const h = await l.elementHandle({ timeout: 15000 });
+  try {
+    if (ready) await ready(h);
+    await recheck(call, h);
+    return await act(h, call);
+  } finally { await h.dispose().catch(() => {}); }
+}
+
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
 // Runs in the page: drags the files of input i onto el (dragenter, dragover, drop, dragleave). true when the page
@@ -110,6 +136,9 @@ function dropFiles(el, i, mark) {
 // mainWorld (camoufox): Firefox hides files that our isolated world put into a DataTransfer from the page, so the drop
 // is dispatched by a script element in the page's own world (unless the page's CSP refuses inline scripts).
 async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
+  // A macro step (onTarget): before any file goes anywhere, the page, and the input it goes into, are where the
+  // macro may act. The click below may have navigated away.
+  const call = stepCall();
   const input = await l.evaluate((el) => {
     const i = el.tagName === 'INPUT' ? el : el.tagName === 'LABEL' ? el.control : null;
     return i && i.type === 'file' ? { multiple: i.multiple, disabled: i.disabled } : null;
@@ -130,6 +159,8 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
     const onChooser = (c) => { fc ??= c; };
     page.on('filechooser', onChooser);
     try {
+      // A macro step: the element is looked at once it can be clicked, right before the click.
+      if (call) { await l.click({ trial: true, timeout: 15000 }); await recheck(call, l); }
       await l.click({ timeout: 15000 });
       for (const end = Date.now() + (method === 'chooser' ? 10000 : 5000); !fc && Date.now() < end;) await sleep(100);
     } finally {
@@ -137,12 +168,14 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
     }
     if (fc) {
       if (many && !fc.isMultiple()) throw new Error(`the file chooser this opened takes one file; got ${paths.length}`);
+      await recheck(call, fc.element());
       await fc.setFiles(paths, { timeout: 30000 });
       return { method: 'chooser' };
     }
     if (method === 'chooser') throw new Error('clicking the element opened no file chooser within 10 s');
   }
   // Drop: the files go into a temporary input of our own, then onto the element as a DataTransfer.
+  await recheck(call, l);
   const tmp = await page.evaluateHandle(() => {
     const i = document.createElement('input');
     i.type = 'file';
@@ -152,6 +185,7 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
     return i;
   });
   try {
+    await recheck(call, tmp);
     await tmp.setInputFiles(paths, { timeout: 30000 });
     let accepted = null;
     if (mainWorld) {
@@ -185,7 +219,9 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
 
 // The tools a token with policy "ephemeral" may call: ephemeral sessions and page tools. No profiles, keepalive,
 // meetings or handoff.
-export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for', 'screenshot', 'sessions']);
+// Macros: list, get and run (the steps are held to the same set), but not save or delete.
+export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for', 'screenshot', 'sessions',
+  'macro_list', 'macro_get', 'macro_run']);
 
 export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn = { inflight: 0 }, uploadBase = null }) {
   const ephemeral = policy === 'ephemeral';
@@ -197,7 +233,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.13.1' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.14.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -221,29 +257,19 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   // Every tool: bounded concurrency per connection, sanitized errors, and a deadline (deadline.mjs; not for the tools
   // that keep their own limits). A tool the policy doesn't allow is registered as a stub that only refuses (its
-  // handler is never wired up) and is left out of tools/list below.
+  // handler is never wired up) and is left out of tools/list below. The handlers this token may call, with their
+  // argument schemas, are also kept in handlers: a macro step runs the same code as the tool.
+  const handlers = new Map();
   const tool = (name, desc, shape, fn) => {
     if (ephemeral && !EPHEMERAL_TOOLS.has(name)) return server.tool(name, NOT_ALLOWED, {}, async () => { throw new Error(`${name}: ${NOT_ALLOWED}`); });
+    handlers.set(name, { fn, schema: z.object(shape) });
     const limitMs = cfg.toolTimeouts?.get(name) ?? null;
     return server.tool(name, desc, shape, async (a, extra) => {
       if (conn.inflight >= cfg.maxInflight) throw new Error(`too many concurrent requests on this connection (max ${cfg.maxInflight})`);
       conn.inflight++;
-      let call = null, timer;
       try {
-        if (!limitMs) return await fn(a, extra);
-        call = { name, limitMs, at: Date.now() + limitMs, reserveMs: reserveMs(limitMs), done: false, expired: false, inPage: false, queued: false, state: null };
-        const work = runCall(call, () => fn(a, extra));
-        // The call is answered by its deadline. A page operation is cut off earlier by the session (run), which
-        // checks the page and usually answers first; if that check is still going on, this says how far it got.
-        const late = new Promise((_, reject) => {
-          timer = setTimeout(() => {
-            call.expired = true;
-            reject(new Error(timeoutMessage(call, call.state ?? (call.queued && !call.inPage ? 'queued' : call.inPage ? 'checking' : null))));
-          }, limitMs);
-        });
-        work.catch(() => {});
-        return await Promise.race([work, late]);
-      } catch (e) { throw new Error(cleanError(e)); } finally { clearTimeout(timer); if (call) call.done = true; conn.inflight--; }
+        return limitMs ? await withDeadline(name, limitMs, () => fn(a, extra)) : await fn(a, extra);
+      } catch (e) { throw new Error(cleanError(e)); } finally { conn.inflight--; }
     });
   };
 
@@ -317,7 +343,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target }, async (a) => run(a.session, async (s) => {
     const mark = capture?.mark();
-    await locate(s.page, a).click({ timeout: 15000 });
+    await onTarget(locate(s.page, a), (t) => t.click({ timeout: 15000 }), { ready: (h) => h.click({ trial: true, timeout: 15000 }) });
     await s.page.waitForTimeout(1000);
     const dl = capture ? await capture.since(s.id, mark) : [];
     const w = noteWall(s, await wall(s.page));
@@ -333,8 +359,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       return run(a.session, async (s) => {
         const l = locate(s.page, a);
         if (a.secret_id !== undefined) return ok(await typeSecret(s, l, a));
-        await l.fill(a.value, { timeout: 15000 });
-        if (a.submit) { await l.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
+        await onTarget(l, async (t, call) => {
+          await t.fill(a.value, { timeout: 15000 });
+          // A macro step looks again before it goes on (and submits): a field that became a password field while it
+          // was filled is cleared; a step that ran out of time meanwhile, or a page that left the site, stops here.
+          await recheck(call, t).catch(async (e) => { await t.fill('', { timeout: 5000 }).catch(() => {}); throw e; });
+          if (a.submit) { await t.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
+        }, { ready: async (h) => { await h.waitForElementState('visible', { timeout: 15000 }); await h.waitForElementState('editable', { timeout: 15000 }); } });
         return ok(await pageInfo(s.page));
       });
     });
@@ -345,16 +376,17 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   // any error are masked with the value itself.
   const NO_SECRET_TYPES = new Set(['file', 'checkbox', 'radio', 'submit', 'button', 'image', 'reset', 'hidden', 'range', 'color']);
   async function typeSecret(s, loc, a) {
+    const call = stepCall();
     secrets.find(tenant, a.secret_id); // fails before the page is touched
     if (driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
     const l = await loc.elementHandle({ timeout: 15000 });
     try {
-      return await typeSecretInto(s, l, a);
+      return await typeSecretInto(s, l, a, call);
     } finally {
       await l.dispose().catch(() => {});
     }
   }
-  async function typeSecretInto(s, l, a) {
+  async function typeSecretInto(s, l, a, call) {
     // The page the secret goes into, also for scrubbing and leaving it: s.page may change under a call that ran out
     // of time (the tab is replaced).
     const page = s.page;
@@ -363,6 +395,9 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     if (kind !== 'password' && !a.allow_non_password) throw new Error(`this field is ${kind === 'textarea' ? 'a <textarea>' : `<input type=${kind}>`}, not a password field; pass allow_non_password: true to type the secret into it anyway (an OTP or e-mail field). The secret was not used.`);
     await markSensitive(page, l);
     if (!(await l.evaluate((el) => el.isConnected))) throw new Error('the field left the page before anything was typed; the secret was not used');
+    // A macro step: the field and the page are still where the macro may act (the field was found after a wait
+    // that a navigation may have crossed), and the step has not run out of time.
+    await recheck(call, l);
     const buf = secrets.take(tenant, a.secret_id);
     let value = buf.toString('utf8');
     buf.fill(0);
@@ -383,7 +418,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         throw new Error('the secret did not end up in the field that was checked (the page moved the focus or the field); Bosun left the page (about:blank) so nothing on it can show the secret, check the site before trying again');
       }
       await markValue(page, value);
-      if (a.submit) { await l.press('Enter', { timeout: 15000 }); await page.waitForTimeout(1500); }
+      if (a.submit) { await recheck(call); await l.press('Enter', { timeout: 15000 }); await page.waitForTimeout(1500); }
       const info = await pageInfo(page);
       console.error(`bosun: secret ${a.secret_id} of tenant ${tenant}: typed in session ${s.id}, ${Buffer.byteLength(value)} bytes`);
       return { ...info, url: hide(info.url), title: hide(info.title), secret: 'typed and deleted' };
@@ -395,7 +430,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   }
 
   tool('select', 'Choose an option in a <select>.', { session: str(40), ...target, value: str(1000) }, async (a) => run(a.session, async (s) => {
-    await locate(s.page, a).selectOption({ label: a.value }, { timeout: 15000 }).catch(() => locate(s.page, a).selectOption(a.value, { timeout: 15000 }));
+    await onTarget(locate(s.page, a), (t, call) => t.selectOption({ label: a.value }, { timeout: 15000 }).catch(async () => { await recheck(call); return t.selectOption(a.value, { timeout: 15000 }); }),
+      { ready: (h) => h.waitForElementState('enabled', { timeout: 15000 }) });
     return ok(await pageInfo(s.page));
   }));
 
@@ -493,7 +529,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         const ids = [...new Set(a.files ?? [a.file_id])];
         return run(a.session, async (s) => {
           const files = uploads.use(tenant, ids, s.id);
-          const r = await putFiles(s.page, locate(s.page, a), files.map((f) => f.file), a.method || 'auto', { mainWorld: s.engine === 'camoufox' });
+          const r = await onTarget(locate(s.page, a), (t) => putFiles(s.page, t, files.map((f) => f.file), a.method || 'auto', { mainWorld: s.engine === 'camoufox' }));
           await s.page.waitForTimeout(500);
           return ok({ ...r, files: files.map((f) => ({ file_id: f.id, filename: f.name, size: f.size })), ...(await pageInfo(s.page)) });
         });
@@ -610,6 +646,120 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     tool('meeting_leave', 'Leave the meeting; the recording is finished and kept (bosun:meeting-ended).', mid, async (a) => ok(await meetings.leave(tenant, a.meeting_id)));
     tool('meeting_recording_delete', `Delete a meeting's recording (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
       async (a) => ok(await meetings.deleteRecording(tenant, a.meeting_id)));
+  }
+
+  // Macros: step sequences saved by this tenant (a read-only tenant: by the tenant BROWSER_MACRO_SOURCE names), each
+  // step run by the handler of its tool above, so this token's policy, allowlists and limits apply to it as they do
+  // to the tool.
+  const macros = manager.macros;
+  if (macros) {
+    // The page side of a run (macros.mjs runMacro) in one session of this connection. Errors come out as the tools'
+    // do (cleanError: no Playwright call log, which can quote the page), keeping err.fatal.
+    const clean = (e) => { throw Object.assign(new Error(cleanError(e)), { fatal: !!e?.fatal }); };
+    const macroOps = (session, extra) => {
+      const progressToken = extra?._meta?.progressToken;
+      const page = () => {
+        const s = manager.get(owner, session);
+        if (s.handoff) throw new Error(HANDOFF_ACTIVE);
+        return s.page;
+      };
+      // One step: the handler of its tool, its arguments parsed by that tool's schema, under limitMs (the tool's
+      // deadline or what is left of the run), with the step's guard and vet (deadline.mjs withDeadline).
+      const step = async (name, args, limitMs, signal, hooks) => {
+        const h = handlers.get(name);
+        const r = h.schema.safeParse({ ...args, session });
+        if (!r.success) throw new Error(`invalid step: ${r.error.issues.map((i) => `${i.path.join('.') || name}: ${i.message}`).join('; ')}`);
+        return withDeadline(name, limitMs, () => h.fn(r.data, { signal }), hooks).catch(clean);
+      };
+      return {
+        allowed: (name) => (name === 'assert' || handlers.has(name) ? null : `${name} is not available for this token`),
+        limitOf: (name) => cfg.toolTimeouts?.get(name === 'assert' ? 'wait_for' : name) ?? null,
+        step,
+        url: () => page().url(),
+        // The first main-frame navigation off the site while a step runs (a redirect that comes back is still seen).
+        watch(isOff) {
+          const p = page();
+          let seen = null;
+          const on = (f) => { if (!seen && f === p.mainFrame() && isOff(f.url())) seen = f.url(); };
+          p.on('framenavigated', on);
+          return { seen: () => seen, stop: () => p.off('framenavigated', on) };
+        },
+        assert: (c, limitMs, hooks) => withDeadline('assert', limitMs, () => run(session, async (s) => {
+          const t = c.timeoutMs ?? 5000;
+          const failed = (what) => (e) => { throw e?.name === 'TimeoutError' ? new Error(`assert failed: ${what} within ${t} ms`) : e; };
+          if (c.url_contains !== undefined) {
+            for (const end = Date.now() + t; !s.page.url().includes(c.url_contains);) {
+              if (Date.now() >= end) throw new Error(`assert failed: the URL does not contain "${c.url_contains}" within ${t} ms`);
+              await sleep(200);
+            }
+          }
+          if (c.selector !== undefined) await s.page.locator(c.selector).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`no visible element matches selector ${c.selector}`));
+          if (c.text !== undefined) await s.page.getByText(c.text).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`text "${c.text}" is not visible`));
+          return true;
+        }), hooks).catch(clean),
+        // Where the run stopped: URL, title and the start of the a11y snapshot (masked as read masks it), and a
+        // screenshot (masked as screenshot masks it).
+        // until: when the run's time is up (ms since epoch); each part gets its tool's deadline at most, and is left
+        // out once less than a second remains.
+        async failure(until) {
+          const out = {};
+          const within = (name) => {
+            const ms = Math.min(cfg.toolTimeouts?.get(name) ?? Infinity, until - Date.now());
+            if (ms < 1000) throw new Error('no time left in the run for this');
+            return ms;
+          };
+          try {
+            const r = await step('read', { mode: 'a11y', maxChars: 4000 }, within('read')).catch(() => step('read', { mode: 'text', maxChars: 4000 }, within('read')));
+            const text = r.content[0].text;
+            const [head, body] = [text.slice(0, text.indexOf('\n\n')), text.slice(text.indexOf('\n\n') + 2)];
+            for (const line of head.split('\n')) { const m = /^(url|title): (.*)$/.exec(line); if (m) out[m[1]] = m[2]; }
+            out.page = body;
+          } catch (e) { out.page_error = cleanError(e); }
+          try { out.screenshot = (await step('screenshot', {}, within('screenshot'))).content.find((c) => c.type === 'image')?.data; } catch {}
+          return out;
+        },
+        progress: progressToken === undefined ? null
+          : (done, total, message) => extra.sendNotification({ method: 'notifications/progress', params: { progressToken, progress: done, total, message } }).catch(() => {}),
+      };
+    };
+
+    const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {role+name | selector | text} (no ref); type {target, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. Any string may use {{param}}; a step that uses a param not given is skipped.`;
+    tool('macro_save', `Save a multi-step flow on a site as a macro to rerun with macro_run (saving an existing name makes a new version; the last 20 are kept). site: the hosts it may run on (e.g. ["web.plaud.ai", "*.plaud.ai"]); a page outside them stops the run. params: {name: {type: string|number|file_id|secret_id, required?, default?, description?}}; a secret or file goes in only as a {{param}} of type secret_id / file_id, never stored. ${stepsHelp} A step whose text says pay, buy, purchase, submit/place order, checkout or delete account is refused unless confirm_risky: true.`,
+      { name: str(64).describe('lowercase letters, digits, . _ -'), description: str(2000).optional(), site: z.array(str(300)).min(1).max(MAX_SITES),
+        params: z.record(z.string().max(40), z.record(z.string(), z.unknown())).optional(), steps: z.array(z.record(z.string(), z.unknown())).min(1).max(MAX_STEPS),
+        confirm_risky: z.boolean().optional().describe('allow steps that may pay, buy, order, check out or delete an account'), created_by: str(100).optional().describe('who saved it (default: the tenant)') },
+      async (a) => {
+        const v = macros.save(tenant, a, { createdBy: a.created_by || tenant });
+        return ok({ saved: v.name, version: v.version, steps: v.steps.length, site: v.site, params: v.params, confirm_risky: v.confirm_risky, ...(v.risky_steps.length ? { risky_steps: v.risky_steps } : {}), next: `macro_run { name: "${v.name}", session, args }` });
+      });
+    tool('macro_list', 'List your macros (latest version of each): name, version, description, site, params (type, ? = optional), number of steps, confirm_risky and the risky steps.', {},
+      async () => ok(macros.list(tenant)));
+    tool('macro_get', 'A macro in full (steps and all), the latest version or version.', { name: str(64), version: z.number().int().min(1).optional() },
+      async (a) => ok(macros.get(tenant, a.name, a.version)));
+    tool('macro_delete', 'Delete a macro with all its versions.', { name: str(64) }, async (a) => ok(macros.delete(tenant, a.name)));
+    tool('macro_run', `Run a macro in session, step by step; each step works like the tool of that name and has its deadline, the whole run at most timeout_sec (default ${RUN_DEFAULT_SEC}, up to ${RUN_MAX_SEC}; raise your MCP client's request timeout above that, or send a progressToken: Bosun reports progress after every step). Returns per-step status, reads (the read steps' text), downloads (download_id to fetch with download_get) and screenshots (images). On failure: the step, its error, the URL, the start of the page's a11y snapshot and a screenshot, so you can fix the macro and save a new version. A page outside the macro's site stops the run. dry_run: check args and show the steps as they would run, without touching the page.`,
+      { name: str(64), session: str(40).optional().describe('required unless dry_run'), args: z.record(z.string().max(40), z.union([z.string().max(10000), z.number()])).optional(),
+        version: z.number().int().min(1).optional(), dry_run: z.boolean().optional(), timeout_sec: z.number().int().min(10).max(RUN_MAX_SEC).optional() },
+      async (a, extra) => {
+        const m = macros.get(tenant, a.name, a.version);
+        let s = null;
+        if (!a.dry_run) {
+          if (!a.session) throw new Error('give session (or dry_run: true)');
+          s = manager.get(owner, a.session); // an unknown session fails before anything runs
+          // Two runs in one tab would take turns step by step, each on the page the other left.
+          if (s.macroRun) throw new Error(`macro ${s.macroRun} is running in session ${s.id}; wait for it to finish`);
+          s.macroRun = m.name;
+        }
+        let out;
+        try {
+          out = await runMacro(m, { args: a.args ?? {}, dryRun: !!a.dry_run, maxMs: (a.timeout_sec ?? RUN_DEFAULT_SEC) * 1000, signal: extra?.signal, ops: macroOps(a.session, extra) });
+        } finally { if (s) s.macroRun = null; }
+        const { result, images } = out;
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 1) }, ...images.map((im) => ({ type: 'image', data: im.data, mimeType: 'image/jpeg' }))],
+          ...(result.ok ? {} : { isError: true }),
+        };
+      });
   }
 
   tool('sessions', 'List your open sessions.', {}, async () => ok(manager.list(owner).map((s) => (
