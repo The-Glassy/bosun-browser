@@ -91,8 +91,10 @@ const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
 // on. A step whose call is over (it ran out of time, and its handler is still going) does nothing more.
 async function recheck(call, h) {
   if (!call) return;
-  if (call.expired || call.done) throw new Error(`${call.name} ran out of time; nothing more is done on the page`);
+  const over = () => { if (call.expired || call.done) throw new Error(`${call.name} ran out of time; nothing more is done on the page`); };
+  over();
   if (h) await call.vet?.(h);
+  over(); // also when it ran out while the element was looked at
   call.guard?.();
 }
 
@@ -157,6 +159,8 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
     const onChooser = (c) => { fc ??= c; };
     page.on('filechooser', onChooser);
     try {
+      // A macro step: the element is looked at once it can be clicked, right before the click.
+      if (call) { await l.click({ trial: true, timeout: 15000 }); await recheck(call, l); }
       await l.click({ timeout: 15000 });
       for (const end = Date.now() + (method === 'chooser' ? 10000 : 5000); !fc && Date.now() < end;) await sleep(100);
     } finally {
@@ -425,7 +429,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   }
 
   tool('select', 'Choose an option in a <select>.', { session: str(40), ...target, value: str(1000) }, async (a) => run(a.session, async (s) => {
-    await onTarget(locate(s.page, a), (t) => t.selectOption({ label: a.value }, { timeout: 15000 }).catch(() => t.selectOption(a.value, { timeout: 15000 })),
+    await onTarget(locate(s.page, a), (t, call) => t.selectOption({ label: a.value }, { timeout: 15000 }).catch(async () => { await recheck(call); return t.selectOption(a.value, { timeout: 15000 }); }),
       { ready: (h) => h.waitForElementState('enabled', { timeout: 15000 }) });
     return ok(await pageInfo(s.page));
   }));

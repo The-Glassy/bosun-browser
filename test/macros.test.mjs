@@ -29,6 +29,8 @@ function serverA() {
         <button id="b1">Buy now</button>
         <button id="ib" aria-label="Buy now"><span id="icon">→</span></button>
         <button id="nb" aria-label="Buy now"><span id="nicon" onclick="">→</span></button>
+        <button id="ab"><img alt="Buy now" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></button>
+        <span id="lbl" hidden>Checkout</span><button id="lb2" aria-labelledby="lbl">→</button>
         <button id="lt" aria-label="Buy now">${'all the details you could want '.repeat(30)}</button>
         <button id="nav" onclick='location.href = ${JSON.stringify(q('away'))}'>Attach</button>
         <script>document.getElementById('f').onchange = async (e) => {
@@ -382,9 +384,9 @@ test('risky at run time: a selector that hits a "Buy now" button, and risky text
   assert.equal(out.failure.step, 2);
   assert.match(out.failure.error, /refused: the element says "Buy now"/);
   // What the click reaches counts: an icon inside a "Buy now" button, a label longer than anything a person reads.
-  for (const sel of ['#icon', '#nicon', '#lt']) {
+  for (const sel of ['#icon', '#nicon', '#lt', '#ab', '#lb2']) {
     assert.equal((await c.call('macro_save', { name: 'sneaky2', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/app` }, { tool: 'click', selector: sel }] })).isError, false);
-    assert.match((await c.call('macro_run', { name: 'sneaky2', session: s })).json().failure.error, /refused: the element says "Buy now"/, sel);
+    assert.match((await c.call('macro_run', { name: 'sneaky2', session: s })).json().failure.error, /refused: the element says "(Buy now|Checkout)"/, sel);
   }
   // upload clicks what is not a file input: the same check.
   const f = (await c.call('upload_create', { filename: 'x.txt', content_base64: Buffer.from('x').toString('base64') })).json().file_id;
