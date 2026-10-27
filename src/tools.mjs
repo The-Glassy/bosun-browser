@@ -133,24 +133,29 @@ const TAGS = ('a abbr address area article aside audio b bdi bdo blockquote body
   + 'progress q s samp search section select slot small source span strong sub summary sup table tbody td template textarea tfoot th '
   + 'thead time tr u ul var video svg g path use rect circle ellipse line polyline polygon text tspan image foreignObject').split(' ');
 
+// Names an element by TAGS: what the page reports is checked here, in this process (on chromium a page can change
+// what our in-page code reads).
+const tagOf = (n) => (typeof n === 'string' && TAGS.includes(n) ? n : typeof n === 'string' && n.includes('-') ? 'custom element' : 'element');
+const HIDDEN = { self: 'display: none', visibility: 'visibility: hidden', size: 'zero size' };
+const hiddenWhy = (w) => (w?.by === 'ancestor' ? `inside a display: none <${tagOf(w.tag)}>` : HIDDEN[w?.by] ?? null);
+
 // Runs in the page: what an element is (tag, whole id and class: they are masked before they are cut short) and why
-// it is not shown.
-function sketch(el, tags) {
-  // Only names from TAGS: any other element's name is the page's own text.
-  const kind = (x) => (tags.includes(x.localName) ? x.localName : x.localName.includes('-') ? 'custom element' : 'element');
+// it is not shown (by: self, ancestor (tag), visibility or size).
+function sketch(el) {
   let why = null;
   for (let x = el; x && x.nodeType === 1; x = x.parentElement ?? x.getRootNode?.()?.host) {
-    if (getComputedStyle(x).display === 'none') { why = x === el ? 'display: none' : `inside a display: none <${kind(x)}>`; break; }
+    if (getComputedStyle(x).display === 'none') { why = x === el ? { by: 'self' } : { by: 'ancestor', tag: x.localName }; break; }
   }
-  if (!why && getComputedStyle(el).visibility !== 'visible') why = 'visibility: hidden';
-  if (!why) { const r = el.getBoundingClientRect(); if (!r.width || !r.height) why = 'zero size'; }
-  return { tag: kind(el), id: el.id, cls: el.getAttribute('class') ?? '', why };
+  if (!why && getComputedStyle(el).visibility !== 'visible') why = { by: 'visibility' };
+  if (!why) { const r = el.getBoundingClientRect(); if (!r.width || !r.height) why = { by: 'size' }; }
+  return { tag: el.localName, id: el.id, cls: el.getAttribute('class') ?? '', why };
 }
 
 // What an error may say about an element of the page: its tag (one HTML or SVG defines), id and first classes, the
 // last two masked as read masks them (an id or class can hold what was typed into a password or OTP field) before
 // they are cut short; just its tag if that can't be checked, or once the call is over.
-async function safeTag(page, { tag, id, cls }, call) {
+async function safeTag(page, { tag: raw, id, cls }, call) {
+  const tag = tagOf(raw);
   let values;
   try { stillOn(call); values = await sensitiveValues(page); } catch { return `<${tag}>`; }
   const m = (v) => maskText(String(v ?? ''), values);
@@ -206,7 +211,7 @@ async function locate(p, t, { hidden = false, until = Date.now() + FIND_MS } = {
       if (chosen) return chosen;
     }
     stillOn(call);
-    if (hidden && !ordinal && await matches(p, t).count()) return matches(p, t).first();
+    if (hidden && !ordinal && await matches(p, t, { all: true }).count()) return matches(p, t, { all: true }).first();
     if (Date.now() >= until) { stillOn(call); throw new Error(await whyNone(p, t, missing, count, call)); }
     await sleep(Math.min(200, Math.max(0, until - Date.now())));
   }
@@ -237,8 +242,8 @@ async function whyNone(p, t, missing, count, call) {
   if (!n) return `nothing matches ${show(t)} within ${secs}`;
   if (!shown) {
     stillOn(call);
-    const first = await all.first().evaluate(sketch, TAGS, { timeout: 2000 }).catch(() => null);
-    return `${show(t)} matched ${n} element${n > 1 ? 's' : ''}, none visible within ${secs}${first ? ` (the first is ${await safeTag(p, first, call)}${first.why ? `, ${first.why}` : ''})` : ''}`;
+    const first = await all.first().evaluate(sketch, null, { timeout: 2000 }).catch(() => null);
+    return `${show(t)} matched ${n} element${n > 1 ? 's' : ''}, none visible within ${secs}${first ? ` (the first is ${await safeTag(p, first, call)}${hiddenWhy(first.why) ? `, ${hiddenWhy(first.why)}` : ''})` : ''}`;
   }
   const where = [t.after && `after "${t.after}"`, t.before && `before "${t.before}"`].filter(Boolean).join(' and ');
   return `${show(t)}: ${count ?? shown} visible match${(count ?? shown) === 1 ? '' : 'es'}${where ? ` ${where}` : ''}, so nth ${t.nth ?? 0} is not there${n > shown ? ` (${n - shown} more hidden)` : ''}`;
@@ -246,11 +251,9 @@ async function whyNone(p, t, missing, count, call) {
 
 // Runs in the page: why a click on el cannot happen: it is disabled, or another element covers its middle (the one
 // a click there would hit; its tag, id and classes).
-function blocker(el, tags) {
-  // Only names from TAGS: any other element's name is the page's own text.
-  const kind = (x) => (tags.includes(x.localName) ? x.localName : x.localName.includes('-') ? 'custom element' : 'element');
-  if (!el.isConnected) return { why: 'it left the page' };
-  if (el.disabled || el.closest('fieldset:disabled') || el.getAttribute('aria-disabled') === 'true') return { why: 'it is disabled' };
+function blocker(el) {
+  if (!el.isConnected) return { why: 'gone' };
+  if (el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true') return { why: 'disabled' };
   const r = el.getBoundingClientRect();
   const x = r.left + r.width / 2, y = r.top + r.height / 2;
   if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return null;
@@ -258,7 +261,7 @@ function blocker(el, tags) {
   while (hit?.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
   const holds = (a, b) => { for (let n = b; n; n = n.parentNode ?? n.host ?? null) if (n === a) return true; return false; };
   if (!hit || holds(el, hit)) return null;
-  return { covered: { tag: kind(hit), id: hit.id, cls: hit.getAttribute('class') ?? '' } };
+  return { covered: { tag: hit.localName, id: hit.id, cls: hit.getAttribute('class') ?? '' } };
 }
 
 // click(opts) on el (a locator or a handle) by until, with Playwright's waits for it to be clickable. One that times
@@ -270,9 +273,9 @@ async function clicking(page, el, click, until) {
   } catch (e) {
     if (e?.name !== 'TimeoutError') throw e;
     stillOn(call); // a call that is over looks no further
-    const b = await el.evaluate(blocker, TAGS, { timeout: 2000 }).catch(() => null);
+    const b = await el.evaluate(blocker, null, { timeout: 2000 }).catch(() => null);
     stillOn(call);
-    const why = b?.why ?? (b?.covered ? `it is covered by ${await safeTag(page, b.covered, call)}, which would get the click` : null);
+    const why = b?.why === 'gone' ? 'it left the page' : b?.why === 'disabled' ? 'it is disabled' : b?.covered ? `it is covered by ${await safeTag(page, b.covered, call)}, which would get the click` : null;
     throw new Error(`the element did not become clickable within ${Math.round(FIND_MS / 1000)} s${why ? `: ${why}` : ' (it stayed hidden, moving or disabled)'}`);
   }
 }
