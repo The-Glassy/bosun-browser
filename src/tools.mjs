@@ -87,14 +87,18 @@ function locate(p, t) {
 const str = (n) => z.string().max(n);
 const target = { ref: str(20).optional().describe('element ref from read (e.g. "e12")'), role: str(40).optional(), name: str(1000).optional(), selector: str(2000).optional(), text: str(1000).optional() };
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
-// Runs act on the element l finds. In a macro step (macros.mjs) the call's vet looks at that element first, and the
-// action goes to the very element it passed (a handle), in the same page operation.
-async function onTarget(l, act) {
-  const vet = currentCall()?.vet;
-  if (!vet) return act(l);
+// Runs act on the element l finds. In a macro step (macros.mjs, deadline.mjs hooks) the element is resolved to a
+// handle first and made ready (ready: the action's own waits), then the call's vet looks at it and its guard at the
+// page, and only then does the action go to that very element: nothing waits in between, so what was checked is
+// what is acted on.
+async function onTarget(l, act, { ready = null } = {}) {
+  const call = currentCall();
+  if (!call?.vet && !call?.guard) return act(l);
   const h = await l.elementHandle({ timeout: 15000 });
   try {
-    await vet(h);
+    if (ready) await ready(h);
+    await call.vet?.(h);
+    call.guard?.();
     return await act(h);
   } finally { await h.dispose().catch(() => {}); }
 }
@@ -321,7 +325,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target }, async (a) => run(a.session, async (s) => {
     const mark = capture?.mark();
-    await onTarget(locate(s.page, a), (t) => t.click({ timeout: 15000 }));
+    await onTarget(locate(s.page, a), (t) => t.click({ timeout: 15000 }), { ready: (h) => h.click({ trial: true, timeout: 15000 }) });
     await s.page.waitForTimeout(1000);
     const dl = capture ? await capture.since(s.id, mark) : [];
     const w = noteWall(s, await wall(s.page));
@@ -339,8 +343,11 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         if (a.secret_id !== undefined) return ok(await typeSecret(s, l, a));
         await onTarget(l, async (t) => {
           await t.fill(a.value, { timeout: 15000 });
+          // A macro step looks again: a field that became a password field while it was filled is cleared.
+          const vet = currentCall()?.vet;
+          if (vet) await vet(t).catch(async (e) => { await t.fill('', { timeout: 5000 }).catch(() => {}); throw e; });
           if (a.submit) { await t.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
-        });
+        }, { ready: async (h) => { await h.waitForElementState('visible', { timeout: 15000 }); await h.waitForElementState('editable', { timeout: 15000 }); } });
         return ok(await pageInfo(s.page));
       });
     });
@@ -369,6 +376,11 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     if (kind !== 'password' && !a.allow_non_password) throw new Error(`this field is ${kind === 'textarea' ? 'a <textarea>' : `<input type=${kind}>`}, not a password field; pass allow_non_password: true to type the secret into it anyway (an OTP or e-mail field). The secret was not used.`);
     await markSensitive(page, l);
     if (!(await l.evaluate((el) => el.isConnected))) throw new Error('the field left the page before anything was typed; the secret was not used');
+    // A macro step: the field and the page are still where the macro may act (the field was found after a wait
+    // that a navigation may have crossed).
+    const call = currentCall();
+    await call?.vet?.(l);
+    call?.guard?.();
     const buf = secrets.take(tenant, a.secret_id);
     let value = buf.toString('utf8');
     buf.fill(0);
@@ -499,7 +511,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         const ids = [...new Set(a.files ?? [a.file_id])];
         return run(a.session, async (s) => {
           const files = uploads.use(tenant, ids, s.id);
-          const r = await putFiles(s.page, locate(s.page, a), files.map((f) => f.file), a.method || 'auto', { mainWorld: s.engine === 'camoufox' });
+          const r = await onTarget(locate(s.page, a), (t) => putFiles(s.page, t, files.map((f) => f.file), a.method || 'auto', { mainWorld: s.engine === 'camoufox' }));
           await s.page.waitForTimeout(500);
           return ok({ ...r, files: files.map((f) => ({ file_id: f.id, filename: f.name, size: f.size })), ...(await pageInfo(s.page)) });
         });
@@ -669,16 +681,23 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         }), hooks).catch(clean),
         // Where the run stopped: URL, title and the start of the a11y snapshot (masked as read masks it), and a
         // screenshot (masked as screenshot masks it).
-        async failure() {
+        // until: when the run's time is up (ms since epoch); each part gets its tool's deadline at most, and is left
+        // out once less than a second remains.
+        async failure(until) {
           const out = {};
+          const within = (name) => {
+            const ms = Math.min(cfg.toolTimeouts?.get(name) ?? Infinity, until - Date.now());
+            if (ms < 1000) throw new Error('no time left in the run for this');
+            return ms;
+          };
           try {
-            const r = await step('read', { mode: 'a11y', maxChars: 4000 }, 20_000).catch(() => step('read', { mode: 'text', maxChars: 4000 }, 20_000));
+            const r = await step('read', { mode: 'a11y', maxChars: 4000 }, within('read')).catch(() => step('read', { mode: 'text', maxChars: 4000 }, within('read')));
             const text = r.content[0].text;
             const [head, body] = [text.slice(0, text.indexOf('\n\n')), text.slice(text.indexOf('\n\n') + 2)];
             for (const line of head.split('\n')) { const m = /^(url|title): (.*)$/.exec(line); if (m) out[m[1]] = m[2]; }
             out.page = body;
           } catch (e) { out.page_error = cleanError(e); }
-          try { out.screenshot = (await step('screenshot', {}, 20_000)).content.find((c) => c.type === 'image')?.data; } catch {}
+          try { out.screenshot = (await step('screenshot', {}, within('screenshot'))).content.find((c) => c.type === 'image')?.data; } catch {}
           return out;
         },
         progress: progressToken === undefined ? null

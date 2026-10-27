@@ -156,17 +156,29 @@ download). A macro stores such a flow once, per tenant, and `macro_run` replays 
   `type` secret_id, and those fields take nothing but such a param: ids are used once, and a macro never stores a
   secret. A step that uses an optional param that was not given is skipped.
 - **Site.** Each macro names its hosts (no `*`). Checked before the run (every `navigate` URL, after the args are
-  filled in), before each step (the page must be on the site or `about:blank`), and during each step: a listener on
-  the tab's main-frame navigations notes the first one off the site, so a redirect out and back is still seen.
-  Off the site the run stops after the step, also an optional one. This is a check after the fact, not a block:
-  the tab may have loaded the page outside (within the tenant's allowlist, which the proxy enforces) before the run
-  stops; no further step acts on it. Blocking it outright would need request interception in every engine.
+  filled in) and before each step (the page must be on the site or `about:blank`). A step's deadline call carries
+  two hooks (`withDeadline` hooks): `guard()` runs in the session's queue (`SessionManager.run`) right before each
+  page operation of the step, since another call on the session may have moved the page meanwhile, and again right
+  before an element is acted on. `vet(handle)` runs on the element `click`, `type` and `upload` resolved
+  (`onTarget`). The element must be in a document on the site, and a `type` with a secret checks it before the
+  secret is taken. A listener on the tab's main-frame navigations notes the first one off the site, so a redirect
+  out and back is still seen, and the guard refuses after it. Off the site the run stops after the step, also an
+  optional one. Loading a page outside is not blocked (the tab may load it, within the tenant's allowlist, which
+  the proxy enforces); acting on it is. Blocking the load itself would need request interception in every engine.
 - **Risky steps.** A word list (pay, buy, purchase, submit/place order, checkout, delete account, and German
   equivalents) is matched against every string of every step at save time (refused without `confirm_risky`), again
   after the args are filled in, and against the visible text / value / aria-label / title of the element a `click`
-  hits. A list is crude; it catches the obvious cases a macro should not do by accident, not an adversarial page.
-- **Time.** Each step: its tool's deadline. The run: `timeout_sec` (default 300, max 900); the failure report
-  (read + screenshot) may add up to 40 s. A progress notification after every step keeps a client with
+  hits. The element is resolved to a handle, waited for until it can be clicked (a trial click), vetted, and then
+  that handle is clicked, so there is no wait between check and click. If it can't be vetted, nothing is clicked.
+  `type` with a `value` works the same way. It checks the control Playwright fills (a `<label>` leads to its
+  control), refuses a password field, and looks again after the fill (a field that became a password field is
+  cleared). A word list is crude; it catches the obvious cases a macro should not do by accident, not an
+  adversarial page that rewrites a button between the check and the click.
+- **Time.** Each page operation gets the smaller of its tool's deadline and what is left of the run. The run:
+  `timeout_sec` (default 300, max 900), the failure report included (the steps stop 15 s, or a third of a shorter
+  run, early; the report's read and screenshot get the rest). A wait of the step's own (`wait_for`, `assert`,
+  `download_wait`) is shortened to end before the deadline: a wait cut off by the deadline would keep the page busy
+  and make the next call wait, or replace the tab. A progress notification after every step keeps a client with
   `resetTimeoutOnProgress` from timing out; a cancelled request stops the run before the next step.
 - **Read-only tenants** list, get and run (`EPHEMERAL_TOOLS`), but cannot save or delete. Since a tenant has one
   policy, a read-only tenant has no macros of its own: `BROWSER_MACRO_SOURCE=<read-only>=<tenant>` points it at a

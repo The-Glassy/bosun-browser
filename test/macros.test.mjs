@@ -33,6 +33,7 @@ function serverA() {
           document.getElementById('st').textContent = 'Uploaded: ' + file.name;
         };</script>`);
     }
+    if (u.pathname === '/redir') return html(res, `<title>Redirect</title><script>setTimeout(() => { location.href = ${JSON.stringify(q('to'))}; }, ${Number(q('ms')) || 700})</script>`);
     if (u.pathname === '/late') { // a password field and a "Buy now" button that show up after a second
       return html(res, `<title>Late</title><p>loading</p><script>setTimeout(() => {
         document.body.insertAdjacentHTML('beforeend', '<input id="lpw" type="password"><button id="lb">Buy now</button>');
@@ -66,7 +67,7 @@ function serverA() {
 const pressedOnB = [];
 const serverB = () => http.createServer((req, res) => {
   if (req.url.startsWith('/pressed')) { pressedOnB.push(req.url); res.end('ok'); return; }
-  html(res, `<title>Elsewhere</title><p>off the site</p><input id="q" autofocus>
+  html(res, `<title>Elsewhere</title><p>off the site</p><input id="q" autofocus><input id="bpw" type="password">
     <script>addEventListener('keydown', () => fetch('/pressed'));</script>`);
 });
 
@@ -206,15 +207,25 @@ const fakeOps = (over = {}) => {
 
 test('runMacro: assert gets the wait_for deadline; every step the guard, click and type the vet; cancelled runs say not_run', async () => {
   const m = { ...checkMacro({ name: 'u', site: ['a.example'], steps: [{ tool: 'assert', text: 'x', timeoutMs: 60000 }, { tool: 'click', text: 'Go' }, { tool: 'type', selector: '#q', value: 'v' }, { tool: 'press', key: 'Enter' }] }), version: 1 };
-  const ops = fakeOps();
+  let url = 'https://a.example/';
+  const ops = fakeOps({ url: () => url });
   const { result } = await runMacro(m, { args: {}, ops });
   assert.equal(result.ok, true);
   assert.equal(ops.calls[0].limitMs, 1500); // TOOL_TIMEOUTS wait_for, not the assert's own 60 s
   assert.equal(ops.calls[0].c.timeoutMs, 500); // and the wait ends before that: 1500 - 500 reserve - 500
   for (const c of ops.calls) assert.equal(typeof c.hooks.guard, 'function', c.tool);
   assert.deepEqual(ops.calls.map((c) => [c.tool, typeof c.hooks.vet]), [['assert', 'undefined'], ['click', 'function'], ['type', 'function'], ['press', 'object']]);
-  // The guard refuses a page off the site, and one the step navigated off of before acting.
-  assert.throws(() => ops.calls[3].hooks.guard({ page: { url: () => 'https://b.example/' } }), /the page is at b\.example, outside this macro's site/);
+  // The guard refuses a page off the site.
+  ops.calls[3].hooks.guard();
+  url = 'https://b.example/';
+  assert.throws(() => ops.calls[3].hooks.guard(), /the page is at b\.example, outside this macro's site/);
+  // The failure report gets what is left of timeout_sec: the steps stop a third of a short run before its end.
+  let until = null;
+  const fails = { ...m, steps: [{ tool: 'press', key: 'x' }] };
+  const t0 = Date.now();
+  const r2 = (await runMacro(fails, { args: {}, maxMs: 30_000, ops: fakeOps({ step: async () => { throw new Error('boom'); }, failure: async (u) => { until = u; return {}; } }) })).result;
+  assert.equal(r2.failure.error, 'boom');
+  assert.ok(until > t0 + 29_000 && until <= t0 + 30_100, String(until - t0));
   const ab = new AbortController();
   ab.abort();
   const cancelled = (await runMacro(m, { args: {}, ops: fakeOps(), signal: ab.signal })).result;
@@ -406,6 +417,19 @@ test('a secret goes in only through a secret_id param, typed by the type handler
   const pw = (await c.call('macro_run', { name: 'pw-arg', session: s, args: { p: 'hunter2' } })).json();
   assert.equal(pw.failure.step, 2);
   assert.match(pw.failure.error, /refused: this is a password field; in a macro it takes only secret_id/);
+  // Also through its label, which Playwright follows to the field.
+  assert.equal((await c.call('macro_save', { name: 'pw-label', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/app` }, { tool: 'type', selector: 'label:has(#pw)', value: 'plain' }] })).isError, false);
+  assert.match((await c.call('macro_run', { name: 'pw-label', session: s })).json().failure.error, /refused: this is a password field/);
+  // A secret step whose page leaves the site while it waits for the field: nothing typed, the secret not used.
+  const y = (await c.call('secret_create', { label: 'redir' })).json();
+  assert.equal((await fetch(y.put_url, { method: 'PUT', body: 'never-off-site' })).status, 201);
+  assert.equal((await c.call('macro_save', { name: 'pw-redir', site: [A.host], params: { pw: { type: 'secret_id' } }, steps: [{ tool: 'navigate', url: `${A.base}/redir?ms=3000&to=${encodeURIComponent(`${B.base}/`)}` }, { tool: 'type', selector: '#bpw', secret_id: '{{pw}}' }] })).isError, false);
+  const off = (await c.call('macro_run', { name: 'pw-redir', session: s, args: { pw: y.secret_id } })).json();
+  assert.equal(off.failure.step, 2);
+  assert.match(off.failure.error, new RegExp(`(went to|is at|document at) ${B.host.replace(/\./g, '\\.')}`));
+  const sess = [...svc.manager.sessions.values()].find((x) => x.id === s);
+  assert.equal(await sess.page.evaluate(() => document.getElementById('bpw')?.value ?? 'no field'), '');
+  assert.doesNotThrow(() => svc.secrets.find('alice', y.secret_id)); // still there, unused
   await c.call('session_close', { session: s });
 });
 

@@ -382,7 +382,7 @@ export class SessionManager {
       // Too little of its time left to run and still check the page: not run at all.
       if (call && (call.expired || Date.now() >= call.at - call.reserveMs)) throw new Error(timeoutMessage(call, 'queued'));
       // A macro step's check that the page is still where the macro may act (macros.mjs), at the moment it would.
-      call?.guard?.(s);
+      call?.guard?.();
       if (call) call.inPage = true;
       const gen = s.gen;
       s.busy++;

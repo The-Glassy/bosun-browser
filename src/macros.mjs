@@ -23,6 +23,7 @@ export const VERSIONS_KEPT = 20; // older versions of a macro are dropped
 export const MAX_DOC_BYTES = 256 * 1024;
 export const RUN_DEFAULT_SEC = 300;
 export const RUN_MAX_SEC = 900;
+const REPORT_MS = 15_000; // kept for the failure report at the end of the run's time
 export const STEP_TOOLS = ['navigate', 'click', 'type', 'select', 'press', 'wait_for', 'upload', 'download_wait', 'read', 'screenshot', 'assert'];
 
 // What a step may not do without confirm_risky at save time: pay, buy, order, check out, delete an account.
@@ -281,9 +282,10 @@ const hostOf = (u) => { try { return new URL(u).host || u.slice(0, 60); } catch 
 //   allowed(tool) -> null | why not;  limitOf(tool) -> ms | null (the tool's deadline);
 //   step(tool, args, limitMs, signal, hooks) -> MCP result of that tool;  assert(cond, limitMs, hooks);
 //   url() -> current URL;  watch(isOff) -> {seen() -> first off-site URL navigated to, stop()};
-//   failure() -> {url, title, page, screenshot} (best effort);  progress(done, total, message).
-// hooks (deadline.mjs withDeadline): guard(s), run in the session's queue right before each page operation of the
-// step, refuses a page off the site; vet(handle), run by click and type on the element they act on.
+//   failure(until) -> {url, title, page, screenshot} (best effort, done by until);  progress(done, total, message).
+// hooks (deadline.mjs withDeadline): guard(), run in the session's queue right before each page operation of the
+// step and right before an element is acted on, refuses a page off the site; vet(handle), run by click, type and
+// upload on the element they act on (tools.mjs onTarget).
 // Returns { result (JSON-able), images: [{step, data}] }.
 export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SEC * 1000, signal, ops }) {
   const values = checkArgs(m, args);
@@ -309,7 +311,9 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
   // downloads: every one a step reported. pending: those a click or navigate reported (click waits up to 5 s for
   // one to finish, and then download_wait would not see it again) that no download_wait step has taken yet.
   const images = [], reads = [], downloads = [], pending = [];
-  const end = Date.now() + maxMs;
+  // The steps end REPORT_MS (a third of a short run) before maxMs, which leaves the failure report its time within it.
+  const hardEnd = Date.now() + maxMs;
+  const end = hardEnd - Math.min(REPORT_MS, Math.floor(maxMs / 3));
   const total = m.steps.length;
   let failure = null;
   for (let i = 0; i < total; i++) {
@@ -335,12 +339,13 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
       w = ops.watch(off);
       // Checked again in the session's queue, right before each page operation of the step: the page may have
       // moved since (another call on the session, a page that navigates by itself).
-      const guard = (s) => {
+      const guard = () => {
         const seen = w.seen();
         if (seen) throw refusal(`the page went to ${hostOf(seen)}, outside this macro's site (${sites})`);
-        if (st.tool !== 'navigate' && off(s.page.url())) throw refusal(`the page is at ${hostOf(s.page.url())}, outside this macro's site (${sites})`);
+        const now = ops.url();
+        if (st.tool !== 'navigate' && off(now)) throw refusal(`the page is at ${hostOf(now)}, outside this macro's site (${sites})`);
       };
-      const out = await runStep(st, { ops, end, signal, guard, confirmRisky: m.confirm_risky, pending });
+      const out = await runStep(st, { ops, end, signal, guard, off, sites, confirmRisky: m.confirm_risky, pending });
       Object.assign(rec, out.rec);
       if (out.read !== undefined) reads.push({ step: n, ...(st.as ? { as: st.as } : {}), text: out.read });
       if (out.downloads) {
@@ -372,7 +377,7 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
   if (failure) {
     res.ok = false;
     const { noPage, ...f } = failure;
-    res.failure = { ...f, ...(noPage ? {} : await ops.failure().catch(() => ({}))) };
+    res.failure = { ...f, ...(noPage ? {} : await ops.failure(hardEnd).catch(() => ({}))) };
     if (res.failure.screenshot) { images.push({ step: failure.step, data: res.failure.screenshot, failure: true }); res.failure.screenshot = 'attached (image after this text)'; }
     res.next = 'fix the step (macro_get, then macro_save a new version) or the page state, and run again';
   }
@@ -383,17 +388,25 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
 const refusal = (msg) => Object.assign(new Error(msg), { fatal: true });
 const json = (r) => { const t = r?.content?.find((c) => c.type === 'text')?.text; try { return JSON.parse(t); } catch { return t ?? null; } };
 
-// Runs in the page, on the element a click or type step is about to act on: what it says, and its kind.
+// Runs in the page, on the element a click, type or upload step is about to act on: what it says, the kind of the
+// control a fill goes to (Playwright follows a <label>, or an element inside one, to its control), and the URL of
+// the document it is in (a frame may be elsewhere).
 function describe(el) {
+  let c = el;
+  if (!['input', 'textarea', 'select'].includes(c.localName) && !c.isContentEditable) {
+    const label = c.localName === 'label' ? c : c.closest('label');
+    if (label?.control) c = label.control;
+  }
   return {
     label: [el.innerText, el.value, el.getAttribute('aria-label'), el.title].filter((x) => typeof x === 'string' && x).join(' ').slice(0, 500),
-    kind: el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName,
+    kind: c.localName === 'input' ? String(c.type || 'text').toLowerCase() : c.localName,
+    doc: String(el.ownerDocument?.location?.href ?? ''),
   };
 }
 
 // One step; returns { rec (what to report), read?, downloads?, image? } or throws. Every page operation gets what is
 // left of the run at most, and the step's tool deadline at most.
-async function runStep(st, { ops, end, signal, guard, confirmRisky, pending }) {
+async function runStep(st, { ops, end, signal, guard, off, sites, confirmRisky, pending }) {
   const { tool, optional, note, as, ...a } = st;
   const limit = (name) => {
     const ms = Math.min(ops.limitOf(name) ?? Infinity, end - Date.now());
@@ -420,21 +433,17 @@ async function runStep(st, { ops, end, signal, guard, confirmRisky, pending }) {
     if (r?.state !== 'ready') throw new Error(r?.state === 'none' || !r?.state ? 'no download finished in time' : `download ${r.state}${r.reason ? `: ${r.reason}` : ''}`);
     return { rec: { download_id: r.download_id, filename: r.filename }, ...(took ? {} : { downloads: [r] }) };
   }
-  // The element a click or type acts on is looked at first, in the same operation (tools.mjs onTarget); if that
-  // fails, nothing is done.
-  let vet = null;
-  if (tool === 'click' && !confirmRisky) {
+  // The element a click, type or upload acts on is looked at first, in the same operation, right before the action
+  // (tools.mjs onTarget); if that fails, nothing is done. A type with secret_id is looked at too (only where it is).
+  const vet = !['click', 'type', 'upload'].includes(tool) ? null : async (h) => {
+    const d = await h.evaluate(describe);
+    if (off(d.doc)) throw refusal(`the element is in a document at ${hostOf(d.doc)}, outside this macro's site (${sites})`);
     // What the element says, not only how the step finds it: a selector can point at a "Buy now" button.
-    vet = async (h) => {
-      const risky = riskyIn((await h.evaluate(describe)).label);
-      if (risky) throw refusal(`refused: the element says "${risky}" (a macro that may pay, buy, order, check out or delete an account needs confirm_risky at save time)`);
-    };
-  } else if (tool === 'type' && a.value !== undefined) {
+    const risky = tool === 'click' && !confirmRisky ? riskyIn(d.label) : null;
+    if (risky) throw refusal(`refused: the element says "${risky}" (a macro that may pay, buy, order, check out or delete an account needs confirm_risky at save time)`);
     // A password goes into a macro only by secret_id: never stored in it, nor passed through the agent as an arg.
-    vet = async (h) => {
-      if ((await h.evaluate(describe)).kind === 'password') throw refusal('refused: this is a password field; in a macro it takes only secret_id: "{{param}}" (a param of type secret_id)');
-    };
-  }
+    if (tool === 'type' && a.value !== undefined && d.kind === 'password') throw refusal('refused: this is a password field; in a macro it takes only secret_id: "{{param}}" (a param of type secret_id)');
+  };
   const r = await ops.step(tool, a, limit(tool), signal, { guard, vet });
   if (tool === 'screenshot') return { rec: {}, image: r.content.find((c) => c.type === 'image')?.data };
   if (tool === 'read') {

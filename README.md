@@ -406,7 +406,9 @@ note? }`.
 **`macro_run { name, session, args, version?, dry_run?, timeout_sec? }`** runs the steps in order in the session.
 
 - Each step has its tool's deadline (`TOOL_TIMEOUT_SEC` / `TOOL_TIMEOUTS`; `assert` that of `wait_for`), and the
-  whole run `timeout_sec` (default 300, at most 900). A run longer than your MCP client's request timeout (60 s in
+  whole run `timeout_sec` (default 300, at most 900), the failure report included: the steps stop 15 s (a third of
+  a shorter run) before it ends. A step's own wait (`wait_for`, `assert`, `download_wait`) is shortened to end
+  within its deadline. A run longer than your MCP client's request timeout (60 s in
   the SDK) needs that timeout raised, or a `progressToken`: Bosun sends a progress notification after every step,
   which a client with `resetTimeoutOnProgress` counts as a sign of life. A cancelled request stops the run before
   its next step.
@@ -420,16 +422,22 @@ note? }`.
 **Safety.**
 
 - **Site.** A `navigate` to a host outside `site` is refused before the first step runs (also when an arg made the
-  URL). A step that starts on a page outside it is not run. Any navigation of the tab outside it while a step runs,
-  a redirect that comes back included, stops the run after that step, even an `optional` one. `about:blank` counts
-  as no page. The tenant's host allowlist still applies on top, enforced by its proxy.
+  URL). The page is checked again in the session's queue right before each page operation of a step (another call
+  on the session may have moved it), and once more right before `click`, `type` or `upload` acts on its element,
+  which must itself be in a document on the site (not in a frame from elsewhere). Any navigation of the tab outside
+  the site while a step runs, a redirect that comes back included, stops the run after that step, even an
+  `optional` one. `about:blank` counts as no page. The tenant's host allowlist still applies on top, enforced by its
+  proxy.
 - **Secrets** go in only as a `{{param}}` of type `secret_id`, in `type`'s `secret_id`: a stored macro never holds
-  one, nor a `file_id` (both are used once). A `secret_id` or `file_id` param can't go into any other field.
+  one, nor a `file_id` (both are used once). A `secret_id` or `file_id` param can't go into any other field. A
+  `type` with `value` into a password field (also through its `<label>`) is refused, whether the value was stored
+  or passed as an arg, and a field that turns into one while it is filled is cleared.
 - **Risky steps.** A step whose text (any of its strings, after the args are filled in) says pay, buy, purchase,
   submit or place order, checkout or delete account (also: kaufen, bezahlen, zahlungspflichtig, kostenpflichtig
   bestellen, Konto löschen) is refused unless the macro was saved with `confirm_risky: true`. A `click` is also
   checked against what the element it hits says (text, value, `aria-label`, `title`), so a selector can't point at
-  a "Buy now" button unnoticed. `macro_list` and `macro_save` show `confirm_risky` and the risky steps.
+  a "Buy now" button unnoticed: once the element is ready to click, then that same element is clicked. If it can't
+  be looked at, it isn't clicked. `macro_list` and `macro_save` show `confirm_risky` and the risky steps.
 - **Storage.** `BROWSER_DATA/macros/<tenant>/<name>.json` (0600), all kept versions in one file, written
   atomically; it survives restarts and upgrades with the data volume. Per tenant at most 200 macros of 256 KB each.
 - **Read-only tokens** (policy `ephemeral`) may `macro_list`, `macro_get` and `macro_run` but not save or delete,
