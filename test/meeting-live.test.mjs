@@ -26,11 +26,11 @@ after(async () => { await Promise.all([fake?.close(), fz?.close(), el?.close()])
 const MCPL = { experimental: { mcpl: { version: '0.5', pushEvents: true } } };
 const zoomPlatform = () => ({ ...zoom, accountUrl: `${fz.base}/profile`, joinUrl: (u) => zoomWebClientUrl(u).replace('https://app.zoom.us', fz.base), origins: () => [fz.base] });
 
-async function withService(fn, { env = {}, el: withEl = true } = {}) {
+async function withService(fn, { env = {}, el: withEl = true, meetings = {} } = {}) {
   const audio = fakeAudio();
   const zp = zoomPlatform();
   const svc = await startBosun({ KEEPALIVE: '0', ...(withEl ? { ELEVENLABS_API_KEY: el.key, ELEVENLABS_BASE_URL: el.base } : {}), TTS_URL: el.base, ...env }, {
-    meetings: { audio, platformFor: (u) => (u.startsWith(fake.base) ? meet : zoom.matches(u) ? zp : null), pollMs: 200 },
+    meetings: { audio, platformFor: (u) => (u.startsWith(fake.base) ? meet : zoom.matches(u) ? zp : null), pollMs: 200, ...meetings },
   });
   const ev = { transcript: [], 'transcript-stopped': [], speech: [], optout: [], ended: [] };
   for (const k of Object.keys(ev)) svc.events.on(`meeting-${k}`, (e) => ev[k].push(e));
@@ -343,6 +343,39 @@ test('barge-in: meeting_stop_speaking cuts it off and mutes; interrupt replaces 
     assert.match((await c.call('meeting_speak', { meeting_id: id, audio_file_id: pl.file_id })).text, /is not WAV, Ogg, FLAC, MP3, M4A or WebM audio/);
     await c.close();
   });
+});
+
+test('stopped while the text is still being synthesized: the microphone is muted again; a player that never ends is cut off; NODE_DEBUG keeps the key unused', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    const { id, code } = await admitted(c, { live: false });
+    el.st.ttsDelayMs = 1500;
+    const slow = c.call('meeting_speak', { meeting_id: id, text: 'Slow to synthesize.' });
+    await until(() => media(code, 'mic').length === 1, 5000);
+    const st = (await c.call('meeting_stop_speaking', { meeting_id: id })).json();
+    assert.equal(st.state, 'interrupted');
+    el.st.ttsDelayMs = 0;
+    const r = await slow;
+    assert.equal(r.json().state, 'interrupted');
+    await sleep(300);
+    assert.deepEqual(media(code, 'mic'), [true, false]);
+    assert.equal(audio.players.length, 0, 'nothing played');
+
+    audio.stuckPlayers = true;
+    const w = (await c.call('meeting_speak', { meeting_id: id, text: 'Stuck.', wait: true })).json();
+    assert.equal(w.state, 'failed');
+    assert.match(w.error, /playback did not end in time/);
+    assert.equal(audio.players.at(-1).stopped, true);
+    assert.equal(media(code, 'mic').at(-1), false);
+    audio.stuckPlayers = false;
+
+    process.env.NODE_DEBUG = 'net';
+    try {
+      assert.match((await c.call('meeting_speak', { meeting_id: id, text: 'x', backend: 'elevenlabs' })).text, /NODE_DEBUG is set/);
+      assert.match((await c.call('meeting_join', { url: fake.newRoom().url, live_transcript: true })).text, /live_transcript is refused: NODE_DEBUG is set/);
+    } finally { delete process.env.NODE_DEBUG; }
+    await c.close();
+  }, { meetings: { speechGraceMs: 500 } });
 });
 
 test('Meet: meeting_raise_hand raises and lowers the hand; leaving while speaking stops the audio', async () => {

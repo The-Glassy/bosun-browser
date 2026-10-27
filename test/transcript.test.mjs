@@ -260,6 +260,34 @@ test('errors after sessions that lasted never add up to giving up', async () => 
   } finally { await t.stop('left'); }
 });
 
+test('a partial still waiting for its turn when its segment is committed is dropped, not sent as the next segment', async () => {
+  const ev = { partial: [], final: [] };
+  const t = new LiveTranscript({ apiKey: el.key, baseUrl: el.base, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { partial: (s) => ev.partial.push(s), final: (s) => ev.final.push(s) } });
+  t.onMessage({ message_type: 'partial_transcript', text: 'Hello' });
+  t.onMessage({ message_type: 'partial_transcript', text: 'Hello Misha' }); // throttled: waits
+  t.onMessage({ message_type: 'committed_transcript', text: 'Hello Misha, hi.' });
+  await sleep(700);
+  assert.deepEqual(ev.partial.map((p) => [p.seq, p.text]), [[1, 'Hello']]);
+  t.onMessage({ message_type: 'committed_transcript_with_timestamps', text: 'Hello Misha, hi.', words: [] });
+  t.onMessage({ message_type: 'partial_transcript', text: 'Next' });
+  assert.deepEqual(ev.final.map((f) => [f.seq, f.text]), [[1, 'Hello Misha, hi.']]);
+  assert.deepEqual(ev.partial.at(-1).seq, 2);
+  await t.stop('left');
+});
+
+test('NODE_DEBUG set: no connection with the key (Node would log its headers)', async () => {
+  const n = el.conns.length;
+  process.env.NODE_DEBUG = 'net';
+  try {
+    const { ev } = live(source(silence(2)));
+    await until(() => ev.stopped.length === 1, 3000);
+    assert.equal(ev.stopped[0].reason, 'error');
+    assert.match(ev.stopped[0].error, /NODE_DEBUG is set/);
+    assert.equal(el.conns.length, n);
+    await assert.rejects(synthesizeWav({ elevenlabs: { apiKey: el.key, baseUrl: el.base } }, { text: 'x', backend: 'elevenlabs' }), /NODE_DEBUG is set/);
+  } finally { delete process.env.NODE_DEBUG; }
+});
+
 test('a tenant named __proto__ is counted and capped like any other', () => {
   const file = path.join(tmpDir(), 'u.json');
   const u = new TranscriptUsage({ file, tz: 'Europe/Vienna', capMin: 1 });

@@ -305,7 +305,8 @@ export function fakeAudio({ openMs = 0, stopMs = 0 } = {}) {
         play(input) {
           let done, t = null;
           const p = { ...input, bytes: input.file ? fs.readFileSync(input.file) : Buffer.alloc(0), startedAt: Date.now(), stopped: false, done: new Promise((r) => { done = r; }), error: () => null };
-          const finish = (sec) => { t = setTimeout(() => done(true), Math.max(0, p.startedAt + sec * 1000 - Date.now())); };
+          // stuckPlayers: never ends by itself (an ffmpeg that hangs).
+          const finish = (sec) => { if (!audio.stuckPlayers) t = setTimeout(() => done(true), Math.max(0, p.startedAt + sec * 1000 - Date.now())); };
           if (input.file) finish(wavSeconds(p.bytes) ?? 1);
           p.write = (b) => { p.bytes = Buffer.concat([p.bytes, b]); };
           p.end = () => finish(p.bytes.length / (input.pcm.rate * input.pcm.channels * 2));

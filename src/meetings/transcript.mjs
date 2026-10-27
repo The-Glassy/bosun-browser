@@ -20,6 +20,9 @@ import WebSocket from 'ws';
 import { PCM_RATE } from './audio.mjs';
 
 export const EL_MODEL = 'scribe_v2_realtime';
+// Node's own diagnostics (NODE_DEBUG=net, http, fetch, ...) print request headers: the key is not sent while it is set.
+export const nodeDebugOn = () => !!String(process.env.NODE_DEBUG || '').trim();
+export const NODE_DEBUG_REFUSED = 'NODE_DEBUG is set (Node would log the request headers with the ElevenLabs key); the operator has to switch it off';
 export const EL_PATH = '/v1/speech-to-text/realtime';
 const BYTES_PER_SEC = PCM_RATE * 2;
 const CHUNK_BYTES = BYTES_PER_SEC / 4; // 250 ms per message (ElevenLabs: 0.1 - 1 s)
@@ -167,6 +170,7 @@ export class LiveTranscript {
 
   connect() {
     if (this.state === 'stopped') return;
+    if (nodeDebugOn()) { this.stop('error', NODE_DEBUG_REFUSED); return; }
     this.sessionSent = false;
     this.stallSince = null;
     const ws = this.ws = new WebSocket(this.url, { headers: { 'xi-api-key': this.apiKey }, handshakeTimeout: 15_000 });
@@ -212,7 +216,10 @@ export class LiveTranscript {
       // not a second segment: plain texts and copies are paired by their order, never by their text.
       case 'committed_transcript': {
         if (this.stampedAhead > 0) { this.stampedAhead--; return; }
-        // The segment's number is taken now: partials that come before its copy belong to the next one.
+        // The segment's number is taken now: partials that come before its copy belong to the next one, and a partial
+        // of this segment still waiting for its turn is dropped (its text is committed).
+        const lp = this.lastPartial;
+        clearTimeout(lp.timer); lp.timer = null; lp.queued = null; lp.text = '';
         const text = String(m.text || '').trim();
         const c = { text, end: this.sentPos(), fell: false, seq: text ? ++this.seq : null };
         c.timer = setTimeout(() => this.commitFallback(c), FINAL_WAIT_MS);

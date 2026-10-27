@@ -22,7 +22,7 @@ import { cleanChatText, cleanSender } from './platforms/common.mjs';
 import { meet } from './platforms/meet.mjs';
 import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
-import { LiveTranscript, TranscriptUsage } from './transcript.mjs';
+import { LiveTranscript, TranscriptUsage, nodeDebugOn, NODE_DEBUG_REFUSED } from './transcript.mjs';
 import { synthesizeWav, splitSpeech, probeSeconds, audioFormat } from './speech.mjs';
 
 export const ID_RE = /^m[0-9a-f]{12}$/;
@@ -39,6 +39,7 @@ const MEDIA_ARGS = ['--use-fake-ui-for-media-stream', '--autoplay-policy=no-user
 const SELF_SENDERS = /^(?:you|du|sie|ich|me|myself)$/i; // how a chat UI labels our own messages
 const MAX_STARTING = 50; // meetings still setting up, across tenants
 const SPEECH_TAIL_MS = 400; // the microphone stays on this long after the audio ends (what is still on its way)
+const SPEECH_GRACE_MS = 15_000; // playback still going this long after the audio should have ended is cut off
 
 // state: joining -> waiting -> admitted -> recording -> ended (recording -> admitted when it is stopped early).
 const NEXT = {
@@ -120,8 +121,8 @@ export class Meetings {
   // audio: {unsupported() -> reason|null, open() -> {browserEnv, args?, record(file), close()}, needsHeadful};
   // platformFor(url) -> platform|null; bus: EventBus (meeting events).
   constructor({ cfg, manager, bus, audio = pulseAudio, platformFor = (url) => PLATFORMS.find((p) => p.matches(url)) || null,
-    now = Date.now, pollMs = POLL_MS, aloneMs = ALONE_MS, aloneLeaveMs = ALONE_LEAVE_MS }) {
-    Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs, aloneLeaveMs });
+    now = Date.now, pollMs = POLL_MS, aloneMs = ALONE_MS, aloneLeaveMs = ALONE_LEAVE_MS, speechGraceMs = SPEECH_GRACE_MS }) {
+    Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs, aloneLeaveMs, speechGraceMs });
     this.dir = path.join(cfg.dataDir, 'recordings');
     this.active = new Map(); // id -> meeting
     this.dryRuns = new Set(); // dry runs in progress: {tenant, session} (capacity)
@@ -238,6 +239,7 @@ export class Meetings {
     if (!ANNOUNCE_MODES.includes(announce)) throw new Error(`announce must be one of ${ANNOUNCE_MODES.join(', ')}`);
     if (liveTranscript) {
       if (!this.cfg.elevenlabs) throw new Error('live_transcript needs ElevenLabs (ELEVENLABS_API_KEY is not set on this Bosun); join without it');
+      if (nodeDebugOn()) throw new Error(`live_transcript is refused: ${NODE_DEBUG_REFUSED}`);
       if (this.usage.left(tenant) <= 0) throw new Error(`the daily live transcript limit (${this.usage.capSec / 60} min) is used up for today; join without live_transcript`);
     }
     const checked = await this.check(tenant, { url, profile, engine });
@@ -685,12 +687,15 @@ export class Meetings {
       return { file: f.file, format, seconds };
     })();
     // The microphone goes on while the first audio is prepared.
-    // Speaking owns the unmute only when it saw the microphone off (then also an unmute that half-worked is muted again).
+    // Speaking owns the unmute when it clicked the microphone on (also when the click half-worked: it is muted again). An
+    // utterance that ended meanwhile (stopped) mutes again here what it turned on, unless another one speaks now.
     const mic = autoMute ? this.page(m, async (p) => {
-      const before = await m.platform.micState(p);
-      if (before === 'on') return;
-      if (before === 'off') m.speechUnmuted = true;
-      await m.platform.setMic(p, true);
+      if (u.ending) return;
+      let r;
+      try { r = await m.platform.setMic(p, true); } catch (e) { if (e.clicked) m.speechUnmuted = true; throw e; }
+      if (!r.changed) return;
+      if (u.ending && !m.speech) await m.platform.setMic(p, false).catch(() => { m.speechUnmuted = true; });
+      else m.speechUnmuted = true;
     }) : Promise.resolve(null);
     const [a, b] = await Promise.allSettled([first, mic]);
     const prepMs = this.now() - t0;
@@ -721,6 +726,12 @@ export class Meetings {
       }
       u.player.end();
     }
+    // Playback that doesn't end when it should (ffmpeg stuck) is cut off, and the microphone muted again.
+    if (!u.ending) {
+      u.watchdog = setTimeout(() => { if (!u.ending) { u.cancelled = true; u.player.stop(); this.endUtterance(m, u, 'failed', new Error('playback did not end in time')); } },
+        Math.max(0, u.seconds * 1000 + this.speechGraceMs - (this.now() - u.startedAt)));
+      u.watchdog.unref?.();
+    }
     const started = {
       meeting_id: m.id, utterance_id: u.id, speaking: u.state === 'speaking', duration_s: Math.round(u.seconds * 100) / 100, source: text ? backend : 'file',
       ...(head.voice ? { voice: head.voice } : {}), ...(text ? { pieces: pieces.length } : {}),
@@ -737,6 +748,7 @@ export class Meetings {
   async endUtterance(m, u, state, error, { t0 = u.t0, tail = false } = {}) {
     if (u.ending) return u.finished;
     u.ending = true;
+    clearTimeout(u.watchdog);
     if (tail) await sleep(SPEECH_TAIL_MS);
     u.state = state;
     if (m.speech === u) m.speech = null;
@@ -781,16 +793,16 @@ export class Meetings {
     this.inCall(m, on ? 'muting' : 'unmuting');
     await m.announceDone.p;
     this.inCall(m, on ? 'muting' : 'unmuting');
-    const s = await this.page(m, (p) => m.platform.setMic(p, !on));
+    const r = await this.page(m, (p) => m.platform.setMic(p, !on));
     m.speechUnmuted = false; // the agent decides now: speaking leaves the microphone as it is
-    return { meeting_id: id, muted: s === 'off' };
+    return { meeting_id: id, muted: r.state === 'off' };
   }
 
   async raiseHand(tenant, id, on) {
     const m = this.get(tenant, id);
     this.inCall(m, 'raising a hand');
-    const s = await this.page(m, (p) => m.platform.setHand(p, on));
-    return { meeting_id: id, hand_raised: s === 'on' };
+    const r = await this.page(m, (p) => m.platform.setHand(p, on));
+    return { meeting_id: id, hand_raised: r.state === 'on' };
   }
 
   async leave(tenant, id) {

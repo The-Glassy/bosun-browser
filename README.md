@@ -816,6 +816,8 @@ Chat text is kept only in memory, for the last 50 meetings.
   day: a join is refused once it is used up, and a running stream stops with `bosun:meeting-transcript-stopped`
   (`reason: daily-cap`) while the meeting and the recording go on. The count survives restarts
   (`BROWSER_DATA/live-transcript-usage.json`).
+- **`NODE_DEBUG`:** while it is set, the key is not sent (Node's diagnostics print request headers): `live_transcript`
+  and the `elevenlabs` voice are refused, as secrets are.
 - **Drops:** a dropped connection is opened again (with growing pauses, 8 tries in a row at most); up to 20 s of
   audio meanwhile is kept and sent once it's back, with the last words as context. A wrong key, a used-up quota or
   unaccepted terms stop it (`reason: error`).

@@ -10,6 +10,7 @@
 //               {text, model_id: eleven_flash_v2_5, language_code}; voice = an ElevenLabs voice id.
 import fs from 'fs';
 import { execFile } from 'child_process';
+import { nodeDebugOn, NODE_DEBUG_REFUSED } from './transcript.mjs';
 
 export const BACKENDS = ['supertonic', 'elevenlabs'];
 export const SUPERTONIC_VOICES = [...'FM'].flatMap((g) => [1, 2, 3, 4, 5].map((i) => `supertonic-${g}${i}`));
@@ -93,6 +94,7 @@ export async function synthesizeWav(cfg, { text, backend = 'supertonic', voice, 
     }, 'supertonic');
   } else if (backend === 'elevenlabs') {
     if (!cfg.elevenlabs?.apiKey) throw new Error('no ElevenLabs key configured (ELEVENLABS_API_KEY)');
+    if (nodeDebugOn()) throw new Error(NODE_DEBUG_REFUSED);
     voice ??= cfg.elevenlabs.voice || EL_DEFAULT_VOICE;
     if (!/^[A-Za-z0-9]{10,40}$/.test(voice)) throw new Error('voice must be an ElevenLabs voice id for backend elevenlabs');
     const u = new URL(`/v1/text-to-speech/${voice}`, cfg.elevenlabs.baseUrl);

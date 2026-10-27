@@ -172,15 +172,15 @@ export async function revealToolbar(page) {
 }
 
 // A two-state control in the call (the microphone, a raised hand): 'on' while onLabel is shown (the button would turn
-// it off), 'off' while offLabel is, null when neither is visible. reveal: tried once when neither is (a faded toolbar).
-export async function controlState(page, onLabel, offLabel, reveal = null) {
+// it off), 'off' while offLabel is, null when neither is visible.
+export async function controlState(page, onLabel, offLabel) {
   if (await firstVisible(button(page, onLabel))) return 'on';
   if (await firstVisible(button(page, offLabel))) return 'off';
-  if (reveal) { await reveal(page); return controlState(page, onLabel, offLabel); }
   return null;
 }
 
-// Clicks the control until it shows the wanted state and returns that state, or throws. One click, then up to a second
+// Clicks the control until it shows the wanted state and returns {state, changed: whether it clicked}, or throws (with
+// clicked: whether it clicked before giving up). One click, then up to a second
 // for the page to show the change (a second click too early would undo the first). open(page): makes the control
 // visible where it sits in a menu; called while no control is shown. answer(page): called on every round, for a
 // question the site asks in between (Zoom asking for the microphone).
@@ -191,11 +191,11 @@ export async function setControl(page, { onLabel, offLabel, on, what, site, open
   for (;;) {
     if (answer) await answer(page);
     const s = await controlState(page, onLabel, offLabel);
-    if (s === want) return want;
+    if (s === want) return { state: want, changed: clicked > 0 };
     if (!s && open) await open(page);
     const b = s ? await firstVisible(button(page, s === 'on' ? onLabel : offLabel)) : null;
     if (b && Date.now() - clicked > 1000 && !(await disabled(b))) clicked = await b.click({ timeout: 3000 }).then(() => Date.now(), () => clicked);
-    if (Date.now() > until) throw new Error(s ? `could not turn the ${what} ${want} in ${site} (its control did not change)` : `no ${what} control found in ${site}`);
+    if (Date.now() > until) throw Object.assign(new Error(s ? `could not turn the ${what} ${want} in ${site} (its control did not change)` : `no ${what} control found in ${site}`), { clicked: clicked > 0 });
     await page.waitForTimeout(150);
   }
 }

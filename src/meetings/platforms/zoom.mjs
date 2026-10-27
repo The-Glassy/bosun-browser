@@ -8,7 +8,7 @@
 // and labels are also matched in German and Ukrainian (some Russian). These markers were written from Zoom's web
 // client as documented and seen in screenshots, and tested against a local stand-in (test/fakezoom.mjs), not yet
 // against live Zoom: a run against real Zoom that fails here is fixed here.
-import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, chatError, controlState, setControl, revealToolbar, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, chatError, setControl, revealToolbar, DIALOGS, HEADINGS } from './common.mjs';
 
 const TEXT = {
   // The waiting room, or a meeting the host has not started yet (Zoom lets you in when it starts).
@@ -649,7 +649,6 @@ export const zoom = {
   // The toolbar's "Mute" / "Unmute". Bosun joined without giving Zoom the microphone, so the first unmute makes Zoom ask
   // "Do you want people to hear you…?": the agent asked to be heard, so "Use microphone" (and nothing with the camera).
   // A question that can't be answered that way is answered without it again, and the unmute fails.
-  micState: (page) => controlState(page, LABEL.micOff, LABEL.micOn, revealToolbar),
   async setMic(page, on) {
     const answer = on ? async (p) => { const b = await firstVisible(button(p, LABEL.useMic)); if (b) await b.click({ timeout: 2000 }).catch(() => {}); } : null;
     try {
@@ -659,7 +658,6 @@ export const zoom = {
       throw e;
     }
   },
-  handState: (page) => controlState(page, LABEL.handUp, LABEL.handDown),
   // Opens the menu holding the hand (every 2 s at most, so an open menu isn't closed again), and closes it after.
   async setHand(page, on) {
     let openedAt = 0;
