@@ -163,7 +163,9 @@ download). A macro stores such a flow once, per tenant, and `macro_run` replays 
   (`onTarget`). The element must be in a document on the site, and a `type` with a secret checks it before the
   secret is taken. A listener on the tab's main-frame navigations notes the first one off the site, so a redirect
   out and back is still seen, and the guard refuses after it. Off the site the run stops after the step, also an
-  optional one. Loading a page outside is not blocked (the tab may load it, within the tenant's allowlist, which
+  optional one. The hooks are taken when the step starts and kept for all it does: a handler still going after its
+  step ran out of time (an upload waiting for a file chooser) finds its call over and does nothing more on the page.
+  Loading a page outside is not blocked (the tab may load it, within the tenant's allowlist, which
   the proxy enforces); acting on it is. Blocking the load itself would need request interception in every engine.
 - **Risky steps.** A word list (pay, buy, purchase, submit/place order, checkout, delete account, and German
   equivalents) is matched against every string of every step at save time (refused without `confirm_risky`), again

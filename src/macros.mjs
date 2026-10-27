@@ -369,7 +369,8 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
     }
     if (failure) { rec.status = 'failed'; break; }
     rec.status = rec.error ? 'failed_optional' : 'ok';
-    await ops.progress?.(n, total, `${n}/${total} ${tool} ${rec.status}`); // sent before the answer, in order
+    // Sent before the answer, in order; a client that doesn't read holds the run up to 5 s, not past its time.
+    if (ops.progress) await settleWithin(ops.progress(n, total, `${n}/${total} ${tool} ${rec.status}`), Math.min(5000, hardEnd - Date.now()), signal);
   }
   for (let i = res.steps.length; i < total; i++) res.steps.push({ step: i + 1, tool: m.steps[i].tool, status: 'not_run' });
   if (reads.length) res.reads = reads;
@@ -383,6 +384,14 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
   }
   return { result: res, images };
 }
+
+// p, or nothing after ms or once signal aborts.
+const settleWithin = (p, ms, signal) => new Promise((resolve) => {
+  const done = () => { clearTimeout(t); signal?.removeEventListener('abort', done); resolve(); };
+  const t = setTimeout(done, Math.max(0, ms));
+  signal?.addEventListener('abort', done, { once: true });
+  Promise.resolve(p).then(done, done);
+});
 
 // An error that stops the run even in an optional step.
 const refusal = (msg) => Object.assign(new Error(msg), { fatal: true });
@@ -399,9 +408,20 @@ function describe(el, risky) {
     const label = c.localName === 'label' ? c : c.closest('label');
     if (label?.control) c = label.control;
   }
-  const said = (x) => (x ? [x.innerText, x.value, x.getAttribute?.('aria-label'), x.title, x.getAttribute?.('alt')] : []);
-  const reached = el.closest('button, a[href], summary, label, [role=button], [role=link], [role=menuitem], [role=tab], [role=checkbox], [role=switch], input, [onclick]');
-  const fields = [...said(el), ...said(reached), ...said(reached?.localName === 'label' ? reached.control : null), ...said(c === el ? null : c)];
+  // Every control the click reaches on its way up (through shadow roots too), not only the nearest one. Text is read
+  // in full from the element and from controls; from a label or an element with onclick, which may wrap a whole
+  // form, only when it is short (a button's worth).
+  const CONTROL = 'button, a[href], summary, input, select, textarea, [role=button], [role=link], [role=menuitem], [role=tab], [role=checkbox], [role=switch], [role=option]';
+  const fields = [];
+  const said = (x, text) => fields.push(...(text ? [x.innerText] : []), x.value, x.getAttribute?.('aria-label'), x.title, x.getAttribute?.('alt'));
+  said(el, true);
+  if (c !== el) said(c, true);
+  for (let x = el.parentElement ?? el.getRootNode?.()?.host; x; x = x.parentElement ?? x.getRootNode?.()?.host) {
+    const control = x.matches(CONTROL);
+    if (!control && !x.matches('label, [onclick]')) continue;
+    said(x, control || String(x.innerText ?? '').length <= 200);
+    if (x.localName === 'label' && x.control) said(x.control, true);
+  }
   const re = new RegExp(risky, 'i');
   return {
     risky: fields.filter((x) => typeof x === 'string' && x).map((x) => re.exec(x)?.[0]).find(Boolean) ?? null,
@@ -445,8 +465,9 @@ async function runStep(st, { ops, end, signal, guard, off, sites, confirmRisky, 
   const vet = !['click', 'type', 'select', 'upload'].includes(tool) ? null : async (h) => {
     const d = await h.evaluate(describe, RISKY_RE.source);
     if (off(d.doc)) throw refusal(`the element is in a document at ${hostOf(d.doc)}, outside this macro's site (${sites})`);
-    // What the element says, not only how the step finds it: a selector can point at a "Buy now" button.
-    const risky = tool === 'click' && !confirmRisky ? d.risky : null;
+    // What the element says, not only how the step finds it: a selector can point at a "Buy now" button. upload
+    // clicks too, when the element is not a file input.
+    const risky = (tool === 'click' || tool === 'upload') && !confirmRisky ? d.risky : null;
     if (risky) throw refusal(`refused: the element says "${risky}" (a macro that may pay, buy, order, check out or delete an account needs confirm_risky at save time)`);
     // A password goes into a macro only by secret_id: never stored in it, nor passed through the agent as an arg.
     if (tool === 'type' && a.value !== undefined && d.kind === 'password') throw refusal('refused: this is a password field; in a macro it takes only secret_id: "{{param}}" (a param of type secret_id)');

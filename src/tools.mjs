@@ -16,7 +16,7 @@ import { BASE64_MAX_BYTES } from './uploads.mjs';
 import { DRIVER_LOGS_REFUSED, SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS, driverLogsValues } from './secrets.mjs';
 import { INLINE_MAX_BYTES } from './downloads.mjs';
 import { showPattern } from './allow.mjs';
-import { currentCall, withDeadline } from './deadline.mjs';
+import { currentCall, stepCall, withDeadline } from './deadline.mjs';
 import { MAX_SITES, MAX_STEPS, RUN_DEFAULT_SEC, RUN_MAX_SEC, runMacro } from './macros.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
@@ -87,21 +87,29 @@ function locate(p, t) {
 const str = (n) => z.string().max(n);
 const target = { ref: str(20).optional().describe('element ref from read (e.g. "e12")'), role: str(40).optional(), name: str(1000).optional(), selector: str(2000).optional(), text: str(1000).optional() };
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
-// Runs act on the element l finds. In a macro step (macros.mjs, deadline.mjs hooks) the element is resolved to a
-// handle first and made ready (ready: the action's own waits), then the call's vet looks at it and its guard at the
-// page, and only then does the action go to that very element: nothing waits in between, so what was checked is
-// what is acted on.
+// A macro step's checks (deadline.mjs stepCall: guard, vet), before it acts on the page; h: the element it acts
+// on. A step whose call is over (it ran out of time, and its handler is still going) does nothing more.
+async function recheck(call, h) {
+  if (!call) return;
+  if (call.expired || call.done) throw new Error(`${call.name} ran out of time; nothing more is done on the page`);
+  if (h) await call.vet?.(h);
+  call.guard?.();
+}
+
+// Runs act on the element l finds. In a macro step the element is resolved to a handle first and made ready (ready:
+// the action's own waits), then the call's vet looks at it and its guard at the page, and only then does the action
+// go to that very element: nothing waits in between, so what was checked is what is acted on.
 async function onTarget(l, act, { ready = null } = {}) {
-  const call = currentCall();
-  if (!call?.vet && !call?.guard) return act(l);
+  const call = stepCall();
+  if (!call) return act(l, null);
   const h = await l.elementHandle({ timeout: 15000 });
   try {
     if (ready) await ready(h);
-    await call.vet?.(h);
-    call.guard?.();
-    return await act(h);
+    await recheck(call, h);
+    return await act(h, call);
   } finally { await h.dispose().catch(() => {}); }
 }
+
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
 // Runs in the page: drags the files of input i onto el (dragenter, dragover, drop, dragleave). true when the page
@@ -128,7 +136,7 @@ function dropFiles(el, i, mark) {
 async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
   // A macro step (onTarget): before any file goes anywhere, the page, and the input it goes into, are where the
   // macro may act. The click below may have navigated away.
-  const recheck = async (h) => { const c = currentCall(); if (h) await c?.vet?.(h); c?.guard?.(); };
+  const call = stepCall();
   const input = await l.evaluate((el) => {
     const i = el.tagName === 'INPUT' ? el : el.tagName === 'LABEL' ? el.control : null;
     return i && i.type === 'file' ? { multiple: i.multiple, disabled: i.disabled } : null;
@@ -156,14 +164,14 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
     }
     if (fc) {
       if (many && !fc.isMultiple()) throw new Error(`the file chooser this opened takes one file; got ${paths.length}`);
-      await recheck(fc.element());
+      await recheck(call, fc.element());
       await fc.setFiles(paths, { timeout: 30000 });
       return { method: 'chooser' };
     }
     if (method === 'chooser') throw new Error('clicking the element opened no file chooser within 10 s');
   }
   // Drop: the files go into a temporary input of our own, then onto the element as a DataTransfer.
-  await recheck(l);
+  await recheck(call, l);
   const tmp = await page.evaluateHandle(() => {
     const i = document.createElement('input');
     i.type = 'file';
@@ -173,7 +181,7 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
     return i;
   });
   try {
-    await recheck(tmp);
+    await recheck(call, tmp);
     await tmp.setInputFiles(paths, { timeout: 30000 });
     let accepted = null;
     if (mainWorld) {
@@ -347,11 +355,10 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       return run(a.session, async (s) => {
         const l = locate(s.page, a);
         if (a.secret_id !== undefined) return ok(await typeSecret(s, l, a));
-        await onTarget(l, async (t) => {
+        await onTarget(l, async (t, call) => {
           await t.fill(a.value, { timeout: 15000 });
           // A macro step looks again: a field that became a password field while it was filled is cleared.
-          const vet = currentCall()?.vet;
-          if (vet) await vet(t).catch(async (e) => { await t.fill('', { timeout: 5000 }).catch(() => {}); throw e; });
+          if (call?.vet) await call.vet(t).catch(async (e) => { await t.fill('', { timeout: 5000 }).catch(() => {}); throw e; });
           if (a.submit) { await t.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
         }, { ready: async (h) => { await h.waitForElementState('visible', { timeout: 15000 }); await h.waitForElementState('editable', { timeout: 15000 }); } });
         return ok(await pageInfo(s.page));
@@ -364,16 +371,17 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   // any error are masked with the value itself.
   const NO_SECRET_TYPES = new Set(['file', 'checkbox', 'radio', 'submit', 'button', 'image', 'reset', 'hidden', 'range', 'color']);
   async function typeSecret(s, loc, a) {
+    const call = stepCall();
     secrets.find(tenant, a.secret_id); // fails before the page is touched
     if (driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
     const l = await loc.elementHandle({ timeout: 15000 });
     try {
-      return await typeSecretInto(s, l, a);
+      return await typeSecretInto(s, l, a, call);
     } finally {
       await l.dispose().catch(() => {});
     }
   }
-  async function typeSecretInto(s, l, a) {
+  async function typeSecretInto(s, l, a, call) {
     // The page the secret goes into, also for scrubbing and leaving it: s.page may change under a call that ran out
     // of time (the tab is replaced).
     const page = s.page;
@@ -383,10 +391,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     await markSensitive(page, l);
     if (!(await l.evaluate((el) => el.isConnected))) throw new Error('the field left the page before anything was typed; the secret was not used');
     // A macro step: the field and the page are still where the macro may act (the field was found after a wait
-    // that a navigation may have crossed).
-    const call = currentCall();
-    await call?.vet?.(l);
-    call?.guard?.();
+    // that a navigation may have crossed), and the step has not run out of time.
+    await recheck(call, l);
     const buf = secrets.take(tenant, a.secret_id);
     let value = buf.toString('utf8');
     buf.fill(0);

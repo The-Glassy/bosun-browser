@@ -28,6 +28,7 @@ function serverA() {
         <a id="away" href="${q('away')}">Help</a>
         <button id="b1">Buy now</button>
         <button id="ib" aria-label="Buy now"><span id="icon">→</span></button>
+        <button id="nb" aria-label="Buy now"><span id="nicon" onclick="">→</span></button>
         <button id="lt" aria-label="Buy now">${'all the details you could want '.repeat(30)}</button>
         <button id="nav" onclick='location.href = ${JSON.stringify(q('away'))}'>Attach</button>
         <script>document.getElementById('f').onchange = async (e) => {
@@ -381,10 +382,14 @@ test('risky at run time: a selector that hits a "Buy now" button, and risky text
   assert.equal(out.failure.step, 2);
   assert.match(out.failure.error, /refused: the element says "Buy now"/);
   // What the click reaches counts: an icon inside a "Buy now" button, a label longer than anything a person reads.
-  for (const sel of ['#icon', '#lt']) {
+  for (const sel of ['#icon', '#nicon', '#lt']) {
     assert.equal((await c.call('macro_save', { name: 'sneaky2', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/app` }, { tool: 'click', selector: sel }] })).isError, false);
     assert.match((await c.call('macro_run', { name: 'sneaky2', session: s })).json().failure.error, /refused: the element says "Buy now"/, sel);
   }
+  // upload clicks what is not a file input: the same check.
+  const f = (await c.call('upload_create', { filename: 'x.txt', content_base64: Buffer.from('x').toString('base64') })).json().file_id;
+  assert.equal((await c.call('macro_save', { name: 'up-buy', site: [A.host], params: { f: { type: 'file_id' } }, steps: [{ tool: 'navigate', url: `${A.base}/app` }, { tool: 'upload', selector: '#b1', file_id: '{{f}}' }] })).isError, false);
+  assert.match((await c.call('macro_run', { name: 'up-buy', session: s, args: { f } })).json().failure.error, /refused: the element says "Buy now"/);
   assert.equal((await c.call('macro_save', { name: 'clicker', site: [A.host], params: { what: { type: 'string' } }, steps: [{ tool: 'click', text: '{{what}}' }] })).isError, false);
   assert.match((await c.call('macro_run', { name: 'clicker', session: s, args: { what: 'Checkout' } })).text, /step 1 \(click\): refused, "Checkout"/);
   await c.call('session_close', { session: s });
@@ -484,6 +489,22 @@ test('select and upload do nothing on a page that left the site while they waite
   assert.match(up.failure.error, new RegExp(`(went to|is at|document at) ${B.host.replace(/\./g, '\\.')}`));
   assert.deepEqual(pressedOnB.filter((u) => u.includes('fileinput')), []); // no file input was added to B's page
   await c.call('session_close', { session: s });
+});
+
+test('a step that ran out of time does nothing more on the page (its handler still going)', async () => {
+  const svc2 = await startBosun({ TOOL_TIMEOUTS: 'upload=3' });
+  const c2 = await connect(svc2);
+  try {
+    const s = await c2.open();
+    const file = (await c2.call('upload_create', { filename: 'private.txt', content_base64: Buffer.from('private').toString('base64') })).json().file_id;
+    assert.equal((await c2.call('macro_save', { name: 'up-late', site: [A.host], params: { f: { type: 'file_id' } }, steps: [{ tool: 'navigate', url: `${A.base}/app?away=${encodeURIComponent(`${B.base}/`)}` }, { tool: 'upload', selector: '#nav', file_id: '{{f}}' }] })).isError, false);
+    pressedOnB.length = 0;
+    const out = (await c2.call('macro_run', { name: 'up-late', session: s, args: { f: file } }, { timeout: 120_000 })).json();
+    assert.equal(out.failure.step, 2);
+    await new Promise((r) => setTimeout(r, 7000)); // the upload's chooser wait (5 s) is over: it would drop now
+    assert.deepEqual(pressedOnB.filter((u) => u.includes('fileinput')), []);
+    await c2.call('session_close', { session: s });
+  } finally { await c2.close(); await svc2.stop(); }
 });
 
 test('click and type look at the element they act on, and refuse when they cannot (late elements too)', async () => {

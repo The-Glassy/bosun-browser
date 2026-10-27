@@ -47,6 +47,9 @@ const scope = new AsyncLocalStorage();
 export const runCall = (call, fn) => scope.run(call, fn);
 // Only while the call is still running: work it started that outlives it (a timer, a background visit) is not bound.
 export const currentCall = () => { const c = scope.getStore(); return c && !c.done ? c : null; };
+// The macro step (a call with hooks) this runs in, also once it is over: work it started that outlives it must
+// still be checked, and refused (tools.mjs recheck), never run unchecked.
+export const stepCall = () => { const c = scope.getStore(); return c?.guard || c?.vet ? c : null; };
 
 // Runs fn as one call named name that is answered within limitMs, whatever the browser does. A page operation in it
 // is cut off earlier by its session (sessions.mjs run), which checks the page and usually answers first; if that
