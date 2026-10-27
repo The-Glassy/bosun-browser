@@ -179,6 +179,47 @@ other. patchright and camoufox-js are `optionalDependencies`; their browsers are
 
 Chromium spawns many threads: under systemd give the unit a generous `TasksMax` (e.g. 2000).
 
+## Finding elements
+
+`click`, `type`, `select`, `upload` and `screenshot` take the element as one of:
+
+- `ref` from `read` (`"e12"`): that very element. Refs change with every `read`, so a macro can't use them.
+- `role` (+ `name`), `selector` (CSS, `xpath=…`, `text=…`, any Playwright selector) or `text` (a substring of the
+  visible text). Bosun takes the **first visible** match: a hidden copy that comes earlier in the page (the closed
+  popover of a toolbar, the small-screen copy of a menu) is skipped. Finding it and waiting for it to be clickable
+  (or editable) share 15 s.
+  `select` and `upload` fall back to a hidden match when none is visible, since a hidden `<select>` or file input
+  still takes options or files.
+
+For icon buttons with no name (the `button [ref=e149]` lines in a `read`), add one or more of these:
+
+- `nth`: which visible match, `0` = first (default), `-1` = last. With `nth`, `after` or `before`, the element
+  that was counted is the one acted on, even if the page adds others meanwhile.
+- `after: "<text>"`: only matches after the first visible element showing that text, in page order, the nearest
+  first. `{ role: "button", after: "Share" }` is the first button after Share; with `nth: 1`, the one after that.
+- `before: "<text>"`: only matches before it, the nearest first.
+
+Page order runs through open shadow roots. Neither `after` nor `before` counts an element that contains the anchor
+or sits inside it. The anchor is the
+**first** visible element with that text: if the text shows up twice (a sidebar entry and a toolbar button, say),
+pick an anchor that shows up once. `read` shows what comes after what.
+
+When nothing can be clicked, the error says why, instead of a bare timeout. It names elements by tag, id and
+classes only, masked as `read` masks them:
+
+```text
+selector xpath=//*[normalize-space(text())='Share']/parent::*//button matched 2 elements, none visible within 15 s
+  (the first is <button>, inside a display: none <div>)
+nothing matches selector #send within 15 s
+no visible element shows the text "Download all" (after) within 15 s
+role button: 1 visible match after "Share", so nth 3 is not there (4 more hidden)
+the element did not become clickable within 15 s: it is covered by <div class="tooltip-mask">, which would get the click
+the element did not become clickable within 15 s: it is disabled
+```
+
+`read { selector }`, `wait_for { selector | text }`, a macro's `assert` and a keepalive's `logged_in_check` also go
+by the first visible match.
+
 ## Uploading files
 
 Two calls and a `curl` between them:
@@ -385,7 +426,7 @@ note? }`.
 | tool | arguments |
 |---|---|
 | `navigate` | `url`, `wait?` |
-| `click` | `role` (+`name`), `selector` or `text` — no `ref`: refs change with every `read` |
+| `click` | `role` (+`name`), `selector` or `text`, optionally `nth`, `after`, `before` (see [Finding elements](#finding-elements)) — no `ref`: refs change with every `read` |
 | `type` | the element, `value` or `secret_id: "{{param}}"`, `submit?`, `allow_non_password?` |
 | `select` | the element, `value` |
 | `press` | `key` |

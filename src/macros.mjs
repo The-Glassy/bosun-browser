@@ -32,7 +32,8 @@ export const RISKY_RE = /\b(pay(?:\s+now)?|buy(?:\s+now)?|purchase|submit\s+(?:t
 export const riskyIn = (text) => RISKY_RE.exec(String(text ?? ''))?.[0] ?? null;
 
 const s = (n) => z.string().max(n);
-const target = { role: s(40).optional(), name: s(1000).optional(), selector: s(2000).optional(), text: s(1000).optional() };
+const target = { role: s(40).optional(), name: s(1000).optional(), selector: s(2000).optional(), text: s(1000).optional(),
+  nth: z.number().int().min(-100).max(100).optional(), after: s(1000).optional(), before: s(1000).optional() };
 const common = { optional: z.boolean().optional().describe('a failure of this step is noted and the run goes on'), note: s(300).optional() };
 const ms = (max) => z.number().int().min(0).max(max).optional();
 const STEP_SCHEMAS = {
@@ -78,6 +79,7 @@ function checkStep(raw, i, params) {
   const st = r.data;
   const needsTarget = ['click', 'type', 'select', 'upload'];
   if (st.name !== undefined && !st.role) fail(`${head}: name goes with role`);
+  if ((st.nth !== undefined || st.after !== undefined || st.before !== undefined) && !hasTarget(st)) fail(`${head}: nth, after and before go with role, selector or text`);
   if (needsTarget.includes(st.tool) && !hasTarget(st)) fail(`${head}: give the element: role (+name), selector or text`);
   if (st.tool === 'type' && (st.value === undefined) === (st.secret_id === undefined)) fail(`${head}: give value or secret_id (not both)`);
   if (st.tool === 'upload' && (st.file_id === undefined) === (st.files === undefined)) fail(`${head}: give file_id or files (not both)`);

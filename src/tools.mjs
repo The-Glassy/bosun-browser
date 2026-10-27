@@ -76,40 +76,245 @@ async function pageInfo(p) { return { url: p.url(), title: await p.title().catch
 // Playwright errors carry a call log that can quote page markup; keep only the headline.
 const cleanError = (e) => String(e?.message || e).split('\nCall log:')[0].replace(/\x1b\[[0-9;]*m/g, '').slice(0, 500);
 
-// Locate an element: ref (from read a11y: "e12" -> aria-ref), role+name, css, or visible text.
-function locate(p, t) {
-  if (t.ref) return p.locator(`aria-ref=${t.ref}`);
-  if (t.role) return p.getByRole(t.role, t.name ? { name: t.name } : {}).first();
-  if (t.selector) return p.locator(t.selector).first();
-  if (t.text) return p.getByText(t.text, { exact: false }).first();
+// Every element a target matches, in document order: role+name, css (or any Playwright selector), or text. getByRole
+// leaves hidden elements out by itself; all: with them (to say what matched).
+function matches(p, t, { all = false } = {}) {
+  if (t.role) return p.getByRole(t.role, { ...(t.name ? { name: t.name } : {}), ...(all ? { includeHidden: true } : {}) });
+  if (t.selector) return p.locator(t.selector);
+  if (t.text) return p.getByText(t.text, { exact: false });
   throw new Error('give ref, role(+name), selector or text');
 }
+const show = (t) => (t.role ? `role ${t.role}${t.name ? ` named "${t.name}"` : ''}` : t.selector ? `selector ${t.selector}` : `text "${t.text}"`);
+// Finding an element and making it ready (visible, enabled, not covered) share this time; the action itself gets at
+// least a second of it.
+const FIND_MS = 15000;
+const left = (until, min = 1000) => Math.max(min, until - Date.now());
+
+// A call that ran out of time (its handler still going) does nothing more on the page.
+function stillOn(call) {
+  if (call && (call.expired || call.done)) throw new Error(`${call.name} ran out of time; nothing more is done on the page`);
+}
+
+// Runs in the page: which of the visible matches els the target means, by its after/before anchors (the visible
+// elements showing that text; the first of them counts) and nth; an index into els, or { left } (how many qualify)
+// when there is no such one. Page order runs through open shadow roots (a host, then its shadow root, then its
+// children). A match that holds an anchor, or sits in one, is neither after nor before it. Counted in page order;
+// with only before, from the anchor back (the nearest first).
+function pick([els, afters, befores, nth]) {
+  const chain = (n) => { const out = []; for (let x = n; x; x = x.parentNode ?? x.host ?? null) out.unshift(x); return out; };
+  // Where a and b part: [i, chain a, chain b].
+  const part = (a, b) => { const ca = chain(a), cb = chain(b); let i = 0; while (i < ca.length && i < cb.length && ca[i] === cb[i]) i++; return [i, ca, cb]; };
+  const nested = (a, b) => { const [i, ca, cb] = part(a, b); return i === ca.length || i === cb.length; };
+  // Page order: < 0 when a comes first (an element before what it holds); 0: the same, or another document.
+  const order = (a, b) => {
+    const [i, ca, cb] = part(a, b);
+    if (!i || (i === ca.length && i === cb.length)) return 0;
+    if (i === ca.length) return -1;
+    if (i === cb.length) return 1;
+    if (ca[i].nodeType === 11) return -1;
+    if (cb[i].nodeType === 11) return 1;
+    return ca[i].compareDocumentPosition(cb[i]) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+  };
+  const first = (xs) => [...xs].sort(order)[0] ?? null;
+  const after = first(afters), before = first(befores);
+  const idx = els.map((_, i) => i)
+    .filter((i) => (!after || (!nested(after, els[i]) && order(after, els[i]) < 0)) && (!before || (!nested(els[i], before) && order(els[i], before) < 0)))
+    .sort((i, j) => order(els[i], els[j]));
+  if (before && !after) idx.reverse();
+  const k = nth < 0 ? idx.length + nth : nth;
+  return k >= 0 && k < idx.length ? idx[k] : { left: idx.length };
+}
+
+// The element names an error may show: HTML's and SVG's own (a page can name its elements anything, a password
+// included).
+const TAGS = ('a abbr address area article aside audio b bdi bdo blockquote body br button canvas caption cite code col colgroup data '
+  + 'datalist dd del details dfn dialog div dl dt em embed fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hgroup hr '
+  + 'html i iframe img input ins kbd label legend li main map mark menu meter nav object ol optgroup option output p picture pre '
+  + 'progress q s samp search section select slot small source span strong sub summary sup table tbody td template textarea tfoot th '
+  + 'thead time tr u ul var video svg g path use rect circle ellipse line polyline polygon text tspan image foreignObject').split(' ');
+
+// Names an element by TAGS: what the page reports is checked here, in this process (on chromium a page can change
+// what our in-page code reads).
+const tagOf = (n) => (typeof n === 'string' && TAGS.includes(n) ? n : typeof n === 'string' && n.includes('-') ? 'custom element' : 'element');
+const HIDDEN = { self: 'display: none', visibility: 'visibility: hidden', size: 'zero size' };
+const hiddenWhy = (w) => (w?.by === 'ancestor' ? `inside a display: none <${tagOf(w.tag)}>` : Object.hasOwn(HIDDEN, String(w?.by)) ? HIDDEN[w.by] : null);
+
+// Runs in the page: what an element is (tag, whole id and class: they are masked before they are cut short) and why
+// it is not shown (by: self, ancestor (tag), visibility or size).
+function sketch(el) {
+  let why = null;
+  for (let x = el; x && x.nodeType === 1; x = x.parentElement ?? x.getRootNode?.()?.host) {
+    if (getComputedStyle(x).display === 'none') { why = x === el ? { by: 'self' } : { by: 'ancestor', tag: x.localName }; break; }
+  }
+  if (!why && getComputedStyle(el).visibility !== 'visible') why = { by: 'visibility' };
+  if (!why) { const r = el.getBoundingClientRect(); if (!r.width || !r.height) why = { by: 'size' }; }
+  return { tag: el.localName, id: el.id, cls: el.getAttribute('class') ?? '', why };
+}
+
+// What an error may say about an element of the page: its tag (one HTML or SVG defines), id and first classes, the
+// last two masked as read masks them (an id or class can hold what was typed into a password or OTP field) before
+// they are cut short; just its tag if that can't be checked, or once the call is over.
+async function safeTag(page, { tag: raw, id, cls }, call) {
+  const tag = tagOf(raw);
+  let values;
+  try { stillOn(call); values = await sensitiveValues(page); } catch { return `<${tag}>`; }
+  const m = (v) => maskText(String(v ?? ''), values);
+  const c = m(cls).trim().split(/\s+/).filter(Boolean).slice(0, 3).join(' ');
+  return `<${tag}${id ? ` id="${m(id).slice(0, 40)}"` : ''}${c ? ` class="${c.slice(0, 60)}"` : ''}>`;
+}
+
+// Locate an element: ref (from read a11y: "e12" -> aria-ref) as it is; role+name, selector or text: the first
+// VISIBLE match (a hidden copy that comes first, e.g. a closed popover's buttons, is passed over), or the nth one
+// (nth; negative from the end), counted after or before the first visible element showing a text (after/before).
+// Waits until `until` for one, then says why there is none. hidden: if only hidden elements match, the first of
+// them (a hidden <input type=file> or <select> takes files or options all the same).
+// Returns a locator, or for nth/after/before the element handle that was picked (what was counted is what is acted
+// on, whatever the page adds meanwhile): use it through withTarget, which lets it go.
+async function locate(p, t, { hidden = false, until = Date.now() + FIND_MS } = {}) {
+  const ordinal = t.nth !== undefined || t.after || t.before;
+  if (t.ref) {
+    if (ordinal) throw new Error('nth, after and before go with role, selector or text, not with ref');
+    return p.locator(`aria-ref=${t.ref}`);
+  }
+  const shown = matches(p, t).filter({ visible: true });
+  const call = stepCall() ?? currentCall();
+  for (;;) {
+    stillOn(call);
+    let count = null, missing = null;
+    if (!ordinal) {
+      if (await shown.count()) return shown.first();
+    } else {
+      const held = [];
+      let chosen = null;
+      try {
+        const hs = await shown.elementHandles();
+        held.push(...hs);
+        const anchors = [];
+        for (const [k, text] of [['after', t.after], ['before', t.before]]) {
+          stillOn(call);
+          const a = text ? await p.getByText(text, { exact: false }).filter({ visible: true }).elementHandles() : [];
+          held.push(...a);
+          if (text && !a.length) missing ??= `no visible element shows the text "${text}" (${k})`;
+          anchors.push(a);
+        }
+        if (!missing) {
+          stillOn(call);
+          const i = await p.evaluate(pick, [hs, ...anchors, t.nth ?? 0]).catch(() => {
+            throw new Error('nth, after and before work on the page itself (the matches and the text in one frame)');
+          });
+          // On chromium the page can change what pick runs on (Array.prototype.sort, say): only an index or a count in
+          // range is taken from it, never anything that would end up in an error as it came.
+          const ok = (n, max) => Number.isSafeInteger(n) && n >= 0 && n <= max;
+          if (ok(i, hs.length - 1)) chosen = hs[i];
+          else if (ok(i?.left, hs.length)) count = i.left;
+          else throw new Error('nth, after and before: the page gave an answer that makes no sense; use another target');
+        }
+      } finally {
+        for (const h of held) if (h !== chosen) await h.dispose().catch(() => {});
+      }
+      if (chosen) return chosen;
+    }
+    stillOn(call);
+    if (hidden && !ordinal && await matches(p, t, { all: true }).count()) return matches(p, t, { all: true }).first();
+    if (Date.now() >= until) { stillOn(call); throw new Error(await whyNone(p, t, missing, count, call)); }
+    await sleep(Math.min(200, Math.max(0, until - Date.now())));
+  }
+}
+
+// Runs fn on what locate finds, and lets go of a handle it picked. retry: once more if that element left the page
+// before fn acted on it (the page re-rendered it), while there is time.
+async function withTarget(p, t, opts, fn, { retry = false } = {}) {
+  const call = stepCall() ?? currentCall();
+  for (;;) {
+    const l = await locate(p, t, opts);
+    try {
+      stillOn(call); // found only after the call was cut off: not acted on
+      return await fn(l);
+    } catch (e) {
+      if (!(retry && l.asElement && /not attached to the DOM/i.test(e?.message) && Date.now() < opts.until)) throw e;
+    } finally { if (l.asElement) await l.dispose().catch(() => {}); }
+  }
+}
+
+async function whyNone(p, t, missing, count, call) {
+  const secs = `${Math.round(FIND_MS / 1000)} s`;
+  if (missing) return `${missing} within ${secs}`;
+  const all = matches(p, t, { all: true });
+  const n = await all.count();
+  stillOn(call);
+  const shown = await all.filter({ visible: true }).count();
+  if (!n) return `nothing matches ${show(t)} within ${secs}`;
+  if (!shown) {
+    stillOn(call);
+    const first = await all.first().evaluate(sketch, null, { timeout: 2000 }).catch(() => null);
+    return `${show(t)} matched ${n} element${n > 1 ? 's' : ''}, none visible within ${secs}${first ? ` (the first is ${await safeTag(p, first, call)}${hiddenWhy(first.why) ? `, ${hiddenWhy(first.why)}` : ''})` : ''}`;
+  }
+  const where = [t.after && `after "${t.after}"`, t.before && `before "${t.before}"`].filter(Boolean).join(' and ');
+  return `${show(t)}: ${count ?? shown} visible match${(count ?? shown) === 1 ? '' : 'es'}${where ? ` ${where}` : ''}, so nth ${t.nth ?? 0} is not there${n > shown ? ` (${n - shown} more hidden)` : ''}`;
+}
+
+// Runs in the page: why a click on el cannot happen: it is disabled, or another element covers its middle (the one
+// a click there would hit; its tag, id and classes).
+function blocker(el) {
+  if (!el.isConnected) return { why: 'gone' };
+  if (el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true') return { why: 'disabled' };
+  const r = el.getBoundingClientRect();
+  const x = r.left + r.width / 2, y = r.top + r.height / 2;
+  if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return null;
+  let hit = document.elementFromPoint(x, y);
+  while (hit?.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
+  const holds = (a, b) => { for (let n = b; n; n = n.parentNode ?? n.host ?? null) if (n === a) return true; return false; };
+  if (!hit || holds(el, hit)) return null;
+  return { covered: { tag: hit.localName, id: hit.id, cls: hit.getAttribute('class') ?? '' } };
+}
+
+// click(opts) on el (a locator or a handle) by until, with Playwright's waits for it to be clickable. One that times
+// out says why, where it can tell.
+async function clicking(page, el, click, until) {
+  const call = stepCall() ?? currentCall();
+  try {
+    return await click({ timeout: left(until) });
+  } catch (e) {
+    if (e?.name !== 'TimeoutError') throw e;
+    stillOn(call); // a call that is over looks no further
+    const b = await el.evaluate(blocker, null, { timeout: 2000 }).catch(() => null);
+    stillOn(call);
+    const why = b?.why === 'gone' ? 'it left the page' : b?.why === 'disabled' ? 'it is disabled' : b?.covered ? `it is covered by ${await safeTag(page, b.covered, call)}, which would get the click` : null;
+    throw new Error(`the element did not become clickable within ${Math.round(FIND_MS / 1000)} s${why ? `: ${why}` : ' (it stayed hidden, moving or disabled)'}`);
+  }
+}
+
 const str = (n) => z.string().max(n);
-const target = { ref: str(20).optional().describe('element ref from read (e.g. "e12")'), role: str(40).optional(), name: str(1000).optional(), selector: str(2000).optional(), text: str(1000).optional() };
+const target = { ref: str(20).optional().describe('element ref from read (e.g. "e12")'), role: str(40).optional(), name: str(1000).optional(), selector: str(2000).optional(), text: str(1000).optional(),
+  nth: z.number().int().min(-100).max(100).optional().describe('with role, selector or text: which visible match, 0 = first (default), -1 = last'),
+  after: str(1000).optional().describe('with role, selector or text: count matches from the first visible element showing this text on (document order); e.g. role button, after "Share" = the first button after Share'),
+  before: str(1000).optional().describe('with role, selector or text: count matches from the first visible element showing this text back, the nearest first') };
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
 // A macro step's checks (deadline.mjs stepCall: guard, vet), before it acts on the page; h: the element it acts
 // on. A step whose call is over (it ran out of time, and its handler is still going) does nothing more.
 async function recheck(call, h) {
   if (!call) return;
-  const over = () => { if (call.expired || call.done) throw new Error(`${call.name} ran out of time; nothing more is done on the page`); };
-  over();
+  stillOn(call);
   if (h) await call.vet?.(h);
-  over(); // also when it ran out while the element was looked at
+  stillOn(call); // also when it ran out while the element was looked at
   call.guard?.();
 }
 
-// Runs act on the element l finds. In a macro step the element is resolved to a handle first and made ready (ready:
-// the action's own waits), then the call's vet looks at it and its guard at the page, and only then does the action
-// go to that very element: nothing waits in between, so what was checked is what is acted on.
-async function onTarget(l, act, { ready = null } = {}) {
+// Runs act on the element l (a locator, or a handle locate picked). In a macro step the element is resolved to a
+// handle first and made ready (ready: the action's own waits), then the call's vet looks at it and its guard at the
+// page, and only then does the action go to that very element: nothing waits in between, so what was checked is what
+// is acted on.
+async function onTarget(l, act, { ready = null, until = Date.now() + FIND_MS } = {}) {
   const call = stepCall();
   if (!call) return act(l, null);
-  const h = await l.elementHandle({ timeout: 15000 });
+  stillOn(call);
+  const h = l.asElement ? l : await l.elementHandle({ timeout: left(until) });
   try {
+    stillOn(call);
     if (ready) await ready(h);
     await recheck(call, h);
     return await act(h, call);
-  } finally { await h.dispose().catch(() => {}); }
+  } finally { if (h !== l) await h.dispose().catch(() => {}); }
 }
 
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
@@ -135,7 +340,7 @@ function dropFiles(el, i, mark) {
 // files from disk itself: no bytes pass through this process or the protocol.
 // mainWorld (camoufox): Firefox hides files that our isolated world put into a DataTransfer from the page, so the drop
 // is dispatched by a script element in the page's own world (unless the page's CSP refuses inline scripts).
-async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
+async function putFiles(page, l, paths, method, { mainWorld = false, until = Date.now() + FIND_MS } = {}) {
   // A macro step (onTarget): before any file goes anywhere, the page, and the input it goes into, are where the
   // macro may act. The click below may have navigated away.
   const call = stepCall();
@@ -160,8 +365,8 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
     page.on('filechooser', onChooser);
     try {
       // A macro step: the element is looked at once it can be clicked, right before the click.
-      if (call) { await l.click({ trial: true, timeout: 15000 }); await recheck(call, l); }
-      await l.click({ timeout: 15000 });
+      if (call) { await clicking(page, l, (o) => l.click({ ...o, trial: true }), until); await recheck(call, l); }
+      await clicking(page, l, (o) => l.click(o), until);
       for (const end = Date.now() + (method === 'chooser' ? 10000 : 5000); !fc && Date.now() < end;) await sleep(100);
     } finally {
       page.off('filechooser', onChooser);
@@ -233,7 +438,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.14.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.14.1' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -323,7 +528,9 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     { session: str(40), mode: z.enum(['a11y', 'text']).optional(), selector: str(2000).optional(), maxChars: z.number().int().min(1).max(200000).optional() },
     async (a) => run(a.session, async (s) => {
       const max = a.maxChars ?? 20000;
-      const root = a.selector ? s.page.locator(a.selector).first() : s.page.locator('body');
+      // The first visible match (as click finds it), or the first one when none is visible.
+      const sel = a.selector ? s.page.locator(a.selector) : null;
+      const root = !sel ? s.page.locator('body') : (await sel.filter({ visible: true }).count()) ? sel.filter({ visible: true }).first() : sel.first();
       let out, total;
       if ((a.mode || 'a11y') === 'a11y') {
         if (!a.selector) {
@@ -343,7 +550,9 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target }, async (a) => run(a.session, async (s) => {
     const mark = capture?.mark();
-    await onTarget(locate(s.page, a), (t) => t.click({ timeout: 15000 }), { ready: (h) => h.click({ trial: true, timeout: 15000 }) });
+    const until = Date.now() + FIND_MS;
+    await withTarget(s.page, a, { until }, (l) => onTarget(l, (t) => clicking(s.page, t, (o) => t.click(o), until),
+      { until, ready: (h) => clicking(s.page, h, (o) => h.click({ ...o, trial: true }), until) }), { retry: true });
     await s.page.waitForTimeout(1000);
     const dl = capture ? await capture.since(s.id, mark) : [];
     const w = noteWall(s, await wall(s.page));
@@ -357,15 +566,15 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       if ((a.value === undefined) === (a.secret_id === undefined)) throw new Error(secrets ? 'give value or secret_id (not both)' : 'give value');
       if (a.secret_id !== undefined && ephemeral) throw new Error(`type with secret_id: ${NOT_ALLOWED}`);
       return run(a.session, async (s) => {
-        const l = locate(s.page, a);
-        if (a.secret_id !== undefined) return ok(await typeSecret(s, l, a));
-        await onTarget(l, async (t, call) => {
-          await t.fill(a.value, { timeout: 15000 });
+        if (a.secret_id !== undefined) return ok(await typeSecret(s, a));
+        const until = Date.now() + FIND_MS;
+        await withTarget(s.page, a, { until }, (l) => onTarget(l, async (t, call) => {
+          await t.fill(a.value, { timeout: left(until) });
           // A macro step looks again before it goes on (and submits): a field that became a password field while it
           // was filled is cleared; a step that ran out of time meanwhile, or a page that left the site, stops here.
           await recheck(call, t).catch(async (e) => { await t.fill('', { timeout: 5000 }).catch(() => {}); throw e; });
           if (a.submit) { await t.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
-        }, { ready: async (h) => { await h.waitForElementState('visible', { timeout: 15000 }); await h.waitForElementState('editable', { timeout: 15000 }); } });
+        }, { until, ready: async (h) => { await h.waitForElementState('visible', { timeout: left(until) }); await h.waitForElementState('editable', { timeout: left(until) }); } }));
         return ok(await pageInfo(s.page));
       });
     });
@@ -375,24 +584,29 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   // nothing typed. Nothing returned or thrown carries the secret: the URL and title (a page may echo it there) and
   // any error are masked with the value itself.
   const NO_SECRET_TYPES = new Set(['file', 'checkbox', 'radio', 'submit', 'button', 'image', 'reset', 'hidden', 'range', 'color']);
-  async function typeSecret(s, loc, a) {
+  async function typeSecret(s, a) {
     const call = stepCall();
     secrets.find(tenant, a.secret_id); // fails before the page is touched
     if (driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
-    const l = await loc.elementHandle({ timeout: 15000 });
-    try {
-      return await typeSecretInto(s, l, a, call);
-    } finally {
-      await l.dispose().catch(() => {});
-    }
+    const until = Date.now() + FIND_MS;
+    return withTarget(s.page, a, { until }, async (found) => {
+      const l = found.asElement ? found : await found.elementHandle({ timeout: left(until) });
+      try {
+        stillOn(call);
+        return await typeSecretInto(s, l, a, call, until);
+      } finally {
+        if (l !== found) await l.dispose().catch(() => {});
+      }
+    });
   }
-  async function typeSecretInto(s, l, a, call) {
+  async function typeSecretInto(s, l, a, call, until) {
     // The page the secret goes into, also for scrubbing and leaving it: s.page may change under a call that ran out
     // of time (the tab is replaced).
     const page = s.page;
     const kind = await l.evaluate((el) => (el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName === 'textarea' ? 'textarea' : `<${el.localName}>`));
     if (kind.startsWith('<') || NO_SECRET_TYPES.has(kind)) throw new Error(`a secret goes only into a text field (<input> or <textarea>); this element is ${kind.startsWith('<') ? kind : `<input type=${kind}>`}`);
     if (kind !== 'password' && !a.allow_non_password) throw new Error(`this field is ${kind === 'textarea' ? 'a <textarea>' : `<input type=${kind}>`}, not a password field; pass allow_non_password: true to type the secret into it anyway (an OTP or e-mail field). The secret was not used.`);
+    stillOn(call); // nothing is marked on a page whose step is over
     await markSensitive(page, l);
     if (!(await l.evaluate((el) => el.isConnected))) throw new Error('the field left the page before anything was typed; the secret was not used');
     // A macro step: the field and the page are still where the macro may act (the field was found after a wait
@@ -405,7 +619,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     const forms = [...new Set([value, encodeURIComponent(value), new URLSearchParams({ v: value }).toString().slice(2)])];
     const hide = (t) => forms.reduce((out, f) => (value && out.includes(f) ? out.split(f).join('[masked]') : out), String(t));
     try {
-      await l.fill(value, { timeout: 15000 });
+      await l.fill(value, { timeout: left(until) });
       // fill types through the page's keyboard: a page that moves the focus meanwhile gets the text elsewhere (another
       // field, a contenteditable). Unless it is in the element that was checked, the call fails and the page is left;
       // otherwise every field that holds it is masked.
@@ -430,8 +644,24 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   }
 
   tool('select', 'Choose an option in a <select>.', { session: str(40), ...target, value: str(1000) }, async (a) => run(a.session, async (s) => {
-    await onTarget(locate(s.page, a), (t, call) => t.selectOption({ label: a.value }, { timeout: 15000 }).catch(async () => { await recheck(call); return t.selectOption(a.value, { timeout: 15000 }); }),
-      { ready: (h) => h.waitForElementState('enabled', { timeout: 15000 }) });
+    const until = Date.now() + FIND_MS;
+    const cc = stepCall() ?? currentCall();
+    // A hidden <select> (one a custom dropdown stands in for) takes the option all the same, once it is enabled. Looked
+    // at before a macro step's last checks (ready), so nothing but the selection comes after them.
+    let force = null;
+    const probe = async (h) => {
+      force = !(await h.isVisible());
+      if (force && !(await h.isEnabled())) throw new Error('this <select> is hidden and disabled');
+    };
+    await withTarget(s.page, a, { until, hidden: true }, (l) => onTarget(l, async (t, call) => {
+      if (force === null) await probe(t);
+      stillOn(cc);
+      return t.selectOption({ label: a.value }, { timeout: left(until), force }).catch(async () => {
+        await recheck(call);
+        stillOn(cc);
+        return t.selectOption(a.value, { timeout: left(until), force });
+      });
+    }, { until, ready: async (h) => { await h.waitForElementState('enabled', { timeout: left(until) }); await probe(h); } }));
     return ok(await pageInfo(s.page));
   }));
 
@@ -448,8 +678,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   tool('wait_for', 'Wait for text or selector to appear (timeoutMs up to 60000).', { session: str(40), text: str(1000).optional(), selector: str(2000).optional(), timeoutMs: z.number().int().min(1).max(60000).optional() }, async (a) => run(a.session, async (s) => {
     const t = a.timeoutMs ?? 15000;
-    if (a.text) await s.page.getByText(a.text).first().waitFor({ timeout: t });
-    else if (a.selector) await s.page.locator(a.selector).first().waitFor({ timeout: t });
+    if (a.text) await s.page.getByText(a.text).filter({ visible: true }).first().waitFor({ timeout: t });
+    else if (a.selector) await s.page.locator(a.selector).filter({ visible: true }).first().waitFor({ timeout: t });
     return ok(await pageInfo(s.page));
   }));
 
@@ -458,10 +688,11 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       const opt = { type: 'jpeg', quality: 70, timeout: 30000 };
       const buf = await maskedScreenshot(s.page, async (mask) => {
         if (hasTarget(a)) {
-          const l = locate(s.page, a);
-          const box = await l.boundingBox({ timeout: 15000 });
-          if (box && box.width * box.height > MAX_SHOT_PX * 2000) throw new Error('element too large to screenshot');
-          return l.screenshot({ ...opt, mask });
+          return withTarget(s.page, a, { until: Date.now() + FIND_MS }, async (l) => {
+            const box = await l.boundingBox({ timeout: 15000 });
+            if (box && box.width * box.height > MAX_SHOT_PX * 2000) throw new Error('element too large to screenshot');
+            return l.screenshot({ ...opt, mask });
+          });
         }
         if (!a.fullPage) return s.page.screenshot({ ...opt, mask });
         const [w, h] = await s.page.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.scrollHeight]);
@@ -529,7 +760,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         const ids = [...new Set(a.files ?? [a.file_id])];
         return run(a.session, async (s) => {
           const files = uploads.use(tenant, ids, s.id);
-          const r = await onTarget(locate(s.page, a), (t) => putFiles(s.page, t, files.map((f) => f.file), a.method || 'auto', { mainWorld: s.engine === 'camoufox' }));
+          const until = Date.now() + FIND_MS;
+          const r = await withTarget(s.page, a, { until, hidden: true }, (l) => onTarget(l, (t) => putFiles(s.page, t, files.map((f) => f.file), a.method || 'auto', { mainWorld: s.engine === 'camoufox', until }), { until }));
           await s.page.waitForTimeout(500);
           return ok({ ...r, files: files.map((f) => ({ file_id: f.id, filename: f.name, size: f.size })), ...(await pageInfo(s.page)) });
         });
@@ -693,8 +925,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
               await sleep(200);
             }
           }
-          if (c.selector !== undefined) await s.page.locator(c.selector).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`no visible element matches selector ${c.selector}`));
-          if (c.text !== undefined) await s.page.getByText(c.text).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`text "${c.text}" is not visible`));
+          if (c.selector !== undefined) await s.page.locator(c.selector).filter({ visible: true }).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`no visible element matches selector ${c.selector}`));
+          if (c.text !== undefined) await s.page.getByText(c.text).filter({ visible: true }).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`text "${c.text}" is not visible`));
           return true;
         }), hooks).catch(clean),
         // Where the run stopped: URL, title and the start of the a11y snapshot (masked as read masks it), and a
@@ -723,7 +955,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       };
     };
 
-    const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {role+name | selector | text} (no ref); type {target, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. Any string may use {{param}}; a step that uses a param not given is skipped.`;
+    const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {target} where target is role+name | selector | text (no ref), optionally with nth (which visible match, -1 = last) and after / before (count from a text on the page: {"role": "button", "after": "Share"} is the first button after Share; for icon buttons without a name); type {target, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. Any string may use {{param}}; a step that uses a param not given is skipped.`;
     tool('macro_save', `Save a multi-step flow on a site as a macro to rerun with macro_run (saving an existing name makes a new version; the last 20 are kept). site: the hosts it may run on (e.g. ["web.plaud.ai", "*.plaud.ai"]); a page outside them stops the run. params: {name: {type: string|number|file_id|secret_id, required?, default?, description?}}; a secret or file goes in only as a {{param}} of type secret_id / file_id, never stored. ${stepsHelp} A step whose text says pay, buy, purchase, submit/place order, checkout or delete account is refused unless confirm_risky: true.`,
       { name: str(64).describe('lowercase letters, digits, . _ -'), description: str(2000).optional(), site: z.array(str(300)).min(1).max(MAX_SITES),
         params: z.record(z.string().max(40), z.record(z.string(), z.unknown())).optional(), steps: z.array(z.record(z.string(), z.unknown())).min(1).max(MAX_STEPS),

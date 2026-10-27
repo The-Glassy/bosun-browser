@@ -93,11 +93,11 @@ export function nextRun(from, e, rnd = Math.random, tz = 'Europe/Vienna') {
 export async function evaluateCheck(page, check) {
   if (check.url_not_contains && page.url().includes(check.url_not_contains)) return { ok: false, reason: 'url contains url_not_contains' };
   if (check.selector) {
-    const seen = await page.locator(check.selector).first().waitFor({ state: 'visible', timeout: CHECK_TIMEOUT_MS }).then(() => true, () => false);
+    const seen = await page.locator(check.selector).filter({ visible: true }).first().waitFor({ state: 'visible', timeout: CHECK_TIMEOUT_MS }).then(() => true, () => false);
     if (!seen) return { ok: false, reason: 'selector not visible' };
   }
   if (check.text) {
-    const seen = await page.getByText(check.text).first().waitFor({ state: 'visible', timeout: CHECK_TIMEOUT_MS }).then(() => true, () => false);
+    const seen = await page.getByText(check.text).filter({ visible: true }).first().waitFor({ state: 'visible', timeout: CHECK_TIMEOUT_MS }).then(() => true, () => false);
     if (!seen) return { ok: false, reason: 'text not found' };
   }
   return { ok: true };
