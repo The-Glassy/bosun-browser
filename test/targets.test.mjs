@@ -38,6 +38,20 @@ function server() {
         <div class="bar"><button class="dl" onclick="${say('download')}">Download</button></div>
         <pre id="log"></pre>`);
     }
+    if (u.pathname === '/more') { // shadow roots on both sides of a text; buttons that keep arriving ahead of it; a
+      // button shown late that stays disabled; a hidden button that takes what is typed into a password field as its id
+      return html(res, `<title>More</title><pre id="log"></pre>
+        <x-a id="xa"></x-a><span>Anchor</span><x-b id="xb"></x-b>
+        <div id="churn"></div><span>Go</span><button onclick="${say('target')}">Target</button>
+        <button id="late" disabled style="display:none">Late</button>
+        <input id="pw" type="password" oninput="document.querySelector('.hb').id = 'otp-' + this.value"><button class="hb" hidden>x</button>
+        <script>
+          document.getElementById('xa').attachShadow({ mode: 'open' }).innerHTML = '<button onclick="document.getElementById(\\'log\\').textContent += \\'A;\\'">A</button>';
+          document.getElementById('xb').attachShadow({ mode: 'open' }).innerHTML = '<button onclick="document.getElementById(\\'log\\').textContent += \\'B;\\'">B</button>';
+          let n = 0; const t = setInterval(() => { document.getElementById('churn').insertAdjacentHTML('afterbegin', '<button>Churn</button>'); if (++n > 400) clearInterval(t); }, 20);
+          setTimeout(() => { document.getElementById('late').style.display = ''; }, 8000);
+        </script>`);
+    }
     if (u.pathname === '/export') {
       const body = Buffer.from('Speaker 1: hello\n');
       res.writeHead(200, { 'content-type': 'text/plain', 'content-disposition': 'attachment; filename="rec.txt"', 'content-length': String(body.length) });
@@ -149,4 +163,32 @@ test('a macro clicks the unnamed export icon: after Share, Export transcript, th
   assert.deepEqual(out.steps.map((x) => x.status), Array(6).fill('ok'));
   assert.equal(out.downloads[0].filename, 'rec.txt');
   await c.call('session_close', { session: s });
+});
+
+test('after and before across shadow roots; a picked element stays picked while the page adds more', async () => {
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${base}/more` });
+  assert.equal((await c.call('click', { session: s, role: 'button', after: 'Anchor' })).isError, false);
+  assert.equal((await c.call('click', { session: s, role: 'button', before: 'Anchor' })).isError, false);
+  // Buttons are put in ahead of Go every 20 ms: what was counted after Go is what gets clicked.
+  for (let i = 0; i < 4; i++) assert.equal((await c.call('click', { session: s, role: 'button', after: 'Go' })).isError, false);
+  assert.equal(await log(s), 'B;A;target;target;target;target;');
+  await c.call('session_close', { session: s });
+});
+
+test('finding and clicking share one 15 s; an id that holds a typed password is masked in the error', async () => {
+  const [s1, s2] = [await c.open(), await c.open()];
+  await Promise.all([s1, s2].map((s) => c.call('navigate', { session: s, url: `${base}/more` })));
+  assert.equal((await c.call('type', { session: s2, selector: '#pw', value: 'hunter42' })).isError, false);
+  const t0 = Date.now();
+  const [late, masked] = await Promise.all([
+    // Shown after 8 s, still disabled: the click gives up 15 s after it started, not 15 s after the button showed.
+    c.call('click', { session: s1, selector: '#late' }).then((r) => ({ ...r, ms: Date.now() - t0 })),
+    c.call('click', { session: s2, selector: '.hb' }),
+  ]);
+  assert.match(late.text, /did not become clickable within 15 s: it is disabled/);
+  assert.ok(late.ms < 20_000, `${late.ms} ms`);
+  assert.match(masked.text, /the first is <button id="otp-\[masked\]" class="hb">, display: none/);
+  assert.doesNotMatch(masked.text, /hunter42/);
+  await Promise.all([s1, s2].map((s) => c.call('session_close', { session: s })));
 });

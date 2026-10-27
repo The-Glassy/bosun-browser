@@ -292,8 +292,8 @@ test('a profile used headful is never visited headless; it is visited with its r
 test('evaluateCheck: each condition, all must hold', async () => {
   const page = (url, visible) => ({
     url: () => url,
-    locator: (sel) => ({ first: () => ({ waitFor: async () => { if (!visible.includes(sel)) throw new Error('timeout'); } }) }),
-    getByText: (t) => ({ first: () => ({ waitFor: async () => { if (!visible.includes(t)) throw new Error('timeout'); } }) }),
+    locator: (sel) => ({ filter: () => ({ first: () => ({ waitFor: async () => { if (!visible.includes(sel)) throw new Error('timeout'); } }) }) }),
+    getByText: (t) => ({ filter: () => ({ first: () => ({ waitFor: async () => { if (!visible.includes(t)) throw new Error('timeout'); } }) }) }),
   });
   assert.deepEqual(await evaluateCheck(page('https://x/app', ['#who', 'Hi']), { selector: '#who', text: 'Hi', url_not_contains: 'login' }), { ok: true });
   assert.deepEqual(await evaluateCheck(page('https://x/login?next=app', ['#who']), { url_not_contains: 'login', selector: '#who' }), { ok: false, reason: 'url contains url_not_contains' });
