@@ -31,6 +31,7 @@ function serverA() {
         <button id="nb" aria-label="Buy now"><span id="nicon" onclick="">→</span></button>
         <button id="ab"><img alt="Buy now" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></button>
         <span id="lbl" hidden>Checkout</span><button id="lb2" aria-labelledby="lbl">→</button>
+        <div id="sh"></div><script>document.getElementById('sh').attachShadow({ mode: 'open' }).innerHTML = '<span id="slbl">Buy now</span><button id="sgo" aria-labelledby="slbl">→</button>';</script>
         <button id="lt" aria-label="Buy now">${'all the details you could want '.repeat(30)}</button>
         <button id="nav" onclick='location.href = ${JSON.stringify(q('away'))}'>Attach</button>
         <script>document.getElementById('f').onchange = async (e) => {
@@ -38,6 +39,10 @@ function serverA() {
           await fetch('/up?name=' + encodeURIComponent(file.name), { method: 'POST', body: await file.text() });
           document.getElementById('st').textContent = 'Uploaded: ' + file.name;
         };</script>`);
+    }
+    if (u.pathname === '/slow') { // typing takes 1.5 s (a busy input handler); Enter is reported
+      return html(res, `<title>Slow</title><input id="si" oninput="for (const e = Date.now() + 1500; Date.now() < e;);">
+        <script>addEventListener('keydown', (e) => { if (e.key === 'Enter') fetch('/up?name=enter', { method: 'POST' }); });</script>`);
     }
     if (u.pathname === '/redir') return html(res, `<title>Redirect</title><script>setTimeout(() => { location.href = ${JSON.stringify(q('to'))}; }, ${Number(q('ms')) || 700})</script>`);
     if (u.pathname === '/late') { // a password field and a "Buy now" button that show up after a second
@@ -384,7 +389,7 @@ test('risky at run time: a selector that hits a "Buy now" button, and risky text
   assert.equal(out.failure.step, 2);
   assert.match(out.failure.error, /refused: the element says "Buy now"/);
   // What the click reaches counts: an icon inside a "Buy now" button, a label longer than anything a person reads.
-  for (const sel of ['#icon', '#nicon', '#lt', '#ab', '#lb2']) {
+  for (const sel of ['#icon', '#nicon', '#lt', '#ab', '#lb2', '#sgo']) {
     assert.equal((await c.call('macro_save', { name: 'sneaky2', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/app` }, { tool: 'click', selector: sel }] })).isError, false);
     assert.match((await c.call('macro_run', { name: 'sneaky2', session: s })).json().failure.error, /refused: the element says "(Buy now|Checkout)"/, sel);
   }
@@ -466,9 +471,11 @@ test('a step queued behind a navigation off the site is not run there', async ()
   assert.equal(nav.json().title, 'Elsewhere');
   const out = (await run).json();
   assert.equal(out.ok, false);
-  assert.equal(out.failure.step, 3);
+  // Step 3 is refused before it acts; on a slower engine the navigation lands while step 2 still runs, and the run
+  // stops there.
+  assert.ok([2, 3].includes(out.failure.step), JSON.stringify(out.failure));
   assert.match(out.failure.error, new RegExp(`the page (is at|went to) ${B.host.replace(/\./g, '\\.')}, outside this macro's site`));
-  assert.equal(out.steps[2].status, 'failed');
+  assert.notEqual(out.steps[2].status, 'ok');
   assert.deepEqual(pressedOnB, []); // the key never reached the page off the site
   await c.call('session_close', { session: s });
 });
@@ -494,7 +501,7 @@ test('select and upload do nothing on a page that left the site while they waite
 });
 
 test('a step that ran out of time does nothing more on the page (its handler still going)', async () => {
-  const svc2 = await startBosun({ TOOL_TIMEOUTS: 'upload=3' });
+  const svc2 = await startBosun({ TOOL_TIMEOUTS: 'upload=3,type=2' });
   const c2 = await connect(svc2);
   try {
     const s = await c2.open();
@@ -505,6 +512,14 @@ test('a step that ran out of time does nothing more on the page (its handler sti
     assert.equal(out.failure.step, 2);
     await new Promise((r) => setTimeout(r, 7000)); // the upload's chooser wait (5 s) is over: it would drop now
     assert.deepEqual(pressedOnB.filter((u) => u.includes('fileinput')), []);
+    // type with submit: the fill outlasts the 2 s deadline; Enter is not pressed after that.
+    assert.equal((await c2.call('macro_save', { name: 'type-late', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/slow` }, { tool: 'type', selector: '#si', value: 'x', submit: true }] })).isError, false);
+    received.length = 0;
+    const t = (await c2.call('macro_run', { name: 'type-late', session: s }, { timeout: 120_000 })).json();
+    assert.equal(t.failure.step, 2);
+    assert.match(t.failure.error, /timed out/);
+    await new Promise((r) => setTimeout(r, 3000));
+    assert.deepEqual(received.filter((x) => x.name === 'enter'), []);
     await c2.call('session_close', { session: s });
   } finally { await c2.close(); await svc2.stop(); }
 });

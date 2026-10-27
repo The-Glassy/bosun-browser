@@ -361,8 +361,9 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         if (a.secret_id !== undefined) return ok(await typeSecret(s, l, a));
         await onTarget(l, async (t, call) => {
           await t.fill(a.value, { timeout: 15000 });
-          // A macro step looks again: a field that became a password field while it was filled is cleared.
-          if (call?.vet) await call.vet(t).catch(async (e) => { await t.fill('', { timeout: 5000 }).catch(() => {}); throw e; });
+          // A macro step looks again before it goes on (and submits): a field that became a password field while it
+          // was filled is cleared; a step that ran out of time meanwhile, or a page that left the site, stops here.
+          await recheck(call, t).catch(async (e) => { await t.fill('', { timeout: 5000 }).catch(() => {}); throw e; });
           if (a.submit) { await t.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
         }, { ready: async (h) => { await h.waitForElementState('visible', { timeout: 15000 }); await h.waitForElementState('editable', { timeout: 15000 }); } });
         return ok(await pageInfo(s.page));
@@ -417,7 +418,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         throw new Error('the secret did not end up in the field that was checked (the page moved the focus or the field); Bosun left the page (about:blank) so nothing on it can show the secret, check the site before trying again');
       }
       await markValue(page, value);
-      if (a.submit) { await l.press('Enter', { timeout: 15000 }); await page.waitForTimeout(1500); }
+      if (a.submit) { await recheck(call); await l.press('Enter', { timeout: 15000 }); await page.waitForTimeout(1500); }
       const info = await pageInfo(page);
       console.error(`bosun: secret ${a.secret_id} of tenant ${tenant}: typed in session ${s.id}, ${Buffer.byteLength(value)} bytes`);
       return { ...info, url: hide(info.url), title: hide(info.title), secret: 'typed and deleted' };

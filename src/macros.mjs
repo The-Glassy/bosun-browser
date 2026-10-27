@@ -416,7 +416,9 @@ function describe(el, risky) {
   // Its name as assistive technology has it, roughly: text, value, aria-label, aria-labelledby, title, alt; with its
   // text, also the alt and aria-label of what is inside (an <img alt="Buy now"> in a button).
   const said = (x, text) => {
-    const by = (x.getAttribute?.('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => x.ownerDocument.getElementById(id)?.textContent);
+    const root = x.getRootNode?.();
+    const byId = (id) => (root?.getElementById ? root.getElementById(id) : null) ?? x.ownerDocument.getElementById(id); // a shadow root first
+    const by = (x.getAttribute?.('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => byId(id)?.textContent);
     fields.push(x.value, x.getAttribute?.('aria-label'), x.title, x.getAttribute?.('alt'), ...by);
     if (text) fields.push(x.innerText, ...[...(x.querySelectorAll?.('[alt], [aria-label], [title]') ?? [])].slice(0, 50).flatMap((y) => [y.getAttribute('alt'), y.getAttribute('aria-label'), y.title]));
   };
