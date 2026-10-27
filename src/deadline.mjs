@@ -52,7 +52,7 @@ export const currentCall = () => { const c = scope.getStore(); return c && !c.do
 // is cut off earlier by its session (sessions.mjs run), which checks the page and usually answers first; if that
 // check is still going on, the answer says how far it got. hooks: what a macro step adds (macros.mjs): guard(),
 // run in the session's queue right before each page operation of the call and again right before an element is
-// acted on; vet(handle), run by click, type and upload on the element they are about to act on (tools.mjs
+// acted on; vet(handle), run by click, type, select and upload on the element they are about to act on (tools.mjs
 // onTarget).
 export async function withDeadline(name, limitMs, fn, hooks = {}) {
   const call = { name, limitMs, at: Date.now() + limitMs, reserveMs: reserveMs(limitMs), done: false, expired: false, inPage: false, queued: false, state: null, guard: hooks.guard ?? null, vet: hooks.vet ?? null };

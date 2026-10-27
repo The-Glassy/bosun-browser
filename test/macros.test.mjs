@@ -27,6 +27,9 @@ function serverA() {
         <p id="st"></p><label>Title <input id="title"></label><label>Password <input id="pw" type="password"></label>
         <a id="away" href="${q('away')}">Help</a>
         <button id="b1">Buy now</button>
+        <button id="ib" aria-label="Buy now"><span id="icon">→</span></button>
+        <button id="lt" aria-label="Buy now">${'all the details you could want '.repeat(30)}</button>
+        <button id="nav" onclick='location.href = ${JSON.stringify(q('away'))}'>Attach</button>
         <script>document.getElementById('f').onchange = async (e) => {
           const file = e.target.files[0];
           await fetch('/up?name=' + encodeURIComponent(file.name), { method: 'POST', body: await file.text() });
@@ -68,7 +71,11 @@ const pressedOnB = [];
 const serverB = () => http.createServer((req, res) => {
   if (req.url.startsWith('/pressed')) { pressedOnB.push(req.url); res.end('ok'); return; }
   html(res, `<title>Elsewhere</title><p>off the site</p><input id="q" autofocus><input id="bpw" type="password">
-    <script>addEventListener('keydown', () => fetch('/pressed'));</script>`);
+    <select id="choice"><option>a</option><option>b</option></select>
+    <script>addEventListener('keydown', () => fetch('/pressed'));
+      document.getElementById('choice').onchange = () => fetch('/pressed?select');
+      new MutationObserver((ms) => { if (ms.some((m) => [...m.addedNodes].some((n) => n.type === 'file'))) fetch('/pressed?fileinput'); })
+        .observe(document.documentElement, { childList: true, subtree: true });</script>`);
 });
 
 let A, B, svc, c;
@@ -373,6 +380,11 @@ test('risky at run time: a selector that hits a "Buy now" button, and risky text
   const out = (await c.call('macro_run', { name: 'sneaky', session: s })).json();
   assert.equal(out.failure.step, 2);
   assert.match(out.failure.error, /refused: the element says "Buy now"/);
+  // What the click reaches counts: an icon inside a "Buy now" button, a label longer than anything a person reads.
+  for (const sel of ['#icon', '#lt']) {
+    assert.equal((await c.call('macro_save', { name: 'sneaky2', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/app` }, { tool: 'click', selector: sel }] })).isError, false);
+    assert.match((await c.call('macro_run', { name: 'sneaky2', session: s })).json().failure.error, /refused: the element says "Buy now"/, sel);
+  }
   assert.equal((await c.call('macro_save', { name: 'clicker', site: [A.host], params: { what: { type: 'string' } }, steps: [{ tool: 'click', text: '{{what}}' }] })).isError, false);
   assert.match((await c.call('macro_run', { name: 'clicker', session: s, args: { what: 'Checkout' } })).text, /step 1 \(click\): refused, "Checkout"/);
   await c.call('session_close', { session: s });
@@ -451,6 +463,26 @@ test('a step queued behind a navigation off the site is not run there', async ()
   assert.match(out.failure.error, new RegExp(`the page (is at|went to) ${B.host.replace(/\./g, '\\.')}, outside this macro's site`));
   assert.equal(out.steps[2].status, 'failed');
   assert.deepEqual(pressedOnB, []); // the key never reached the page off the site
+  await c.call('session_close', { session: s });
+});
+
+test('select and upload do nothing on a page that left the site while they waited', async () => {
+  const s = await c.open();
+  pressedOnB.length = 0;
+  assert.equal((await c.call('macro_save', { name: 'sel-redir', site: [A.host], steps: [{ tool: 'navigate', url: `${A.base}/redir?ms=3000&to=${encodeURIComponent(`${B.base}/`)}` }, { tool: 'select', selector: '#choice', value: 'b' }] })).isError, false);
+  const sel = (await c.call('macro_run', { name: 'sel-redir', session: s })).json();
+  assert.equal(sel.failure.step, 2);
+  assert.match(sel.failure.error, new RegExp(`(went to|is at|document at) ${B.host.replace(/\./g, '\\.')}`));
+  const page = () => [...svc.manager.sessions.values()].find((x) => x.id === s).page;
+  assert.equal(await page().evaluate(() => document.getElementById('choice').value), 'a');
+  // upload (auto): the button navigates off the site instead of opening a chooser; no input gets the file there.
+  const file = (await c.call('upload_create', { filename: 'private.txt', content_base64: Buffer.from('private').toString('base64') })).json().file_id;
+  assert.equal((await c.call('macro_save', { name: 'up-redir', site: [A.host], params: { f: { type: 'file_id' } }, steps: [{ tool: 'navigate', url: `${A.base}/app?away=${encodeURIComponent(`${B.base}/`)}` }, { tool: 'upload', selector: '#nav', file_id: '{{f}}' }] })).isError, false);
+  pressedOnB.length = 0;
+  const up = (await c.call('macro_run', { name: 'up-redir', session: s, args: { f: file } }, { timeout: 120_000 })).json();
+  assert.equal(up.failure.step, 2);
+  assert.match(up.failure.error, new RegExp(`(went to|is at|document at) ${B.host.replace(/\./g, '\\.')}`));
+  assert.deepEqual(pressedOnB.filter((u) => u.includes('fileinput')), []); // no file input was added to B's page
   await c.call('session_close', { session: s });
 });
 

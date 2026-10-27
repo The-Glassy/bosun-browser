@@ -284,8 +284,8 @@ const hostOf = (u) => { try { return new URL(u).host || u.slice(0, 60); } catch 
 //   url() -> current URL;  watch(isOff) -> {seen() -> first off-site URL navigated to, stop()};
 //   failure(until) -> {url, title, page, screenshot} (best effort, done by until);  progress(done, total, message).
 // hooks (deadline.mjs withDeadline): guard(), run in the session's queue right before each page operation of the
-// step and right before an element is acted on, refuses a page off the site; vet(handle), run by click, type and
-// upload on the element they act on (tools.mjs onTarget).
+// step and right before an element is acted on, refuses a page off the site; vet(handle), run by click, type,
+// select and upload on the element they act on (tools.mjs onTarget).
 // Returns { result (JSON-able), images: [{step, data}] }.
 export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SEC * 1000, signal, ops }) {
   const values = checkArgs(m, args);
@@ -388,17 +388,23 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
 const refusal = (msg) => Object.assign(new Error(msg), { fatal: true });
 const json = (r) => { const t = r?.content?.find((c) => c.type === 'text')?.text; try { return JSON.parse(t); } catch { return t ?? null; } };
 
-// Runs in the page, on the element a click, type or upload step is about to act on: what it says, the kind of the
-// control a fill goes to (Playwright follows a <label>, or an element inside one, to its control), and the URL of
+// Runs in the page, on the element a click, type, select or upload step is about to act on: the risky words (risky:
+// RISKY_RE's source) in what it says, or in what the control a click on it reaches says (a click on an icon inside
+// a "Buy now" button is a click on that button; one on a label, on its control), every field whole; the kind of the
+// control a fill goes to (Playwright follows a <label>, or an element inside one, to its control); and the URL of
 // the document it is in (a frame may be elsewhere).
-function describe(el) {
+function describe(el, risky) {
   let c = el;
   if (!['input', 'textarea', 'select'].includes(c.localName) && !c.isContentEditable) {
     const label = c.localName === 'label' ? c : c.closest('label');
     if (label?.control) c = label.control;
   }
+  const said = (x) => (x ? [x.innerText, x.value, x.getAttribute?.('aria-label'), x.title, x.getAttribute?.('alt')] : []);
+  const reached = el.closest('button, a[href], summary, label, [role=button], [role=link], [role=menuitem], [role=tab], [role=checkbox], [role=switch], input, [onclick]');
+  const fields = [...said(el), ...said(reached), ...said(reached?.localName === 'label' ? reached.control : null), ...said(c === el ? null : c)];
+  const re = new RegExp(risky, 'i');
   return {
-    label: [el.innerText, el.value, el.getAttribute('aria-label'), el.title].filter((x) => typeof x === 'string' && x).join(' ').slice(0, 500),
+    risky: fields.filter((x) => typeof x === 'string' && x).map((x) => re.exec(x)?.[0]).find(Boolean) ?? null,
     kind: c.localName === 'input' ? String(c.type || 'text').toLowerCase() : c.localName,
     doc: String(el.ownerDocument?.location?.href ?? ''),
   };
@@ -433,13 +439,14 @@ async function runStep(st, { ops, end, signal, guard, off, sites, confirmRisky, 
     if (r?.state !== 'ready') throw new Error(r?.state === 'none' || !r?.state ? 'no download finished in time' : `download ${r.state}${r.reason ? `: ${r.reason}` : ''}`);
     return { rec: { download_id: r.download_id, filename: r.filename }, ...(took ? {} : { downloads: [r] }) };
   }
-  // The element a click, type or upload acts on is looked at first, in the same operation, right before the action
-  // (tools.mjs onTarget); if that fails, nothing is done. A type with secret_id is looked at too (only where it is).
-  const vet = !['click', 'type', 'upload'].includes(tool) ? null : async (h) => {
-    const d = await h.evaluate(describe);
+  // The element a click, type, select or upload acts on is looked at first, in the same operation, right before the
+  // action (tools.mjs onTarget); if that fails, nothing is done. A type with secret_id and the input an upload fills
+  // are looked at too (only where they are).
+  const vet = !['click', 'type', 'select', 'upload'].includes(tool) ? null : async (h) => {
+    const d = await h.evaluate(describe, RISKY_RE.source);
     if (off(d.doc)) throw refusal(`the element is in a document at ${hostOf(d.doc)}, outside this macro's site (${sites})`);
     // What the element says, not only how the step finds it: a selector can point at a "Buy now" button.
-    const risky = tool === 'click' && !confirmRisky ? riskyIn(d.label) : null;
+    const risky = tool === 'click' && !confirmRisky ? d.risky : null;
     if (risky) throw refusal(`refused: the element says "${risky}" (a macro that may pay, buy, order, check out or delete an account needs confirm_risky at save time)`);
     // A password goes into a macro only by secret_id: never stored in it, nor passed through the agent as an arg.
     if (tool === 'type' && a.value !== undefined && d.kind === 'password') throw refusal('refused: this is a password field; in a macro it takes only secret_id: "{{param}}" (a param of type secret_id)');

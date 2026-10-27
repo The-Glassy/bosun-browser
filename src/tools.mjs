@@ -126,6 +126,9 @@ function dropFiles(el, i, mark) {
 // mainWorld (camoufox): Firefox hides files that our isolated world put into a DataTransfer from the page, so the drop
 // is dispatched by a script element in the page's own world (unless the page's CSP refuses inline scripts).
 async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
+  // A macro step (onTarget): before any file goes anywhere, the page, and the input it goes into, are where the
+  // macro may act. The click below may have navigated away.
+  const recheck = async (h) => { const c = currentCall(); if (h) await c?.vet?.(h); c?.guard?.(); };
   const input = await l.evaluate((el) => {
     const i = el.tagName === 'INPUT' ? el : el.tagName === 'LABEL' ? el.control : null;
     return i && i.type === 'file' ? { multiple: i.multiple, disabled: i.disabled } : null;
@@ -153,12 +156,14 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
     }
     if (fc) {
       if (many && !fc.isMultiple()) throw new Error(`the file chooser this opened takes one file; got ${paths.length}`);
+      await recheck(fc.element());
       await fc.setFiles(paths, { timeout: 30000 });
       return { method: 'chooser' };
     }
     if (method === 'chooser') throw new Error('clicking the element opened no file chooser within 10 s');
   }
   // Drop: the files go into a temporary input of our own, then onto the element as a DataTransfer.
+  await recheck(l);
   const tmp = await page.evaluateHandle(() => {
     const i = document.createElement('input');
     i.type = 'file';
@@ -168,6 +173,7 @@ async function putFiles(page, l, paths, method, { mainWorld = false } = {}) {
     return i;
   });
   try {
+    await recheck(tmp);
     await tmp.setInputFiles(paths, { timeout: 30000 });
     let accepted = null;
     if (mainWorld) {
@@ -413,7 +419,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   }
 
   tool('select', 'Choose an option in a <select>.', { session: str(40), ...target, value: str(1000) }, async (a) => run(a.session, async (s) => {
-    await locate(s.page, a).selectOption({ label: a.value }, { timeout: 15000 }).catch(() => locate(s.page, a).selectOption(a.value, { timeout: 15000 }));
+    await onTarget(locate(s.page, a), (t) => t.selectOption({ label: a.value }, { timeout: 15000 }).catch(() => t.selectOption(a.value, { timeout: 15000 })),
+      { ready: (h) => h.waitForElementState('enabled', { timeout: 15000 }) });
     return ok(await pageInfo(s.page));
   }));
 

@@ -423,7 +423,8 @@ note? }`.
 
 - **Site.** A `navigate` to a host outside `site` is refused before the first step runs (also when an arg made the
   URL). The page is checked again in the session's queue right before each page operation of a step (another call
-  on the session may have moved it), and once more right before `click`, `type` or `upload` acts on its element,
+  on the session may have moved it), and once more right before `click`, `type`, `select` or `upload` acts on its
+  element (and before `upload` fills a file chooser or an input of its own),
   which must itself be in a document on the site (not in a frame from elsewhere). Any navigation of the tab outside
   the site while a step runs, a redirect that comes back included, stops the run after that step, even an
   `optional` one. `about:blank` counts as no page. The tenant's host allowlist still applies on top, enforced by its
@@ -435,8 +436,9 @@ note? }`.
 - **Risky steps.** A step whose text (any of its strings, after the args are filled in) says pay, buy, purchase,
   submit or place order, checkout or delete account (also: kaufen, bezahlen, zahlungspflichtig, kostenpflichtig
   bestellen, Konto löschen) is refused unless the macro was saved with `confirm_risky: true`. A `click` is also
-  checked against what the element it hits says (text, value, `aria-label`, `title`), so a selector can't point at
-  a "Buy now" button unnoticed: once the element is ready to click, then that same element is clicked. If it can't
+  checked against what the element it hits says (text, value, `aria-label`, `title`, `alt`, each in full), and what
+  the button, link or label around it says, so a selector can't point at a "Buy now" button (or the icon in it)
+  unnoticed: once the element is ready to click, then that same element is clicked. If it can't
   be looked at, it isn't clicked. `macro_list` and `macro_save` show `confirm_risky` and the risky steps.
 - **Storage.** `BROWSER_DATA/macros/<tenant>/<name>.json` (0600), all kept versions in one file, written
   atomically; it survives restarts and upgrades with the data volume. Per tenant at most 200 macros of 256 KB each.
