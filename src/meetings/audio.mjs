@@ -149,9 +149,10 @@ export function startCapture(pulse) {
 
 // ffmpeg: audio -> bosun_mic, in real time (the null sink takes it at its clock). input: {file} (any format ffmpeg
 // reads), or {pcm: {rate, channels}}: raw s16le written as it comes (write(buf), end()); a pause in the writing is a
-// pause in the audio. done resolves when it has played (true) or was stopped / failed (false); stop() cuts it off.
+// pause in the audio. A file is read with the demuxer `format` names (speech.mjs audioFormat) and nothing but the file
+// itself. done resolves when it has played (true) or was stopped / failed (false); stop() cuts it off.
 export function startPlayer(pulse, input) {
-  const src = input.file ? ['-i', input.file] : ['-f', 's16le', '-ar', String(input.pcm.rate), '-ac', String(input.pcm.channels), '-i', 'pipe:0'];
+  const src = input.file ? ['-protocol_whitelist', 'file', '-f', input.format, '-i', input.file] : ['-f', 's16le', '-ar', String(input.pcm.rate), '-ac', String(input.pcm.channels), '-i', 'pipe:0'];
   const proc = spawn('ffmpeg', [
     '-nostdin', '-hide_banner', '-loglevel', 'error', ...src,
     '-ac', '2', '-ar', '48000', '-f', 'pulse', '-server', pulse.server, '-device', 'bosun_mic', '-buffer_duration', '40', 'bosun-speak',

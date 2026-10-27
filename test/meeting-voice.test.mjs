@@ -10,6 +10,7 @@
 //   docker run --rm -v "$PWD":/app -w /app bosun-meeting-test xvfb-run -a node --test test/meeting-voice.test.mjs
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
 import { startBosun, connect, until, sleep } from './helpers.mjs';
 import { startFakeMeet } from './fakemeet.mjs';
 import { startFakeElevenLabs } from './fakeelevenlabs.mjs';
@@ -81,6 +82,17 @@ test(`${ENGINE}: meeting_speak is heard through the browser's microphone, and on
       const heard = room.heard.slice(from);
       const span = heard.at(-1).at - heard[0].at;
       assert.ok(span > r.duration_s * 1000 - 800 && span < r.duration_s * 1000 + 800, `heard for ${span} ms of ${r.duration_s} s`);
+    }
+    // An uploaded file (WAV), read with a fixed demuxer.
+    {
+      const up = (await c.call('upload_create', { filename: 'hello.wav' })).json();
+      const put = await fetch(up.put_url, { method: 'PUT', body: fs.readFileSync(new URL('./fixtures/speech-en.wav', import.meta.url)) });
+      assert.equal(put.status, 201);
+      const from = room.heard.length;
+      const r = (await c.call('meeting_speak', { meeting_id: id, audio_file_id: up.file_id, wait: true })).json();
+      assert.equal(r.state, 'done');
+      assert.equal(r.source, 'file');
+      assert.ok(room.heard.length - from >= 10, `heard ${room.heard.length - from} times`);
     }
     // Barge-in: cut off within a moment.
     const from = room.heard.length;

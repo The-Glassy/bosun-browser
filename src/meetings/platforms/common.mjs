@@ -164,6 +164,13 @@ export async function ensureOff(page, { what, onLabel, offLabel, missing, text, 
   }
 }
 
+// A call's toolbar that faded out (Zoom's after a few seconds without the mouse moving) comes back on a mouse move.
+export async function revealToolbar(page) {
+  const v = page.viewportSize() || { width: 1280, height: 720 };
+  await page.mouse.move(v.width / 2 + Math.round(Math.random() * 40 - 20), v.height - 60 - Math.round(Math.random() * 20)).catch(() => {});
+  await page.waitForTimeout(200);
+}
+
 // A two-state control in the call (the microphone, a raised hand): 'on' while onLabel is shown (the button would turn
 // it off), 'off' while offLabel is, null when neither is visible.
 export async function controlState(page, onLabel, offLabel) {

@@ -10,7 +10,7 @@ import path from 'path';
 import { PassThrough } from 'stream';
 import { fileURLToPath } from 'url';
 import { LiveTranscript, TranscriptUsage, realtimeUrl, EL_MODEL } from '../src/meetings/transcript.mjs';
-import { synthesizeWav, splitSpeech, wavSeconds, parseWav } from '../src/meetings/speech.mjs';
+import { synthesizeWav, splitSpeech, wavSeconds, parseWav, audioFormat, probeSeconds } from '../src/meetings/speech.mjs';
 import { startFakeElevenLabs, tonePcm, toneWav } from './fakeelevenlabs.mjs';
 import { tmpDir, until, sleep } from './helpers.mjs';
 
@@ -37,7 +37,7 @@ const usage = (capMin = 60, file = path.join(tmpDir(), 'u.json')) => new Transcr
 function live(src, opts = {}) {
   const ev = { partial: [], final: [], stopped: [] };
   const t = new LiveTranscript({
-    apiKey: el.key, baseUrl: el.base, source: src, tenant: 'alice', usage: opts.usage || usage(), retryMs: 50, partials: opts.partials ?? true,
+    apiKey: el.key, baseUrl: el.base, source: src, tenant: 'alice', usage: opts.usage || usage(), retryMs: 50, partials: opts.partials ?? true, limits: opts.limits,
     on: { partial: (s) => ev.partial.push({ ...s, t: Date.now() }), final: (s) => ev.final.push(s), stopped: (s) => ev.stopped.push(s) },
   });
   return { t: t.start(), ev };
@@ -206,6 +206,76 @@ test('parseWav reads the header (also a LIST chunk first, a streamed size); synt
   assert.deepEqual(req.body, { text: 'Привіт', model_id: 'eleven_flash_v2_5', language_code: 'uk' });
   await assert.rejects(synthesizeWav({ ...cfg, elevenlabs: { ...cfg.elevenlabs, apiKey: 'wrong-key-0123456789' } }, { text: 'x', backend: 'elevenlabs' }), /ElevenLabs text-to-speech answered HTTP 401/);
   await assert.rejects(synthesizeWav({ ttsUrl: 'http://127.0.0.1:9' }, { text: 'x' }), /supertonic could not be reached/);
+});
+
+test('a timestamped copy that comes late, or before its committed_transcript, makes no second segment', async () => {
+  for (const [k, v] of [['stampDelayMs', 2500], ['stampFirst', true]]) {
+    el.st[k] = v;
+    const { t, ev } = live(source(Buffer.concat([tonePcm(1.5), silence(1.5), tonePcm(1.5), silence(4)]), { speed: 2 }));
+    try {
+      await until(() => ev.final.length >= 2, 15_000);
+      await sleep(3000);
+      assert.equal(ev.final.length, 2, `${k}: ${JSON.stringify(ev.final.map((f) => [f.seq, f.text, f.end_s]))}`);
+      assert.deepEqual(ev.final.map((f) => f.seq), [1, 2]);
+      assert.ok(ev.final[1].start_s >= ev.final[0].end_s, `${k}: times go forward ${JSON.stringify(ev.final)}`);
+    } finally { el.st[k] = k === 'stampFirst' ? false : 0; await t.stop('left'); }
+  }
+});
+
+test('a server that never starts the session, or stops reading the audio, is given up and connected again', async () => {
+  el.st.silent = true;
+  const n = el.conns.length;
+  const a = live(source(silence(30)), { limits: { startMs: 300 } });
+  await until(() => el.conns.length >= n + 2, 5000);
+  assert.notEqual(a.t.status().state, 'live');
+  await a.t.stop('left');
+  el.st.silent = false;
+
+  el.st.stall = true;
+  const m = el.conns.length;
+  const b = live(source(silence(600), { speed: 40 }), { limits: { unsentBytes: 64 * 1024, stallMs: 500 } });
+  try {
+    await until(() => el.conns.length >= m + 1 && el.conns.at(-1).stalled, 5000);
+    el.st.stall = false;
+    await until(() => el.conns.length >= m + 2 && b.t.status().state === 'live', 10_000);
+  } finally { el.st.stall = false; await b.t.stop('left'); }
+});
+
+test('a tenant named __proto__ is counted and capped like any other', () => {
+  const file = path.join(tmpDir(), 'u.json');
+  const u = new TranscriptUsage({ file, tz: 'Europe/Vienna', capMin: 1 });
+  u.add('__proto__', 100);
+  assert.equal(u.used('__proto__'), 100);
+  assert.equal(u.left('__proto__'), 0);
+  assert.equal(u.used('alice'), 0);
+  u.save();
+  const again = new TranscriptUsage({ file, tz: 'Europe/Vienna', capMin: 1 });
+  assert.equal(again.used('__proto__'), 100);
+  assert.equal(Object.getPrototypeOf(again.state.tenants), null);
+});
+
+test('uploaded audio: only self-contained containers, read with a fixed demuxer (a playlist could pull in other files)', async () => {
+  const dir = tmpDir();
+  const f = (name, bytes) => { const p = path.join(dir, name); fs.writeFileSync(p, bytes); return p; };
+  assert.equal(audioFormat(f('a.wav', toneWav(0.5))), 'wav');
+  assert.equal(audioFormat(f('a.ogg', Buffer.from('OggS\0\x02xxxxxxxxxx'))), 'ogg');
+  assert.equal(audioFormat(f('a.mp3', Buffer.from('ID3\x04\0\0\0\0\0\0xxxxxx'))), 'mp3');
+  assert.equal(audioFormat(f('a.m4a', Buffer.from('\0\0\0\x20ftypM4A xxxxxxxx'))), 'mov');
+  const secret = f('secret.wav', toneWav(2));
+  const m3u8 = f('list.m3u8', `#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:2,\n${secret}\n#EXT-X-ENDLIST\n`);
+  assert.equal(audioFormat(m3u8), null);
+  assert.equal(audioFormat(f('c.txt', 'ffconcat version 1.0\nfile secret.wav\n')), null);
+  assert.equal(audioFormat(path.join(dir, 'missing')), null);
+  assert.equal(await probeSeconds(secret, 'wav'), 2);
+  // A playlist renamed as WAV doesn't pass either: the demuxer is fixed.
+  assert.equal(await probeSeconds(m3u8, 'wav'), null);
+});
+
+test('a TTS body larger than 50 MB is cut off, not held in memory', async () => {
+  el.st.hugeTts = true;
+  try {
+    await assert.rejects(synthesizeWav({ ttsUrl: el.base }, { text: 'x' }), /sent more than 52428800 bytes of audio/);
+  } finally { el.st.hugeTts = false; }
 });
 
 // The real thing: a few seconds of English speech to ElevenLabs. Costs about $0.001.

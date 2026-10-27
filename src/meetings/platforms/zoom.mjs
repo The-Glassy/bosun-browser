@@ -8,7 +8,7 @@
 // and labels are also matched in German and Ukrainian (some Russian). These markers were written from Zoom's web
 // client as documented and seen in screenshots, and tested against a local stand-in (test/fakezoom.mjs), not yet
 // against live Zoom: a run against real Zoom that fails here is fixed here.
-import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, chatError, controlState, setControl, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, chatError, controlState, setControl, revealToolbar, DIALOGS, HEADINGS } from './common.mjs';
 
 const TEXT = {
   // The waiting room, or a meeting the host has not started yet (Zoom lets you in when it starts).
@@ -653,7 +653,7 @@ export const zoom = {
   async setMic(page, on) {
     const answer = on ? async (p) => { const b = await firstVisible(button(p, LABEL.useMic)); if (b) await b.click({ timeout: 2000 }).catch(() => {}); } : null;
     try {
-      return await setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Zoom', answer, timeoutMs: 10_000 });
+      return await setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Zoom', answer, open: revealToolbar, timeoutMs: 10_000 });
     } catch (e) {
       if (on && await declineDevices(page)) throw new Error('Zoom did not take the microphone when unmuting (it asked for one and offered no "Use microphone"); nothing can be said');
       throw e;
@@ -665,6 +665,7 @@ export const zoom = {
     let openedAt = 0;
     const open = async (p) => {
       if (Date.now() - openedAt < 2000) return;
+      if (!(await firstVisible(button(p, LABEL.reactions)))) await revealToolbar(p);
       const b = await firstVisible(button(p, LABEL.reactions));
       if (b) openedAt = await b.click({ timeout: 3000 }).then(() => Date.now(), () => 0);
     };

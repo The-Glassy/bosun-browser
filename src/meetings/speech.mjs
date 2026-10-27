@@ -8,6 +8,7 @@
 //               response_format: wav}; voices supertonic-F1..F5, supertonic-M1..M5.
 //   elevenlabs  POST https://api.elevenlabs.io/v1/text-to-speech/<voice_id>?output_format=wav_24000&enable_logging=false
 //               {text, model_id: eleven_flash_v2_5, language_code}; voice = an ElevenLabs voice id.
+import fs from 'fs';
 import { execFile } from 'child_process';
 
 export const BACKENDS = ['supertonic', 'elevenlabs'];
@@ -38,19 +39,39 @@ export function splitSpeech(text) {
   return out;
 }
 
+// A response body, read up to max bytes: more is cut off (cut: true) and the rest of the body is not read.
+async function readUpTo(r, max) {
+  const parts = [];
+  let n = 0;
+  const reader = r.body?.getReader();
+  if (!reader) return { buf: Buffer.alloc(0), cut: false };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return { buf: Buffer.concat(parts), cut: false };
+    if (n + value.length > max) {
+      parts.push(Buffer.from(value.subarray(0, max - n)));
+      await reader.cancel().catch(() => {});
+      return { buf: Buffer.concat(parts), cut: true };
+    }
+    parts.push(Buffer.from(value));
+    n += value.length;
+  }
+}
+
 async function fetchAudio(url, init, what) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), TTS_TIMEOUT_MS);
   try {
     const r = await fetch(url, { ...init, signal: ac.signal, redirect: 'error' });
     if (!r.ok) {
-      const body = (await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 300);
+      const { buf } = await readUpTo(r, 2000).catch(() => ({ buf: Buffer.alloc(0) }));
+      const body = buf.toString('utf8').replace(/\s+/g, ' ').slice(0, 300);
       throw new Error(`${what} answered HTTP ${r.status}${body ? `: ${body}` : ''}`);
     }
     const len = Number(r.headers.get('content-length') || 0);
-    if (len > MAX_AUDIO_BYTES) throw new Error(`${what} sent ${len} bytes of audio (more than ${MAX_AUDIO_BYTES})`);
-    const buf = Buffer.from(await r.arrayBuffer());
-    if (buf.length > MAX_AUDIO_BYTES) throw new Error(`${what} sent more than ${MAX_AUDIO_BYTES} bytes of audio`);
+    if (len > MAX_AUDIO_BYTES) { await r.body?.cancel().catch(() => {}); throw new Error(`${what} sent ${len} bytes of audio (more than ${MAX_AUDIO_BYTES})`); }
+    const { buf, cut } = await readUpTo(r, MAX_AUDIO_BYTES);
+    if (cut) throw new Error(`${what} sent more than ${MAX_AUDIO_BYTES} bytes of audio`);
     return buf;
   } catch (e) {
     if (e.name === 'AbortError') throw new Error(`${what} took longer than ${TTS_TIMEOUT_MS / 1000} s`);
@@ -111,10 +132,30 @@ export function parseWav(buf) {
 
 export const wavSeconds = (buf) => parseWav(buf)?.seconds ?? null;
 
-// The length of any audio file ffprobe reads, in seconds (null if it can't tell).
-export function probeSeconds(file) {
+// An uploaded file's container, from its first bytes, as the ffmpeg demuxer that reads it: only formats that hold
+// their audio themselves (a playlist or a concat list could make ffmpeg read other files: another tenant's recording).
+// null: not one of them.
+export function audioFormat(file) {
+  let head;
+  try {
+    const fd = fs.openSync(file, 'r');
+    try { head = Buffer.alloc(16); fs.readSync(fd, head, 0, 16, 0); } finally { fs.closeSync(fd); }
+  } catch { return null; }
+  const a = (from, to) => head.toString('latin1', from, to);
+  if (a(0, 4) === 'RIFF' && a(8, 12) === 'WAVE') return 'wav';
+  if (a(0, 4) === 'OggS') return 'ogg';
+  if (a(0, 4) === 'fLaC') return 'flac';
+  if (a(4, 8) === 'ftyp') return 'mov'; // m4a / mp4 (external data references are off by default)
+  if (head.readUInt32BE(0) === 0x1a45dfa3) return 'matroska'; // webm / mka
+  if (a(0, 3) === 'ID3' || (head[0] === 0xff && (head[1] & 0xe6) === 0xe2)) return 'mp3';
+  return null;
+}
+
+// The length of an audio file in a format from audioFormat, in seconds (null if it can't tell). The demuxer is fixed,
+// so nothing in the file chooses another one.
+export function probeSeconds(file, format) {
   return new Promise((resolve) => {
-    execFile('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file], { timeout: 10_000 }, (e, out) => {
+    execFile('ffprobe', ['-v', 'error', '-protocol_whitelist', 'file', '-f', format, '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file], { timeout: 10_000 }, (e, out) => {
       const n = Number(String(out).trim());
       resolve(!e && Number.isFinite(n) && n > 0 ? n : null);
     });

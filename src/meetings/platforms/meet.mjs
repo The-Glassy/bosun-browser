@@ -24,7 +24,7 @@
 // Ukrainian and Russian, so a UI that comes up in another of those languages works too. Markers are labels, roles
 // and texts a person sees; a run against real Meet that fails here is fixed here.
 
-import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, chatError, controlState, setControl, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, chatError, controlState, setControl, revealToolbar, DIALOGS, HEADINGS } from './common.mjs';
 
 const JOIN_LABELS = ['ask to join', 'join now', 'join', 'ask to join anyway', 'join anyway', 'join the call now', 'trotzdem teilnehmen', 'teilnahme erbitten', 'teilnahme anfragen', 'teilnehmen anfragen', 'jetzt teilnehmen', 'teilnehmen', 'beitreten',
   'požiadať o pripojenie', 'pripojiť sa', 'pripojiť sa teraz', 'попросити приєднатися', 'попросити дозволу приєднатися', 'приєднатися', 'приєднатися зараз',
@@ -348,12 +348,16 @@ export const meet = {
 
   // In the call the microphone button is named after what it does ("Turn on microphone (ctrl + d)" while muted).
   micState: (page) => controlState(page, LABEL.micOff, LABEL.micOn),
-  setMic: (page, on) => setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Meet' }),
+  setMic: (page, on) => setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Meet', open: revealToolbar }),
   handState: (page) => controlState(page, LABEL.handUp, LABEL.handDown),
   // Without a hand button in sight (a narrow window moves it under "More options"), Meet's shortcut, once.
   async setHand(page, on) {
     let pressed = false;
-    const open = async (p) => { if (!pressed) { pressed = true; await p.keyboard.press('Control+Alt+KeyH').catch(() => {}); } };
+    let moved = false;
+    const open = async (p) => {
+      if (!moved) { moved = true; return revealToolbar(p); }
+      if (!pressed) { pressed = true; await p.keyboard.press('Control+Alt+KeyH').catch(() => {}); }
+    };
     return setControl(page, { onLabel: LABEL.handUp, offLabel: LABEL.handDown, on, what: 'raised hand', site: 'Meet', open });
   },
 

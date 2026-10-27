@@ -23,7 +23,7 @@ import { meet } from './platforms/meet.mjs';
 import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
 import { LiveTranscript, TranscriptUsage } from './transcript.mjs';
-import { synthesizeWav, splitSpeech, probeSeconds } from './speech.mjs';
+import { synthesizeWav, splitSpeech, probeSeconds, audioFormat } from './speech.mjs';
 
 export const ID_RE = /^m[0-9a-f]{12}$/;
 export const ANNOUNCE_MODES = ['chat', 'host', 'none'];
@@ -667,29 +667,31 @@ export class Meetings {
     const prev = m.speech;
     if (prev && !interrupt) throw new Error(`already speaking (utterance ${prev.id}); meeting_stop_speaking first, or pass interrupt: true`);
     const t0 = this.now();
-    const u = { id: `u${++m.speechSeq}`, state: 'preparing', player: null, remute: false, cancelled: false, seconds: 0 };
+    const u = { id: `u${++m.speechSeq}`, state: 'preparing', player: null, autoMute, cancelled: false, seconds: 0 };
     u.finished = new Promise((r) => { u.finish = r; });
     m.speech = u;
-    // The previous utterance stops without muting: this one takes the microphone over (and mutes it after, if that one would have).
-    if (prev) { u.remute = prev.remute; prev.remute = false; prev.cancelled = true; await prev.player?.stop(); }
+    // The previous utterance stops without muting: this one takes the microphone over (m.speechUnmuted: whether
+    // speaking turned it on, so that the last utterance mutes it again).
+    if (prev) { prev.cancelled = true; await prev.player?.stop(); }
     const pieces = text ? splitSpeech(text) : null;
     const first = (async () => {
       if (text) return synthesizeWav(this.cfg, { text: pieces[0], backend, voice, lang });
       const f = this.manager.uploads?.use(tenant, [audioFileId], m.session.id)[0];
       if (!f) throw new Error('uploads are off on this Bosun (FEATURES_UPLOADS=0)');
-      const seconds = await probeSeconds(f.file);
+      const format = audioFormat(f.file);
+      if (!format) throw new Error(`file ${audioFileId} is not WAV, Ogg, FLAC, MP3, M4A or WebM audio`);
+      const seconds = await probeSeconds(f.file, format);
       if (seconds === null) throw new Error(`file ${audioFileId} is not audio ffmpeg can read`);
-      return { file: f.file, seconds };
+      return { file: f.file, format, seconds };
     })();
     // The microphone goes on while the first audio is prepared.
     const mic = autoMute ? this.page(m, async (p) => {
-      const before = await m.platform.micState(p);
-      if (before !== 'on') await m.platform.setMic(p, true);
-      return before;
+      if (await m.platform.micState(p) === 'on') return;
+      m.speechUnmuted = true; // before the click: an unmute that half-worked is still muted again
+      await m.platform.setMic(p, true);
     }) : Promise.resolve(null);
     const [a, b] = await Promise.allSettled([first, mic]);
     const prepMs = this.now() - t0;
-    if (b.status === 'fulfilled' && autoMute && b.value !== 'on') u.remute = true;
     const fail = a.status === 'rejected' ? a.reason : b.status === 'rejected' ? b.reason : u.cancelled || m.speech !== u ? new Error('stopped before it played')
       : m.state !== 'admitted' && m.state !== 'recording' ? new Error(`meeting ${m.id} is ${m.state}`) : null;
     if (fail) {
@@ -698,7 +700,7 @@ export class Meetings {
       throw new Error(`nothing was said: ${oneLine(fail)}`);
     }
     const head = a.value;
-    u.player = m.rig.play(text ? { pcm: head.pcm } : { file: head.file });
+    u.player = m.rig.play(text ? { pcm: head.pcm } : { file: head.file, format: head.format });
     if (text) u.player.write(head.data);
     u.state = 'speaking';
     u.startedAt = this.now();
@@ -720,7 +722,7 @@ export class Meetings {
     const started = {
       meeting_id: m.id, utterance_id: u.id, speaking: u.state === 'speaking', duration_s: Math.round(u.seconds * 100) / 100, source: text ? backend : 'file',
       ...(head.voice ? { voice: head.voice } : {}), ...(text ? { pieces: pieces.length } : {}),
-      prepare_ms: prepMs, start_ms: u.startedAt - t0, ...(text ? { synth_ms: this.now() - t0 } : {}), unmuted: u.remute,
+      prepare_ms: prepMs, start_ms: u.startedAt - t0, ...(text ? { synth_ms: this.now() - t0 } : {}), unmuted: !!m.speechUnmuted,
       ...(error ? { error: `cut short, the rest could not be synthesized: ${oneLine(error)}` } : {}),
     };
     if (!wait) return started;
@@ -735,7 +737,9 @@ export class Meetings {
     if (tail) await sleep(SPEECH_TAIL_MS);
     u.state = state;
     if (m.speech === u) m.speech = null;
-    if (u.remute && !m.speech && (m.state === 'admitted' || m.state === 'recording')) {
+    // The last utterance mutes again what speaking turned on; one followed by another (interrupt) leaves it to that one.
+    if (u.autoMute && m.speechUnmuted && !m.speech && (m.state === 'admitted' || m.state === 'recording')) {
+      m.speechUnmuted = false;
       await this.page(m, (p) => m.platform.setMic(p, false)).catch((e) => { m.muteError = oneLine(e); });
     }
     const played = u.startedAt ? Math.round((this.now() - u.startedAt) / 10) / 100 : 0;
@@ -760,7 +764,7 @@ export class Meetings {
     const u = m.speech;
     if (!u) return;
     u.cancelled = true;
-    u.remute = false; // the meeting is ending
+    m.speechUnmuted = false; // the meeting is ending
     await u.player?.stop();
   }
 
@@ -772,7 +776,7 @@ export class Meetings {
     await m.announceDone.p;
     this.inCall(m, on ? 'muting' : 'unmuting');
     const s = await this.page(m, (p) => m.platform.setMic(p, !on));
-    if (m.speech) m.speech.remute = false;
+    m.speechUnmuted = false; // the agent decides now: speaking leaves the microphone as it is
     return { meeting_id: id, muted: s === 'off' };
   }
 
@@ -794,6 +798,7 @@ export class Meetings {
     if (!ID_RE.test(String(id))) throw new Error(`no meeting ${id}`);
     const m = this.active.get(id) || this.ended.get(id);
     if (m && m.tenant !== tenant) throw new Error(`no meeting ${id}`);
+    if (m && m.state !== 'ended') m.noRecord = true; // a meeting not recording yet never starts (nor its transcript)
     if (m) await this.stopTranscript(m, 'stopped', { clear: true }); // the transcript goes with the recording
     if (m && (m.rec || m.stopping)) { m.noRecord = true; return { ...(await this.stopRecording(m, { del: true })), meeting_id: id }; }
     const f = this.file(tenant, id);

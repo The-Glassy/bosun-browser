@@ -32,6 +32,9 @@ const MAX_RETRIES = 8; // connection attempts in a row without a session
 const FATAL = new Set(['auth_error', 'quota_exceeded', 'unaccepted_terms', 'invalid_request', 'input_error', 'chunk_size_exceeded']);
 const PREVIOUS_TEXT = 50; // characters of context sent with the first chunk after a reconnect
 const SHORT_SESSION_MS = 10_000; // a session closed sooner than this counts as a failed attempt
+const START_MS = 15_000; // session_started must come this long after connecting
+const MAX_UNSENT_BYTES = 1024 * 1024; // audio the socket may hold unsent (about 25 s as base64 JSON); then it waits
+const STALL_MS = 15_000; // a socket that keeps that much unsent this long is given up and opened again
 
 // The realtime URL for a base URL (https://api.elevenlabs.io, or a test server).
 export function realtimeUrl(base, { zeroRetention = true } = {}) {
@@ -47,10 +50,11 @@ export function realtimeUrl(base, { zeroRetention = true } = {}) {
 export class TranscriptUsage {
   constructor({ file, tz, capMin, now = Date.now }) {
     Object.assign(this, { file, tz, capSec: capMin * 60, now });
-    this.state = { day: this.day(), tenants: {} };
+    // Tenants in a dictionary without a prototype: a tenant named __proto__ is counted like any other.
+    this.state = { day: this.day(), tenants: Object.create(null) };
     try {
       const s = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (s && typeof s.day === 'string' && s.tenants && typeof s.tenants === 'object') this.state = s;
+      if (s && typeof s.day === 'string' && s.tenants && typeof s.tenants === 'object') this.state = { day: s.day, tenants: Object.assign(Object.create(null), s.tenants) };
     } catch {}
     this.dirty = false;
   }
@@ -59,7 +63,7 @@ export class TranscriptUsage {
 
   roll() {
     const d = this.day();
-    if (this.state.day !== d) { this.state = { day: d, tenants: {} }; this.dirty = true; }
+    if (this.state.day !== d) { this.state = { day: d, tenants: Object.create(null) }; this.dirty = true; }
   }
 
   used(tenant) { this.roll(); return Number(this.state.tenants[tenant]) || 0; }
@@ -87,8 +91,10 @@ export class TranscriptUsage {
 // final(seg), stopped({reason, error})}. Stops by itself at the tenant's daily cap (reason daily-cap), on an error
 // that a new connection would not fix (reason error), or when the audio ends (reason audio-ended).
 export class LiveTranscript {
-  constructor({ apiKey, baseUrl, source, tenant, usage, on, partials = true, now = Date.now, retryMs = 1000 }) {
+  // limits (tests): {startMs, unsentBytes, stallMs}.
+  constructor({ apiKey, baseUrl, source, tenant, usage, on, partials = true, now = Date.now, retryMs = 1000, limits = {} }) {
     Object.assign(this, { apiKey, baseUrl, source, tenant, usage, on, partials, now, retryMs });
+    this.limits = { startMs: START_MS, unsentBytes: MAX_UNSENT_BYTES, stallMs: STALL_MS, ...limits };
     this.url = realtimeUrl(baseUrl);
     this.state = 'connecting'; // connecting | live | reconnecting | stopped
     this.reason = null; this.error = null;
@@ -101,7 +107,8 @@ export class LiveTranscript {
     this.segStart = 0; // where the open segment starts (the last final's end)
     this.finals = [];
     this.lastPartial = { text: '', at: 0, timer: null, queued: null };
-    this.committed = null; // committed_transcript waiting for its timestamped copy
+    this.commits = []; // committed_transcript waiting for its timestamped copy, in order
+    this.stampedAhead = 0; // copies that came before their committed_transcript
     this.ws = null; this.session = null; this.sessionBase = 0; this.sessions = 0; this.failures = 0;
     this.zeroRetention = null; this.warnings = [];
     this.streamedSec = 0;
@@ -136,6 +143,13 @@ export class LiveTranscript {
   flush() {
     if (this.state !== 'live' || this.ws?.readyState !== WebSocket.OPEN) return;
     while (this.buffer.length && this.state === 'live') {
+      // ElevenLabs not reading: keep the audio in the bounded buffer, and after STALL_MS open a new connection.
+      if (this.ws.bufferedAmount > this.limits.unsentBytes) {
+        this.stallSince ??= this.now();
+        if (this.now() - this.stallSince > this.limits.stallMs) this.dropped(this.ws, 'stalled', `ElevenLabs took no audio for ${this.limits.stallMs / 1000} s`);
+        return;
+      }
+      this.stallSince = null;
       const { buf, at } = this.buffer.shift();
       const first = !this.sessionSent;
       if (first) { this.sessionSent = true; this.sessionBase = at; }
@@ -154,8 +168,11 @@ export class LiveTranscript {
   connect() {
     if (this.state === 'stopped') return;
     this.sessionSent = false;
+    this.stallSince = null;
     const ws = this.ws = new WebSocket(this.url, { headers: { 'xi-api-key': this.apiKey }, handshakeTimeout: 15_000 });
     let started = false;
+    clearTimeout(this.startTimer);
+    this.startTimer = setTimeout(() => this.dropped(ws, 'error', `no session_started within ${this.limits.startMs / 1000} s`), this.limits.startMs);
     ws.on('unexpected-response', (_req, res) => {
       const code = res.statusCode;
       res.resume();
@@ -166,6 +183,7 @@ export class LiveTranscript {
       let m;
       try { m = JSON.parse(String(data)); } catch { return; }
       if (m.message_type === 'session_started') {
+        clearTimeout(this.startTimer);
         started = this.now();
         this.sessions++;
         this.session = m.session_id || null;
@@ -190,11 +208,25 @@ export class LiveTranscript {
   onMessage(m) {
     switch (m.message_type) {
       case 'partial_transcript': return this.partial(String(m.text || '').trim());
-      case 'committed_transcript':
-        clearTimeout(this.committed?.timer);
-        this.committed = { text: String(m.text || '').trim(), timer: setTimeout(() => this.final({ text: this.committed?.text ?? '' }), FINAL_WAIT_MS) };
+      // A segment comes as committed_transcript and then its timestamped copy, in order. The final is made once: from
+      // the copy, or from the plain text when the copy is late (FINAL_WAIT_MS). A late copy, or one that came first, is
+      // not a second segment: plain texts and copies are paired by their order, never by their text.
+      case 'committed_transcript': {
+        if (this.stampedAhead > 0) { this.stampedAhead--; return; }
+        const c = { text: String(m.text || '').trim(), end: this.sentPos(), fell: false };
+        c.timer = setTimeout(() => this.commitFallback(c), FINAL_WAIT_MS);
+        this.commits.push(c);
+        // Copies that never come: plain texts already made into finals don't pile up.
+        while (this.commits.length > 50 && this.commits[0].fell) this.commits.shift();
         return;
-      case 'committed_transcript_with_timestamps': return this.final(m);
+      }
+      case 'committed_transcript_with_timestamps': {
+        const c = this.commits.shift();
+        if (!c) { this.stampedAhead++; return this.final(m); }
+        if (c.fell) return; // its final was made without it
+        clearTimeout(c.timer);
+        return this.final(m);
+      }
       case 'warning':
         if (/zero retention/i.test(m.warning || '')) this.zeroRetention = false;
         if (this.warnings.length < 5) this.warnings.push(String(m.warning || '').slice(0, 300));
@@ -226,15 +258,26 @@ export class LiveTranscript {
 
   sentPos() { return this.sentAt.length ? this.sentAt.at(-1)[0] : this.segStart; }
 
-  final(m) {
-    clearTimeout(this.committed?.timer);
-    this.committed = null;
+  // The final from committed_transcript alone (no word times; it ends where the audio sent was when it came); its
+  // timestamped copy, should it still come, is dropped. Earlier ones waiting go first, in order.
+  commitFallback(c) {
+    const i = this.commits.indexOf(c);
+    if (i < 0) return;
+    for (const x of this.commits.slice(0, i + 1)) {
+      if (x.fell) continue;
+      clearTimeout(x.timer);
+      x.fell = true;
+      this.final({ text: x.text }, { end: x.end });
+    }
+  }
+
+  final(m, { end: plainEnd = null } = {}) {
     const lp = this.lastPartial;
     clearTimeout(lp.timer); lp.timer = null; lp.queued = null; lp.text = '';
     const text = String(m.text || '').trim();
     const words = Array.isArray(m.words) ? m.words.filter((w) => w.type === 'word' && Number.isFinite(w.start) && Number.isFinite(w.end)) : [];
     const start = words.length ? this.sessionBase + words[0].start : this.segStart;
-    const end = words.length ? this.sessionBase + words.at(-1).end : this.sentPos();
+    const end = words.length ? this.sessionBase + words.at(-1).end : Math.max(start, plainEnd ?? this.sentPos());
     if (!text) { this.segStart = Math.max(this.segStart, end); return; }
     const speakers = [...new Set(words.map((w) => w.speaker_id).filter(Boolean))];
     // How long after its last word was sent the final arrived.
@@ -257,8 +300,10 @@ export class LiveTranscript {
   dropped(ws, kind, error) {
     if (ws !== this.ws || this.state === 'stopped') return;
     this.ws = null;
+    clearTimeout(this.startTimer);
     try { ws.terminate(); } catch {}
-    if (this.committed) this.final({ text: this.committed.text });
+    if (this.commits.length) this.commitFallback(this.commits.at(-1));
+    this.commits = []; this.stampedAhead = 0; // a new connection starts its own pairing
     if (kind && FATAL.has(kind)) return this.stop('error', `${kind}: ${error}`);
     if (kind) { this.failures++; this.lastError = `${kind}: ${error}`; }
     if (this.failures > MAX_RETRIES) return this.stop('error', this.lastError || 'ElevenLabs kept closing the connection');
@@ -274,8 +319,10 @@ export class LiveTranscript {
     this.reason = reason;
     this.error = error;
     clearTimeout(this.retry);
+    clearTimeout(this.startTimer);
     clearTimeout(this.lastPartial.timer);
-    clearTimeout(this.committed?.timer);
+    for (const c of this.commits) clearTimeout(c.timer);
+    this.commits = [];
     clearInterval(this.saver);
     this.buffer = [];
     const ws = this.ws;

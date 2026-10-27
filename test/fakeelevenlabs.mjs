@@ -3,7 +3,9 @@
 // relies on it: session_started (and, like a plan without zero retention, a warning when enable_logging=false), then
 // per stretch of speech in the audio it receives (a simple level detector): partial_transcript while it lasts and,
 // after 1 s of silence, committed_transcript and committed_transcript_with_timestamps with word times in seconds of
-// that connection's audio. The texts are `phrases`, one per stretch (the last one repeats).
+// that connection's audio. The texts are `phrases`, one per stretch (the last one repeats). Misbehaviour on demand (st):
+// silent (no session_started), stampDelayMs / stampFirst (the timestamped copy late, or before committed_transcript),
+// stall (stop reading the socket), hugeTts (a 60 MB TTS body without a length), ttsDelayMs.
 import http from 'http';
 import { WebSocketServer } from 'ws';
 
@@ -26,7 +28,7 @@ const LEVEL = 500; // int16 RMS above which a chunk counts as speech
 const SILENCE_SEC = 1.0;
 
 export async function startFakeElevenLabs({ key = 'el-test-key-0123456789', phrases = ['Hello Misha, this is a test.'], ttsDelayMs = 0, zeroRetention = false } = {}) {
-  const st = { conns: [], tts: [], speech: [], rejectNext: null, phrases, phraseAt: 0 };
+  const st = { conns: [], tts: [], speech: [], rejectNext: null, phrases, phraseAt: 0, ttsDelayMs, silent: false, stampDelayMs: 0, stampFirst: false, stall: false, hugeTts: false };
   const wss = new WebSocketServer({ noServer: true });
   const body = (req) => new Promise((r) => { let b = ''; req.on('data', (d) => { b += d; }); req.on('end', () => { try { r(JSON.parse(b || '{}')); } catch { r({}); } }); });
   const srv = http.createServer(async (req, res) => {
@@ -35,7 +37,8 @@ export async function startFakeElevenLabs({ key = 'el-test-key-0123456789', phra
     if (req.method === 'POST' && u.pathname === '/v1/audio/speech') { // Supertonic
       const b = await body(req);
       st.speech.push({ ...b, at: Date.now() });
-      if (ttsDelayMs) await new Promise((r) => setTimeout(r, ttsDelayMs));
+      if (st.ttsDelayMs) await new Promise((r) => setTimeout(r, st.ttsDelayMs));
+      if (st.hugeTts) { res.writeHead(200, { 'content-type': 'audio/wav' }); for (let i = 0; i < 60 && !res.destroyed; i++) await new Promise((r) => res.write(Buffer.alloc(1024 * 1024), r)); return res.end(); }
       if (b.response_format !== 'wav') { res.writeHead(400); return res.end('wav only here'); }
       return wav(Math.max(0.5, String(b.input || '').split(/\s+/).length * 0.3));
     }
@@ -44,7 +47,7 @@ export async function startFakeElevenLabs({ key = 'el-test-key-0123456789', phra
       if (req.headers['xi-api-key'] !== key) { res.writeHead(401, { 'content-type': 'application/json' }); return res.end('{"detail":{"status":"invalid_api_key"}}'); }
       const b = await body(req);
       st.tts.push({ voice: m[1], query: Object.fromEntries(u.searchParams), body: b, at: Date.now() });
-      if (ttsDelayMs) await new Promise((r) => setTimeout(r, ttsDelayMs));
+      if (st.ttsDelayMs) await new Promise((r) => setTimeout(r, st.ttsDelayMs));
       return wav(Math.max(0.5, String(b.text || '').split(/\s+/).length * 0.3));
     }
     res.writeHead(404); res.end();
@@ -62,8 +65,10 @@ export async function startFakeElevenLabs({ key = 'el-test-key-0123456789', phra
     const c = { ws, query: Object.fromEntries(query), bytes: 0, chunks: 0, previousText: [], sampleRates: new Set(), closed: false, sent: [] };
     st.conns.push(c);
     const send = (m) => { c.sent.push(m); if (ws.readyState === 1) ws.send(JSON.stringify(m)); };
+    if (st.silent) return;
     send({ message_type: 'session_started', session_id: `s${st.conns.length}`, config: { sample_rate: 16000, audio_format: query.get('audio_format'), model_id: query.get('model_id'), disable_logging: zeroRetention && query.get('enable_logging') === 'false' } });
     if (query.get('enable_logging') === 'false' && !zeroRetention) send({ message_type: 'warning', warning: 'Zero retention mode was requested (enable_logging=false) but was not applied. Only users from the enterprise or trial tier can use ZRM mode. This session is still being logged.' });
+    if (st.stall) { ws._socket.pause(); c.stalled = true; return; } // the session started, then nothing is read
     let pos = 0, speaking = false, segStart = 0, lastVoice = 0, lastPartial = 0, k = 0;
     ws.on('message', (data) => {
       let m;
@@ -90,11 +95,12 @@ export async function startFakeElevenLabs({ key = 'el-test-key-0123456789', phra
         speaking = false;
         st.phraseAt++;
         const step = (lastVoice - segStart) / words.length;
-        send({ message_type: 'committed_transcript', text: phrase });
-        send({
+        const plain = { message_type: 'committed_transcript', text: phrase };
+        const stamped = {
           message_type: 'committed_transcript_with_timestamps', text: phrase, language_code: 'en',
           words: words.flatMap((w, i) => [{ text: w, start: segStart + i * step, end: segStart + (i + 0.8) * step, type: 'word', speaker_id: null }, { text: ' ', start: 0, end: 0, type: 'spacing' }]),
-        });
+        };
+        if (st.stampFirst) { send(stamped); send(plain); } else if (st.stampDelayMs) { send(plain); setTimeout(() => send(stamped), st.stampDelayMs); } else { send(plain); send(stamped); }
       }
     });
     ws.on('close', () => { c.closed = true; });

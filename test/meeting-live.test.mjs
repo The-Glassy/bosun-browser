@@ -162,6 +162,24 @@ test('meeting_stop_recording stops the transcript too; meeting_recording_delete 
   });
 });
 
+test('meeting_recording_delete before admission: the meeting never records or streams once admitted', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    const id = (await c.call('meeting_join', { url, live_transcript: true })).json().meeting_id;
+    await c.call('meeting_recording_delete', { meeting_id: id });
+    const conns = el.conns.length;
+    fake.admit(code);
+    await until(async () => (await status(c, id)).state === 'admitted' && fake.room(code).chat.length >= 2, 15_000);
+    await sleep(1000);
+    assert.equal(audio.recorders.length, 0);
+    assert.equal(audio.captures.length, 0);
+    assert.equal(el.conns.length, conns);
+    assert.equal((await status(c, id)).live_transcript.state, 'off');
+    await c.close();
+  });
+});
+
 test('live transcript refused up front: no ElevenLabs key, or the daily minutes used up; a meeting without it has none', async () => {
   await withService(async (svc) => {
     const c = await connect(svc);
@@ -279,6 +297,19 @@ test('barge-in: meeting_stop_speaking cuts it off and mutes; interrupt replaces 
     await until(() => ev.speech.length === 3);
     assert.deepEqual(ev.speech.map((e) => e.state), ['interrupted', 'interrupted', 'done']);
 
+    // Interrupted while the first one is still being synthesized: the microphone is still muted again at the end.
+    el.st.ttsDelayMs = 800;
+    const slow = c.call('meeting_speak', { meeting_id: id, text: 'Slow to synthesize.' });
+    await until(() => media(code, 'mic').length === 5, 5000);
+    el.st.ttsDelayMs = 0;
+    const fast = (await c.call('meeting_speak', { meeting_id: id, text: 'Fast.', interrupt: true, wait: true })).json();
+    assert.equal(fast.state, 'done');
+    await slow;
+    await until(() => ev.speech.length >= 4, 5000).catch(() => {});
+    await sleep(600);
+    assert.equal(media(code, 'mic').at(-1), false, `mic ${JSON.stringify(media(code, 'mic'))}`);
+    assert.equal((await status(c, id)).speaking, undefined);
+
     // The agent unmutes itself: speaking leaves it on.
     assert.deepEqual((await c.call('meeting_mute', { meeting_id: id, on: false })).json(), { meeting_id: id, muted: false });
     await c.call('meeting_speak', { meeting_id: id, text: 'Still here.', wait: true });
@@ -298,6 +329,9 @@ test('barge-in: meeting_stop_speaking cuts it off and mutes; interrupt replaces 
     assert.ok(Math.abs(f.duration_s - 1.2) < 0.05, `duration ${f.duration_s}`);
     assert.match((await c.call('meeting_speak', { meeting_id: id })).text, /pass text or audio_file_id/);
     assert.match((await c.call('meeting_speak', { meeting_id: id, audio_file_id: 'f0000000000000000' })).text, /nothing was said: no uploaded file/);
+    const pl = (await c.call('upload_create', { filename: 'list.m3u8' })).json();
+    await fetch(pl.put_url, { method: 'PUT', body: '#EXTM3U\n#EXTINF:2,\n/etc/hostname\n#EXT-X-ENDLIST\n' });
+    assert.match((await c.call('meeting_speak', { meeting_id: id, audio_file_id: pl.file_id })).text, /is not WAV, Ogg, FLAC, MP3, M4A or WebM audio/);
     await c.close();
   });
 });
