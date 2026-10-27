@@ -95,47 +95,57 @@ function stillOn(call) {
   if (call && (call.expired || call.done)) throw new Error(`${call.name} ran out of time; nothing more is done on the page`);
 }
 
-// Runs in the page: which of the visible matches els the target means, by its after/before anchors (elements, or
-// null) and nth; an index into els, or { left } (how many qualify) when there is no such one. Order and nesting are
-// the page's across open shadow roots (a host, then its shadow root, then its children). A match that holds an
-// anchor, or sits in one, is neither after nor before it. With after, counted from the anchor on; with only before,
-// from the anchor back (the nearest first).
-function pick([els, after, before, nth]) {
+// Runs in the page: which of the visible matches els the target means, by its after/before anchors (the visible
+// elements showing that text; the first of them counts) and nth; an index into els, or { left } (how many qualify)
+// when there is no such one. Page order runs through open shadow roots (a host, then its shadow root, then its
+// children). A match that holds an anchor, or sits in one, is neither after nor before it. Counted in page order;
+// with only before, from the anchor back (the nearest first).
+function pick([els, afters, befores, nth]) {
   const chain = (n) => { const out = []; for (let x = n; x; x = x.parentNode ?? x.host ?? null) out.unshift(x); return out; };
-  // < 0: a comes before b; > 0: after it; 0: the same, one holds the other, or another document.
+  // Where a and b part: [i, chain a, chain b].
+  const part = (a, b) => { const ca = chain(a), cb = chain(b); let i = 0; while (i < ca.length && i < cb.length && ca[i] === cb[i]) i++; return [i, ca, cb]; };
+  const nested = (a, b) => { const [i, ca, cb] = part(a, b); return i === ca.length || i === cb.length; };
+  // Page order: < 0 when a comes first (an element before what it holds); 0: the same, or another document.
   const order = (a, b) => {
-    const ca = chain(a), cb = chain(b);
-    let i = 0;
-    while (i < ca.length && i < cb.length && ca[i] === cb[i]) i++;
-    if (!i || i === ca.length || i === cb.length) return 0;
+    const [i, ca, cb] = part(a, b);
+    if (!i || (i === ca.length && i === cb.length)) return 0;
+    if (i === ca.length) return -1;
+    if (i === cb.length) return 1;
     if (ca[i].nodeType === 11) return -1;
     if (cb[i].nodeType === 11) return 1;
     return ca[i].compareDocumentPosition(cb[i]) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
   };
-  const idx = els.map((_, i) => i).filter((i) => (!after || order(after, els[i]) < 0) && (!before || order(els[i], before) < 0));
-  if (after || before) idx.sort((i, j) => order(els[i], els[j]));
+  const first = (xs) => [...xs].sort(order)[0] ?? null;
+  const after = first(afters), before = first(befores);
+  const idx = els.map((_, i) => i)
+    .filter((i) => (!after || (!nested(after, els[i]) && order(after, els[i]) < 0)) && (!before || (!nested(els[i], before) && order(els[i], before) < 0)))
+    .sort((i, j) => order(els[i], els[j]));
   if (before && !after) idx.reverse();
   const k = nth < 0 ? idx.length + nth : nth;
   return k >= 0 && k < idx.length ? idx[k] : { left: idx.length };
 }
 
-// Runs in the page: a short description of el, its tag, id and classes (no text or values), and why it is not shown.
+// Runs in the page: what an element is (tag, whole id and class: they are masked before they are cut short) and why
+// it is not shown.
 function sketch(el) {
-  const cls = typeof el.className === 'string' ? el.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).join(' ') : '';
-  const tag = `<${el.localName}${el.id ? ` id="${el.id.slice(0, 40)}"` : ''}${cls ? ` class="${cls.slice(0, 60)}"` : ''}>`;
   let why = null;
   for (let x = el; x && x.nodeType === 1; x = x.parentElement ?? x.getRootNode?.()?.host) {
     if (getComputedStyle(x).display === 'none') { why = x === el ? 'display: none' : `inside a display: none <${x.localName}>`; break; }
   }
   if (!why && getComputedStyle(el).visibility !== 'visible') why = 'visibility: hidden';
   if (!why) { const r = el.getBoundingClientRect(); if (!r.width || !r.height) why = 'zero size'; }
-  return { tag, why };
+  return { tag: el.localName, id: el.id, cls: typeof el.className === 'string' ? el.className : '', why };
 }
 
-// What an error may say about an element of the page: masked as read masks it (an id or class can hold what was
-// typed into a password or OTP field); nothing if that can't be checked.
-async function safe(page, text) {
-  try { return maskText(text, await sensitiveValues(page)); } catch { return null; }
+// What an error may say about an element of the page: its tag, id and first classes, masked as read masks them (an
+// id or class can hold what was typed into a password or OTP field) before they are cut short; just its tag if that
+// can't be checked.
+async function safeTag(page, { tag, id, cls }) {
+  let values;
+  try { values = await sensitiveValues(page); } catch { return `<${tag}>`; }
+  const m = (v) => maskText(String(v ?? ''), values);
+  const c = m(cls).trim().split(/\s+/).filter(Boolean).slice(0, 3).join(' ');
+  return `<${tag}${id ? ` id="${m(id).slice(0, 40)}"` : ''}${c ? ` class="${c.slice(0, 60)}"` : ''}>`;
 }
 
 // Locate an element: ref (from read a11y: "e12" -> aria-ref) as it is; role+name, selector or text: the first
@@ -152,7 +162,6 @@ async function locate(p, t, { hidden = false, until = Date.now() + FIND_MS } = {
     return p.locator(`aria-ref=${t.ref}`);
   }
   const shown = matches(p, t).filter({ visible: true });
-  const anchor = (text) => p.getByText(text, { exact: false }).filter({ visible: true }).first();
   const call = stepCall() ?? currentCall();
   for (;;) {
     stillOn(call);
@@ -160,29 +169,35 @@ async function locate(p, t, { hidden = false, until = Date.now() + FIND_MS } = {
     if (!ordinal) {
       if (await shown.count()) return shown.first();
     } else {
-      const hs = await shown.elementHandles();
-      const ends = [];
+      const held = [];
       let chosen = null;
       try {
+        const hs = await shown.elementHandles();
+        held.push(...hs);
+        const anchors = [];
         for (const [k, text] of [['after', t.after], ['before', t.before]]) {
-          const h = text && await anchor(text).count() ? await anchor(text).elementHandle({ timeout: 2000 }).catch(() => null) : null;
-          if (text && !h) missing ??= `no visible element shows the text "${text}" (${k})`;
-          ends.push(h);
+          stillOn(call);
+          const a = text ? await p.getByText(text, { exact: false }).filter({ visible: true }).elementHandles() : [];
+          held.push(...a);
+          if (text && !a.length) missing ??= `no visible element shows the text "${text}" (${k})`;
+          anchors.push(a);
         }
         if (!missing) {
-          const i = await p.evaluate(pick, [hs, ...ends, t.nth ?? 0]).catch(() => {
+          stillOn(call);
+          const i = await p.evaluate(pick, [hs, ...anchors, t.nth ?? 0]).catch(() => {
             throw new Error('nth, after and before work on the page itself (the matches and the text in one frame)');
           });
           if (typeof i === 'number') chosen = hs[i];
           else count = i.left;
         }
       } finally {
-        for (const h of [...hs, ...ends]) if (h && h !== chosen) await h.dispose().catch(() => {});
+        for (const h of held) if (h !== chosen) await h.dispose().catch(() => {});
       }
       if (chosen) return chosen;
     }
+    stillOn(call);
     if (hidden && !ordinal && await matches(p, t).count()) return matches(p, t).first();
-    if (Date.now() >= until) throw new Error(await whyNone(p, t, missing, count));
+    if (Date.now() >= until) { stillOn(call); throw new Error(await whyNone(p, t, missing, count)); }
     await sleep(Math.min(200, Math.max(0, until - Date.now())));
   }
 }
@@ -209,8 +224,7 @@ async function whyNone(p, t, missing, count) {
   if (!n) return `nothing matches ${show(t)} within ${secs}`;
   if (!shown) {
     const first = await all.first().evaluate(sketch, null, { timeout: 2000 }).catch(() => null);
-    const tag = first && await safe(p, first.tag);
-    return `${show(t)} matched ${n} element${n > 1 ? 's' : ''}, none visible within ${secs}${first ? ` (the first is ${tag ?? 'an element'}${first.why ? `, ${first.why}` : ''})` : ''}`;
+    return `${show(t)} matched ${n} element${n > 1 ? 's' : ''}, none visible within ${secs}${first ? ` (the first is ${await safeTag(p, first)}${first.why ? `, ${first.why}` : ''})` : ''}`;
   }
   const where = [t.after && `after "${t.after}"`, t.before && `before "${t.before}"`].filter(Boolean).join(' and ');
   return `${show(t)}: ${count ?? shown} visible match${(count ?? shown) === 1 ? '' : 'es'}${where ? ` ${where}` : ''}, so nth ${t.nth ?? 0} is not there${n > shown ? ` (${n - shown} more hidden)` : ''}`;
@@ -228,20 +242,21 @@ function blocker(el) {
   while (hit?.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
   const holds = (a, b) => { for (let n = b; n; n = n.parentNode ?? n.host ?? null) if (n === a) return true; return false; };
   if (!hit || holds(el, hit)) return null;
-  const cls = typeof hit.className === 'string' ? hit.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).join(' ') : '';
-  return { covered: `<${hit.localName}${hit.id ? ` id="${hit.id.slice(0, 40)}"` : ''}${cls ? ` class="${cls.slice(0, 60)}"` : ''}>` };
+  return { covered: { tag: hit.localName, id: hit.id, cls: typeof hit.className === 'string' ? hit.className : '' } };
 }
 
 // click(opts) on el (a locator or a handle) by until, with Playwright's waits for it to be clickable. One that times
 // out says why, where it can tell.
 async function clicking(page, el, click, until) {
+  const call = stepCall() ?? currentCall();
   try {
     return await click({ timeout: left(until) });
   } catch (e) {
     if (e?.name !== 'TimeoutError') throw e;
+    stillOn(call); // a call that is over looks no further
     const b = await el.evaluate(blocker, null, { timeout: 2000 }).catch(() => null);
-    const by = b?.covered && await safe(page, b.covered);
-    const why = b?.why ?? (b?.covered ? `it is covered by ${by ?? 'another element'}, which would get the click` : null);
+    stillOn(call);
+    const why = b?.why ?? (b?.covered ? `it is covered by ${await safeTag(page, b.covered)}, which would get the click` : null);
     throw new Error(`the element did not become clickable within ${Math.round(FIND_MS / 1000)} s${why ? `: ${why}` : ' (it stayed hidden, moving or disabled)'}`);
   }
 }
@@ -531,7 +546,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         if (a.secret_id !== undefined) return ok(await typeSecret(s, a));
         const until = Date.now() + FIND_MS;
         await withTarget(s.page, a, { until }, (l) => onTarget(l, async (t, call) => {
-          await t.fill(a.value, { timeout: 15000 });
+          await t.fill(a.value, { timeout: left(until) });
           // A macro step looks again before it goes on (and submits): a field that became a password field while it
           // was filled is cleared; a step that ran out of time meanwhile, or a page that left the site, stops here.
           await recheck(call, t).catch(async (e) => { await t.fill('', { timeout: 5000 }).catch(() => {}); throw e; });
@@ -555,13 +570,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       const l = found.asElement ? found : await found.elementHandle({ timeout: left(until) });
       try {
         stillOn(call);
-        return await typeSecretInto(s, l, a, call);
+        return await typeSecretInto(s, l, a, call, until);
       } finally {
         if (l !== found) await l.dispose().catch(() => {});
       }
     });
   }
-  async function typeSecretInto(s, l, a, call) {
+  async function typeSecretInto(s, l, a, call, until) {
     // The page the secret goes into, also for scrubbing and leaving it: s.page may change under a call that ran out
     // of time (the tab is replaced).
     const page = s.page;
@@ -581,7 +596,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     const forms = [...new Set([value, encodeURIComponent(value), new URLSearchParams({ v: value }).toString().slice(2)])];
     const hide = (t) => forms.reduce((out, f) => (value && out.includes(f) ? out.split(f).join('[masked]') : out), String(t));
     try {
-      await l.fill(value, { timeout: 15000 });
+      await l.fill(value, { timeout: left(until) });
       // fill types through the page's keyboard: a page that moves the focus meanwhile gets the text elsewhere (another
       // field, a contenteditable). Unless it is in the element that was checked, the call fails and the page is left;
       // otherwise every field that holds it is masked.
@@ -607,7 +622,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   tool('select', 'Choose an option in a <select>.', { session: str(40), ...target, value: str(1000) }, async (a) => run(a.session, async (s) => {
     const until = Date.now() + FIND_MS;
-    await withTarget(s.page, a, { until, hidden: true }, (l) => onTarget(l, (t, call) => t.selectOption({ label: a.value }, { timeout: 15000 }).catch(async () => { await recheck(call); return t.selectOption(a.value, { timeout: 15000 }); }),
+    await withTarget(s.page, a, { until, hidden: true }, (l) => onTarget(l, (t, call) => t.selectOption({ label: a.value }, { timeout: left(until) }).catch(async () => { await recheck(call); return t.selectOption(a.value, { timeout: left(until) }); }),
       { until, ready: (h) => h.waitForElementState('enabled', { timeout: left(until) }) }));
     return ok(await pageInfo(s.page));
   }));

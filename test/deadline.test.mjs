@@ -90,20 +90,22 @@ test('a slow call on a page that still responds: answered at its deadline; the n
   await c.call('navigate', { session: s, url: `${base}/slow` });
   // click waits up to 15 s for an element that never comes; its deadline is 4 s.
   const t0 = Date.now();
-  const [clicked, back] = await Promise.all([
+  const [clicked, queued] = await Promise.all([
     c.call('click', { session: s, selector: '#never' }),
-    sleep(200).then(() => c.call('back', { session: s })),
+    sleep(200).then(() => c.call('read', { session: s, mode: 'text' })),
   ]);
   assert.equal(clicked.isError, true);
   assert.match(clicked.text, /^click timed out after 4 s .*; the page still responds and the session is usable/);
-  // back was queued behind the click: its own 4 s ran out while it waited, so it was answered without running.
-  assert.equal(back.isError, true);
-  assert.match(back.text, /^back timed out after 4 s .* while waiting behind other calls on this session; it was not run, the session is usable/);
+  // read was queued behind the click. The click stops looking for its element once it is cut off (a little before
+  // its deadline), so read gets the page near the end of its own 4 s, if at all: it runs, or is answered by its
+  // deadline.
+  if (queued.isError) assert.match(queued.text, /^read timed out after 4 s .*(while waiting behind other calls on this session; it was not run|the page still responds), (and )?the session is usable/);
   assert.ok(Date.now() - t0 < 4200 + 1000, 'both answered by their deadlines');
-  // The next call waits until the click has stopped (its own 15 s), so the two never overlap; then it runs.
+  // The next call waits until the click has stopped, so the two never overlap; then it runs. A click that ran out of
+  // time stops looking for its element at once (it used to keep looking for its own 15 s).
   const shot = await c.call('screenshot', { session: s });
   assert.equal(shot.isError, false, shot.text);
-  assert.ok(Date.now() - t0 >= 14500, `ran after ${Date.now() - t0} ms, while the click was still running`);
+  assert.ok(Date.now() - t0 >= 2500 && Date.now() - t0 < 12_000, `ran after ${Date.now() - t0} ms`); // the click is cut off at 4 s less the reserve
   const again = await c.call('read', { session: s, mode: 'text' });
   assert.match(again.text, /nothing to click here/);
   await c.call('session_close', { session: s });

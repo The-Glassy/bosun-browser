@@ -42,11 +42,13 @@ function server() {
       // button shown late that stays disabled; a hidden button that takes what is typed into a password field as its id
       return html(res, `<title>More</title><pre id="log"></pre>
         <x-a id="xa"></x-a><span>Anchor</span><x-b id="xb"></x-b>
+        <div><x-c id="xc"></x-c><button onclick="${say('light')}">Ord light</button></div>
         <div id="churn"></div><span>Go</span><button onclick="${say('target')}">Target</button>
         <button id="late" disabled style="display:none">Late</button>
-        <input id="pw" type="password" oninput="document.querySelector('.hb').id = 'otp-' + this.value"><button class="hb" hidden>x</button>
+        <input id="pw" type="password" oninput="document.querySelector('.hb').id = 'otp-' + 'x'.repeat(32) + this.value"><button class="hb" hidden>x</button>
         <script>
           document.getElementById('xa').attachShadow({ mode: 'open' }).innerHTML = '<button onclick="document.getElementById(\\'log\\').textContent += \\'A;\\'">A</button>';
+          document.getElementById('xc').attachShadow({ mode: 'open' }).innerHTML = '<button onclick="document.getElementById(\\'log\\').textContent += \\'shadow;\\'">Ord shadow</button>';
           document.getElementById('xb').attachShadow({ mode: 'open' }).innerHTML = '<button onclick="document.getElementById(\\'log\\').textContent += \\'B;\\'">B</button>';
           let n = 0; const t = setInterval(() => { document.getElementById('churn').insertAdjacentHTML('afterbegin', '<button>Churn</button>'); if (++n > 400) clearInterval(t); }, 20);
           setTimeout(() => { document.getElementById('late').style.display = ''; }, 8000);
@@ -172,7 +174,10 @@ test('after and before across shadow roots; a picked element stays picked while 
   assert.equal((await c.call('click', { session: s, role: 'button', before: 'Anchor' })).isError, false);
   // Buttons are put in ahead of Go every 20 ms: what was counted after Go is what gets clicked.
   for (let i = 0; i < 4; i++) assert.equal((await c.call('click', { session: s, role: 'button', after: 'Go' })).isError, false);
-  assert.equal(await log(s), 'B;A;target;target;target;target;');
+  // nth alone counts in page order too: the shadow root's button comes first.
+  assert.equal((await c.call('click', { session: s, role: 'button', name: 'Ord', nth: 0 })).isError, false);
+  assert.equal((await c.call('click', { session: s, role: 'button', name: 'Ord', nth: -1 })).isError, false);
+  assert.equal(await log(s), 'B;A;target;target;target;target;shadow;light;');
   await c.call('session_close', { session: s });
 });
 
@@ -188,7 +193,8 @@ test('finding and clicking share one 15 s; an id that holds a typed password is 
   ]);
   assert.match(late.text, /did not become clickable within 15 s: it is disabled/);
   assert.ok(late.ms < 20_000, `${late.ms} ms`);
-  assert.match(masked.text, /the first is <button id="otp-\[masked\]" class="hb">, display: none/);
-  assert.doesNotMatch(masked.text, /hunter42/);
+  // Masked before the id is cut short to 40 characters, so no part of it shows.
+  assert.match(masked.text, /the first is <button id="otp-x{32}\[mas" class="hb">, display: none/);
+  assert.doesNotMatch(masked.text, /hunt/);
   await Promise.all([s1, s2].map((s) => c.call('session_close', { session: s })));
 });
