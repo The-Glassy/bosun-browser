@@ -217,21 +217,30 @@ test('meeting_speak: refused before admission; unmutes, plays the synthesized te
     assert.ok(s.start_ms >= s.prepare_ms && s.start_ms < 5000);
     assert.deepEqual(media(code, 'mic'), [true], 'unmuted before it plays');
     assert.equal(el.st.speech.at(-1).input, 'Hi everyone, this is Glassy.');
+    assert.equal(s.pieces, 1);
     assert.equal(audio.players.length, 1);
-    assert.equal(audio.players[0].bytes.toString('ascii', 0, 4), 'RIFF');
+    assert.deepEqual(audio.players[0].pcm, { rate: 24000, channels: 1 });
+    assert.equal(audio.players[0].bytes.length, 1.5 * 24000 * 2);
     assert.equal((await status(c, id)).speaking.utterance_id, s.utterance_id);
     // Another one while it plays: refused.
     assert.match((await c.call('meeting_speak', { meeting_id: id, text: 'again' })).text, /already speaking/);
     await until(() => ev.speech.length === 1, 5000);
     assert.deepEqual(media(code, 'mic'), [true, false], 'muted again after');
     assert.equal(ev.speech[0].state, 'done');
-    assert.equal(fs.existsSync(path.dirname(audio.players[0].file)), false, 'the synthesized file is gone');
+    // Several sentences: synthesized one after the other into the same player, the first one playing meanwhile.
+    const n = el.st.speech.length;
+    const m2 = (await c.call('meeting_speak', { meeting_id: id, text: 'First sentence here. Second one follows! And a third?', wait: true })).json();
+    assert.equal(m2.pieces, 2);
+    assert.deepEqual(el.st.speech.slice(n).map((x) => x.input), ['First sentence here.', 'Second one follows! And a third?']);
+    assert.equal(m2.duration_s, 0.9 + 1.8);
+    assert.equal(audio.players.at(-1).bytes.length, Math.round(2.7 * 24000) * 2);
+    assert.deepEqual(media(code, 'mic'), [true, false, true, false]);
     // wait: answers once it has played.
     const w = (await c.call('meeting_speak', { meeting_id: id, text: 'Short.', wait: true })).json();
     assert.equal(w.state, 'done');
     assert.equal(w.speaking, false);
     assert.ok(w.played_s >= 0.5, `played ${w.played_s}`);
-    assert.deepEqual(media(code, 'mic'), [true, false, true, false]);
+    assert.deepEqual(media(code, 'mic'), [true, false, true, false, true, false]);
     // ElevenLabs as the voice.
     const e = (await c.call('meeting_speak', { meeting_id: id, text: 'Привіт усім', backend: 'elevenlabs', lang: 'uk', wait: true })).json();
     assert.equal(e.source, 'elevenlabs');

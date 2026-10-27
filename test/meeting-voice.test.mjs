@@ -72,6 +72,16 @@ test(`${ENGINE}: meeting_speak is heard through the browser's microphone, and on
     }
     console.log(`${ENGINE} speak latency (call -> first sound in the page, local TTS stand-in): ${JSON.stringify(lat)}`);
     for (const l of lat) assert.ok(l.heard_ms < 2500, `heard after ${l.heard_ms} ms`);
+    // Several sentences: one player, fed while it plays; heard for the whole of it.
+    {
+      const from = room.heard.length;
+      const r = (await c.call('meeting_speak', { meeting_id: id, text: 'First part of it here. Then the second part follows. And a third one.', wait: true })).json();
+      assert.equal(r.state, 'done');
+      assert.equal(r.pieces, 2);
+      const heard = room.heard.slice(from);
+      const span = heard.at(-1).at - heard[0].at;
+      assert.ok(span > r.duration_s * 1000 - 800 && span < r.duration_s * 1000 + 800, `heard for ${span} ms of ${r.duration_s} s`);
+    }
     // Barge-in: cut off within a moment.
     const from = room.heard.length;
     await c.call('meeting_speak', { meeting_id: id, text: 'one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen' });

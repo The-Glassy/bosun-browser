@@ -31,8 +31,7 @@ const MAX_RETRIES = 8; // connection attempts in a row without a session
 // Errors after which another connection would fail the same way: the transcript stops.
 const FATAL = new Set(['auth_error', 'quota_exceeded', 'unaccepted_terms', 'invalid_request', 'input_error', 'chunk_size_exceeded']);
 const PREVIOUS_TEXT = 50; // characters of context sent with the first chunk after a reconnect
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const SHORT_SESSION_MS = 10_000; // a session closed sooner than this counts as a failed attempt
 
 // The realtime URL for a base URL (https://api.elevenlabs.io, or a test server).
 export function realtimeUrl(base, { zeroRetention = true } = {}) {
@@ -163,12 +162,12 @@ export class LiveTranscript {
       this.dropped(ws, code === 401 || code === 403 ? 'auth_error' : 'error', `HTTP ${code} from ElevenLabs`);
     });
     ws.on('message', (data) => {
+      if (ws !== this.ws) return;
       let m;
       try { m = JSON.parse(String(data)); } catch { return; }
       if (m.message_type === 'session_started') {
-        started = true;
+        started = this.now();
         this.sessions++;
-        this.failures = 0;
         this.session = m.session_id || null;
         // Zero retention applied: the session's config says logging is off, and no warning said otherwise.
         this.zeroRetention = m.config?.disable_logging === true || m.config?.enable_logging === false;
@@ -176,10 +175,15 @@ export class LiveTranscript {
         this.flush();
         return;
       }
-      if (ws !== this.ws) return;
       this.onMessage(m);
     });
-    ws.on('close', () => this.dropped(ws, started ? null : 'error', started ? null : 'the connection closed before the session started'));
+    // Closed after a session: opened again at once, unless the session was short (then it counts as a failure).
+    ws.on('close', (code) => {
+      if (!started) return this.dropped(ws, 'error', `the connection closed before the session started (${code})`);
+      const short = this.now() - started < SHORT_SESSION_MS;
+      if (!short && ws === this.ws) this.failures = 0; // a session that lasted: the count of failures in a row starts over
+      this.dropped(ws, short ? 'closed' : null, `closed after ${Math.round((this.now() - started) / 1000)} s (${code})`);
+    });
     ws.on('error', (e) => this.dropped(ws, 'error', String(e?.message || e).slice(0, 200)));
   }
 
@@ -305,8 +309,3 @@ export class LiveTranscript {
 
 const round = (x) => Math.round(x * 100) / 100;
 
-// Waits until fn() is true or ms passed (tests and shutdown).
-export async function waitFor(fn, ms = 5000) {
-  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) if (fn()) return true;
-  return fn();
-}

@@ -1,14 +1,13 @@
-// Speech for a meeting: text to an audio file (TTS backends), and the length of an audio file. What is played goes into
-// the meeting's microphone (audio.mjs play); when to speak is the agent's call, never Bosun's.
+// Speech for a meeting: text to audio (TTS backends), a piece at a time, and the length of an audio file. What is played
+// goes into the meeting's microphone (audio.mjs play); when to speak is the agent's call, never Bosun's. Text is split
+// into sentences (splitSpeech) so the first one plays while the next are synthesized: a local TTS on a busy CPU takes
+// about as long as the audio lasts, and a long first sentence would keep the meeting waiting.
 //
 // Backends:
 //   supertonic  (default) a local OpenAI-style TTS service: POST <TTS_URL>/v1/audio/speech {input, voice, lang,
 //               response_format: wav}; voices supertonic-F1..F5, supertonic-M1..M5.
 //   elevenlabs  POST https://api.elevenlabs.io/v1/text-to-speech/<voice_id>?output_format=wav_24000&enable_logging=false
 //               {text, model_id: eleven_flash_v2_5, language_code}; voice = an ElevenLabs voice id.
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
 import { execFile } from 'child_process';
 
 export const BACKENDS = ['supertonic', 'elevenlabs'];
@@ -17,12 +16,26 @@ export const EL_TTS_MODEL = 'eleven_flash_v2_5';
 export const EL_DEFAULT_VOICE = 'EXAVITQu4vr4xnSDxMaL'; // "Sarah", one of ElevenLabs' premade voices
 const TTS_TIMEOUT_MS = 30_000;
 const MAX_AUDIO_BYTES = 50 * 1024 * 1024;
+const FIRST_MAX = 80; // a longer first sentence is cut at its first comma (after FIRST_MIN characters)
+const FIRST_MIN = 12;
+const REST_MAX = 160;
 
-// A temporary directory of its own (0700) for one utterance; removed with remove().
-export function tempAudio(ext = 'wav') {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bosun-speak-'));
-  fs.chmodSync(dir, 0o700);
-  return { dir, file: path.join(dir, `speech.${ext}`), remove: () => fs.rmSync(dir, { recursive: true, force: true }) };
+// Text -> the pieces it is synthesized in: sentences (after . ! ? … and line breaks), the first one also cut at a comma
+// or semicolon when it is long, so the first audio comes soon.
+export function splitSpeech(text) {
+  const parts = String(text).replace(/\s+\n|\n\s*/g, '\n').split(/(?<=[.!?…])\s+|\n+/).map((t) => t.trim()).filter(Boolean);
+  if (parts[0]?.length > FIRST_MAX) {
+    const m = /^(.{12,}?[,;:])\s+(.+)$/su.exec(parts[0]);
+    if (m && m[1].length >= FIRST_MIN) parts.splice(0, 1, m[1], m[2]);
+  }
+  if (!parts.length) return [String(text).trim()];
+  // After the first piece, sentences go together up to REST_MAX characters (fewer requests, steadier voice).
+  const out = [parts[0]];
+  for (const t of parts.slice(1)) {
+    if (out.length > 1 && out.at(-1).length + 1 + t.length <= REST_MAX) out[out.length - 1] += ` ${t}`;
+    else out.push(t);
+  }
+  return out;
 }
 
 async function fetchAudio(url, init, what) {
@@ -46,8 +59,8 @@ async function fetchAudio(url, init, what) {
   } finally { clearTimeout(t); }
 }
 
-// text -> a WAV file. Returns {file, remove(), bytes, backend, voice}.
-export async function synthesize(cfg, { text, backend = 'supertonic', voice, lang }) {
+// One piece of text -> WAV audio. Returns {pcm: {rate, channels}, data (s16le samples), seconds, voice}.
+export async function synthesizeWav(cfg, { text, backend = 'supertonic', voice, lang }) {
   let buf;
   if (backend === 'supertonic') {
     if (!cfg.ttsUrl) throw new Error('no TTS service configured (TTS_URL): pass audio_file_id, or backend "elevenlabs"');
@@ -69,29 +82,34 @@ export async function synthesize(cfg, { text, backend = 'supertonic', voice, lan
       body: JSON.stringify({ text, model_id: EL_TTS_MODEL, ...(lang ? { language_code: lang } : {}) }),
     }, 'ElevenLabs text-to-speech');
   } else throw new Error(`backend must be one of ${BACKENDS.join(', ')}`);
-  if (wavSeconds(buf) === null) throw new Error(`${backend} did not send WAV audio`);
-  const t = tempAudio('wav');
-  fs.writeFileSync(t.file, buf, { mode: 0o600 });
-  return { ...t, bytes: buf.length, backend, ...(voice ? { voice } : {}), seconds: wavSeconds(buf) };
+  const w = parseWav(buf);
+  if (!w || w.bits !== 16 || w.format !== 1) throw new Error(`${backend} did not send 16-bit PCM WAV audio`);
+  return { pcm: { rate: w.rate, channels: w.channels }, data: w.data, seconds: w.seconds, ...(voice ? { voice } : {}) };
 }
 
-// The length of a WAV file from its header (RIFF chunks 'fmt ' and 'data'); null if it is no WAV. A streamed WAV
-// whose data size is unknown (0 or 0xFFFFFFFF) is measured by the bytes there are.
-export function wavSeconds(buf) {
+// A WAV file's format and samples (RIFF chunks 'fmt ' and 'data'); null if it is no WAV. A streamed WAV whose data size
+// is unknown (0 or 0xFFFFFFFF) has the bytes there are.
+export function parseWav(buf) {
   if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return null;
-  let byteRate = 0;
+  let fmt = null;
   for (let p = 12; p + 8 <= buf.length;) {
     const id = buf.toString('ascii', p, p + 4), size = buf.readUInt32LE(p + 4);
-    if (id === 'fmt ' && p + 16 <= buf.length) byteRate = buf.readUInt32LE(p + 16);
+    if (id === 'fmt ' && p + 24 <= buf.length) {
+      fmt = { format: buf.readUInt16LE(p + 8), channels: buf.readUInt16LE(p + 10), rate: buf.readUInt32LE(p + 12), byteRate: buf.readUInt32LE(p + 16), bits: buf.readUInt16LE(p + 22) };
+    }
     if (id === 'data') {
-      if (!byteRate) return null;
+      if (!fmt?.byteRate) return null;
       const have = buf.length - (p + 8);
-      return (size && size !== 0xffffffff ? Math.min(size, have) : have) / byteRate;
+      const n = size && size !== 0xffffffff ? Math.min(size, have) : have;
+      const data = buf.subarray(p + 8, p + 8 + n - (n % Math.max(1, fmt.channels * (fmt.bits / 8))));
+      return { ...fmt, data, seconds: data.length / fmt.byteRate };
     }
     p += 8 + size + (size % 2);
   }
   return null;
 }
+
+export const wavSeconds = (buf) => parseWav(buf)?.seconds ?? null;
 
 // The length of any audio file ffprobe reads, in seconds (null if it can't tell).
 export function probeSeconds(file) {

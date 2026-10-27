@@ -10,7 +10,7 @@ import path from 'path';
 import { PassThrough } from 'stream';
 import { fileURLToPath } from 'url';
 import { LiveTranscript, TranscriptUsage, realtimeUrl, EL_MODEL } from '../src/meetings/transcript.mjs';
-import { synthesize, wavSeconds } from '../src/meetings/speech.mjs';
+import { synthesizeWav, splitSpeech, wavSeconds, parseWav } from '../src/meetings/speech.mjs';
 import { startFakeElevenLabs, tonePcm, toneWav } from './fakeelevenlabs.mjs';
 import { tmpDir, until, sleep } from './helpers.mjs';
 
@@ -168,33 +168,44 @@ test('the daily cap: minutes are counted per tenant and day, survive a restart, 
   assert.equal(el.conns.length, before);
 });
 
-test('wavSeconds reads the header; synthesize: Supertonic (wav, voice, lang) and ElevenLabs (voice id, key, flash model, zero retention asked)', async () => {
+test('splitSpeech: sentences, a long first one cut at a comma, the rest grouped', () => {
+  assert.deepEqual(splitSpeech('Hi Misha, this is Glassy. I can hear you well, shall we start?'), ['Hi Misha, this is Glassy.', 'I can hear you well, shall we start?']);
+  assert.deepEqual(splitSpeech('One sentence only'), ['One sentence only']);
+  assert.deepEqual(splitSpeech('Привіт, Міша! Як справи? Добре.'), ['Привіт, Міша!', 'Як справи? Добре.']);
+  const long = 'A really long first sentence that goes on and on, with a comma somewhere in the middle of it, and more words after.';
+  assert.deepEqual(splitSpeech(`${long}\nNext line`), ['A really long first sentence that goes on and on,', 'with a comma somewhere in the middle of it, and more words after. Next line']);
+  assert.deepEqual(splitSpeech('  '), ['']);
+});
+
+test('parseWav reads the header (also a LIST chunk first, a streamed size); synthesizeWav: Supertonic (wav, voice, lang) and ElevenLabs (voice id, key, flash model, zero retention asked)', async () => {
   assert.equal(wavSeconds(toneWav(1.5)), 1.5);
   assert.equal(wavSeconds(Buffer.from('not a wav file at all, not even close to one....')), null);
   const streamed = toneWav(1); streamed.writeUInt32LE(0xffffffff, 40);
   assert.equal(wavSeconds(streamed), 1);
+  const t = toneWav(0.5);
+  const list = Buffer.concat([t.subarray(0, 36), Buffer.from('LIST'), Buffer.from([4, 0, 0, 0]), Buffer.from('INFO'), t.subarray(36)]);
+  assert.deepEqual({ ...parseWav(list), data: null }, { format: 1, channels: 1, rate: 24000, byteRate: 48000, bits: 16, data: null, seconds: 0.5 });
   const fx = fs.readFileSync(path.join(FIXTURES, 'speech-en.wav'));
   assert.ok(Math.abs(wavSeconds(fx) - 6.8) < 0.05);
 
   const cfg = { ttsUrl: el.base, elevenlabs: { apiKey: el.key, baseUrl: el.base, voice: null } };
-  const a = await synthesize(cfg, { text: 'Hello there everyone', voice: 'supertonic-M2', lang: 'en' });
-  try {
-    assert.ok(Math.abs(a.seconds - 0.9) < 0.01);
-    assert.equal(fs.statSync(a.dir).mode & 0o777, 0o700);
-    assert.deepEqual({ ...el.st.speech.at(-1), at: 0 }, { input: 'Hello there everyone', voice: 'supertonic-M2', lang: 'en', response_format: 'wav', at: 0 });
-  } finally { a.remove(); }
-  assert.equal(fs.existsSync(a.dir), false);
-  await assert.rejects(synthesize(cfg, { text: 'x', voice: 'alloy' }), /voice must be one of supertonic-F1/);
-  await assert.rejects(synthesize({}, { text: 'x' }), /no TTS service configured/);
+  const a = await synthesizeWav(cfg, { text: 'Hello there everyone', voice: 'supertonic-M2', lang: 'en' });
+  assert.ok(Math.abs(a.seconds - 0.9) < 0.01);
+  assert.deepEqual(a.pcm, { rate: 24000, channels: 1 });
+  assert.equal(a.data.length, 0.9 * 24000 * 2);
+  assert.equal(a.voice, 'supertonic-M2');
+  assert.deepEqual({ ...el.st.speech.at(-1), at: 0 }, { input: 'Hello there everyone', voice: 'supertonic-M2', lang: 'en', response_format: 'wav', at: 0 });
+  await assert.rejects(synthesizeWav(cfg, { text: 'x', voice: 'alloy' }), /voice must be one of supertonic-F1/);
+  await assert.rejects(synthesizeWav({}, { text: 'x' }), /no TTS service configured/);
 
-  const b = await synthesize(cfg, { text: 'Привіт', backend: 'elevenlabs', lang: 'uk' });
-  b.remove();
+  const b = await synthesizeWav(cfg, { text: 'Привіт', backend: 'elevenlabs', lang: 'uk' });
+  assert.equal(b.voice, 'EXAVITQu4vr4xnSDxMaL');
   const req = el.st.tts.at(-1);
   assert.equal(req.voice, 'EXAVITQu4vr4xnSDxMaL');
   assert.deepEqual(req.query, { output_format: 'wav_24000', enable_logging: 'false' });
   assert.deepEqual(req.body, { text: 'Привіт', model_id: 'eleven_flash_v2_5', language_code: 'uk' });
-  await assert.rejects(synthesize({ ...cfg, elevenlabs: { ...cfg.elevenlabs, apiKey: 'wrong-key-0123456789' } }, { text: 'x', backend: 'elevenlabs' }), /ElevenLabs text-to-speech answered HTTP 401/);
-  await assert.rejects(synthesize({ ttsUrl: 'http://127.0.0.1:9' }, { text: 'x' }), /supertonic could not be reached/);
+  await assert.rejects(synthesizeWav({ ...cfg, elevenlabs: { ...cfg.elevenlabs, apiKey: 'wrong-key-0123456789' } }, { text: 'x', backend: 'elevenlabs' }), /ElevenLabs text-to-speech answered HTTP 401/);
+  await assert.rejects(synthesizeWav({ ttsUrl: 'http://127.0.0.1:9' }, { text: 'x' }), /supertonic could not be reached/);
 });
 
 // The real thing: a few seconds of English speech to ElevenLabs. Costs about $0.001.

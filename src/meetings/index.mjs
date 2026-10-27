@@ -23,7 +23,7 @@ import { meet } from './platforms/meet.mjs';
 import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
 import { LiveTranscript, TranscriptUsage } from './transcript.mjs';
-import { synthesize, probeSeconds } from './speech.mjs';
+import { synthesizeWav, splitSpeech, probeSeconds } from './speech.mjs';
 
 export const ID_RE = /^m[0-9a-f]{12}$/;
 export const ANNOUNCE_MODES = ['chat', 'host', 'none'];
@@ -653,8 +653,10 @@ export class Meetings {
   }
 
   // Plays text (synthesized: supertonic, or elevenlabs) or an uploaded audio file into the meeting's microphone. The
-  // microphone is unmuted for it and muted again after (autoMute; a microphone that was on stays on). Returns once
-  // the audio plays (wait: once it has played). A second utterance while one plays is refused unless interrupt.
+  // microphone is unmuted for it and muted again after (autoMute; a microphone that was on stays on). Text is
+  // synthesized a sentence at a time: the first one plays as soon as it is there, the rest is added while it plays.
+  // Returns once all of it is synthesized (wait: once it has played). A second utterance while one plays is refused
+  // unless interrupt.
   async speak(tenant, id, { text, audioFileId, voice, lang, backend = 'supertonic', autoMute = true, interrupt = false, wait = false }) {
     const m = this.get(tenant, id);
     this.inCall(m, 'speaking');
@@ -665,28 +667,28 @@ export class Meetings {
     const prev = m.speech;
     if (prev && !interrupt) throw new Error(`already speaking (utterance ${prev.id}); meeting_stop_speaking first, or pass interrupt: true`);
     const t0 = this.now();
-    const u = { id: `u${++m.speechSeq}`, state: 'preparing', player: null, audio: null, remute: false, cancelled: false, seconds: null };
+    const u = { id: `u${++m.speechSeq}`, state: 'preparing', player: null, remute: false, cancelled: false, seconds: 0 };
     u.finished = new Promise((r) => { u.finish = r; });
     m.speech = u;
     // The previous utterance stops without muting: this one takes the microphone over (and mutes it after, if that one would have).
     if (prev) { u.remute = prev.remute; prev.remute = false; prev.cancelled = true; await prev.player?.stop(); }
-    const prep = (async () => {
-      if (text) return synthesize(this.cfg, { text, backend, voice, lang });
+    const pieces = text ? splitSpeech(text) : null;
+    const first = (async () => {
+      if (text) return synthesizeWav(this.cfg, { text: pieces[0], backend, voice, lang });
       const f = this.manager.uploads?.use(tenant, [audioFileId], m.session.id)[0];
       if (!f) throw new Error('uploads are off on this Bosun (FEATURES_UPLOADS=0)');
       const seconds = await probeSeconds(f.file);
       if (seconds === null) throw new Error(`file ${audioFileId} is not audio ffmpeg can read`);
-      return { file: f.file, seconds, remove: () => {}, backend: 'file' };
+      return { file: f.file, seconds };
     })();
-    // The microphone goes on while the audio is prepared.
+    // The microphone goes on while the first audio is prepared.
     const mic = autoMute ? this.page(m, async (p) => {
       const before = await m.platform.micState(p);
       if (before !== 'on') await m.platform.setMic(p, true);
       return before;
     }) : Promise.resolve(null);
-    const [a, b] = await Promise.allSettled([prep, mic]);
+    const [a, b] = await Promise.allSettled([first, mic]);
     const prepMs = this.now() - t0;
-    if (a.status === 'fulfilled') u.audio = a.value;
     if (b.status === 'fulfilled' && autoMute && b.value !== 'on') u.remute = true;
     const fail = a.status === 'rejected' ? a.reason : b.status === 'rejected' ? b.reason : u.cancelled || m.speech !== u ? new Error('stopped before it played')
       : m.state !== 'admitted' && m.state !== 'recording' ? new Error(`meeting ${m.id} is ${m.state}`) : null;
@@ -695,22 +697,39 @@ export class Meetings {
       if (u.cancelled) return r;
       throw new Error(`nothing was said: ${oneLine(fail)}`);
     }
-    u.seconds = Math.round(u.audio.seconds * 100) / 100;
-    u.player = m.rig.play(u.audio.file);
+    const head = a.value;
+    u.player = m.rig.play(text ? { pcm: head.pcm } : { file: head.file });
+    if (text) u.player.write(head.data);
     u.state = 'speaking';
     u.startedAt = this.now();
+    u.seconds = head.seconds;
     u.player.done.then((ok) => this.endUtterance(m, u, u.cancelled ? 'interrupted' : ok ? 'done' : 'failed', ok || u.cancelled ? null : new Error(u.player.error() || 'playback failed'), { t0, tail: ok }));
+    // The rest, synthesized while the first piece plays (in the voice the first one got).
+    let error = null;
+    if (text) {
+      for (const piece of pieces.slice(1)) {
+        if (u.cancelled || u.state !== 'speaking') break;
+        const w = await synthesizeWav(this.cfg, { text: piece, backend, voice: head.voice ?? voice, lang }).catch((e) => { error = e; return null; });
+        if (!w || u.cancelled || u.state !== 'speaking') break;
+        if (w.pcm.rate !== head.pcm.rate || w.pcm.channels !== head.pcm.channels) { error = new Error(`${backend} changed its audio format mid-text`); break; }
+        u.player.write(w.data);
+        u.seconds += w.seconds;
+      }
+      u.player.end();
+    }
     const started = {
-      meeting_id: m.id, utterance_id: u.id, speaking: true, duration_s: u.seconds, source: u.audio.backend, ...(u.audio.voice ? { voice: u.audio.voice } : {}),
-      prepare_ms: prepMs, start_ms: u.startedAt - t0, unmuted: u.remute,
+      meeting_id: m.id, utterance_id: u.id, speaking: u.state === 'speaking', duration_s: Math.round(u.seconds * 100) / 100, source: text ? backend : 'file',
+      ...(head.voice ? { voice: head.voice } : {}), ...(text ? { pieces: pieces.length } : {}),
+      prepare_ms: prepMs, start_ms: u.startedAt - t0, ...(text ? { synth_ms: this.now() - t0 } : {}), unmuted: u.remute,
+      ...(error ? { error: `cut short, the rest could not be synthesized: ${oneLine(error)}` } : {}),
     };
     if (!wait) return started;
     const end = await u.finished;
     return { ...started, ...end, speaking: false };
   }
 
-  // An utterance is over (played, interrupted, failed): the microphone is muted again if speaking turned it on, the
-  // synthesized file goes, and bosun:meeting-speech says how it ended.
+  // An utterance is over (played, interrupted, failed): the microphone is muted again if speaking turned it on, and
+  // bosun:meeting-speech says how it ended.
   async endUtterance(m, u, state, error, { t0, tail = false } = {}) {
     if (u.state === 'done' || u.state === 'interrupted' || u.state === 'failed') return u.finished;
     if (tail) await sleep(SPEECH_TAIL_MS);
@@ -719,9 +738,8 @@ export class Meetings {
     if (u.remute && !m.speech && (m.state === 'admitted' || m.state === 'recording')) {
       await this.page(m, (p) => m.platform.setMic(p, false)).catch((e) => { m.muteError = oneLine(e); });
     }
-    try { u.audio?.remove(); } catch {}
     const played = u.startedAt ? Math.round((this.now() - u.startedAt) / 10) / 100 : 0;
-    const r = { utterance_id: u.id, state, played_s: Math.min(played, u.seconds ?? played), ...(error ? { error: oneLine(error) } : {}), total_ms: this.now() - t0 };
+    const r = { utterance_id: u.id, state, played_s: Math.min(played, Math.round(u.seconds * 100) / 100 || played), ...(error ? { error: oneLine(error) } : {}), total_ms: this.now() - t0 };
     if (u.startedAt) this.emit(m, 'speech', r);
     u.finish(r);
     return r;

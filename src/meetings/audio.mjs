@@ -147,18 +147,27 @@ export function startCapture(pulse) {
   return { stream: proc.stdout, exited, error: () => err.trim().split('\n').pop() || null, stop: () => endProc(proc, exited, 'SIGTERM', 2000) };
 }
 
-// ffmpeg: an audio file (any format ffmpeg reads) -> bosun_mic, in real time (the null sink takes it at its clock).
-// done resolves when it has played (true) or was stopped / failed (false); stop() cuts it off at once.
-export function startPlayer(pulse, file) {
+// ffmpeg: audio -> bosun_mic, in real time (the null sink takes it at its clock). input: {file} (any format ffmpeg
+// reads), or {pcm: {rate, channels}}: raw s16le written as it comes (write(buf), end()); a pause in the writing is a
+// pause in the audio. done resolves when it has played (true) or was stopped / failed (false); stop() cuts it off.
+export function startPlayer(pulse, input) {
+  const src = input.file ? ['-i', input.file] : ['-f', 's16le', '-ar', String(input.pcm.rate), '-ac', String(input.pcm.channels), '-i', 'pipe:0'];
   const proc = spawn('ffmpeg', [
-    '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', file,
+    '-nostdin', '-hide_banner', '-loglevel', 'error', ...src,
     '-ac', '2', '-ar', '48000', '-f', 'pulse', '-server', pulse.server, '-device', 'bosun_mic', '-buffer_duration', '40', 'bosun-speak',
-  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+  ].filter((a) => !(input.pcm && a === '-nostdin')), { stdio: [input.pcm ? 'pipe' : 'ignore', 'ignore', 'pipe'] });
   let err = '';
   proc.stderr.on('data', (d) => { if (err.length < 4000) err += d; });
+  proc.stdin?.on('error', () => {}); // a player stopped meanwhile
   let ok = false;
   const exited = new Promise((r) => { proc.on('exit', (code) => { ok = code === 0; r(true); }); proc.on('error', (e) => { err += `\n${e.code || e.message}`; r(true); }); });
-  return { done: exited.then(() => ok), error: () => err.trim().split('\n').pop() || null, stop: () => endProc(proc, exited, 'SIGKILL', 1000) };
+  return {
+    done: exited.then(() => ok),
+    write: (buf) => { if (proc.stdin?.writable) proc.stdin.write(buf); },
+    end: () => { proc.stdin?.end(); },
+    error: () => err.trim().split('\n').pop() || null,
+    stop: () => endProc(proc, exited, 'SIGKILL', 1000),
+  };
 }
 
 // The default audio backend for meetings.
@@ -168,7 +177,7 @@ export const pulseAudio = {
   async open() {
     const pulse = await startPulse();
     return {
-      browserEnv: pulse.browserEnv, record: (file) => startRecorder(pulse, file), capture: () => startCapture(pulse), play: (file) => startPlayer(pulse, file),
+      browserEnv: pulse.browserEnv, record: (file) => startRecorder(pulse, file), capture: () => startCapture(pulse), play: (input) => startPlayer(pulse, input),
       close: pulse.close,
     };
   },

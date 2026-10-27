@@ -678,7 +678,7 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
 
 1. **Browser:** a fresh browser of its own, or `profile` (Chromium or patchright only; camoufox is refused).
    - Media permission prompts are accepted (`--use-fake-ui-for-media-stream`), but no fake devices are used: the
-     microphone is a silent audio source and there is no camera.
+     microphone is an audio source that is silent unless Bosun speaks (`meeting_speak`), and there is no camera.
    - The browser asks for an **English UI** (Meet: `hl=en`; Zoom: its language cookie; both: Accept-Language
      `en-US`). The account or region can still win, so Meet's texts and labels are also recognized in German,
      Slovak, Ukrainian and Russian, and Zoom's in German and Ukrainian (some Russian).
@@ -837,7 +837,8 @@ Chat text is kept only in memory, for the last 50 meetings.
 - **`meeting_mute { on }`** and **`meeting_raise_hand { on }`** on Meet (the toolbar's microphone and hand buttons;
   the hand by Ctrl+Alt+H where the button isn't shown) and Zoom (Mute/Unmute; the hand in the Reactions menu). On
   Zoom a profile that never gave Zoom the microphone can't unmute: `meeting_speak` then says so.
-- **Measured** (0.15.0, see CHANGELOG): text to first sound in the call under 2.5 s for one sentence with Supertonic.
+- **Latency:** from the call to the first sound in the call about 0.35 s plus the synthesis of the first sentence
+  (Supertonic: about 1–1.3 s for a short one on a busy CPU). Start with a short sentence for a quick answer.
 - **Engines:** chromium and patchright (meetings refuse camoufox).
 
 **Audio setup (Linux).** Each meeting gets a private PulseAudio server: its own `XDG_RUNTIME_DIR`, socket and
