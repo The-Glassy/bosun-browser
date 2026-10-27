@@ -16,10 +16,16 @@
   - `macro_run` answers with every step's status and time, the `read` steps' text, the downloads and the
     screenshots; on failure with the step, its error, the URL and title, the start of the page's a11y snapshot and
     a screenshot (both masked). `dry_run` shows the steps as they would run.
-  - Safety: a navigate outside `site` is refused, a navigation off it stops the run; secrets and files go in only as
-    `secret_id` / `file_id` params, never stored; steps that may pay, buy, order, check out or delete an account
-    (also a `click` whose element says so) are refused unless saved with `confirm_risky: true`, which `macro_list`
-    shows.
+  - Safety:
+    - Site. A navigate outside `site` is refused. The page is checked again in the session's queue right before
+      each page operation, and right before `click`, `type`, `select` or `upload` acts on its element (which must be
+      in a document on the site). A navigation off the site stops the run.
+    - Secrets and files go in only as `secret_id` / `file_id` params, never stored. A plain value into a password
+      field (also through its label) is refused.
+    - Steps that may pay, buy, order, check out or delete an account are refused unless saved with
+      `confirm_risky: true`, which `macro_list` shows. This covers a `click` or `upload` whose element, or a control
+      around it, says so.
+    - A step that ran out of time does nothing more on the page.
   - Stored in `BROWSER_DATA/macros/<tenant>/<name>.json` (0600, last 20 versions), kept across restarts.
   - Read-only (`ephemeral`) tokens may list, get and run, not save or delete; `BROWSER_MACRO_SOURCE=swarm=me` lets
     the read-only tenant `swarm` use the macros of tenant `me`. Their steps hold to the read-only policy.
@@ -28,7 +34,10 @@
 ### Changed
 
 - The per-call deadline is one function (`withDeadline` in `src/deadline.mjs`) used by the tools and by macro
-  steps; behaviour is unchanged.
+  steps; behaviour is unchanged for tool calls. `click`, `type`, `select` and `upload` act through `onTarget`, which
+  resolves the element to a handle first only inside a macro step.
+- homelab: the read-only tenant now lists 15 tools (`macro_list`, `macro_get`, `macro_run` added); a health check
+  that counts them needs the new number.
 
 ### Tests
 
@@ -36,8 +45,11 @@
   risky words), args and templates, the site check, `BROWSER_MACRO_SOURCE`, the store (versions, 0600, a restart);
   and runs through the MCP tools against a local Plaud-like flow: upload through a file chooser, a param,
   re-navigate, generate, assert, read and a download fetched with `download_get`; a failing assert and its failure
-  payload; a click that leaves the site and a navigate outside it; a risky element behind a selector and risky
-  text from args; a read-only token (list/get/run, no save/delete, no upload step); a secret_id param.
+  payload; a click that leaves the site and a navigate outside it; a step queued behind a navigation off the site;
+  a secret step, a select and an upload whose page redirects off the site while they wait; an upload and a
+  type+submit that outlive their deadline; risky elements (behind a selector, an icon in a button, img alt,
+  aria-labelledby, shadow roots, slots, too large) and risky text from args; late password fields; the run cap;
+  a read-only token (list/get/run, no save/delete, no upload step); a secret_id param; one run per session.
 
 ## 0.13.1 — record when the chat reaches only the host, or nobody
 
