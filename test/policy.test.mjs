@@ -65,7 +65,8 @@ test('an ephemeral token is refused every other tool, whatever its arguments', a
       keepalive_set: { profile: 'p', url: 'https://example.com', logged_in_check: { text: 'x' } }, keepalive_list: {}, keepalive_remove: { profile: 'p' },
       meeting_join: { url: 'https://meet.google.com/abc-defg-hij' }, meeting_status: {}, meeting_chat_read: { meeting_id: 'm' },
       meeting_chat_send: { meeting_id: 'm', text: 'hi' }, meeting_stop_recording: { meeting_id: 'm' }, meeting_leave: { meeting_id: 'm' },
-      meeting_recording_delete: { meeting_id: 'm' },
+      meeting_recording_delete: { meeting_id: 'm' }, meeting_transcript: { meeting_id: 'm' }, meeting_speak: { meeting_id: 'm', text: 'hi' },
+      meeting_stop_speaking: { meeting_id: 'm' }, meeting_mute: { meeting_id: 'm', on: false }, meeting_raise_hand: { meeting_id: 'm', on: true },
     };
     for (const [name, args] of Object.entries(calls)) {
       for (const a of [args, {}, { bogus: 1 }]) {

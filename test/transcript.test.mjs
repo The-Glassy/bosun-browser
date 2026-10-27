@@ -1,0 +1,218 @@
+// The live transcript client (src/meetings/transcript.mjs) against a local ElevenLabs stand-in (fakeelevenlabs.mjs):
+// the URL and key, partials (throttled) and finals with times, zero retention reported as it applied, reconnecting
+// (previous_text, times carried on), errors that stop it, the daily cap; and the speech helpers (speech.mjs): WAV
+// lengths, Supertonic and ElevenLabs text-to-speech requests. One test calls the real ElevenLabs API, only with
+// ELEVENLABS_API_KEY set (a few seconds of audio).
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'fs';
+import path from 'path';
+import { PassThrough } from 'stream';
+import { fileURLToPath } from 'url';
+import { LiveTranscript, TranscriptUsage, realtimeUrl, EL_MODEL } from '../src/meetings/transcript.mjs';
+import { synthesize, wavSeconds } from '../src/meetings/speech.mjs';
+import { startFakeElevenLabs, tonePcm, toneWav } from './fakeelevenlabs.mjs';
+import { tmpDir, until, sleep } from './helpers.mjs';
+
+const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
+let el;
+before(async () => { el = await startFakeElevenLabs({ phrases: ['Hello Misha, this is a test.', 'Second sentence here.'] }); });
+after(async () => { await el?.close(); });
+
+const silence = (sec) => Buffer.alloc(Math.round(sec * 16000) * 2);
+// A source that plays `pcm` in real time (100 ms steps, `speed` times faster), then silence until stopped.
+function source(pcm, { speed = 4 } = {}) {
+  const stream = new PassThrough();
+  let done, at = 0;
+  const exited = new Promise((r) => { done = r; });
+  const t = setInterval(() => {
+    const chunk = Buffer.alloc(3200);
+    if (at < pcm.length) pcm.copy(chunk, 0, at, Math.min(pcm.length, at + 3200));
+    at += 3200;
+    stream.write(chunk);
+  }, 100 / speed);
+  return { stream, exited, error: () => null, stopped: false, async stop() { clearInterval(t); this.stopped = true; stream.end(); done(true); } };
+}
+const usage = (capMin = 60, file = path.join(tmpDir(), 'u.json')) => new TranscriptUsage({ file, tz: 'Europe/Vienna', capMin });
+function live(src, opts = {}) {
+  const ev = { partial: [], final: [], stopped: [] };
+  const t = new LiveTranscript({
+    apiKey: el.key, baseUrl: el.base, source: src, tenant: 'alice', usage: opts.usage || usage(), retryMs: 50, partials: opts.partials ?? true,
+    on: { partial: (s) => ev.partial.push({ ...s, t: Date.now() }), final: (s) => ev.final.push(s), stopped: (s) => ev.stopped.push(s) },
+  });
+  return { t: t.start(), ev };
+}
+
+test('realtimeUrl: Scribe v2 Realtime, PCM 16 kHz, VAD commits, word times, language detection, zero retention asked for', () => {
+  const u = new URL(realtimeUrl('https://api.elevenlabs.io'));
+  assert.equal(u.protocol, 'wss:');
+  assert.equal(u.host, 'api.elevenlabs.io');
+  assert.equal(u.pathname, '/v1/speech-to-text/realtime');
+  assert.deepEqual(Object.fromEntries(u.searchParams), {
+    model_id: EL_MODEL, audio_format: 'pcm_16000', commit_strategy: 'vad', vad_silence_threshold_secs: '1', include_timestamps: 'true',
+    include_language_detection: 'true', enable_logging: 'false',
+  });
+  assert.equal(new URL(realtimeUrl('http://127.0.0.1:5')).protocol, 'ws:');
+  assert.equal(u.searchParams.has('language_code'), false); // detected per segment
+});
+
+test('a stretch of speech: throttled partials with the coming seq, then one final with times and language; zero retention reported as not applied', async () => {
+  const src = source(Buffer.concat([silence(1), tonePcm(3), silence(1.5)]), { speed: 1 });
+  const { t, ev } = live(src);
+  try {
+    await until(() => ev.final.length === 1, 15_000);
+    const c = el.conns.at(-1);
+    assert.equal(c.query.model_id, EL_MODEL);
+    assert.deepEqual([...c.sampleRates], [16000]);
+    assert.ok(ev.partial.length >= 2, `partials ${ev.partial.length}`);
+    for (const p of ev.partial) { assert.equal(p.final, false); assert.equal(p.seq, 1); }
+    for (let i = 1; i < ev.partial.length; i++) {
+      assert.ok(ev.partial[i].t - ev.partial[i - 1].t >= 450, 'at most two partials a second');
+      assert.notEqual(ev.partial[i].text, ev.partial[i - 1].text);
+    }
+    const f = ev.final[0];
+    assert.equal(f.seq, 1);
+    assert.equal(f.final, true);
+    assert.equal(f.text, 'Hello Misha, this is a test.');
+    assert.equal(f.lang, 'en');
+    assert.ok(Math.abs(f.start_s - 1) <= 0.3, `start ${f.start_s}`);
+    assert.ok(f.end_s > 3 && f.end_s <= 4.1, `end ${f.end_s}`);
+    assert.ok(f.lag_s >= 0 && f.lag_s < 3, `lag ${f.lag_s}`);
+    const s = t.status();
+    assert.equal(s.state, 'live');
+    assert.equal(s.zero_retention, false);
+    assert.match(s.warnings[0], /Zero retention mode was requested/);
+    assert.equal(s.segments, 1);
+    assert.deepEqual(t.since(0).map((x) => x.seq), [1]);
+    assert.deepEqual(t.since(1), []);
+  } finally { await t.stop('left'); }
+  assert.equal(src.stopped, true);
+  assert.deepEqual(ev.stopped, [{ reason: 'left' }]);
+  await until(() => el.conns.at(-1).closed, 5000);
+});
+
+test('transcript_partials false: finals only', async () => {
+  const { t, ev } = live(source(Buffer.concat([tonePcm(2), silence(1.5)])), { partials: false });
+  try {
+    await until(() => ev.final.length === 1, 15_000);
+    assert.equal(ev.partial.length, 0);
+  } finally { await t.stop('left'); }
+});
+
+test('a dropped connection is opened again: the audio meanwhile is sent, previous_text carries the last words, times go on', async () => {
+  const src = source(Buffer.concat([tonePcm(1.5), silence(1.5), silence(1), tonePcm(1.5), silence(1.5)]), { speed: 2 });
+  const { t, ev } = live(src);
+  try {
+    await until(() => ev.final.length === 1, 15_000);
+    const n = el.conns.length;
+    el.drop();
+    await until(() => el.conns.length === n + 1 && t.status().state === 'live', 10_000);
+    await until(() => ev.final.length === 2, 15_000);
+    assert.deepEqual(el.conns.at(-1).previousText, [ev.final[0].text.slice(-50)]);
+    assert.ok(ev.final[1].start_s > ev.final[0].end_s, `${ev.final[1].start_s} after ${ev.final[0].end_s}`);
+    assert.ok(ev.final[1].start_s >= 3.5 && ev.final[1].start_s <= 4.6, `second segment at ${ev.final[1].start_s}`);
+    assert.equal(ev.final[1].seq, 2);
+  } finally { await t.stop('left'); }
+});
+
+test('an error a new connection would not fix stops it (auth_error); one it would (resource_exhausted) is retried', async () => {
+  const a = live(source(silence(30)));
+  await until(() => a.t.status().state === 'live', 5000);
+  const n = el.conns.length;
+  el.fail('resource_exhausted', 'busy');
+  await until(() => el.conns.length === n + 1 && a.t.status().state === 'live', 10_000);
+  el.fail('auth_error', 'invalid key');
+  await until(() => a.ev.stopped.length === 1, 5000);
+  assert.deepEqual(a.ev.stopped, [{ reason: 'error', error: 'auth_error: invalid key' }]);
+  assert.equal(a.t.status().state, 'stopped');
+
+  // A wrong key: HTTP 401 at the handshake, stopped at once.
+  const ev = { stopped: [] };
+  const src = source(silence(5));
+  const b = new LiveTranscript({ apiKey: 'wrong-key-0123456789', baseUrl: el.base, source: src, tenant: 'alice', usage: usage(), retryMs: 50, on: { stopped: (s) => ev.stopped.push(s) } }).start();
+  await until(() => ev.stopped.length === 1, 5000);
+  assert.equal(ev.stopped[0].reason, 'error');
+  assert.match(ev.stopped[0].error, /auth_error: HTTP 401/);
+  assert.equal(src.stopped, true);
+  assert.equal(b.status().state, 'stopped');
+});
+
+test('the daily cap: minutes are counted per tenant and day, survive a restart, and stop the stream when used up', async () => {
+  const dir = tmpDir();
+  const file = path.join(dir, 'usage.json');
+  let now = Date.parse('2026-10-27T10:00:00Z');
+  const u = new TranscriptUsage({ file, tz: 'Europe/Vienna', capMin: 1, now: () => now });
+  u.add('alice', 58);
+  u.save();
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  const again = new TranscriptUsage({ file, tz: 'Europe/Vienna', capMin: 1, now: () => now });
+  assert.equal(again.used('alice'), 58);
+  assert.equal(again.left('alice'), 2);
+  assert.equal(again.left('bob'), 60);
+  const { t, ev } = live(source(silence(20), { speed: 4 }), { usage: again });
+  await until(() => ev.stopped.length === 1, 10_000);
+  assert.deepEqual(ev.stopped, [{ reason: 'daily-cap' }]);
+  assert.ok(again.used('alice') >= 60);
+  assert.equal(t.status().today_min, 1);
+  // The next local day starts from zero (Vienna midnight is 23:00 UTC in winter).
+  now = Date.parse('2026-10-27T23:00:01Z');
+  assert.equal(again.used('alice'), 0);
+  // A tenant whose cap is used up gets no connection at all.
+  const before = el.conns.length;
+  const full = new TranscriptUsage({ file: path.join(dir, 'x.json'), tz: 'Europe/Vienna', capMin: 1 });
+  full.add('alice', 60);
+  const r = live(source(silence(1)), { usage: full });
+  await until(() => r.ev.stopped.length === 1, 2000);
+  assert.deepEqual(r.ev.stopped, [{ reason: 'daily-cap' }]);
+  await sleep(200);
+  assert.equal(el.conns.length, before);
+});
+
+test('wavSeconds reads the header; synthesize: Supertonic (wav, voice, lang) and ElevenLabs (voice id, key, flash model, zero retention asked)', async () => {
+  assert.equal(wavSeconds(toneWav(1.5)), 1.5);
+  assert.equal(wavSeconds(Buffer.from('not a wav file at all, not even close to one....')), null);
+  const streamed = toneWav(1); streamed.writeUInt32LE(0xffffffff, 40);
+  assert.equal(wavSeconds(streamed), 1);
+  const fx = fs.readFileSync(path.join(FIXTURES, 'speech-en.wav'));
+  assert.ok(Math.abs(wavSeconds(fx) - 6.8) < 0.05);
+
+  const cfg = { ttsUrl: el.base, elevenlabs: { apiKey: el.key, baseUrl: el.base, voice: null } };
+  const a = await synthesize(cfg, { text: 'Hello there everyone', voice: 'supertonic-M2', lang: 'en' });
+  try {
+    assert.ok(Math.abs(a.seconds - 0.9) < 0.01);
+    assert.equal(fs.statSync(a.dir).mode & 0o777, 0o700);
+    assert.deepEqual({ ...el.st.speech.at(-1), at: 0 }, { input: 'Hello there everyone', voice: 'supertonic-M2', lang: 'en', response_format: 'wav', at: 0 });
+  } finally { a.remove(); }
+  assert.equal(fs.existsSync(a.dir), false);
+  await assert.rejects(synthesize(cfg, { text: 'x', voice: 'alloy' }), /voice must be one of supertonic-F1/);
+  await assert.rejects(synthesize({}, { text: 'x' }), /no TTS service configured/);
+
+  const b = await synthesize(cfg, { text: 'Привіт', backend: 'elevenlabs', lang: 'uk' });
+  b.remove();
+  const req = el.st.tts.at(-1);
+  assert.equal(req.voice, 'EXAVITQu4vr4xnSDxMaL');
+  assert.deepEqual(req.query, { output_format: 'wav_24000', enable_logging: 'false' });
+  assert.deepEqual(req.body, { text: 'Привіт', model_id: 'eleven_flash_v2_5', language_code: 'uk' });
+  await assert.rejects(synthesize({ ...cfg, elevenlabs: { ...cfg.elevenlabs, apiKey: 'wrong-key-0123456789' } }, { text: 'x', backend: 'elevenlabs' }), /ElevenLabs text-to-speech answered HTTP 401/);
+  await assert.rejects(synthesize({ ttsUrl: 'http://127.0.0.1:9' }, { text: 'x' }), /supertonic could not be reached/);
+});
+
+// The real thing: a few seconds of English speech to ElevenLabs. Costs about $0.001.
+test('ElevenLabs for real: the speech fixture comes back as text', { skip: !process.env.ELEVENLABS_API_KEY && 'ELEVENLABS_API_KEY not set' }, async () => {
+  const pcm = fs.readFileSync(path.join(FIXTURES, 'speech-en.wav')).subarray(44);
+  const ev = { partial: [], final: [], stopped: [] };
+  const t = new LiveTranscript({
+    apiKey: process.env.ELEVENLABS_API_KEY, baseUrl: 'https://api.elevenlabs.io', source: source(Buffer.concat([pcm, silence(3)]), { speed: 1 }), tenant: 'test', usage: usage(),
+    on: { partial: (s) => ev.partial.push(s), final: (s) => ev.final.push(s), stopped: (s) => ev.stopped.push(s) },
+  }).start();
+  try {
+    await until(() => ev.final.length >= 1 && /vienna/i.test(ev.final.map((f) => f.text).join(' ')), 25_000);
+    const text = ev.final.map((f) => f.text).join(' ');
+    assert.match(text, /misha/i);
+    assert.match(text, /live transcript/i);
+    assert.equal(ev.final[0].lang, 'en');
+    assert.ok(ev.partial.length >= 1);
+    const s = t.status();
+    console.log(`real ElevenLabs: ${ev.final.length} finals, partials ${ev.partial.length}, final lag ${JSON.stringify(s.final_lag_s)}, zero_retention ${s.zero_retention}`);
+  } finally { await t.stop('left'); }
+});

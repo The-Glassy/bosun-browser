@@ -1,8 +1,13 @@
 // A local stand-in for Google Meet with the labels and markers platforms/meet.mjs relies on: a lobby (mic and camera
 // toggles, guest name, "Ask to join"), the waiting room, admission or denial, an in-call toolbar, participant tiles, a
 // chat panel, the end of the call and removal. The test plays host through the returned object (admit, deny, say,
-// end, ...). With tone: true the admitted page plays a 440 Hz tone (audio pipeline test).
+// end, ...). With tone: true the admitted page plays a 440 Hz tone (audio pipeline test). In the call: a microphone
+// button (as the lobby left it) and "Raise hand"; the page listens to its microphone (getUserMedia -> analyser) and
+// reports to the server when it hears something while unmuted (heard), and plays a fixture file (test/fixtures/<name>.wav)
+// as the meeting's audio when the test says so (play).
 import http from 'http';
+import { PassThrough } from 'stream';
+import { wavSeconds } from '../src/meetings/speech.mjs';
 import fs from 'fs';
 import path from 'path';
 
@@ -75,7 +80,7 @@ ${live ? `<div role="alert"><h2><span aria-hidden="true">error</span>${esc(L.noC
 <div id="refused" hidden><h1>${esc(L.cantJoin)}</h1><button>${esc(L.home)}</button><p>${esc(L.safe)}</p>${frame}</div>
 <div id="pending" hidden></div>
 <div id="call" hidden><div id="topic">${esc(title || '')}</div><div id="tiles"></div><div id="captions" class="caption-text"></div>
-  <div role="toolbar"><button aria-label="${esc(L.chat)}">chat</button><button aria-label="${esc(L.leave)}">leave</button></div>
+  <div role="toolbar"><button id="callMic">mic</button><button id="hand" aria-label="Raise hand (ctrl + alt + h)">hand</button><button aria-label="${esc(L.chat)}">chat</button><button aria-label="${esc(L.leave)}">leave</button></div>
   <aside id="panel" hidden><div role="list" id="msgs"></div><textarea aria-label="${esc(L.send)}"${chatOff ? ' disabled' : ''}></textarea></aside></div>
 <div id="over" hidden><h1 id="overText"></h1></div>
 <script>
@@ -99,6 +104,27 @@ if ($('dlgOk')) $('dlgOk').onclick = () => $('dlg').remove();
 if (${readyMs}) setTimeout(() => { $('ask').disabled = false; $('ready')?.remove(); }, ${readyMs});
 document.querySelector('[aria-label="' + L.chat + '"]').onclick = () => { $('panel').hidden = false; };
 document.querySelector('[aria-label="' + L.leave + '"]').onclick = () => post('leave', {});
+// In the call: the microphone as the lobby left it, a hand to raise (also Ctrl+Alt+H), and an ear on the microphone.
+let callMic = null, hand = false, played = 0, ear = null;
+const micLabel = () => $('callMic').setAttribute('aria-label', (callMic ? L.micOff : L.micOn) + ' (ctrl + d)');
+$('callMic').onclick = () => { callMic = !callMic; micLabel(); post('media', { mic: callMic }); };
+const toggleHand = () => { hand = !hand; $('hand').setAttribute('aria-label', (hand ? 'Lower hand' : 'Raise hand') + ' (ctrl + alt + h)'); post('media', { hand }); };
+$('hand').onclick = toggleHand;
+document.addEventListener('keydown', (e) => { if (e.ctrlKey && e.altKey && e.code === 'KeyH') toggleHand(); });
+async function listen() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  const c = new AudioContext(), an = c.createAnalyser();
+  an.fftSize = 1024;
+  c.createMediaStreamSource(stream).connect(an);
+  const buf = new Float32Array(an.fftSize);
+  let last = 0;
+  setInterval(() => {
+    an.getFloatTimeDomainData(buf);
+    let sum = 0; for (const x of buf) sum += x * x;
+    const rms = Math.sqrt(sum / buf.length);
+    if (callMic && rms > 0.01 && Date.now() - last > 100) { last = Date.now(); post('heard', { rms, at: Date.now() }); }
+  }, 10);
+}
 const box = document.querySelector('textarea');
 box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); const t = box.value.trim(); box.value = ''; if (t) post('chat', { text: t }); } });
 async function poll() {
@@ -133,6 +159,8 @@ async function poll() {
       g.append(d);
       $('msgs').append(g);
     }
+    if (callMic === null) { callMic = mic; micLabel(); listen().catch((e) => post('heard', { error: String(e) })); }
+    if (s.play && s.play.n !== played) { played = s.play.n; const a = new Audio('/fixture/' + s.play.name + '.wav'); a.play().then(() => post('media', { playing: s.play.name, at: Date.now() }), (e) => post('media', { playError: String(e) })); }
     if (s.tone && !toned) { toned = true; const c = new AudioContext(); const o = c.createOscillator(); o.frequency.value = 440; o.connect(c.destination); o.start(); }
   }
   setTimeout(poll, 150);
@@ -144,7 +172,7 @@ poll();
 export async function startFakeMeet({ tone = false } = {}) {
   const rooms = new Map();
   const room = (code) => {
-    if (!rooms.has(code)) rooms.set(code, { phase: 'lobby', guest: null, chat: [], others: ['host-1', 'guest-2'], over: null, tone, log: [], seq: 0, loads: [] });
+    if (!rooms.has(code)) rooms.set(code, { phase: 'lobby', guest: null, chat: [], others: ['host-1', 'guest-2'], over: null, tone, log: [], seq: 0, loads: [], media: [], heard: [] });
     return rooms.get(code);
   };
   const body = (req) => new Promise((r) => { let b = ''; req.on('data', (d) => { b += d; }); req.on('end', () => r(b ? JSON.parse(b) : {})); });
@@ -167,7 +195,11 @@ export async function startFakeMeet({ tone = false } = {}) {
       if (r.phase === 'pending' && Date.now() >= r.refuseAt) r.phase = 'refused';
       const view = r.over ? 'over' : ['waiting', 'denied', 'refused', 'pending'].includes(r.phase) ? r.phase : r.phase === 'admitted' ? 'call' : 'lobby';
       const chat = r.chat.map((m) => (m.fillAt && Date.now() < m.fillAt ? { ...m, text: '' } : m));
-      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone, caption: r.caption || null });
+      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone, caption: r.caption || null, play: r.play || null });
+    }
+    if (/^\/fixture\/[a-z0-9-]+\.wav$/.test(u.pathname)) {
+      const f = path.join(path.dirname(new URL(import.meta.url).pathname), 'fixtures', path.basename(u.pathname));
+      if (fs.existsSync(f)) { res.writeHead(200, { 'content-type': 'audio/wav' }); return res.end(fs.readFileSync(f)); }
     }
     if (req.method === 'POST') {
       const b = await body(req);
@@ -182,6 +214,8 @@ export async function startFakeMeet({ tone = false } = {}) {
       }
       if (u.pathname === '/api/chat') { r.chat.push({ id: `c${++r.seq}`, sender: r.guest?.name, self: true, text: b.text }); r.log.push(['chat', Date.now(), b.text]); }
       if (u.pathname === '/api/leave') { r.left = true; r.over = 'left'; r.log.push(['leave', Date.now()]); }
+      if (u.pathname === '/api/media') { delete b.code; r.media.push({ ...b, at: b.at || Date.now() }); }
+      if (u.pathname === '/api/heard') { delete b.code; r.heard.push(b); if (r.heard.length > 2000) r.heard.shift(); }
       return json({ ok: true });
     }
     // A body: full Chromium replaces an empty error page with its own (chrome-error://), another URL.
@@ -204,6 +238,8 @@ export async function startFakeMeet({ tone = false } = {}) {
     end: (c) => { room(c).over = 'ended'; },
     caption: (c, text) => { room(c).caption = text; },
     remove: (c) => { room(c).over = 'removed'; },
+    // The meeting plays test/fixtures/<name>.wav (someone speaking).
+    play: (c, name) => { const r = room(c); r.play = { name, n: (r.play?.n || 0) + 1 }; },
     // Variants of a room (set before the page loads): lang, toggles, signedIn, bareName; refuse = Google turns the
     // guest away right after "Ask to join".
     set: (c, opts) => { Object.assign(room(c), opts); },
@@ -212,14 +248,19 @@ export async function startFakeMeet({ tone = false } = {}) {
 }
 
 // Fake audio backend for hosts without PulseAudio: no audio server, the browser is muted, and the "recorder" writes a
-// growing Ogg-looking file until stopped.
+// growing Ogg-looking file until stopped. capture() streams PCM (16 kHz mono s16le) in real time: silence, and what
+// say(pcm) queued; play(file) "plays" a file for as long as it lasts (players lists them).
 // openMs: the audio server takes that long to start; stopMs: a graceful stop takes that long (a kill is immediate).
 export function fakeAudio({ openMs = 0, stopMs = 0 } = {}) {
-  const recorders = [];
+  const recorders = [], captures = [], players = [];
   const stats = { opened: 0, closed: 0 };
+  let queued = Buffer.alloc(0);
   return {
     recorders,
+    captures,
+    players,
     stats,
+    say(pcm) { queued = Buffer.concat([queued, pcm]); },
     unsupported: async () => null,
     needsHeadful: false,
     async open() {
@@ -243,6 +284,32 @@ export function fakeAudio({ openMs = 0, stopMs = 0 } = {}) {
           rec.kill = () => end(true);
           recorders.push(rec);
           return rec;
+        },
+        capture() {
+          const stream = new PassThrough();
+          let done;
+          const exited = new Promise((r) => { done = r; });
+          const STEP = 3200; // 100 ms
+          const t = setInterval(() => {
+            const chunk = Buffer.alloc(STEP);
+            const n = Math.min(STEP, queued.length);
+            queued.copy(chunk, 0, 0, n);
+            queued = queued.subarray(n);
+            stream.write(chunk);
+          }, 100);
+          const c = { stream, exited, error: () => null, stopped: false, stop: async () => { clearInterval(t); c.stopped = true; stream.end(); done(true); } };
+          captures.push(c);
+          return c;
+        },
+        play(file) {
+          const bytes = fs.readFileSync(file);
+          const sec = wavSeconds(bytes) ?? 1;
+          let done;
+          const p = { file, bytes, startedAt: Date.now(), stopped: false, done: new Promise((r) => { done = r; }), error: () => null };
+          const t = setTimeout(() => done(true), sec * 1000);
+          p.stop = async () => { clearTimeout(t); p.stopped = true; done(false); };
+          players.push(p);
+          return p;
         },
         close: async () => { if (!closed) { closed = true; stats.closed++; } },
       };

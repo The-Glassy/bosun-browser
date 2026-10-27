@@ -64,6 +64,8 @@ function webClient(id, r) {
   if (r.web2026 || r.hearYou) r = { ...r, noDevices: false, signedInName: false };
   const aj = r.audioJoined;
   const icon = (c) => `<svg class="zm-icon ${c}" aria-hidden="true" width="16" height="16"><path d="M2 2h12v12H2z"/></svg>`;
+  // Raise Hand / Lower Hand inside the Reactions popup (it closes after a click).
+  const handPop = '<div id="reactPop" role="menu" hidden><button id="clap" aria-label="Clap">👏</button><button id="hand" aria-label="Raise Hand">Raise Hand</button></div>';
   const footer = aj ? `<button id="mic" aria-label="audio">${icon('zm-icon-mic')}${icon('zm-icon-warning')}Audio</button>
     <button id="audioMore" aria-label="More audio controls">${icon('zm-icon-chevron')}</button>
     <ul id="audioPop" class="audio-option-menu__pop-menu" role="menu" hidden>
@@ -76,11 +78,12 @@ function webClient(id, r) {
     <button id="cam" aria-label="Video">Video</button><button aria-label="More video controls">${icon('zm-icon-chevron')}</button>
     <button id="parts" aria-label="open the participants list pane,[0] particpants"><span class="footer-button__number-counter" id="count">0</span>Participants</button>
     <button id="chatBtn" aria-label="open the chat panel">Chat</button><button aria-label="Chat Settings">${icon('zm-icon-chevron')}</button>
-    <button aria-label="React">React</button><button aria-label="Share">Share</button><button aria-label="More meeting control">More</button>`
+    <button id="react" aria-label="React">React</button><button aria-label="Share">Share</button><button aria-label="More meeting control">More</button>${handPop}`
     : `<button id="mic" aria-label="join audio">Join Audio</button>
     <button id="cam" aria-label="start my video">Start Video</button>
     <button id="parts" aria-label="open the manage participants list pane,[0] particpants"><span class="footer-button__number-counter" id="count">0</span>Participants</button>
-    <button id="chatBtn" aria-label="open the chat panel">Chat</button>`;
+    <button id="chatBtn" aria-label="open the chat panel">Chat</button>
+    <button id="react" aria-label="Reactions">Reactions</button>${handPop}`;
   const toasts = aj ? `<div id="toasts" style="position:fixed;top:40px;right:10px;width:320px">
     <div class="zm-toast" id="t1"><span>Introducing My Notes: take private notes during the meeting.</span><button>Got it</button></div>
     <div class="zm-toast" id="t2"><span>For a better meeting experience, enable browser hardware acceleration in your settings.</span><button aria-label="close">${icon('zm-icon-close')}</button></div>
@@ -123,6 +126,7 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
     : '<div id="captions" class="live-transcription-subtitle__box"></div>'}
   ${r.decoyMenu ? `<div class="pin-dropdown-menu" role="menu"><div role="menuitem" id="decoy">${r.decoyMenu === 'renames' ? 'Guest Two' : 'Leave computer audio'}</div><div role="menuitem">Host Person</div></div>` : ''}
   ${toasts}
+  <div role="dialog" id="micAsk" hidden><h2>Do you want people to hear you in the meeting?</h2><button id="micUse">Use microphone</button><button id="micNo">Continue without microphone</button></div>
   <div role="dialog" id="audioDlg" hidden><h2>Join Audio</h2><button id="byComputer">Join Audio by Computer</button></div>
   <div role="dialog" id="recDlg" hidden><p>This meeting is being recorded</p><button id="recOk">Got it</button><button>Leave Meeting</button></div>
   <footer>
@@ -139,7 +143,7 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
   </aside>
 </div>
 <script>
-const R = ${JSON.stringify({ decoyMenu: r.decoyMenu || null, menuHide: r.menuHide || null, tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: r.dropSends || false, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null, audioJoined: r.audioJoined || null })};
+const R = ${JSON.stringify({ decoyMenu: r.decoyMenu || null, menuHide: r.menuHide || null, tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: r.dropSends || false, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micInCall: r.micInCall || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null, audioJoined: r.audioJoined || null })};
 const id = ${JSON.stringify(id)}, $ = (x) => document.getElementById(x);
 const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });
@@ -192,11 +196,19 @@ if (R.audioJoined) {
   if ($('capClose')) $('capClose').onclick = () => clicked('captions close');
   for (const t of document.querySelectorAll('.zm-toast button')) t.onclick = () => { t.parentElement.hidden = true; post('media', { toast: t.parentElement.id }); };
 }
-$('mic').onclick = () => { if (!audio) { $('audioDlg').hidden = false; return; } mic = !mic; micLabel(); post('media', { mic, cam }); };
+// micInCall 'ask': Zoom never got the microphone; the first unmute asks for it.
+let micGiven = R.micInCall !== 'ask';
+$('micUse').onclick = () => { micGiven = true; $('micAsk').hidden = true; mic = true; micLabel(); post('media', { mic, cam, asked: 'used' }); };
+$('micNo').onclick = () => { $('micAsk').hidden = true; post('media', { asked: 'declined' }); };
+$('mic').onclick = () => { if (!audio) { $('audioDlg').hidden = false; return; } if (!mic && !micGiven) { $('micAsk').hidden = false; return; } mic = !mic; micLabel(); post('media', { mic, cam }); };
 // Zoom may connect computer audio with the microphone live, whatever the preview said: Bosun has to mute it.
 $('byComputer').onclick = () => { audio = true; mic = true; $('audioDlg').hidden = true; micLabel(); post('media', { audio, mic, cam }); };
 $('cam').onclick = () => { cam = !cam; $('cam').setAttribute('aria-label', cam ? 'stop my video' : 'start my video'); post('media', { mic, cam }); };
 $('recOk').onclick = () => { $('recDlg').hidden = true; };
+let hand = false;
+$('react').addEventListener('click', () => { $('reactPop').hidden = !$('reactPop').hidden; });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('reactPop').hidden = true; });
+$('hand').onclick = () => { hand = !hand; const l = hand ? 'Lower Hand' : 'Raise Hand'; $('hand').textContent = l; $('hand').setAttribute('aria-label', l); $('reactPop').hidden = true; post('media', { hand }); };
 $('chatBtn').onclick = () => { $('panel').hidden = !$('panel').hidden; $('chatBtn').setAttribute('aria-label', $('panel').hidden ? 'open the chat panel' : 'close the chat panel'); };
 $('leave').onclick = () => { $('leaveMenu').hidden = false; };
 $('leaveConfirm').onclick = () => post('leave', {});

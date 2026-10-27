@@ -1,8 +1,10 @@
 // Audio for a meeting session (Linux): a private PulseAudio server per session — its own XDG_RUNTIME_DIR, socket and
 // config, so meetings never hear each other — with two null sinks: bosun_out, where the browser plays the meeting,
-// and bosun_mic, whose (silent) monitor is the browser's microphone. ffmpeg records bosun_out's monitor to Ogg/Opus,
-// 16 kHz mono 24 kbps. Needs the packages pulseaudio, pulseaudio-utils (pactl) and ffmpeg (built with PulseAudio
-// input, as Debian/Ubuntu's is).
+// and bosun_mic, where Bosun plays what it says. The browser's microphone is bosun_mic_src, a plain source remapped from
+// bosun_mic's monitor (silent unless Bosun speaks): Chromium lists no monitor sources as microphones. ffmpeg records bosun_out's
+// monitor to Ogg/Opus, 16 kHz mono 24 kbps; a second ffmpeg can read the same monitor as raw PCM for the live
+// transcript (capture), and another plays a file into bosun_mic (play). Needs the packages pulseaudio,
+// pulseaudio-utils (pactl) and ffmpeg (built with PulseAudio input and output, as Debian/Ubuntu's is).
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -29,8 +31,8 @@ export function audioUnsupported() {
   return support;
 }
 
-// A per-session PulseAudio server. env: what the browser process needs to play into bosun_out and record from the
-// silent bosun_mic.
+// A per-session PulseAudio server. env: what the browser process needs to play into bosun_out and record from
+// bosun_mic_src.
 export async function startPulse({ tmpRoot = os.tmpdir() } = {}) {
   const dir = fs.mkdtempSync(path.join(tmpRoot, 'bosun-pulse-'));
   fs.chmodSync(dir, 0o700);
@@ -43,6 +45,7 @@ export async function startPulse({ tmpRoot = os.tmpdir() } = {}) {
     `--load=module-native-protocol-unix socket=${sock} auth-anonymous=1`,
     '--load=module-null-sink sink_name=bosun_out sink_properties=device.description=bosun_out rate=48000',
     '--load=module-null-sink sink_name=bosun_mic sink_properties=device.description=bosun_mic rate=48000',
+    '--load=module-remap-source master=bosun_mic.monitor source_name=bosun_mic_src source_properties=device.description=bosun_mic',
   ], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   let err = '';
   proc.stderr.on('data', (d) => { if (err.length < 4000) err += d; });
@@ -68,7 +71,7 @@ export async function startPulse({ tmpRoot = os.tmpdir() } = {}) {
       await sleep(100);
     }
     await pactl('set-default-sink', 'bosun_out');
-    await pactl('set-default-source', 'bosun_mic.monitor');
+    await pactl('set-default-source', 'bosun_mic_src');
   } catch (e) {
     await close();
     throw e;
@@ -76,7 +79,7 @@ export async function startPulse({ tmpRoot = os.tmpdir() } = {}) {
   return {
     dir,
     server: `unix:${sock}`,
-    browserEnv: { ...env, PULSE_SINK: 'bosun_out', PULSE_SOURCE: 'bosun_mic.monitor' },
+    browserEnv: { ...env, PULSE_SINK: 'bosun_out', PULSE_SOURCE: 'bosun_mic_src' },
     close,
   };
 }
@@ -120,12 +123,53 @@ export function startRecorder(pulse, file) {
   };
 }
 
+// Bounded end of a child process: sig, then SIGKILL; resolves once it is gone (or after the waits).
+async function endProc(proc, exited, sig, waitMs) {
+  const alive = () => proc.exitCode === null && proc.signalCode === null && proc.pid !== undefined;
+  if (alive()) { try { proc.kill(sig); } catch {} }
+  if (await Promise.race([exited, sleep(waitMs).then(() => false)])) return;
+  try { proc.kill('SIGKILL'); } catch {}
+  await Promise.race([exited, sleep(2000)]);
+}
+
+// ffmpeg: bosun_out's monitor -> raw PCM s16le 16 kHz mono on stdout, in small fragments (the live transcript reads
+// it as it comes). stop() ends it.
+export const PCM_RATE = 16000;
+export function startCapture(pulse) {
+  const proc = spawn('ffmpeg', [
+    '-nostdin', '-hide_banner', '-loglevel', 'error', '-fflags', 'nobuffer',
+    '-f', 'pulse', '-server', pulse.server, '-name', 'bosun-stt', '-fragment_size', '9600', '-i', 'bosun_out.monitor',
+    '-ac', '1', '-ar', String(PCM_RATE), '-f', 's16le', '-flush_packets', '1', 'pipe:1',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let err = '';
+  proc.stderr.on('data', (d) => { if (err.length < 4000) err += d; });
+  const exited = new Promise((r) => { proc.on('exit', () => r(true)); proc.on('error', (e) => { err += `\n${e.code || e.message}`; r(true); }); });
+  return { stream: proc.stdout, exited, error: () => err.trim().split('\n').pop() || null, stop: () => endProc(proc, exited, 'SIGTERM', 2000) };
+}
+
+// ffmpeg: an audio file (any format ffmpeg reads) -> bosun_mic, in real time (the null sink takes it at its clock).
+// done resolves when it has played (true) or was stopped / failed (false); stop() cuts it off at once.
+export function startPlayer(pulse, file) {
+  const proc = spawn('ffmpeg', [
+    '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', file,
+    '-ac', '2', '-ar', '48000', '-f', 'pulse', '-server', pulse.server, '-device', 'bosun_mic', '-buffer_duration', '40', 'bosun-speak',
+  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+  let err = '';
+  proc.stderr.on('data', (d) => { if (err.length < 4000) err += d; });
+  let ok = false;
+  const exited = new Promise((r) => { proc.on('exit', (code) => { ok = code === 0; r(true); }); proc.on('error', (e) => { err += `\n${e.code || e.message}`; r(true); }); });
+  return { done: exited.then(() => ok), error: () => err.trim().split('\n').pop() || null, stop: () => endProc(proc, exited, 'SIGKILL', 1000) };
+}
+
 // The default audio backend for meetings.
 export const pulseAudio = {
   unsupported: audioUnsupported,
   needsHeadful: true, // headless Chromium plays no audio
   async open() {
     const pulse = await startPulse();
-    return { browserEnv: pulse.browserEnv, record: (file) => startRecorder(pulse, file), close: pulse.close };
+    return {
+      browserEnv: pulse.browserEnv, record: (file) => startRecorder(pulse, file), capture: () => startCapture(pulse), play: (file) => startPlayer(pulse, file),
+      close: pulse.close,
+    };
   },
 };

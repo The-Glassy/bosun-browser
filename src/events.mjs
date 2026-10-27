@@ -15,7 +15,10 @@ export const NEEDS_HUMAN = 'bosun:needs-human';
 export const WATCH_SET = 'bosun.watch';
 export const WATCH_CHANGED = 'bosun:watch-changed';
 export const MEETING_SET = 'bosun.meeting';
-export const MEETING_TAGS = { chat: 'bosun:meeting-chat', optout: 'bosun:meeting-optout', ended: 'bosun:meeting-ended', announce: 'bosun:meeting-announce' };
+export const MEETING_TAGS = {
+  chat: 'bosun:meeting-chat', optout: 'bosun:meeting-optout', ended: 'bosun:meeting-ended', announce: 'bosun:meeting-announce',
+  transcript: 'bosun:meeting-transcript', 'transcript-stopped': 'bosun:meeting-transcript-stopped', speech: 'bosun:meeting-speech',
+};
 export const DOWNLOAD_SET = 'bosun.download';
 export const DOWNLOAD = 'bosun:download';
 export const MANIFEST = {
@@ -39,7 +42,7 @@ export const MANIFEST = {
       },
     },
     [MEETING_SET]: {
-      description: 'Push events from a meeting Bosun attends as a notetaker (meeting_join): every chat message, a participant opting out of the recording (recording stopped and deleted), an announcement that reached fewer people than asked (the host only, or nobody), and the end of the meeting with a reference to the audio recording.',
+      description: 'Push events from a meeting Bosun attends as a notetaker (meeting_join): every chat message, a participant opting out of the recording (recording stopped and deleted), an announcement that reached fewer people than asked (the host only, or nobody), the end of the meeting with a reference to the audio recording; with live_transcript the transcript as it is spoken (partials and finals, only to connections there at the time) and its end; the end of what Bosun said with meeting_speak.',
       uses: ['pushEvents'],
       tagOntology: {
         tags: {
@@ -47,6 +50,9 @@ export const MANIFEST = {
           [MEETING_TAGS.optout]: { desc: 'someone asked not to be recorded; the recording was stopped and deleted' },
           [MEETING_TAGS.ended]: { desc: 'Bosun left the meeting; origin carries duration and the recording (if any)' },
           [MEETING_TAGS.announce]: { desc: 'the recording announcement reached only the host, or could not be posted (origin: mode, sent_to host|failed, reason, error); Bosun records anyway' },
+          [MEETING_TAGS.transcript]: { desc: 'live transcript text (origin: meeting_id, seq, start_s, end_s, text, final, lang, speaker if known); partials (final false) carry the seq their final will have' },
+          [MEETING_TAGS['transcript-stopped']]: { desc: 'the live transcript stopped while the meeting goes on (origin: reason daily-cap|error|opted-out|stopped|audio-ended, error)' },
+          [MEETING_TAGS.speech]: { desc: 'an utterance of meeting_speak ended (origin: utterance_id, state done|interrupted|failed, played_s)' },
         },
         keyed: { 'bosun:meeting': { open: true }, 'bosun:platform': { values: ['meet', 'zoom'] } },
       },
@@ -90,9 +96,13 @@ export function watchEvent({ profile, label, old, new: now, url }) {
   };
 }
 
-// Meeting events -> push/event params. kind: chat | optout | announce | ended; data goes into origin.
+// Meeting events -> push/event params. kind: chat | optout | announce | ended | transcript | transcript-stopped |
+// speech; data goes into origin.
 export function meetingEvent(kind, { meeting_id, platform, ...data }) {
   const text = kind === 'chat' ? `Meeting ${meeting_id} chat — ${data.sender || 'someone'}: ${data.text}`
+    : kind === 'transcript' ? `Meeting ${meeting_id} ${data.final ? 'said' : 'is saying'} (#${data.seq}, ${data.start_s}-${data.end_s} s${data.speaker ? `, ${data.speaker}` : ''}): ${data.text}`
+    : kind === 'transcript-stopped' ? `Meeting ${meeting_id}: the live transcript stopped (${data.reason}${data.error ? `: ${data.error}` : ''}); the meeting goes on.`
+    : kind === 'speech' ? `Meeting ${meeting_id}: utterance ${data.utterance_id} ${data.state} after ${data.played_s} s${data.error ? ` (${data.error})` : ''}.`
     : kind === 'optout' ? `Meeting ${meeting_id}: ${data.sender || 'someone'} asked not to be recorded ("${data.text}"). The recording was stopped and deleted${data.left ? ' and Bosun left the meeting' : ''}.`
     : kind === 'announce' ? `Meeting ${meeting_id}: the recording announcement ${data.sent_to === 'host' ? 'went to the host only' : 'could not be posted in the chat'} (${data.reason}: ${data.error}). Bosun records anyway; a request not to be recorded in the chat still stops it.`
     : `Meeting ${meeting_id} ended for Bosun (${data.reason}) after ${data.duration_s} s.${data.recording ? ` Recording: ${data.recording.bytes} bytes, ${data.recording.path}.` : ' No recording.'}`;
@@ -187,6 +197,13 @@ export class EventBus extends EventEmitter {
   meeting(kind, { tenant, ...e }) {
     this.emit(`meeting-${kind}`, { tenant, ...e });
     return this.publish(tenant, meetingEvent(kind, e));
+  }
+
+  // Live meeting events (transcript text): offered to the tenant's connections now, never kept for later.
+  meetingLive(kind, { tenant, ...e }) {
+    this.emit(`meeting-${kind}`, { tenant, ...e });
+    const params = meetingEvent(kind, e);
+    return Promise.all([...(this.sinks.get(tenant) || [])].map((s) => s(params).catch(() => false))).then((r) => r.some(Boolean));
   }
 
   // From the downloads: info = Downloads.info(f) plus session.

@@ -131,6 +131,12 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `TZ` | `Europe/Vienna` | IANA time zone for keepalive `quiet_hours` |
 | `RECORDING_RETENTION_DAYS` | 30 | meeting recordings are deleted this many days after they were written |
 | `MEETING_OWNER` | – | name in the meeting announcement ("Hi, I'm Glassy, `<owner>`'s AI notetaker"); unset: "an AI notetaker" |
+| `ELEVENLABS_API_KEY` | – | ElevenLabs key: the live meeting transcript (`meeting_join` `live_transcript`) and the `elevenlabs` voice of `meeting_speak`; unset: both refused. Kept in the service only (removed from its environment at start) |
+| `ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io` | another ElevenLabs API host (`https://*.elevenlabs.io`, e.g. `https://api.eu.residency.elevenlabs.io`); nothing else gets the key (http on loopback is accepted, for tests) |
+| `ELEVENLABS_VOICE` | `EXAVITQu4vr4xnSDxMaL` ("Sarah") | default ElevenLabs voice id for `meeting_speak` with `backend: "elevenlabs"` |
+| `LIVE_TRANSCRIPT_DAILY_MIN` | 180 | minutes of live transcript per tenant and local day (`TZ`); at the cap the stream stops (`bosun:meeting-transcript-stopped`, `daily-cap`) |
+| `TTS_URL` | – | the local text-to-speech service for `meeting_speak` (OpenAI-style `POST /v1/audio/speech`, WAV out; Supertonic), e.g. `http://10.78.0.11:5000`; unset: only uploaded audio or `backend: "elevenlabs"` |
+| `TTS_VOICE` | – (the service's own) | default Supertonic voice: `supertonic-F1`..`F5`, `supertonic-M1`..`M5` |
 | `MAX_DOM_NODES` | 60000 | `read` (a11y, whole page) refuses larger pages; pass `selector` |
 | `SAVE_SHOTS` / `SHOTS_PER_SESSION` | – / 20 | `1` = also keep screenshots on disk (0600, deleted when the session closes) |
 
@@ -642,8 +648,10 @@ Bosun can attend a **Google Meet** or a **Zoom** meeting as a notetaker, record 
 - **Zoom:** in Zoom's web client, with a Bosun profile **signed in to a Zoom account**. Zoom turns most anonymous
   browser guests away, so a guest join usually ends with `sign-in-required` or `captcha`.
 
-Nothing is transcribed live. The agent gets the recording when the meeting ends and transcribes it afterwards with
-whatever it likes. Teams is not supported yet. Each platform lives in one file under `src/meetings/platforms/`
+The agent gets the recording when the meeting ends. With `live_transcript: true` it also gets the text **while people
+speak** (ElevenLabs Scribe realtime), and it can **speak into the call** itself, mute and unmute, and raise a hand
+(see [Live transcript and speaking](#live-transcript-and-speaking)). When to speak is always the agent's call: Bosun
+only provides the mechanism. Teams is not supported yet. Each platform lives in one file under `src/meetings/platforms/`
 (`meet.mjs`, `zoom.mjs`) behind a small interface, and the meeting flow around it is shared.
 
 ```jsonc
@@ -659,6 +667,11 @@ meeting_status({ "meeting_id": "m1a2b3c4d5e6" })   // joining | waiting | admitt
 meeting_chat_read({ "meeting_id": "…", "since": 0 })      meeting_chat_send({ "meeting_id": "…", "text": "…" })
 meeting_stop_recording({ "meeting_id": "…", "delete": true })   meeting_leave({ "meeting_id": "…" })
 meeting_recording_delete({ "meeting_id": "…" })
+meeting_join({ "url": "…", "live_transcript": true })            // transcript_partials (true)
+meeting_transcript({ "meeting_id": "…", "since": 0 })             // finals so far
+meeting_speak({ "meeting_id": "…", "text": "…", "lang": "en" })    // voice, backend ("supertonic" | "elevenlabs"), audio_file_id,
+                                                                   // auto_mute (true), interrupt, wait
+meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "…", "on": true })   meeting_raise_hand({ "meeting_id": "…", "on": true })
 ```
 
 **How a meeting runs:**
@@ -759,7 +772,8 @@ admits almost no anonymous browser guests at all.
 
 The meeting runs in a session of its own, so it outlives the agent's connection. It counts against `MAX_SESSIONS`.
 Events use the MCPL feature set **`bosun.meeting`** (tags `bosun:meeting-chat`, `bosun:meeting-optout`,
-`bosun:meeting-announce`, `bosun:meeting-ended`); host recipes that list `enabledFeatureSets` need to add it (or `bosun.*`).
+`bosun:meeting-announce`, `bosun:meeting-ended`, and with 0.15 `bosun:meeting-transcript`,
+`bosun:meeting-transcript-stopped`, `bosun:meeting-speech`); host recipes that list `enabledFeatureSets` need to add it (or `bosun.*`).
 
 **Consent.** Recording starts only after the announcement was tried (or, with `announce: "none"`, without one). No slash commands are needed: a plain-language request
 not to be recorded is enough, in English, German, Ukrainian, Russian or Slovak (`please don't record`, `stop
@@ -778,10 +792,59 @@ recording`, `bitte nicht aufnehmen`, `не записуй`, `не записыв
 11 MB per hour). They are deleted after `RECORDING_RETENTION_DAYS` (default 30), or with `meeting_recording_delete`.
 Chat text is kept only in memory, for the last 50 meetings.
 
+### Live transcript and speaking
+
+**Live transcript** (`meeting_join { live_transcript: true }`, off by default; needs `ELEVENLABS_API_KEY`):
+- **What it is:** the meeting audio Bosun records is also read by a second ffmpeg as raw PCM (16 kHz mono) and
+  streamed to **ElevenLabs Scribe v2 Realtime**: `wss://api.elevenlabs.io/v1/speech-to-text/realtime`, model
+  `scribe_v2_realtime`, `audio_format=pcm_16000`, `commit_strategy=vad` (a 1 s pause ends a segment), word timestamps
+  and language detection on, no language set (Scribe detects it per segment; a uk/ru/en/de/sk mix is fine).
+- **Events:** `bosun:meeting-transcript` with `meeting_id`, `seq`, `start_s`, `end_s` (seconds since the transcript
+  started), `text`, `final`, `lang`, and `speaker` when ElevenLabs gives one (realtime gives none today: one mixed
+  track). While someone speaks, partials (`final: false`, at most two a second, each carrying the `seq` its final
+  will have); then the final, always. `transcript_partials: false` sends finals only. These events go to the
+  connections there at the time and are **never queued** (they would crowd out chat and opt-out events);
+  `meeting_transcript { since }` returns every final so far.
+- **Consent:** it starts and stops **with the recording**: only after the announcement, which then says *"This call
+  is recorded and transcribed live for notes …"* (German too). An opt-out in the chat stops both **at once**, deletes
+  the recording and forgets the transcript's text, and posts *"Recording and live transcript stopped and deleted."*
+  `meeting_stop_recording` stops it too (`delete: true` forgets its text), and so does `meeting_recording_delete`.
+- **Retention at ElevenLabs:** Bosun always asks for zero retention (`enable_logging=false`). ElevenLabs applies it
+  only on enterprise and trial plans; otherwise it answers with a warning and logs the session. `meeting_status`
+  shows `live_transcript.zero_retention` (`false` on a Pro plan) and the warning.
+- **Cost and cap:** $0.39 per hour of audio (about $0.0065 a minute). `LIVE_TRANSCRIPT_DAILY_MIN` (180) per tenant and
+  day: a join is refused once it is used up, and a running stream stops with `bosun:meeting-transcript-stopped`
+  (`reason: daily-cap`) while the meeting and the recording go on. The count survives restarts
+  (`BROWSER_DATA/live-transcript-usage.json`).
+- **Drops:** a dropped connection is opened again (with growing pauses, 8 tries in a row at most); up to 20 s of
+  audio meanwhile is kept and sent once it's back, with the last words as context. A wrong key, a used-up quota or
+  unaccepted terms stop it (`reason: error`).
+- `meeting_status` → `live_transcript { state, zero_retention, segments, streamed_min, today_min, daily_cap_min,
+  final_lag_s }`.
+
+**Speaking** (`meeting_speak`, once admitted and after the announcement):
+- **What is played:** `text`, synthesized by `backend` **`supertonic`** (default: the local TTS service at `TTS_URL`,
+  voices `supertonic-F1`..`F5` / `M1`..`M5`, pass `lang`) or **`elevenlabs`** (`voice` = an ElevenLabs voice id, model
+  `eleven_flash_v2_5`, zero retention asked for); or an uploaded file (`audio_file_id` from `upload_create`, any
+  format ffmpeg reads).
+- **How:** ffmpeg plays it into the meeting's `bosun_mic` sink, whose monitor is the browser's microphone. The join
+  still starts muted; `meeting_speak` unmutes for the utterance and mutes again 0.4 s after it ends (`auto_mute`,
+  default true; a microphone that was already on stays on). It returns once the audio plays, with `duration_s`,
+  `prepare_ms` (synthesis, with the unmute alongside) and `start_ms`; `wait: true` returns once it has played.
+  `bosun:meeting-speech` says when an utterance ended (`done`, `interrupted`, `failed`).
+- **Barge-in:** `meeting_stop_speaking` stops it at once (and mutes again). A second `meeting_speak` while one plays
+  is refused unless `interrupt: true`, which replaces it.
+- **`meeting_mute { on }`** and **`meeting_raise_hand { on }`** on Meet (the toolbar's microphone and hand buttons;
+  the hand by Ctrl+Alt+H where the button isn't shown) and Zoom (Mute/Unmute; the hand in the Reactions menu). On
+  Zoom a profile that never gave Zoom the microphone can't unmute: `meeting_speak` then says so.
+- **Measured** (0.15.0, see CHANGELOG): text to first sound in the call under 2.5 s for one sentence with Supertonic.
+- **Engines:** chromium and patchright (meetings refuse camoufox).
+
 **Audio setup (Linux).** Each meeting gets a private PulseAudio server: its own `XDG_RUNTIME_DIR`, socket and
 config, with two null sinks:
-- **`bosun_out`:** the browser plays the meeting into it, and ffmpeg records its monitor.
-- **`bosun_mic`:** its silent monitor is the browser's microphone.
+- **`bosun_out`:** the browser plays the meeting into it; ffmpeg records its monitor, and a second one reads it for
+  the live transcript.
+- **`bosun_mic`:** its monitor is the browser's microphone, silent unless Bosun speaks.
 
 Meetings never hear each other or the host's sound card. The image needs:
 
@@ -816,7 +879,9 @@ Meetings need a **headful** browser (headless Chromium plays no audio), so run t
 - **An objection in the last second before Zoom leaves the page can be missed.** Bosun reads the chat once more
   when a meeting ends, but if Zoom has already navigated to its end page, messages it hadn't read yet are gone.
   The recording is then kept; the agent can still delete it with `meeting_recording_delete`.
-- **One mixed audio track.** There is no speaker separation and no live transcript.
+- **One mixed audio track.** There is no speaker separation, also not in the live transcript.
+- **Bosun doesn't hear itself.** The meeting doesn't play Bosun's own voice back, so the live transcript has only
+  the others; what Bosun said is what the agent passed to `meeting_speak`.
 - **Consent is the operator's responsibility.** The announcement and the opt-out are a courtesy, not a legal basis.
   Check what applies where the participants are; some places require everyone's explicit consent before recording.
 
@@ -1008,7 +1073,7 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
 
 ## Roadmap
 
-M1 meetings beyond the PoC (Teams, speaker separation), tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
+M1 meetings beyond the PoC (Teams, speaker separation, streaming TTS for lower speak latency), tenant quotas/audit log, mobile viewport for handoff, more push events (handoff done/timeout) · M2 vault (`fill_credential`), downloads as content
 references, watching pages outside keepalive visits · M3 recording macros from an agent's own calls (`macro_record_start/stop`).
 
 ## License

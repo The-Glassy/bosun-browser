@@ -1,6 +1,8 @@
 // Meetings (PoC): Bosun joins a video meeting as a notetaker (a guest, or with a signed-in profile), says so in the chat, records the
-// meeting's audio to a file and leaves again. Transcription is not done here; it happens after the meeting, from the
-// recording. Consent: the chat is told before recording starts (announce: everyone, else the host where the host allows
+// meeting's audio to a file and leaves again. With live_transcript the audio is also transcribed as it is spoken
+// (transcript.mjs, ElevenLabs realtime), under the same consent as the recording: it starts and stops with it. The agent
+// can speak into the call (speech.mjs: text to speech, or an uploaded file, played into the browser's microphone),
+// unmute and mute, and raise a hand; when to do any of that is the agent's call, never Bosun's. Consent: the chat is told before recording starts (announce: everyone, else the host where the host allows
 // chat with the host only; or, when the caller says so, the host only or nobody), every chat message reaches the agent
 // as an event, and a clear request not to be recorded (any of five languages, see optout.mjs) stops the recording and
 // deletes the file at once, whatever the announcement mode.
@@ -20,6 +22,8 @@ import { cleanChatText, cleanSender } from './platforms/common.mjs';
 import { meet } from './platforms/meet.mjs';
 import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
+import { LiveTranscript, TranscriptUsage } from './transcript.mjs';
+import { synthesize, probeSeconds } from './speech.mjs';
 
 export const ID_RE = /^m[0-9a-f]{12}$/;
 export const ANNOUNCE_MODES = ['chat', 'host', 'none'];
@@ -34,6 +38,7 @@ const MAX_CHAT = 500; // kept per meeting
 const MEDIA_ARGS = ['--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'];
 const SELF_SENDERS = /^(?:you|du|sie|ich|me|myself)$/i; // how a chat UI labels our own messages
 const MAX_STARTING = 50; // meetings still setting up, across tenants
+const SPEECH_TAIL_MS = 400; // the microphone stays on this long after the audio ends (what is still on its way)
 
 // state: joining -> waiting -> admitted -> recording -> ended (recording -> admitted when it is stopped early).
 const NEXT = {
@@ -49,15 +54,23 @@ export function transition(m, to) {
 }
 
 const botName = (name) => String(name).replace(/\s*\(.*\)\s*$/, '').trim() || 'Bosun';
-// The default announcement, English then German. owner: whose notetaker it is (MEETING_OWNER), or nobody named.
-export function announcement(name, owner) {
+// The default announcement, English then German. owner: whose notetaker it is (MEETING_OWNER), or nobody named. live: the
+// audio is also transcribed live.
+export function announcement(name, owner, { live = false } = {}) {
   const n = botName(name);
+  if (live) {
+    return [
+      `Hi, I'm ${n}, ${owner ? `${owner}'s` : 'an'} AI notetaker. This call is recorded and transcribed live for notes. If you'd rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop both and delete the recording.`,
+      `Hallo, ich bin ${n}, ${owner ? `KI-Notizassistent von ${owner}` : 'ein KI-Notizassistent'}. Dieser Anruf wird für Notizen aufgezeichnet und live transkribiert. Wenn ihr nicht aufgenommen werden wollt, schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“), dann stoppe ich beides und lösche die Aufnahme.`,
+    ];
+  }
   return [
     `Hi, I'm ${n}, ${owner ? `${owner}'s` : 'an'} AI notetaker. I'm recording audio for notes. If you'd rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the recording.`,
     `Hallo, ich bin ${n}, ${owner ? `KI-Notizassistent von ${owner}` : 'ein KI-Notizassistent'}. Ich nehme den Ton für Notizen auf. Wenn ihr nicht aufgenommen werden wollt, schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“), dann stoppe und lösche ich die Aufnahme.`,
   ];
 }
 export const CONFIRM_DELETED = 'Recording stopped and deleted. / Aufnahme gestoppt und gelöscht.';
+export const CONFIRM_DELETED_LIVE = 'Recording and live transcript stopped and deleted. / Aufnahme und Live-Transkript gestoppt und gelöscht.';
 // Google turned the guest away before anyone could admit it ("You can't join this video call").
 export const REFUSED_BY_GOOGLE = "Google refused to let this guest join (\"You can't join this video call\") before anyone could admit it. " +
   'Google often does this for automated guests, especially from datacenter IPs. Join with a Bosun profile that is signed in to a ' +
@@ -114,6 +127,8 @@ export class Meetings {
     this.dryRuns = new Set(); // dry runs in progress: {tenant, session} (capacity)
     this.ended = new Map(); // id -> meeting (bounded), for status and chat after the end
     this.stopped = false;
+    // Live transcript minutes per tenant and day (LIVE_TRANSCRIPT_DAILY_MIN).
+    this.usage = new TranscriptUsage({ file: path.join(cfg.dataDir, 'live-transcript-usage.json'), tz: cfg.tz, capMin: cfg.liveTranscriptDailyMin ?? 180, now });
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     this.sweep();
     this.sweeper = setInterval(() => this.sweep(), 3_600_000);
@@ -218,8 +233,13 @@ export class Meetings {
 
   // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
   // meeting could not be joined (denied, not a meeting page, no audio, ...).
-  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, announce = 'chat', maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec = null }) {
+  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, announce = 'chat', maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec = null,
+    liveTranscript = false, transcriptPartials = true }) {
     if (!ANNOUNCE_MODES.includes(announce)) throw new Error(`announce must be one of ${ANNOUNCE_MODES.join(', ')}`);
+    if (liveTranscript) {
+      if (!this.cfg.elevenlabs) throw new Error('live_transcript needs ElevenLabs (ELEVENLABS_API_KEY is not set on this Bosun); join without it');
+      if (this.usage.left(tenant) <= 0) throw new Error(`the daily live transcript limit (${this.usage.capSec / 60} min) is used up for today; join without live_transcript`);
+    }
     const checked = await this.check(tenant, { url, profile, engine });
     const { platform, eng } = checked;
     url = checked.url;
@@ -228,7 +248,8 @@ export class Meetings {
     const m = {
       id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, leaveOnOptOut,
       aloneLeaveMs: aloneLeaveSec !== null ? aloneLeaveSec * 1000 : this.aloneLeaveMs, othersSeen: false,
-      announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner),
+      announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner, { live: liveTranscript }),
+      live: liveTranscript, partials: transcriptPartials, transcript: null, speech: null, speechSeq: 0,
       announceMode: announce, announced: { sent_to: null, failures: [] }, chatTo: announce === 'host' ? 'host' : 'everyone', chatError: null,
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
       createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, stopping: null, recMs: 0, file: null, deleted: false,
@@ -305,7 +326,7 @@ export class Meetings {
     if (m.state === 'ended' || signal.aborted) return;
     await this.pollChat(m); // an objection that arrived meanwhile counts before anything is recorded
     if (m.state === 'ended' || signal.aborted) return;
-    if (!m.optedOut && !m.noRecord) this.startRecording(m);
+    if (!m.optedOut && !m.noRecord) { this.startRecording(m); this.startTranscript(m); }
     while (!signal.aborted && m.state !== 'ended') {
       await sleep(this.pollMs, signal);
       if (signal.aborted || m.state === 'ended') return;
@@ -325,6 +346,37 @@ export class Meetings {
       m.rec = null;
       transition(m, 'admitted');
     });
+  }
+
+  // The live transcript, once the recording may start (same consent), for a meeting that asked for it.
+  startTranscript(m) {
+    if (!m.live || m.transcript || m.noRecord || m.optedOut || m.state === 'ended') return;
+    if (!m.rig.capture) { m.transcriptError = 'this audio backend cannot capture the meeting audio'; return; }
+    m.transcript = new LiveTranscript({
+      apiKey: this.cfg.elevenlabs.apiKey, baseUrl: this.cfg.elevenlabs.baseUrl, source: m.rig.capture(), tenant: m.tenant, usage: this.usage,
+      partials: m.partials, now: this.now,
+      on: {
+        partial: (seg) => this.emitLive(m, 'transcript', seg),
+        final: (seg) => this.emitLive(m, 'transcript', seg),
+        // Not when the meeting ends (bosun:meeting-ended says that) or Bosun shuts down.
+        stopped: ({ reason, error }) => { if (reason !== 'ended') this.emit(m, 'transcript-stopped', { reason, ...(error ? { error } : {}), minutes: m.transcript?.status().streamed_min ?? 0 }); },
+      },
+    }).start();
+  }
+
+  // Stops the live transcript (the recording's opt-out, stop and deletion stop it too); clear: forget its text.
+  async stopTranscript(m, reason, { clear = false } = {}) {
+    const t = m.transcript;
+    if (!t) return false;
+    if (clear) t.clear();
+    const was = t.state !== 'stopped';
+    await t.stop(reason);
+    return was;
+  }
+
+  // Transcript segments go to the connections there are now, never into the queue for later (meeting_transcript has them).
+  emitLive(m, kind, data) {
+    Promise.resolve().then(() => this.bus?.meetingLive?.(kind, { tenant: m.tenant, meeting_id: m.id, platform: m.platform.name, ...data })).catch(() => {});
   }
 
   async tick(m) {
@@ -468,9 +520,10 @@ export class Meetings {
   // Someone asked not to be recorded: stop, delete, confirm in the chat, tell the agent, leave (or stay, unrecorded).
   async optOut(m, msg) {
     m.optedOut = { sender: msg.sender, text: msg.text, at: msg.at };
-    await this.stopRecording(m, { del: true });
     m.noRecord = true;
-    await this.page(m, (p) => this.say(m, p, CONFIRM_DELETED)).catch(() => {});
+    // Both at once: the recording (stopped, deleted) and the live transcript (stopped, its text forgotten).
+    const [, live] = await Promise.all([this.stopRecording(m, { del: true }), this.stopTranscript(m, 'opted-out', { clear: true })]);
+    await this.page(m, (p) => this.say(m, p, live || m.live ? CONFIRM_DELETED_LIVE : CONFIRM_DELETED)).catch(() => {});
     this.emit(m, 'optout', { sender: msg.sender, text: msg.text, left: m.leaveOnOptOut });
     if (m.leaveOnOptOut) await this.finish(m, 'opted-out');
   }
@@ -509,8 +562,14 @@ export class Meetings {
       m.joined.resolve();
       m.announceDone.resolve();
       const rec = m.rec;
-      if (rec) { m.rec = null; m.recMs += this.now() - rec.startedAt; m.stopping = rec; await rec.stop().catch(() => {}); }
-      else if (m.stopping) await m.stopping.stop().catch(() => {});
+      await Promise.all([
+        (async () => {
+          if (rec) { m.rec = null; m.recMs += this.now() - rec.startedAt; m.stopping = rec; await rec.stop().catch(() => {}); }
+          else if (m.stopping) await m.stopping.stop().catch(() => {});
+        })(),
+        this.stopTranscript(m, 'ended').catch(() => {}),
+        this.endSpeech(m).catch(() => {}),
+      ]);
       if (m.session && !m.session.disposed) {
         if (wasIn && reason !== 'meeting-ended' && reason !== 'removed') {
           await Promise.race([this.page(m, (p) => m.platform.leave(p)).catch(() => {}), sleep(5000)]);
@@ -546,6 +605,8 @@ export class Meetings {
       ...(m.optedOut ? { opted_out: { sender: m.optedOut.sender, at: m.optedOut.at } } : {}),
       announce: { mode: m.announceMode, sent_to: m.announced.sent_to, ...(m.announced.failures.length ? { reason: m.announced.failures[0].reason, failures: m.announced.failures } : {}) },
       ...(m.chatError ? { chat_error: m.chatError } : {}),
+      ...(m.live ? { live_transcript: m.transcript ? m.transcript.status() : { state: m.transcriptError ? 'unavailable' : m.state === 'ended' || m.noRecord ? 'off' : 'not-started', ...(m.transcriptError ? { error: m.transcriptError } : {}) } } : {}),
+      ...(m.speech ? { speaking: { utterance_id: m.speech.id, state: m.speech.state, ...(m.speech.seconds ? { duration_s: m.speech.seconds } : {}) } } : {}),
       chat_messages: m.chatSeq, joined_at: iso(m.createdAt), admitted_at: iso(m.admittedAt), ended_at: iso(m.endedAt),
     };
   }
@@ -569,13 +630,139 @@ export class Meetings {
     return { sent: true };
   }
 
-  // Also before recording has started: the meeting then never records.
+  // Also before recording has started: the meeting then never records. The live transcript stops with it (its text is
+  // forgotten too when the recording is deleted).
   async stopRecordingTool(tenant, id, del = true) {
     const m = this.get(tenant, id);
     m.noRecord = true;
-    if (!m.rec && !m.stopping && !(del && m.file)) return { stopped: false, deleted: false, recording_disabled: true, state: m.state };
+    const live = await this.stopTranscript(m, 'stopped', { clear: del });
+    if (!m.rec && !m.stopping && !(del && m.file)) return { stopped: false, deleted: false, recording_disabled: true, ...(m.live ? { live_transcript_stopped: live } : {}), state: m.state };
     const r = await this.stopRecording(m, { del });
-    return { ...r, recording_disabled: true, state: m.state };
+    return { ...r, recording_disabled: true, ...(m.live ? { live_transcript_stopped: live } : {}), state: m.state };
+  }
+
+  // Finals of the live transcript so far (seq > since).
+  transcript(tenant, id, since = 0) {
+    const m = this.get(tenant, id);
+    if (!m.live) throw new Error(`meeting ${id} has no live transcript (meeting_join with live_transcript: true)`);
+    return { meeting_id: id, state: m.state, live_transcript: this.view(m).live_transcript, segments: m.transcript ? m.transcript.since(since) : [] };
+  }
+
+  inCall(m, what) {
+    if (m.state !== 'admitted' && m.state !== 'recording') throw new Error(`meeting ${m.id} is ${m.state}; ${what} is possible once admitted`);
+  }
+
+  // Plays text (synthesized: supertonic, or elevenlabs) or an uploaded audio file into the meeting's microphone. The
+  // microphone is unmuted for it and muted again after (autoMute; a microphone that was on stays on). Returns once
+  // the audio plays (wait: once it has played). A second utterance while one plays is refused unless interrupt.
+  async speak(tenant, id, { text, audioFileId, voice, lang, backend = 'supertonic', autoMute = true, interrupt = false, wait = false }) {
+    const m = this.get(tenant, id);
+    this.inCall(m, 'speaking');
+    await m.announceDone.p; // nothing is said before the announcement went out
+    this.inCall(m, 'speaking');
+    if (!m.rig?.play) throw new Error('this audio backend cannot play into the meeting');
+    if (!text === !audioFileId) throw new Error('pass text or audio_file_id (one of them)');
+    const prev = m.speech;
+    if (prev && !interrupt) throw new Error(`already speaking (utterance ${prev.id}); meeting_stop_speaking first, or pass interrupt: true`);
+    const t0 = this.now();
+    const u = { id: `u${++m.speechSeq}`, state: 'preparing', player: null, audio: null, remute: false, cancelled: false, seconds: null };
+    u.finished = new Promise((r) => { u.finish = r; });
+    m.speech = u;
+    // The previous utterance stops without muting: this one takes the microphone over (and mutes it after, if that one would have).
+    if (prev) { u.remute = prev.remute; prev.remute = false; prev.cancelled = true; await prev.player?.stop(); }
+    const prep = (async () => {
+      if (text) return synthesize(this.cfg, { text, backend, voice, lang });
+      const f = this.manager.uploads?.use(tenant, [audioFileId], m.session.id)[0];
+      if (!f) throw new Error('uploads are off on this Bosun (FEATURES_UPLOADS=0)');
+      const seconds = await probeSeconds(f.file);
+      if (seconds === null) throw new Error(`file ${audioFileId} is not audio ffmpeg can read`);
+      return { file: f.file, seconds, remove: () => {}, backend: 'file' };
+    })();
+    // The microphone goes on while the audio is prepared.
+    const mic = autoMute ? this.page(m, async (p) => {
+      const before = await m.platform.micState(p);
+      if (before !== 'on') await m.platform.setMic(p, true);
+      return before;
+    }) : Promise.resolve(null);
+    const [a, b] = await Promise.allSettled([prep, mic]);
+    const prepMs = this.now() - t0;
+    if (a.status === 'fulfilled') u.audio = a.value;
+    if (b.status === 'fulfilled' && autoMute && b.value !== 'on') u.remute = true;
+    const fail = a.status === 'rejected' ? a.reason : b.status === 'rejected' ? b.reason : u.cancelled || m.speech !== u ? new Error('stopped before it played')
+      : m.state !== 'admitted' && m.state !== 'recording' ? new Error(`meeting ${m.id} is ${m.state}`) : null;
+    if (fail) {
+      const r = await this.endUtterance(m, u, u.cancelled ? 'interrupted' : 'failed', fail, { t0 });
+      if (u.cancelled) return r;
+      throw new Error(`nothing was said: ${oneLine(fail)}`);
+    }
+    u.seconds = Math.round(u.audio.seconds * 100) / 100;
+    u.player = m.rig.play(u.audio.file);
+    u.state = 'speaking';
+    u.startedAt = this.now();
+    u.player.done.then((ok) => this.endUtterance(m, u, u.cancelled ? 'interrupted' : ok ? 'done' : 'failed', ok || u.cancelled ? null : new Error(u.player.error() || 'playback failed'), { t0, tail: ok }));
+    const started = {
+      meeting_id: m.id, utterance_id: u.id, speaking: true, duration_s: u.seconds, source: u.audio.backend, ...(u.audio.voice ? { voice: u.audio.voice } : {}),
+      prepare_ms: prepMs, start_ms: u.startedAt - t0, unmuted: u.remute,
+    };
+    if (!wait) return started;
+    const end = await u.finished;
+    return { ...started, ...end, speaking: false };
+  }
+
+  // An utterance is over (played, interrupted, failed): the microphone is muted again if speaking turned it on, the
+  // synthesized file goes, and bosun:meeting-speech says how it ended.
+  async endUtterance(m, u, state, error, { t0, tail = false } = {}) {
+    if (u.state === 'done' || u.state === 'interrupted' || u.state === 'failed') return u.finished;
+    if (tail) await sleep(SPEECH_TAIL_MS);
+    u.state = state;
+    if (m.speech === u) m.speech = null;
+    if (u.remute && !m.speech && (m.state === 'admitted' || m.state === 'recording')) {
+      await this.page(m, (p) => m.platform.setMic(p, false)).catch((e) => { m.muteError = oneLine(e); });
+    }
+    try { u.audio?.remove(); } catch {}
+    const played = u.startedAt ? Math.round((this.now() - u.startedAt) / 10) / 100 : 0;
+    const r = { utterance_id: u.id, state, played_s: Math.min(played, u.seconds ?? played), ...(error ? { error: oneLine(error) } : {}), total_ms: this.now() - t0 };
+    if (u.startedAt) this.emit(m, 'speech', r);
+    u.finish(r);
+    return r;
+  }
+
+  // Barge-in: the utterance playing now stops at once (and the microphone is muted again, if speaking turned it on).
+  async stopSpeaking(tenant, id) {
+    const m = this.get(tenant, id);
+    const u = m.speech;
+    if (!u) return { meeting_id: id, stopped: false };
+    u.cancelled = true;
+    await u.player?.stop();
+    const r = await u.finished;
+    return { meeting_id: id, stopped: true, ...r };
+  }
+
+  async endSpeech(m) {
+    const u = m.speech;
+    if (!u) return;
+    u.cancelled = true;
+    u.remute = false; // the meeting is ending
+    await u.player?.stop();
+  }
+
+  // on: true mutes, false unmutes. Muting while an utterance plays cuts it off for the meeting (it keeps playing into a
+  // muted microphone) and keeps the microphone muted after.
+  async mute(tenant, id, on) {
+    const m = this.get(tenant, id);
+    this.inCall(m, on ? 'muting' : 'unmuting');
+    await m.announceDone.p;
+    this.inCall(m, on ? 'muting' : 'unmuting');
+    const s = await this.page(m, (p) => m.platform.setMic(p, !on));
+    if (m.speech) m.speech.remute = false;
+    return { meeting_id: id, muted: s === 'off' };
+  }
+
+  async raiseHand(tenant, id, on) {
+    const m = this.get(tenant, id);
+    this.inCall(m, 'raising a hand');
+    const s = await this.page(m, (p) => m.platform.setHand(p, on));
+    return { meeting_id: id, hand_raised: s === 'on' };
   }
 
   async leave(tenant, id) {
@@ -589,6 +776,7 @@ export class Meetings {
     if (!ID_RE.test(String(id))) throw new Error(`no meeting ${id}`);
     const m = this.active.get(id) || this.ended.get(id);
     if (m && m.tenant !== tenant) throw new Error(`no meeting ${id}`);
+    if (m) await this.stopTranscript(m, 'stopped', { clear: true }); // the transcript goes with the recording
     if (m && (m.rec || m.stopping)) { m.noRecord = true; return { ...(await this.stopRecording(m, { del: true })), meeting_id: id }; }
     const f = this.file(tenant, id);
     const existed = fs.existsSync(f);
