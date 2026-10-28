@@ -395,7 +395,7 @@ function channelSide(server, { bus, tenant, can }) {
   const publish = async (p) => {
     const ch = target(p, 'channels.publish');
     const r = await ch.handler.publish(textOf(p.content), p);
-    return { delivered: true, messageId: r.messageId };
+    return { delivered: true, ...r }; // messageId, and what the channel adds (a meeting: superseded_by_new_speech, last_turn_seq)
   };
   const any = z.object({}).passthrough().optional();
   server.setRequestHandler(z.object({ method: z.literal('channels/publish'), params: any }), async (req) => publish(req.params));

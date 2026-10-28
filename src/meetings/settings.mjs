@@ -1,7 +1,8 @@
 // Speech settings per tenant (speech_settings_get / speech_settings_set): the backend meeting_speak uses, the ElevenLabs
 // model and voice, the Supertonic voice, and the pause that ends a live transcript segment; how a meeting talks with
 // the agent over its MCPL channel (meeting_channel, transcript_events, agent_partials, channel_prepare_chunks); the
-// acknowledgement played when someone finishes (ack_*). What a call passes wins, then the tenant's setting, then the
+// acknowledgement played when someone finishes (ack_*); how long a final is held for more of the same turn (turn_hold_*)
+// and whether someone speaking over Bosun stops it (barge_in*). What a call passes wins, then the tenant's setting, then the
 // environment (TTS_DEFAULT_BACKEND, ELEVENLABS_TTS_MODEL, ELEVENLABS_VOICE, TTS_VOICE, LIVE_TRANSCRIPT_VAD_SILENCE_S),
 // then Bosun's own default.
 // Stored under <BROWSER_DATA>/speech-settings/<tenant>.json (written atomically, 0600).
@@ -44,11 +45,21 @@ export const SETTINGS = {
   ack_delay_ms: (v) => (Number.isInteger(v) && v >= 0 && v <= 2000 ? null : 'ack_delay_ms must be a whole number of milliseconds from 0 to 2000'),
   ack_min_words: (v) => (Number.isInteger(v) && v >= 1 && v <= 50 ? null : 'ack_min_words must be a whole number from 1 to 50'),
   ack_cooldown_s: (v) => (num(v, 0, 300) ? null : 'ack_cooldown_s must be a number of seconds from 0 to 300'),
+  // A final is held this long for more speech before it goes to the agent (0: at once); what comes meanwhile is merged
+  // into one turn. A final that clearly ends a sentence (a question, or a full sentence) is held turn_hold_complete_ms.
+  turn_hold_ms: (v) => (Number.isInteger(v) && v >= 0 && v <= 5000 ? null : 'turn_hold_ms must be a whole number of milliseconds from 0 to 5000'),
+  turn_hold_complete_ms: (v) => (Number.isInteger(v) && v >= 0 && v <= 5000 ? null : 'turn_hold_complete_ms must be a whole number of milliseconds from 0 to 5000'),
+  // Someone else speaking while Bosun speaks (at least barge_in_min_words new words, or a word and barge_in_min_s
+  // shown speaking on the page) stops it, as meeting_stop_speaking would.
+  barge_in: (v) => (typeof v === 'boolean' ? null : 'barge_in must be true or false'),
+  barge_in_min_words: (v) => (Number.isInteger(v) && v >= 1 && v <= 20 ? null : 'barge_in_min_words must be a whole number from 1 to 20'),
+  barge_in_min_s: (v) => (num(v, 0.2, 5) ? null : 'barge_in_min_s must be a number of seconds from 0.2 to 5'),
 };
 // Bosun's defaults for the settings without an environment fallback.
 export const DEFAULTS = {
   meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
   ack_on_final: false, ack_phrases: ACK_PHRASES_DEFAULT, ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
+  turn_hold_ms: 900, turn_hold_complete_ms: 300, barge_in: true, barge_in_min_words: 2, barge_in_min_s: 0.6,
 };
 
 export class SpeechSettings {
