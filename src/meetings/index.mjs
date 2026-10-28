@@ -618,10 +618,11 @@ export class Meetings {
     return true;
   }
 
-  // Words Bosun is saying now (also an acknowledgement playing out) or said within SAID_ECHO_MS.
+  // Words Bosun is saying now (also an acknowledgement playing out) or said within SAID_ECHO_MS. Not those of a reply
+  // still being prepared: nothing of it can come back yet, and someone may be saying the same words.
   saidWords(m) {
     const out = new Set();
-    for (const u of [m.speech, m.ackPlaying]) for (const w of u?.words || []) out.add(w);
+    for (const u of [m.speech, m.ackPlaying]) if (u?.startedAt) for (const w of u.words) out.add(w);
     const cut = this.now() - SAID_ECHO_MS;
     m.saidRecent = m.saidRecent.filter((x) => x.at >= cut);
     for (const x of m.saidRecent) for (const w of x.words) out.add(w);
@@ -643,7 +644,8 @@ export class Meetings {
     const playing = (x) => x?.startedAt && x.base && !x.cancelled && !x.ending && x.state === 'speaking';
     const p = playing(m.speech) ? m.speech : playing(m.ackPlaying) ? m.ackPlaying : null;
     const u = m.speech;
-    if (!d.barge_in || !p || u?.cancelled || u?.ending || seg.seq < p.base.seq) return;
+    // Audio without text (an uploaded file): its echo can't be told from someone speaking, so it is never cut off.
+    if (!d.barge_in || !p || !p.words.size || u?.cancelled || u?.ending || seg.seq < p.base.seq) return;
     const w = words(seg.text).slice(seg.seq === p.base.seq ? p.base.n : 0);
     if (!w.length || this.ownVoice(m, w)) return;
     const labels = m.speakersSeen && (m.speakerLog.at(-1)?.name || this.now() - m.lastNamedAt < LABEL_FRESH_MS);

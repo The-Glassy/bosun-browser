@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { z } from 'zod';
 import { startBosun, connect, until, sleep } from './helpers.mjs';
 import { startFakeMeet, fakeAudio } from './fakemeet.mjs';
-import { startFakeElevenLabs, tonePcm } from './fakeelevenlabs.mjs';
+import { startFakeElevenLabs, tonePcm, toneWav } from './fakeelevenlabs.mjs';
 import { meet } from '../src/meetings/platforms/meet.mjs';
 import { Meetings } from '../src/meetings/index.mjs';
 import { MEETING_SET } from '../src/events.mjs';
@@ -363,6 +363,46 @@ test('a segment already being said when the final before it arrives (its timesta
       assert.equal(c.finals().length, 1);
       assert.equal(c.finals()[0].content[0].text, 'Here is the first part. And here comes the second part now.');
     } finally { el.st.stampDelayMs = 0; }
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('a reply still being synthesized is not Bosun\'s voice yet: someone saying the same words goes on with their turn (merged, not echo)', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { turn_hold_ms: 5000, turn_hold_complete_ms: 300 });
+    const { id, chId } = await admitted(c);
+    el.st.ttsDelayMs = 4000;
+    try {
+      phrases('So I was thinking about the', 'budget for next year.');
+      audio.say(tonePcm(1.5));
+      await until(async () => (await segments(c, id)).length === 1, 15_000);
+      await c.publish(chId, 'The budget for next year is approved.');
+      audio.say(Buffer.concat([silence(0.2), tonePcm(1.5)]));
+      await until(() => c.finals().length === 1, 15_000);
+      assert.equal(audio.players.length, 0, 'the reply still being synthesized');
+      assert.equal(c.finals()[0].content[0].text, 'So I was thinking about the budget for next year.');
+      assert.equal(c.finals()[0].metadata.echo_suspected, undefined);
+    } finally { el.st.ttsDelayMs = 0; }
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('an uploaded audio file is never cut off by barge-in (no text to tell its echo by)', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    const { id } = await admitted(c);
+    const up = (await c.call('upload_create', { filename: 'tone.wav' })).json();
+    const put = await fetch(up.put_url, { method: 'PUT', body: toneWav(4) });
+    assert.equal(put.status, 201);
+    await c.call('meeting_speak', { meeting_id: id, audio_file_id: up.file_id });
+    await until(() => audio.players.length === 1, 10_000);
+    phrases('Wait, stop, I have a question.');
+    audio.say(tonePcm(2));
+    await until(() => ev.speech.length === 1, 15_000);
+    assert.equal(ev.speech[0].state, 'done');
     await c.call('meeting_leave', { meeting_id: id });
     await c.close();
   });

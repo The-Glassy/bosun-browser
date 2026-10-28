@@ -378,6 +378,8 @@ in a sentence is a final; the agent answers it; the rest arrives while she speak
 - **When it is checked:** only while an utterance's audio plays (`u.startedAt`), not while it is still being
   synthesized. A publish that arrives while someone talks is still said, as item 3 of the brief wants. If they go on
   talking, the barge-in then stops it.
+- **Not for audio files:** `meeting_speak` with `audio_file_id` has no text to recognise its own echo by, so it is
+  never cut off automatically (`meeting_stop_speaking` still works).
 - **Counting:** from `u.base`, the open segment's words already heard when playback began. Only new words count.
 - **Threshold:** `barge_in_min_words` words that are not agreement (a fixed list of backchannel words), or one word
   while the page has shown someone else speaking `barge_in_min_s` since playback began.
@@ -404,7 +406,8 @@ in a sentence is a final; the agent answers it; the rest arrives while she speak
   what the browser plays (`bosun_out`). Meet and Zoom don't play a participant's own audio back to them. Bosun's voice
   can reach the transcript only through someone else's microphone (speakers, failed echo cancellation), or through a
   platform that mixed it in.
-- **The text check:** text whose words are at least 60 % words of the utterance playing (also an acknowledgement
+- **The text check:** text whose words are at least 60 % words of the utterance playing (not one still being
+  synthesized: nothing of it can come back yet, and someone may be saying the same words) (also an acknowledgement
   playing out) or of an utterance that ended within 8 s counts as Bosun's own voice. It never barges in, never extends
   a held turn, never sets `lastHumanAt`, and its final goes at once with `echo_suspected`.
 - **The label check:** where the page names speakers (one was named in the last 2 minutes, or one is shown now),

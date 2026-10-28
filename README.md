@@ -956,6 +956,8 @@ a sentence. In 0.17.0 the agent answered that fragment, and what the speaker add
   - What counts: at least `barge_in_min_words` (2) new words, where agreeing words ("mhm", "yeah", "ok", "так", "ja")
     don't count; or one word while the page shows someone speaking for `barge_in_min_s` (0.6) since Bosun began.
   - What happens: the microphone is muted again, and text from the channel still waiting is dropped.
+  - An uploaded audio file (`audio_file_id`) is never cut off this way, because there is no text to recognise its
+    echo by.
   - What the agent hears: `bosun:meeting-speech` comes with `state: "interrupted"`, `barge_in: true`, `said` (the
     text played so far) and `interrupted_by`. The channel gets a message tagged `bosun:meeting-interrupted`, author
     `bosun`, `(interrupted at "...")`, with `said` and `unsaid` in its metadata. The interrupter's turn follows as
