@@ -487,13 +487,36 @@ test('a microphone that will not mute again: reported in the result, the event a
     const r = (await c.call('meeting_speak', { meeting_id: id, text: 'Hello.', wait: true })).json();
     assert.equal(r.state, 'done');
     assert.match(r.mute_error, /^the microphone may still be on: could not turn the microphone off in Meet/);
+    assert.equal(r.mic_open, true);
     assert.match(ev.speech.at(-1).mute_error, /may still be on/);
-    assert.match((await status(c, id)).mute_error, /may still be on/);
+    let st = await status(c, id);
+    assert.match(st.mute_error, /may still be on/);
+    assert.equal(st.mic_open, true);
+    // Tried again in the background (every 5 s): once the control works, it is muted without anyone speaking.
+    fake.set(code, { micStuckOn: false });
+    await until(async () => (await status(c, id)).mic_open === undefined, 12_000);
+    st = await status(c, id);
+    assert.equal(st.mute_error, undefined);
+    assert.equal(media(code, 'mic').at(-1), false);
+    // The next utterance tries again too.
+    fake.set(code, { micStuckOn: true });
+    assert.equal((await c.call('meeting_speak', { meeting_id: id, text: 'Hello.', wait: true })).json().mic_open, true);
     fake.set(code, { micStuckOn: false });
     const r2 = (await c.call('meeting_speak', { meeting_id: id, text: 'Again.', wait: true })).json();
     assert.equal(r2.mute_error, undefined);
     assert.equal(media(code, 'mic').at(-1), false);
     assert.equal((await status(c, id)).mute_error, undefined);
+    // The agent takes the microphone over (meeting_mute on: false) while a retry is pending: it stays on.
+    fake.set(code, { micStuckOn: true });
+    assert.equal((await c.call('meeting_speak', { meeting_id: id, text: 'Hello.', wait: true })).json().mic_open, true);
+    assert.deepEqual((await c.call('meeting_mute', { meeting_id: id, on: false })).json(), { meeting_id: id, muted: false });
+    fake.set(code, { micStuckOn: false });
+    const n = media(code, 'mic').length;
+    await sleep(7000);
+    assert.deepEqual(media(code, 'mic').slice(n), [], 'no retry muted it after meeting_mute');
+    st = await status(c, id);
+    assert.equal(st.mic_open, undefined);
+    assert.equal(st.mute_error, undefined);
     await c.close();
   });
 });

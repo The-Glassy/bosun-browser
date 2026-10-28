@@ -828,7 +828,9 @@ export class Meetings {
     let err = null;
     for (let i = 0; i < 3; i++) {
       if (i) { await p.keyboard.press('Escape').catch(() => {}); await p.waitForTimeout(500).catch(() => {}); }
-      if (m.speech || (m.state !== 'admitted' && m.state !== 'recording')) return null;
+      // Not when someone speaks now, the meeting is over, or the microphone isn't speaking's any more (meeting_mute
+      // took it over, also while this waited in the page queue).
+      if (m.speech || !m.speechUnmuted || (m.state !== 'admitted' && m.state !== 'recording')) return null;
       err = await m.platform.setMic(p, false).then(() => null, (e) => oneLine(e));
       if (!err) break;
     }

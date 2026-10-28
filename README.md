@@ -140,12 +140,12 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `TTS_URL` | – | the local text-to-speech service for `meeting_speak` (OpenAI-style `POST /v1/audio/speech`, WAV out; Supertonic), e.g. `http://10.78.0.11:5000`; unset: only uploaded audio or `backend: "elevenlabs"` |
 | `TTS_VOICE` | – (the service's own) | fallback Supertonic voice: `supertonic-F1`..`F5`, `supertonic-M1`..`M5` |
 | `TTS_DEFAULT_BACKEND` | `supertonic` | fallback `backend` of `meeting_speak` when none is passed: `supertonic` or `elevenlabs`; `elevenlabs` without `ELEVENLABS_API_KEY` falls back to `supertonic`, with a warning at start |
+| `MAX_DOM_NODES` | 60000 | `read` (a11y, whole page) refuses larger pages; pass `selector` |
+| `SAVE_SHOTS` / `SHOTS_PER_SESSION` | – / 20 | `1` = also keep screenshots on disk (0600, deleted when the session closes) |
 
 The speech values above (`TTS_DEFAULT_BACKEND`, `ELEVENLABS_TTS_MODEL`, `ELEVENLABS_VOICE`, `TTS_VOICE`,
 `LIVE_TRANSCRIPT_VAD_SILENCE_S`) are fallbacks only: each tenant sets its own with `speech_settings_set`, and a call's
 own argument wins over both (see Live transcript and speaking).
-| `MAX_DOM_NODES` | 60000 | `read` (a11y, whole page) refuses larger pages; pass `selector` |
-| `SAVE_SHOTS` / `SHOTS_PER_SESSION` | – / 20 | `1` = also keep screenshots on disk (0600, deleted when the session closes) |
 
 All numbers are validated at startup; a bad value stops the service instead of silently disabling a limit.
 
