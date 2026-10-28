@@ -814,11 +814,25 @@ Chat text is kept only in memory, for the last 50 meetings.
   or more inside a sentence (someone thinking) ends a segment there, so a final may be half a sentence (no words are
   lost; the next final carries the rest). Before answering on a final, check that it reads as finished, or use 0.7 s.
 - **Events:** `bosun:meeting-transcript` with `meeting_id`, `seq`, `start_s`, `end_s` (seconds since the transcript
-  started), `text`, `final`, `lang`, and `speaker` when ElevenLabs gives one (realtime gives none today: one mixed
-  track). While someone speaks, partials (`final: false`, at most two a second, each carrying the `seq` its final
+  started), `text`, `final`, `lang`, and `speaker` when the page showed who was speaking (see *Speaker labels*). While someone speaks, partials (`final: false`, at most two a second, each carrying the `seq` its final
   will have); then the final, always. `transcript_partials: false` sends finals only. These events go to the
   connections there at the time and are **never queued** (they would crowd out chat and opt-out events);
-  `meeting_transcript { since }` returns every final so far.
+  `meeting_transcript { since }` returns every final so far. With the meeting channel (below) taking the text, these
+  events are not sent too (speech setting `transcript_events`: `auto` by default, `always`, `never`).
+- **Speaker labels** (best effort; a guest join is enough). Every 300 ms Bosun reads who the page shows speaking.
+  - Zoom: the speaker view's active tile, or a gallery tile marked active, with the name in its footer.
+  - Meet: a tile with a non-zero `data-audio-level` or Meet's speaking-animation class, with the name in
+    `span.notranslate`.
+  - Bosun's own tile never counts.
+  - A segment's `speaker` is whoever was shown speaking longest while it was said, from 0.3 s before it. `speakers`
+    lists them all when there were several.
+  - Limits:
+    - Zoom's gallery view without an active mark, and a screen shared full size, show nobody.
+    - Meet renames its classes from time to time, so the label then goes missing (never wrong names: the name is read
+      from the tile that carries the mark).
+    - Two people talking over each other get the one shown longer.
+    - The page's highlight lags the voice by a few hundred ms.
+  - `meeting_status.speaker_labels` says whether a speaker has been seen at all (`seen` / `none-seen`).
 - **Consent:** it starts and stops **with the recording**: only after the announcement, which then says *"This call
   is recorded and transcribed live for notes …"* (German too). An opt-out in the chat stops both **at once**, deletes
   the recording and forgets the transcript's text, and posts *"Recording and live transcript stopped and deleted."*
@@ -861,6 +875,17 @@ Chat text is kept only in memory, for the last 50 meetings.
   an open menu closed in between; the utterance's end waits at most 20 s for them. A microphone still on then is
   reported (`mute_error` in the result, the event and `meeting_status`, plus `mic_open: true` in `meeting_status`) and
   tried again every 5 s (6 times) while nobody speaks; the next utterance or `meeting_mute` tries too.
+- **Muting again on real Zoom (0.17.0).** On 2026-10-28 production said "no microphone control found in Zoom" after
+  a 2.5 s utterance, and the microphone was left on. When the toolbar's button can't be worked, Bosun now:
+  1. reads the control from the page itself, including a hidden one or a `<div>`, but only in the toolbar, and clicks
+     it there;
+  2. then presses Alt+A, but only while the page shows the microphone still on.
+
+  Every step is checked by reading the state back. If nothing works: `mic_open: true` and a `mute_error`, a
+  `bosun:meeting-speech` event starting "WARNING: Bosun's microphone may still be ON", and a queued
+  `bosun:meeting-mic-open` event (again with `gave_up` when the retries are over). `meeting_mute { on: true }` or
+  `meeting_leave` if it must be off. The microphone is `bosun_mic_src`, which carries only what Bosun plays, so a
+  microphone left on sends silence, never the room.
 - **Barge-in:** `meeting_stop_speaking` stops it at once (and mutes again). A second `meeting_speak` while one plays
   is refused unless `interrupt: true`, which replaces it.
 - **`meeting_mute { on }`** and **`meeting_raise_hand { on }`** on Meet (the toolbar's microphone and hand buttons,
@@ -871,6 +896,48 @@ Chat text is kept only in memory, for the last 50 meetings.
   pieces arrive long before the one before has played, so `gap_ms` is 0). Start with a short sentence for a quick
   answer.
 - **Engines:** chromium and patchright (meetings refuse camoufox).
+
+**The meeting as an MCPL channel (0.17.0).** With a host that grants MCPL channels (connectome-host grants what a
+server advertises unless the recipe disables it), each meeting Bosun is in becomes a channel `bosun:meeting:<id>`
+once the announcement is out.
+- **Lifecycle:** registered with `channels/register` (bidirectional, `initiallyOpen`) on every connection of the
+  tenant, and removed with `channels/changed` when the meeting ends. The speech setting `meeting_channel: false` turns
+  it off.
+- **Incoming:** transcript finals arrive as `channels/incoming`:
+  - `messageId` `<meeting>:<seq>`, `threadId` the meeting.
+  - `author` is the speaker when known, else "Meeting".
+  - `metadata` `{meeting_id, platform, seq, start_s, end_s, final, lang, speaker, speakers}`, tags
+    `bosun:meeting-transcript` and `bosun:meeting=<id>`.
+  - With `agent_partials: true`, partial text comes too, tagged `bosun:partial`, at most every
+    `agent_partials_interval_s` (1.5 s), so the agent can prepare.
+- **Speaking:** text the host publishes to the channel (`channels/publish`) is acknowledged at once
+  (`{delivered: true, messageId}`) and spoken right away, sentence by sentence (the first one cut at a comma when it
+  is long).
+  - Text published while it plays is added to the same utterance, and the microphone stays on.
+  - Text published while `meeting_speak` plays follows it.
+  - `bosun:meeting-speech` reports the end, with `kind: "stream"`.
+  - In connectome-host an agent publishes with the `channel_publish` tool. Short pieces (a first sentence, then the
+    rest) make the first audio come soonest.
+- **Limits:** a publish of more than 2000 characters, or with more than 6000 characters (or 120 s of audio) from the
+  channel still waiting, is refused before it is acknowledged.
+- **Stopping:** `meeting_stop_speaking` also drops channel text still waiting. An opt-out with
+  `leave_on_optout: false` closes the channel, so no transcript and no automatic speech; `meeting_speak` still works.
+- **Chunks:** `channels/outgoing/chunk` / `complete` are accepted but never spoken (MCPL §14.5: only a publish
+  delivers). With `channel_prepare_chunks: true`, each sentence is synthesized as soon as the stream completes it,
+  and the publish that delivers it plays that audio without waiting for synthesis. This helps only with a host that
+  streams before it publishes: connectome-host sends chunks after the publish, and Bosun doesn't synthesize those
+  again.
+- **Security:** only channels registered on that connection, for that tenant, under the grant as it is now. Anything
+  else gets `-32023` (unknown channel) or `-32002` (capability denied).
+- **Acknowledgement** (`ack_on_final`, off by default). When a final ends someone's turn (at least `ack_min_words`
+  words, ending a sentence), Bosun plays a short clip after `ack_delay_ms` (100):
+  - The clip is one of `ack_phrases`, synthesized once per voice when Bosun is let in, in `ack_lang`.
+  - Nothing is played while something is being said, if the agent starts speaking first, or within
+    `ack_cooldown_s` (8) of the last one.
+  - The agent's reply waits for a clip that is playing (it lasts about half a second) instead of cutting it, and the
+    microphone stays on in between.
+  - Measured locally (stand-ins): the clip's audio starts about 0.4 s after the final reached the host, most of it the
+    unmute click.
 
 **Audio setup (Linux).** Each meeting gets a private PulseAudio server: its own `XDG_RUNTIME_DIR`, socket and
 config, with two null sinks:

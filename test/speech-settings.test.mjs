@@ -20,7 +20,7 @@ test('defaults without env or settings; env fallbacks; the tenant\'s settings ov
     from: { backend: 'default', elevenlabs_model: 'default', elevenlabs_voice: 'default', supertonic_voice: 'default', vad_silence_s: 'default', ...Object.fromEntries(Object.keys(DEFAULTS).map((k) => [k, 'default'])) },
   });
   assert.deepEqual(DEFAULTS, {
-    meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_speak_from: 'publish',
+    meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
     ack_on_final: false, ack_phrases: ['Mhm.', 'One sec.', 'Okay.', 'Right.'], ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
   });
   const s = settings({ ...KEY, TTS_DEFAULT_BACKEND: 'elevenlabs', ELEVENLABS_TTS_MODEL: 'eleven_flash_v2_5', ELEVENLABS_VOICE: 'SAz9YHcvj6GT2YYXdXww', TTS_VOICE: 'supertonic-F2', LIVE_TRANSCRIPT_VAD_SILENCE_S: '0.8' });
@@ -76,7 +76,7 @@ test('backend elevenlabs without an ElevenLabs key: supertonic, with a warning (
 
 test('channel and acknowledgement settings: validated, set and removed per tenant', () => {
   const s = settings(KEY);
-  const r = s.set('a', { meeting_channel: false, transcript_events: 'never', agent_partials: true, agent_partials_interval_s: 2, channel_speak_from: 'chunks',
+  const r = s.set('a', { meeting_channel: false, transcript_events: 'never', agent_partials: true, agent_partials_interval_s: 2, channel_prepare_chunks: true,
     ack_on_final: true, ack_phrases: ['Мгм.', 'Секунду.'], ack_lang: 'uk', ack_delay_ms: 0, ack_min_words: 2, ack_cooldown_s: 0 });
   assert.deepEqual(r.effective.ack_phrases, ['Мгм.', 'Секунду.']);
   assert.equal(r.effective.transcript_events, 'never');
@@ -84,7 +84,7 @@ test('channel and acknowledgement settings: validated, set and removed per tenan
   assert.equal(s.set('a', { ack_phrases: null }).effective.ack_phrases.length, 4);
   for (const [k, v, re] of [
     ['meeting_channel', 'yes', /meeting_channel must be true or false/], ['transcript_events', 'sometimes', /transcript_events must be one of auto, always, never/],
-    ['agent_partials_interval_s', 0.1, /agent_partials_interval_s/], ['channel_speak_from', 'tokens', /channel_speak_from must be one of publish, chunks/],
+    ['agent_partials_interval_s', 0.1, /agent_partials_interval_s/], ['channel_prepare_chunks', 'chunks', /channel_prepare_chunks must be true or false/],
     ['ack_phrases', [], /ack_phrases must be 1 to 12/], ['ack_phrases', ['x'.repeat(41)], /ack_phrases/], ['ack_phrases', [' '], /ack_phrases/], ['ack_phrases', 'Mhm.', /ack_phrases/],
     ['ack_lang', 'ukrainian', /ack_lang/], ['ack_delay_ms', 2001, /ack_delay_ms/], ['ack_delay_ms', 1.5, /ack_delay_ms/], ['ack_min_words', 0, /ack_min_words/], ['ack_cooldown_s', -1, /ack_cooldown_s/],
   ]) assert.throws(() => s.set('a', { [k]: v }), re, `${k}=${JSON.stringify(v)}`);

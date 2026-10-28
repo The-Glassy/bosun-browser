@@ -1,6 +1,6 @@
 // Speech settings per tenant (speech_settings_get / speech_settings_set): the backend meeting_speak uses, the ElevenLabs
 // model and voice, the Supertonic voice, and the pause that ends a live transcript segment; how a meeting talks with
-// the agent over its MCPL channel (meeting_channel, transcript_events, agent_partials, channel_speak_from); the
+// the agent over its MCPL channel (meeting_channel, transcript_events, agent_partials, channel_prepare_chunks); the
 // acknowledgement played when someone finishes (ack_*). What a call passes wins, then the tenant's setting, then the
 // environment (TTS_DEFAULT_BACKEND, ELEVENLABS_TTS_MODEL, ELEVENLABS_VOICE, TTS_VOICE, LIVE_TRANSCRIPT_VAD_SILENCE_S),
 // then Bosun's own default.
@@ -15,7 +15,6 @@ export const VAD_MIN_S = 0.2;
 export const VAD_MAX_S = 3;
 export const VAD_DEFAULT_S = 0.5;
 export const TRANSCRIPT_EVENTS = ['auto', 'always', 'never'];
-export const SPEAK_FROM = ['publish', 'chunks'];
 export const ACK_PHRASES_DEFAULT = ['Mhm.', 'One sec.', 'Okay.', 'Right.'];
 const LANG_RE = /^[a-z]{2,3}(?:-[A-Za-z]{2})?$/;
 const num = (v, min, max) => typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
@@ -34,9 +33,9 @@ export const SETTINGS = {
   // Partial transcript text to the agent over the channel, at most every agent_partials_interval_s.
   agent_partials: (v) => (typeof v === 'boolean' ? null : 'agent_partials must be true or false'),
   agent_partials_interval_s: (v) => (num(v, 0.5, 10) ? null : 'agent_partials_interval_s must be a number of seconds from 0.5 to 10'),
-  // What on the channel is spoken: publish (channels/publish, the delivered text) or chunks (channels/outgoing/chunk as
-  // it streams; a publish of the same text is then not spoken again).
-  channel_speak_from: (v) => (SPEAK_FROM.includes(v) ? null : `channel_speak_from must be one of ${SPEAK_FROM.join(', ')}`),
+  // Sentences of channels/outgoing/chunk synthesized ahead, so the publish that delivers them plays at once (only
+  // channels/publish is ever spoken: MCPL §14.5).
+  channel_prepare_chunks: (v) => (typeof v === 'boolean' ? null : 'channel_prepare_chunks must be true or false'),
   // A short cached clip when a final ends someone's turn, unless the agent speaks first.
   ack_on_final: (v) => (typeof v === 'boolean' ? null : 'ack_on_final must be true or false'),
   ack_phrases: (v) => (Array.isArray(v) && v.length >= 1 && v.length <= 12 && v.every((p) => typeof p === 'string' && p.trim().length >= 1 && p.length <= 40)
@@ -48,7 +47,7 @@ export const SETTINGS = {
 };
 // Bosun's defaults for the settings without an environment fallback.
 export const DEFAULTS = {
-  meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_speak_from: 'publish',
+  meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
   ack_on_final: false, ack_phrases: ACK_PHRASES_DEFAULT, ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
 };
 

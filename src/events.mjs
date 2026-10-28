@@ -268,6 +268,13 @@ export class EventBus extends EventEmitter {
 
 // Pattern match for effectiveCapabilities entries: exact paths, '*', or 'prefix.*'. `cap` may itself be a pattern.
 const grants = (patterns, cap) => patterns.some((p) => p === cap || p === '*' || (p.endsWith('.*') && cap.startsWith(p.slice(0, -1))));
+// A capability path granted by the effective grant (MCPL §5.4): full paths, segment by segment, where `*` matches
+// exactly one segment and the segment counts are equal (a bare `*` grants only depth-1 paths, `channels.*` grants
+// `channels.publish` and nothing deeper).
+const capGranted = (patterns, path) => {
+  const want = path.split('.');
+  return patterns.some((p) => { const s = p.split('.'); return s.length === want.length && s.every((x, i) => x === '*' || x === want[i]); });
+};
 // Two patterns overlap when some capability path matches both.
 const overlaps = (a, b) => grants([a], b) || grants([b], a);
 
@@ -278,7 +285,7 @@ export function mcplConnection(server, { bus, tenant }) {
   let grant = null; // {caps: string[], enabled: Set<string>} after a featureSets/update Request
   let detach = null;
   const wantsMcpl = () => !!server.getClientCapabilities()?.experimental?.mcpl;
-  const allowed = (set) => !!grant && wantsMcpl() && grants(grant.caps, 'pushEvents') && grant.enabled.has(set);
+  const allowed = (set) => !!grant && wantsMcpl() && capGranted(grant.caps, 'pushEvents') && grant.enabled.has(set);
   const pushAllowed = () => Object.keys(MANIFEST.featureSets).some(allowed);
   const sink = async (params) => {
     if (!allowed(params.featureSet)) return false;
@@ -293,7 +300,7 @@ export function mcplConnection(server, { bus, tenant }) {
     const names = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : null);
     const selected = names(p?.enabled), disabled = names(p?.disabled) || [];
     const wanted = Object.keys(MANIFEST.featureSets).filter((n) => (selected === null || grants(selected, n)) && !grants(disabled, n));
-    const enabled = new Set(wanted.filter((n) => MANIFEST.featureSets[n].uses.every((u) => grants(caps, u))));
+    const enabled = new Set(wanted.filter((n) => MANIFEST.featureSets[n].uses.every((u) => capGranted(caps, u))));
     if (form === 'notification') { // a notification can narrow the grant, never widen it
       if (!grant) return true;
       grant = { caps: grant.caps.filter((c) => grants(caps, c)), enabled: new Set([...grant.enabled].filter((n) => enabled.has(n))) };
@@ -302,7 +309,7 @@ export function mcplConnection(server, { bus, tenant }) {
   };
   // A new grant (Request) re-attaches with a fresh sink: events refused under the old grant (say, a feature set that
   // was not enabled yet) are offered again.
-  const chans = channelSide(server, { bus, tenant, can: (cap) => !!grant && wantsMcpl() && grants(grant.caps, cap) });
+  const chans = channelSide(server, { bus, tenant, can: (cap) => !!grant && wantsMcpl() && capGranted(grant.caps, cap) });
   const update = (regrant = false) => {
     if (pushAllowed() && (!detach || regrant)) { detach?.(); detach = bus.attach(tenant, (p) => sink(p)); }
     else if (!pushAllowed() && detach) { detach(); detach = null; }
@@ -313,7 +320,7 @@ export function mcplConnection(server, { bus, tenant }) {
     update(true);
     // Feature sets the host asked for but did not grant the capabilities of (ones it left out are simply off).
     const unavailableFeatures = grant.wanted.filter((n) => !grant.enabled.has(n))
-      .map((featureSet) => ({ featureSet, missingCapabilities: MANIFEST.featureSets[featureSet].uses.filter((u) => !grants(grant.caps, u)), effect: 'disabled' }));
+      .map((featureSet) => ({ featureSet, missingCapabilities: MANIFEST.featureSets[featureSet].uses.filter((u) => !capGranted(grant.caps, u)), effect: 'disabled' }));
     return { accepted: true, unavailableFeatures, notes: [], ...(unavailableFeatures.length ? { mode: 'degraded' } : {}) };
   });
   server.setNotificationHandler(z.object({ method: z.literal('featureSets/update'), params: z.any().optional() }), async (n) => { apply(n.params, 'notification'); update(); }); // malformed: grant already cleared
@@ -333,22 +340,24 @@ const channelError = (code, message, data) => Object.assign(new Error(message), 
 function channelSide(server, { bus, tenant, can }) {
   const registered = new Set(); // channel ids the host accepted on this connection
   let detach = null;
+  let gen = 0; // bumped when the grant loses channels.register: a registration answered after that is taken back
   let queue = Promise.resolve(); // register and remove go out in order
   const later = (fn) => { queue = queue.then(fn).catch(() => {}); return queue; };
+  const unregister = (id) => server.notification({ method: 'channels/changed', params: { added: [], removed: [id], updated: [] } }).catch(() => {});
   const conn = {
     add: (d) => later(async () => {
       await new Promise((r) => setTimeout(r, 0)); // after the answer to the featureSets/update that granted it
       if (!can('channels.register') || registered.has(d.id) || !bus.channel(tenant, d.id)) return;
+      const g = gen;
       const r = await server.request({ method: 'channels/register', params: { channels: [d] } }, z.object({}).passthrough(), { timeout: REGISTER_TIMEOUT_MS });
       const item = Array.isArray(r.results) ? r.results.find((x) => x?.id === d.id) : null;
       const ok = item ? item.accepted === true : Array.isArray(r.registered) && r.registered.includes(d.id);
-      if (ok && bus.channel(tenant, d.id)) registered.add(d.id);
-      else if (ok) conn.remove(d.id); // closed meanwhile
+      if (!ok) return;
+      // The meeting ended, or the grant lost channels.register, while the host answered: taken back at once.
+      if (g === gen && can('channels.register') && bus.channel(tenant, d.id)) registered.add(d.id);
+      else await unregister(d.id);
     }),
-    remove: (id) => later(async () => {
-      if (!registered.delete(id)) return;
-      await server.notification({ method: 'channels/changed', params: { added: [], removed: [id], updated: [] } }).catch(() => {});
-    }),
+    remove: (id) => later(async () => { if (registered.delete(id)) await unregister(id); }),
     ready: (id) => registered.has(id) && can('channels.incoming'),
     async incoming(id, messages) {
       if (!conn.ready(id)) return false;
@@ -361,7 +370,7 @@ function channelSide(server, { bus, tenant, can }) {
   // has it are taken back.
   const sync = () => {
     if (can('channels.register')) { if (!detach) detach = bus.attachChannels(tenant, conn); }
-    else if (detach) { detach(); detach = null; for (const id of [...registered]) conn.remove(id); }
+    else if (detach) { gen++; detach(); detach = null; for (const id of [...registered]) conn.remove(id); }
   };
   // What the host sends to a channel: only to one registered here, of this tenant, with the capability granted now.
   const target = (p, cap) => {

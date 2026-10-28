@@ -23,8 +23,9 @@ const FIRST_MIN = 12;
 const REST_MAX = 160;
 
 // Text -> the pieces it is synthesized in: sentences (after . ! ? … and line breaks), the first one also cut at a comma
-// or semicolon when it is long, so the first audio comes soon.
-export function splitSpeech(text) {
+// or semicolon when it is long, so the first audio comes soon. group false: one piece per sentence (to match sentences
+// synthesized ahead).
+export function splitSpeech(text, { group = true } = {}) {
   const parts = String(text).replace(/\s+\n|\n\s*/g, '\n').split(/(?<=[.!?…])\s+|\n+/).map((t) => t.trim()).filter(Boolean);
   if (parts[0]?.length > FIRST_MAX) {
     const m = /^(.{12,}?[,;:])\s+(.+)$/su.exec(parts[0]);
@@ -34,7 +35,7 @@ export function splitSpeech(text) {
   // After the first piece, sentences go together up to REST_MAX characters (fewer requests, steadier voice).
   const out = [parts[0]];
   for (const t of parts.slice(1)) {
-    if (out.length > 1 && out.at(-1).length + 1 + t.length <= REST_MAX) out[out.length - 1] += ` ${t}`;
+    if (group && out.length > 1 && out.at(-1).length + 1 + t.length <= REST_MAX) out[out.length - 1] += ` ${t}`;
     else out.push(t);
   }
   return out;

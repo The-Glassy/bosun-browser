@@ -259,8 +259,78 @@ The microphone is unmuted through the platform's toolbar control (`setMic`), and
 ends, only if speaking turned it on. Zoom: a microphone Zoom never got makes Zoom ask "Do you want people to hear you?"
 on unmute; since the agent asked to be heard, "Use microphone" is answered then (the lobby still declines it).
 
-**Not done.** Streaming TTS (audio while a piece is still being synthesized); speaker labels (realtime Scribe gives
-none for one mixed track); echo of Bosun's own voice in the transcript can't happen (the meeting doesn't play it back).
+**Not done.** Streaming TTS (audio while a piece is still being synthesized); speaker labels from the audio (realtime
+Scribe gives none for one mixed track; 0.17.0 reads them from the page, §9c); echo of Bosun's own voice in the transcript can't happen (the meeting doesn't play it back).
+
+## 9c. The meeting as an MCPL channel; acknowledgements; speaker labels (0.17.0)
+
+**Why.** On a live call (2026-10-28) Glassy took too long to answer. TTS started about 0.55 s after `meeting_speak`,
+and Scribe's final came about 0.85 s after the speaker stopped. The bulk was the agent's own turn: `meeting_speak` is
+called once the whole reply is written.
+
+**Host side, as it is (connectome-host v0.12.0 → @animalabs/agent-framework 0.24.0, MCPL SPEC §14):**
+- **Grant:** the host grants the channel capabilities a server advertises (`computeGrant`), so Glassy's recipe needs
+  no change.
+- **Incoming:** `channels/incoming` on a registered channel wakes the agent. With no wake policy for the source, the
+  gate's default is `always`.
+- **Prose:** with `proseRouting: "disabled"` (Glassy's recipe) plain prose is never published. The option is
+  agent-wide; there is no per-channel routing. Only the `channel_publish` tool reaches the channel: one
+  `channels/publish` per call, no chunks.
+- **Chunks:** the host sends `channels/outgoing/chunk` only after a publish succeeds, each chunk a whole published
+  piece. The spec forbids streaming before routing is decided (§14.3) and delivering on chunks (§14.5).
+- **Consequence:** Bosun speaks on publish. The gain is that the agent can publish its first sentence (one tool call)
+  and go on writing; each publish is spoken as it arrives.
+- **Needs an upstream change:** token-level streaming would need agent-framework to stream deltas to
+  `channels.streaming` servers before publish. The spec allows that only once routing is decided. Bosun is ready for
+  it: `channel_prepare_chunks` synthesizes chunk sentences ahead, and the publish then plays them at once.
+
+**Bosun side.**
+- **Connections:** `EventBus` keeps the tenant's channels (`openChannel`, `closeChannel`) and each MCPL connection's
+  channel side (`attachChannels`).
+  - A connection attaches while its grant has `channels.register`. It registers every open channel, one
+    `channels/register` each, in order, after the answer to the `featureSets/update` that granted it.
+  - It takes channels back with `channels/changed` when the grant narrows or the meeting ends.
+- **Incoming:** checked at the time against the grant (`channels.incoming`) and the channels the host accepted on
+  that connection.
+- **Publish:** answered at once, because the host queues the agent's next posts behind each publish. The text goes
+  into a per-meeting queue (`channelQueue`).
+  - Bounds: 2000 characters per publish, and 6000 characters waiting or 120 s of audio not played.
+  - `channelGen` drops queued text on an opt-out or `meeting_stop_speaking`. `consentGen` keeps a final from being
+    sent as an event after its text was forgotten (opt-out, deletion) while the channel delivery was pending.
+  - A follower never cuts off the utterance it waits for: if that one doesn't end in its time, the text is dropped
+    (a failed speech event).
+- **Utterances** (`Meetings.utter`, which `meeting_speak` uses too) have a kind: `speak`, `stream` (from the channel)
+  or `ack`.
+  - A `stream` utterance is **open**: its pump (`nextPiece`) takes more pieces while it plays. Once what was written
+    has played and `STREAM_IDLE_MS` (300 ms) passed with nothing new, it closes and ends its ffmpeg player's stdin.
+  - Text that comes later starts a new utterance.
+  - A publish while `meeting_speak` plays waits for it with `speechFollows` raised, so `endUtterance` doesn't mute in
+    between.
+  - An agent utterance while an ack plays waits for the ack's player. An ack still waiting for the microphone is
+    dropped.
+- **Ack:** the clips are synthesized with the tenant's TTS settings and `ack_lang`, at admission (`prepareAcks`) and
+  whenever the settings change. They are cached per (backend, voice, model, lang, phrase), with at most 64 clips; a
+  failed one is tried again after 60 s.
+  - The trigger is a final of at least `ack_min_words` that ends with sentence punctuation, while nothing is being
+    said, outside the cooldown. The clip plays after `ack_delay_ms`, unless the agent spoke meanwhile.
+  - No speech event (it would wake the agent for its own "mhm"). A failed re-mute after an ack still raises
+    `bosun:meeting-mic-open`.
+- **Speaker labels:** an in-page watcher (`common.mjs watchSpeakers`, per-platform selector spec) logs changes of the
+  shown speaker every 200 ms. Bosun drains it every 300 ms outside the page queue (a read; the queue can be busy for
+  seconds with a mute).
+  - `LiveTranscript.wallAt(sec)` maps a segment's audio seconds to wall time through the times its chunks were sent,
+    about 0.25 s after they were heard.
+  - The segment's speaker is the name shown longest within [start − 0.3 s, end].
+- **Zoom muting again** (prod 2026-10-28: "no microphone control found in Zoom"):
+  - The fallback reads the control from the DOM and clicks it there (`element.click()` reaches a control under a
+    faded or hidden toolbar). Then Alt+A, only when the DOM shows the opposite state, so it is never a blind toggle.
+    The state is read back each time.
+  - Timings per try: 2.5 s for Playwright's own clicks, 1 s each for the page click and Alt+A. Three tries fit the
+    20 s an utterance's end waits.
+  - The page click happens only if the control shows the other state at that moment (read and click in one
+    evaluate), so a microphone the host muted meanwhile is never clicked back on.
+  - Not seen live: the web client refused a scripted guest on Zoom's own test meeting ("Automated bots aren't allowed
+    to join this meeting"). Both causes that fit the message are reproduced in the stand-in.
 
 ## 10. Deployment
 

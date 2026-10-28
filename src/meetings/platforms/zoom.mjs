@@ -202,11 +202,13 @@ const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha']
 // The call's microphone control read from the page itself, also where Playwright doesn't count it as a visible button:
 // a toolbar faded out (or hidden by visibility), a control that is a <div> with an aria-label (live Zoom has had both
 // kinds), or Zoom's audio button by its class. Only in the toolbar: never a control in the participants list or the
-// chat. Returns {state: 'on'|'off'|null, label, kind} (the first labelled match), and with click: clicks it in the
-// page (element.click(), which reaches a control under a faded toolbar where a mouse click would not).
+// chat. Returns {state: 'on'|'off'|null, label, kind, clicked} (the first labelled match); with want ('on'|'off'):
+// clicks it in the page (element.click(), which reaches a control under a faded toolbar where a mouse click would not)
+// only if it shows the other state at that very moment (read and click in one go: a microphone muted meanwhile by the
+// host is never clicked back on).
 const MIC_SCOPE = 'footer, [class*="footer"], [class*="toolbar"], [class*="join-audio-container"], [id*="audio" i]';
 const MIC_EL = 'button, [role="button"], [aria-label], .join-audio-container__btn';
-function readMic([{ on, off, scope, el, skip }, click]) {
+function readMic([{ on, off, scope, el, skip }, want]) {
   const ON = new RegExp(on, 'i'), OFF = new RegExp(off, 'i');
   const n = (s) => String(s || '').replace(/\s+/g, ' ').trim();
   for (const e of document.querySelectorAll(el)) {
@@ -214,13 +216,14 @@ function readMic([{ on, off, scope, el, skip }, click]) {
     const label = n(e.getAttribute('aria-label') || e.getAttribute('title') || e.innerText);
     const state = ON.test(label) ? 'on' : OFF.test(label) ? 'off' : null;
     if (!state) continue;
+    const click = !!want && state !== want;
     if (click) (e.closest('button, [role="button"]') || e).click();
-    return { state, label: label.slice(0, 60), kind: e.tagName.toLowerCase() };
+    return { state, label: label.slice(0, 60), kind: e.tagName.toLowerCase(), clicked: click };
   }
-  return { state: null, label: null, kind: null };
+  return { state: null, label: null, kind: null, clicked: false };
 }
 const MIC_ARGS = { on: LABEL.micOff.source, off: LABEL.micOn.source, scope: MIC_SCOPE, el: MIC_EL, skip: '[class*="participants-item"], [class*="participants-li"], [class*="chat"], [role="list"], [role="listitem"]' };
-const micInPage = (page, click = false) => page.evaluate(readMic, [MIC_ARGS, click]).catch(() => ({ state: null, label: null, kind: null }));
+const micInPage = (page, want = null) => page.evaluate(readMic, [MIC_ARGS, want]).catch(() => ({ state: null, label: null, kind: null, clicked: false }));
 async function micSettles(page, want, ms) {
   for (const until = Date.now() + ms; Date.now() < until; await page.waitForTimeout(150)) if ((await micInPage(page)).state === want) return true;
   return false;
@@ -238,8 +241,9 @@ async function micFallback(page, on) {
   let clicked = false;
   if (seen.state) {
     await revealToolbar(page);
-    seen = await micInPage(page, true);
-    clicked = true;
+    seen = await micInPage(page, want); // clicks only if it still shows the other state
+    if (seen.state === want) return { state: want, changed: false, via: 'page' };
+    clicked = seen.clicked;
     if (await micSettles(page, want, 1000)) return { state: want, changed: true, via: 'page' };
     seen = await micInPage(page);
   }

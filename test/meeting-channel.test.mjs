@@ -216,34 +216,126 @@ test('text published to the channel is spoken at once (acknowledged before it pl
   });
 });
 
-test('channel_speak_from chunks: each sentence is spoken as soon as the stream completes it; a publish of the same text after is not spoken again', async () => {
+test('chunks are never spoken; with channel_prepare_chunks their sentences are synthesized ahead and the publish that delivers them plays that audio', async () => {
   await withService(async (svc, ev, audio) => {
     const c = await host(svc);
-    await c.call('speech_settings_set', { channel_speak_from: 'chunks' });
     const { id } = await admitted(c);
     const chId = `bosun:meeting:${id}`;
     await until(() => c.registered.length === 1, 10_000);
+    const chunk = (inf, index, delta) => c.notify('channels/outgoing/chunk', { inferenceId: inf, conversationId: 'x', channelId: chId, index, delta });
     const n0 = el.st.speech.length;
-    const chunk = (index, delta) => c.notify('channels/outgoing/chunk', { inferenceId: 'inf1', conversationId: 'x', channelId: chId, index, delta });
-    await chunk(0, 'Good question. The ans');
+    // Off (default): chunks do nothing, and an inference that never publishes says nothing.
+    await chunk('inf0', 0, 'Not this. Nor this. ');
+    await c.notify('channels/outgoing/complete', { inferenceId: 'inf0', conversationId: 'x', channelId: chId, content: [{ type: 'text', text: 'Not this. Nor this.' }] });
+    await sleep(600);
+    assert.equal(el.st.speech.length, n0);
+    assert.equal(audio.players.length, 0);
+    await c.call('speech_settings_set', { channel_prepare_chunks: true });
+    await chunk('inf1', 0, 'Good question. The ans');
     await until(() => el.st.speech.length === n0 + 1, 10_000);
     assert.equal(el.st.speech.at(-1).input, 'Good question.');
-    await chunk(1, 'wer is ye');
+    await chunk('inf1', 1, 'wer is ye');
     await sleep(300);
     assert.equal(el.st.speech.length, n0 + 1, 'an open sentence waits');
-    await chunk(2, 's');
-    await c.notify('channels/outgoing/complete', { inferenceId: 'inf1', conversationId: 'x', channelId: chId, content: [{ type: 'text', text: 'Good question. The answer is yes' }] });
+    await chunk('inf1', 2, 's.');
+    await c.notify('channels/outgoing/complete', { inferenceId: 'inf1', conversationId: 'x', channelId: chId, content: [{ type: 'text', text: 'Good question. The answer is yes.' }] });
     await until(() => el.st.speech.length === n0 + 2, 10_000);
-    assert.equal(el.st.speech.at(-1).input, 'The answer is yes');
-    assert.equal((await c.publish(chId, 'Good question. The answer is yes')).delivered, true);
+    assert.equal(el.st.speech.at(-1).input, 'The answer is yes.');
+    assert.equal(audio.players.length, 0, 'nothing spoken from chunks');
+    // The publish plays the audio made ahead: no new synthesis, one per sentence.
+    assert.equal((await c.publish(chId, 'Good question. The answer is yes.')).delivered, true);
     await until(() => ev.speech.length === 1, 20_000);
-    await sleep(500);
-    assert.equal(el.st.speech.length, n0 + 2, 'the publish was not spoken again');
-    // publish (default): chunks are not spoken.
-    await c.call('speech_settings_set', { channel_speak_from: null });
-    await chunk(3, 'Not this. ');
+    assert.equal(el.st.speech.length, n0 + 2);
+    assert.equal(audio.players.length, 1);
+    // Text published already is not synthesized again when its chunks come after (connectome-host's order).
+    await chunk('inf2', 0, 'Good question. ');
     await sleep(500);
     assert.equal(el.st.speech.length, n0 + 2);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('publish limits: more than 2000 characters, or more than 6000 waiting, is refused before it is acknowledged', async () => {
+  await withService(async (svc) => {
+    const c = await host(svc);
+    const { id } = await admitted(c);
+    const chId = `bosun:meeting:${id}`;
+    await until(() => c.registered.length === 1, 10_000);
+    await assert.rejects(c.publish(chId, 'x'.repeat(2001)), /at most 2000 characters per publish/);
+    const long = Array.from({ length: 40 }, (_, i) => `Sentence number ${i} is here, and it goes on for a while longer.`).join(' ').slice(0, 1990);
+    assert.equal(long.length, 1990);
+    el.st.ttsDelayMs = 3000; // synthesis falls behind: the text waits
+    try {
+      for (let i = 0; i < 3; i++) assert.equal((await c.publish(chId, long)).delivered, true);
+      await assert.rejects(c.publish(chId, long), /too much is still waiting to be said/);
+    } finally { el.st.ttsDelayMs = 0; }
+    await c.call('meeting_stop_speaking', { meeting_id: id });
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('a publish while meeting_speak is still being prepared follows it and never cuts it off; meeting_stop_speaking drops the text waiting and mutes', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    const { id, code } = await admitted(c);
+    const chId = `bosun:meeting:${id}`;
+    await until(() => c.registered.length === 1, 10_000);
+    el.st.ttsDelayMs = 800;
+    try {
+      const speaking = c.call('meeting_speak', { meeting_id: id, text: 'One two three. Four five six.' });
+      await sleep(100);
+      await c.publish(chId, 'After that.');
+      assert.equal((await speaking).isError, false);
+      await until(() => ev.speech.length === 2, 30_000);
+      assert.deepEqual(ev.speech.map((e) => [e.kind || 'speak', e.state]), [['speak', 'done'], ['stream', 'done']]);
+      assert.deepEqual(mics(code), [true, false]);
+      // Barge-in with channel text waiting behind meeting_speak: all of it stops, and the microphone is muted.
+      await c.call('meeting_speak', { meeting_id: id, text: 'Seven eight nine ten eleven twelve thirteen.' });
+      await c.publish(chId, 'This waits.');
+      const st = (await c.call('meeting_stop_speaking', { meeting_id: id })).json();
+      assert.equal(st.stopped, true);
+      await sleep(1500);
+      assert.equal(audio.players.length, 3, 'the waiting text never played');
+      assert.equal(mics(code).at(-1), false);
+      assert.equal((await status(c, id)).speaking, undefined);
+    } finally { el.st.ttsDelayMs = 0; }
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('an opt-out (staying in the call) closes the channel, cancels a pending acknowledgement and drops channel text waiting', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { ack_on_final: true, ack_delay_ms: 1500, ack_min_words: 1, ack_cooldown_s: 0 });
+    const { id, code } = await admitted(c, { leave_on_optout: false });
+    const chId = `bosun:meeting:${id}`;
+    await until(() => c.registered.length === 1, 10_000);
+    audio.say(tonePcm(2));
+    await until(() => c.incoming.some((m) => m.metadata.final), 15_000);
+    fake.say(code, 'Alex', "please don't record this");
+    await until(() => c.changed.length === 1, 10_000);
+    assert.deepEqual(c.changed[0].removed, [chId]);
+    await sleep(2000);
+    assert.equal(audio.players.length, 0, 'no acknowledgement after the opt-out');
+    await assert.rejects(c.publish(chId, 'hi'), /unknown channel/);
+    const s = await status(c, id);
+    assert.equal(s.channel.open, false);
+    assert.equal(s.state, 'admitted');
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('grant matching per MCPL §5.4: a bare "*" grants no channel capability; channels.* does', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc, { caps: ['*'] });
+    const { id } = await admitted(c);
+    await sleep(800);
+    assert.equal(c.registered.length, 0, 'a bare * matches depth-1 paths only');
+    assert.equal((await status(c, id)).channel.registered, false);
     await c.call('meeting_leave', { meeting_id: id });
     await c.close();
   });
