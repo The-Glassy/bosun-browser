@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.17.1 — don't answer half a turn: turn hold and merge, barge-in, stale-answer flag
+
+### Added
+
+- **Turn hold** (`turn_hold_ms`, default 900; `turn_hold_complete_ms`, default 300). A transcript final is held for more
+  speech before it goes to the agent (channel and `bosun:meeting-transcript` events alike).
+  - If the speaker goes on, the agent gets one merged final: `metadata.merged_seqs`, the last segment's `seq` and
+    `messageId`, and `held_ms`.
+  - A question or a complete sentence is held only `turn_hold_complete_ms`.
+  - A held turn ends early when someone else's final comes, when the meeting ends, or 30 s after its first final.
+  - `turn_hold_ms: 0` turns the hold off (0.17.0's behaviour).
+- **Barge-in** (`barge_in`, default true; `barge_in_min_words` 2; `barge_in_min_s` 0.6). Someone else speaking while
+  Bosun's audio plays stops it, as `meeting_stop_speaking` would.
+  - The microphone is muted again and channel text still waiting is dropped.
+  - `bosun:meeting-speech` reports it with `barge_in`, `said` and `interrupted_by`.
+  - The channel gets a `bosun:meeting-interrupted` message: `(interrupted at "...")`, with `said` and `unsaid`.
+- **Echo safety.** Bosun's own words coming back (text mostly made of what it is saying or said in the last 8 s)
+  never barge in and never extend a turn. Their final is marked `echo_suspected` / `bosun:echo-suspected`.
+  - Where the page names speakers, a barge-in also needs someone other than Bosun shown speaking.
+- **Stale answers.** The acknowledgement of `channels/publish` carries `superseded_by_new_speech`: true when someone
+  has spoken since the last turn the agent was given. It also carries `last_turn_seq`. The text is said all the same.
+- `meeting_status` shows `barge_ins`.
+
+### Changed
+
+- `ack_on_final` plays at the end of the merged turn, once, not after each fragment.
+
 ## 0.17.0 — the meeting as an MCPL channel: speech as soon as text is published; acknowledgements; speaker labels; Zoom mutes again
 
 ### Added
