@@ -50,9 +50,13 @@ export function loadConfig(env = process.env) {
     // test server; nothing else gets the key.
     liveTranscriptDailyMin: int(env, 'LIVE_TRANSCRIPT_DAILY_MIN', 180, 1, 24 * 60),
     elevenlabs: null,
-    // Speaking in meetings (meeting_speak with text): the local OpenAI-style TTS service (Supertonic), its default voice.
+    // Speaking in meetings (meeting_speak with text): the local OpenAI-style TTS service (Supertonic), its default voice,
+    // and the backend meeting_speak uses when none is passed (TTS_DEFAULT_BACKEND; elevenlabs without a key falls back
+    // to supertonic, and ttsWarning says so at start).
     ttsUrl: null,
     ttsVoice: env.TTS_VOICE || null,
+    ttsDefaultBackend: 'supertonic',
+    ttsWarning: null,
     tokens: parseTokens(env),
     // Features a deployment can switch off. FEATURES_MEETINGS=0: no meeting tools, handlers or recordings directory.
     // FEATURES_UPLOADS=0: no upload tools and no PUT endpoint.
@@ -116,6 +120,9 @@ export function loadConfig(env = process.env) {
   // Session cap of each tenant with policy "ephemeral".
   cfg.ephemeralMaxSessions = int(env, 'BROWSER_EPHEMERAL_MAX_SESSIONS', Math.min(2, cfg.maxSessionsPerTenant), 1, cfg.maxSessionsPerTenant);
 
+  // The ElevenLabs text-to-speech model (checked also without a key, so that a typo shows at start).
+  const ttsModel = env.ELEVENLABS_TTS_MODEL || 'eleven_v4_turbo';
+  if (!/^[a-z0-9_]{3,60}$/.test(ttsModel)) throw new Error('ELEVENLABS_TTS_MODEL must be an ElevenLabs model id such as eleven_v4_turbo');
   if (env.ELEVENLABS_API_KEY) {
     const key = String(env.ELEVENLABS_API_KEY).trim();
     if (!/^[\x21-\x7e]{10,200}$/.test(key)) throw new Error('ELEVENLABS_API_KEY is not a valid API key');
@@ -126,8 +133,12 @@ export function loadConfig(env = process.env) {
     if (base.pathname !== '/' || base.search || base.username || base.password) throw new Error('ELEVENLABS_BASE_URL is a host only (no path, query or credentials)');
     const voice = env.ELEVENLABS_VOICE || null;
     if (voice && !/^[A-Za-z0-9]{10,40}$/.test(voice)) throw new Error('ELEVENLABS_VOICE must be an ElevenLabs voice id');
-    cfg.elevenlabs = { apiKey: key, baseUrl: base.origin, voice };
+    cfg.elevenlabs = { apiKey: key, baseUrl: base.origin, voice, ttsModel };
   }
+  const backend = env.TTS_DEFAULT_BACKEND || 'supertonic';
+  if (!['supertonic', 'elevenlabs'].includes(backend)) throw new Error(`TTS_DEFAULT_BACKEND must be supertonic or elevenlabs (got "${backend}")`);
+  if (backend === 'elevenlabs' && !cfg.elevenlabs) cfg.ttsWarning = 'TTS_DEFAULT_BACKEND=elevenlabs but ELEVENLABS_API_KEY is not set: meeting_speak uses supertonic';
+  else cfg.ttsDefaultBackend = backend;
   if (env.TTS_URL) {
     let u;
     try { u = new URL(env.TTS_URL); } catch { throw new Error('TTS_URL is not a valid URL'); }

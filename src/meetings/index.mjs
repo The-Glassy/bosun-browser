@@ -658,12 +658,13 @@ export class Meetings {
     if (m.state !== 'admitted' && m.state !== 'recording') throw new Error(`meeting ${m.id} is ${m.state}; ${what} is possible once admitted`);
   }
 
-  // Plays text (synthesized: supertonic, or elevenlabs) or an uploaded audio file into the meeting's microphone. The
+  // Plays text (synthesized: supertonic, or elevenlabs; no backend: TTS_DEFAULT_BACKEND) or an uploaded audio file into the meeting's microphone. The
   // microphone is unmuted for it and muted again after (autoMute; a microphone that was on stays on). Text is
   // synthesized a sentence at a time: the first one plays as soon as it is there, the rest is added while it plays.
   // Returns once all of it is synthesized (wait: once it has played). A second utterance while one plays is refused
   // unless interrupt.
-  async speak(tenant, id, { text, audioFileId, voice, lang, backend = 'supertonic', autoMute = true, interrupt = false, wait = false }) {
+  async speak(tenant, id, { text, audioFileId, voice, lang, backend, autoMute = true, interrupt = false, wait = false }) {
+    backend ??= this.cfg.ttsDefaultBackend || 'supertonic';
     const m = this.get(tenant, id);
     this.inCall(m, 'speaking');
     await m.announceDone.p; // nothing is said before the announcement went out
@@ -725,14 +726,17 @@ export class Meetings {
     u.startedAt = this.now();
     u.seconds = head.seconds;
     u.player.done.then((ok) => this.endUtterance(m, u, u.cancelled ? 'interrupted' : ok ? 'done' : 'failed', ok || u.cancelled ? null : new Error(u.player.error() || 'playback failed'), { t0, tail: ok }));
-    // The rest, synthesized while the first piece plays (in the voice the first one got).
-    let error = null;
+    // The rest, synthesized while the piece before plays (in the voice the first one got). gapMs: the longest silence
+    // between pieces, when a piece was written after what was written before it had played (counted from the start of
+    // playback, so a little more than the real one).
+    let error = null, gapMs = 0;
     if (text) {
       for (const piece of pieces.slice(1)) {
         if (u.cancelled || u.state !== 'speaking') break;
         const w = await synthesizeWav(this.cfg, { text: piece, backend, voice: head.voice ?? voice, lang }).catch((e) => { error = e; return null; });
         if (!w || u.cancelled || u.state !== 'speaking') break;
         if (w.pcm.rate !== head.pcm.rate || w.pcm.channels !== head.pcm.channels) { error = new Error(`${backend} changed its audio format mid-text`); break; }
+        gapMs = Math.max(gapMs, Math.round(this.now() - u.startedAt - u.seconds * 1000));
         u.player.write(w.data);
         u.seconds += w.seconds;
       }
@@ -748,7 +752,8 @@ export class Meetings {
     const started = {
       meeting_id: m.id, utterance_id: u.id, speaking: u.state === 'speaking', duration_s: Math.round(u.seconds * 100) / 100, source: text ? backend : 'file',
       ...(head.voice ? { voice: head.voice } : {}), ...(text ? { pieces: pieces.length } : {}),
-      prepare_ms: prepMs, start_ms: u.startedAt - t0, ...(text ? { synth_ms: this.now() - t0 } : {}), unmuted: !!m.speechUnmuted,
+      prepare_ms: prepMs, start_ms: u.startedAt - t0, ...(text ? { synth_ms: this.now() - t0 } : {}), ...(pieces?.length > 1 ? { gap_ms: gapMs } : {}),
+      unmuted: !!m.speechUnmuted,
       ...(error ? { error: `cut short, the rest could not be synthesized: ${oneLine(error)}` } : {}),
     };
     if (!wait) return started;

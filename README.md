@@ -134,9 +134,11 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `ELEVENLABS_API_KEY` | – | ElevenLabs key: the live meeting transcript (`meeting_join` `live_transcript`) and the `elevenlabs` voice of `meeting_speak`; unset: both refused. Kept in the service only (removed from its environment at start) |
 | `ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io` | another ElevenLabs API host (`https://*.elevenlabs.io`, e.g. `https://api.eu.residency.elevenlabs.io`); nothing else gets the key (http on loopback is accepted, for tests) |
 | `ELEVENLABS_VOICE` | `EXAVITQu4vr4xnSDxMaL` ("Sarah") | default ElevenLabs voice id for `meeting_speak` with `backend: "elevenlabs"` |
+| `ELEVENLABS_TTS_MODEL` | `eleven_v4_turbo` | ElevenLabs text-to-speech model for `meeting_speak` (`[a-z0-9_]`, 3–60 characters), e.g. `eleven_flash_v2_5` |
 | `LIVE_TRANSCRIPT_DAILY_MIN` | 180 | minutes of live transcript per tenant and local day (`TZ`); at the cap the stream stops (`bosun:meeting-transcript-stopped`, `daily-cap`) |
 | `TTS_URL` | – | the local text-to-speech service for `meeting_speak` (OpenAI-style `POST /v1/audio/speech`, WAV out; Supertonic), e.g. `http://10.78.0.11:5000`; unset: only uploaded audio or `backend: "elevenlabs"` |
 | `TTS_VOICE` | – (the service's own) | default Supertonic voice: `supertonic-F1`..`F5`, `supertonic-M1`..`M5` |
+| `TTS_DEFAULT_BACKEND` | `supertonic` | the `backend` of `meeting_speak` when none is passed: `supertonic` or `elevenlabs`; `elevenlabs` without `ELEVENLABS_API_KEY` falls back to `supertonic`, with a warning at start |
 | `MAX_DOM_NODES` | 60000 | `read` (a11y, whole page) refuses larger pages; pass `selector` |
 | `SAVE_SHOTS` / `SHOTS_PER_SESSION` | – / 20 | `1` = also keep screenshots on disk (0600, deleted when the session closes) |
 
@@ -825,14 +827,17 @@ Chat text is kept only in memory, for the last 50 meetings.
   final_lag_s }`.
 
 **Speaking** (`meeting_speak`, once admitted and after the announcement):
-- **What is played:** `text`, synthesized by `backend` **`supertonic`** (default: the local TTS service at `TTS_URL`,
+- **What is played:** `text`, synthesized by `backend` **`supertonic`** (the local TTS service at `TTS_URL`,
   voices `supertonic-F1`..`F5` / `M1`..`M5`, pass `lang`) or **`elevenlabs`** (`voice` = an ElevenLabs voice id, model
-  `eleven_flash_v2_5`, zero retention asked for); or an uploaded file (`audio_file_id` from `upload_create`, any
+  `ELEVENLABS_TTS_MODEL`, default `eleven_v4_turbo`, zero retention asked for); without `backend`, the one
+  `TTS_DEFAULT_BACKEND` names (default `supertonic`). Or an uploaded file (`audio_file_id` from `upload_create`, any
   format ffmpeg reads).
 - **How:** ffmpeg plays it into the meeting's `bosun_mic` sink, whose monitor is the browser's microphone. The join
   still starts muted; `meeting_speak` unmutes for the utterance and mutes again 0.4 s after it ends (`auto_mute`,
   default true; a microphone that was already on stays on). It returns once the audio plays, with `duration_s`,
-  `prepare_ms` (synthesis, with the unmute alongside) and `start_ms`; `wait: true` returns once it has played.
+  `prepare_ms` (synthesis, with the unmute alongside), `start_ms` and, for text in several pieces, `gap_ms` (the
+  longest pause between pieces because synthesis fell behind; 0 when each piece was there before the one before it had
+  played); `wait: true` returns once it has played.
   `bosun:meeting-speech` says when an utterance ended (`done`, `interrupted`, `failed`).
 - **Barge-in:** `meeting_stop_speaking` stops it at once (and mutes again). A second `meeting_speak` while one plays
   is refused unless `interrupt: true`, which replaces it.
@@ -840,7 +845,9 @@ Chat text is kept only in memory, for the last 50 meetings.
   whose names say their state) and Zoom (Mute/Unmute; the hand in the Reactions menu). On
   Zoom a profile that never gave Zoom the microphone can't unmute: `meeting_speak` then says so.
 - **Latency:** from the call to the first sound in the call about 0.35 s plus the synthesis of the first sentence
-  (Supertonic: about 1–1.3 s for a short one on a busy CPU). Start with a short sentence for a quick answer.
+  (Supertonic: about 1–1.3 s for a short one on a busy CPU; ElevenLabs `eleven_v4_turbo`: 0.3–0.6 s, and the next
+  pieces arrive long before the one before has played, so `gap_ms` is 0). Start with a short sentence for a quick
+  answer.
 - **Engines:** chromium and patchright (meetings refuse camoufox).
 
 **Audio setup (Linux).** Each meeting gets a private PulseAudio server: its own `XDG_RUNTIME_DIR`, socket and

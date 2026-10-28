@@ -228,7 +228,13 @@ ElevenLabs grants it only to enterprise and trial plans and otherwise says so in
 **Speaking.** `meeting_speak` splits text into pieces (sentences; a long first sentence at its first comma; later
 ones grouped up to 160 characters), synthesizes the first, and starts one ffmpeg player on stdin while unmuting in
 parallel; the remaining pieces are synthesized and written into the same player while it plays. A local Supertonic on
-a busy CPU synthesizes at about real time, so time to first audio is the first piece's synthesis, not the whole text's.
+a busy CPU synthesizes at about real time, so time to first audio is the first piece's synthesis, not the whole text's;
+it can also fall behind, and the listener hears a pause between pieces. ElevenLabs (`ELEVENLABS_TTS_MODEL`, default
+`eleven_v4_turbo` since 0.15.1: 94 languages, `language_code` `uk`, 16-bit `wav_24000`) synthesizes a piece in 0.3–0.9 s,
+far less than the piece before it lasts, so the pieces play without a pause; `gap_ms` in the result is the longest
+pause there was (the time a piece was written minus the audio written before it, from the start of playback).
+`TTS_DEFAULT_BACKEND` picks the backend when the agent passes none (0.15.1); `elevenlabs` without a key falls back to
+`supertonic` and says so at start, rather than refusing every utterance.
 The microphone is unmuted through the platform's toolbar control (`setMic`), and muted again 0.4 s after the audio
 ends, only if speaking turned it on. Zoom: a microphone Zoom never got makes Zoom ask "Do you want people to hear you?"
 on unmute; since the agent asked to be heard, "Use microphone" is answered then (the lobby still declines it).

@@ -210,7 +210,9 @@ test('parseWav reads the header (also a LIST chunk first, a streamed size); synt
   const req = el.st.tts.at(-1);
   assert.equal(req.voice, 'EXAVITQu4vr4xnSDxMaL');
   assert.deepEqual(req.query, { output_format: 'wav_24000', enable_logging: 'false' });
-  assert.deepEqual(req.body, { text: 'Привіт', model_id: 'eleven_flash_v2_5', language_code: 'uk' });
+  assert.deepEqual(req.body, { text: 'Привіт', model_id: 'eleven_v4_turbo', language_code: 'uk' });
+  await synthesizeWav({ ...cfg, elevenlabs: { ...cfg.elevenlabs, ttsModel: 'eleven_flash_v2_5' } }, { text: 'Hi', backend: 'elevenlabs' });
+  assert.equal(el.st.tts.at(-1).body.model_id, 'eleven_flash_v2_5');
   await assert.rejects(synthesizeWav({ ...cfg, elevenlabs: { ...cfg.elevenlabs, apiKey: 'wrong-key-0123456789' } }, { text: 'x', backend: 'elevenlabs' }), /ElevenLabs text-to-speech answered HTTP 401/);
   await assert.rejects(synthesizeWav({ ttsUrl: 'http://127.0.0.1:9' }, { text: 'x' }), /supertonic could not be reached/);
 });

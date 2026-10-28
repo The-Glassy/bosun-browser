@@ -270,6 +270,7 @@ test('meeting_speak: refused before admission; unmutes, plays the synthesized te
     assert.deepEqual(el.st.speech.slice(n).map((x) => x.input), ['First sentence here.', 'Second one follows! And a third?']);
     assert.equal(m2.duration_s, 0.9 + 1.8);
     assert.equal(audio.players.at(-1).bytes.length, Math.round(2.7 * 24000) * 2);
+    assert.equal(m2.gap_ms, 0, 'the second piece was there before the first one had played');
     assert.deepEqual(media(code, 'mic'), [true, false, true, false]);
     // wait: answers once it has played.
     const w = (await c.call('meeting_speak', { meeting_id: id, text: 'Short.', wait: true })).json();
@@ -288,6 +289,35 @@ test('meeting_speak: refused before admission; unmutes, plays the synthesized te
     assert.equal((await status(c, id)).speaking, undefined);
     await c.close();
   }, { env: { TTS_VOICE: '' } });
+});
+
+test('TTS_DEFAULT_BACKEND=elevenlabs: meeting_speak without a backend speaks with ElevenLabs (model, voice); gap_ms says when synthesis fell behind', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    const id = (await c.call('meeting_join', { url })).json().meeting_id;
+    fake.admit(code);
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    const [nt, ns] = [el.st.tts.length, el.st.speech.length];
+    // Three sentences, ElevenLabs answering in 300 ms (about what eleven_v4_turbo takes): no pause between the pieces.
+    el.st.ttsDelayMs = 300;
+    try {
+      const r = (await c.call('meeting_speak', { meeting_id: id, text: 'Hi everyone, thanks for having me. I took notes on the first part. Shall I sum up now?', lang: 'en', wait: true })).json();
+      assert.equal(r.source, 'elevenlabs');
+      assert.equal(r.voice, 'SAz9YHcvj6GT2YYXdXww');
+      assert.equal(r.pieces, 2);
+      assert.ok(r.gap_ms < 150, `gap ${r.gap_ms} ms`);
+      assert.equal(el.st.speech.length, ns, 'Supertonic was not asked');
+      assert.deepEqual(el.st.tts.slice(nt).map((x) => [x.voice, x.body.model_id, x.body.language_code]), [['SAz9YHcvj6GT2YYXdXww', 'eleven_v4_turbo', 'en'], ['SAz9YHcvj6GT2YYXdXww', 'eleven_v4_turbo', 'en']]);
+      // Synthesis slower than the first piece lasts (0.9 s of audio, 1.5 s to synthesize the next): the pause is reported.
+      el.st.ttsDelayMs = 1500;
+      const slow = (await c.call('meeting_speak', { meeting_id: id, text: 'One two three. Four five six seven.', wait: true })).json();
+      assert.ok(slow.gap_ms >= 400 && slow.gap_ms < 1500, `gap ${slow.gap_ms} ms`);
+    } finally { el.st.ttsDelayMs = 0; }
+    // An explicit backend still wins.
+    assert.equal((await c.call('meeting_speak', { meeting_id: id, text: 'Short.', backend: 'supertonic', wait: true })).json().source, 'supertonic');
+    await c.close();
+  }, { env: { TTS_DEFAULT_BACKEND: 'elevenlabs', ELEVENLABS_VOICE: 'SAz9YHcvj6GT2YYXdXww', TTS_VOICE: '' } });
 });
 
 test('barge-in: meeting_stop_speaking cuts it off and mutes; interrupt replaces it; auto_mute false leaves the microphone alone; an uploaded file', async () => {

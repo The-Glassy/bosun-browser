@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.15.1 — ElevenLabs as the meeting voice
+
+### Changed
+
+- `meeting_speak` with ElevenLabs uses **`eleven_v4_turbo`** (was `eleven_flash_v2_5`): about as quick to the first
+  audio (0.17–0.28 s to the first byte), 94 languages, Ukrainian as `language_code` `uk`. `ELEVENLABS_TTS_MODEL`
+  chooses another model (checked at start: `[a-z0-9_]`, 3–60 characters).
+
+### Added
+
+- `TTS_DEFAULT_BACKEND` (`supertonic`, default, or `elevenlabs`): the backend `meeting_speak` uses when the agent
+  passes none. `elevenlabs` without `ELEVENLABS_API_KEY` falls back to `supertonic`, with a warning at start.
+- `meeting_speak` returns `gap_ms` for text in several pieces: the longest pause between pieces because synthesis fell
+  behind. Measured with ElevenLabs `eleven_v4_turbo` (voice River) on three utterances (English, Ukrainian, short
+  sentences): 0 ms; the next piece is there 0.5–0.9 s after the first starts, while the first lasts 1.3–2 s. Pieces were
+  already synthesized while the one before played; nothing waits for playback.
+
 ## 0.15.0 — taking part in a call: live transcript and speaking
 
 ### Added

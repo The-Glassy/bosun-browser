@@ -7,14 +7,14 @@
 //   supertonic  (default) a local OpenAI-style TTS service: POST <TTS_URL>/v1/audio/speech {input, voice, lang,
 //               response_format: wav}; voices supertonic-F1..F5, supertonic-M1..M5.
 //   elevenlabs  POST https://api.elevenlabs.io/v1/text-to-speech/<voice_id>?output_format=wav_24000&enable_logging=false
-//               {text, model_id: eleven_flash_v2_5, language_code}; voice = an ElevenLabs voice id.
+//               {text, model_id: ELEVENLABS_TTS_MODEL (eleven_v4_turbo), language_code}; voice = an ElevenLabs voice id.
 import fs from 'fs';
 import { execFile } from 'child_process';
 import { nodeDebugOn, NODE_DEBUG_REFUSED } from './transcript.mjs';
 
 export const BACKENDS = ['supertonic', 'elevenlabs'];
 export const SUPERTONIC_VOICES = [...'FM'].flatMap((g) => [1, 2, 3, 4, 5].map((i) => `supertonic-${g}${i}`));
-export const EL_TTS_MODEL = 'eleven_flash_v2_5';
+export const EL_DEFAULT_TTS_MODEL = 'eleven_v4_turbo'; // ELEVENLABS_TTS_MODEL
 export const EL_DEFAULT_VOICE = 'EXAVITQu4vr4xnSDxMaL'; // "Sarah", one of ElevenLabs' premade voices
 const TTS_TIMEOUT_MS = 30_000;
 const MAX_AUDIO_BYTES = 50 * 1024 * 1024;
@@ -102,7 +102,7 @@ export async function synthesizeWav(cfg, { text, backend = 'supertonic', voice, 
     u.searchParams.set('enable_logging', 'false');
     buf = await fetchAudio(u.href, {
       method: 'POST', headers: { 'content-type': 'application/json', 'xi-api-key': cfg.elevenlabs.apiKey },
-      body: JSON.stringify({ text, model_id: EL_TTS_MODEL, ...(lang ? { language_code: lang } : {}) }),
+      body: JSON.stringify({ text, model_id: cfg.elevenlabs.ttsModel || EL_DEFAULT_TTS_MODEL, ...(lang ? { language_code: lang } : {}) }),
     }, 'ElevenLabs text-to-speech');
   } else throw new Error(`backend must be one of ${BACKENDS.join(', ')}`);
   const w = parseWav(buf);

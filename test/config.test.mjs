@@ -41,6 +41,29 @@ test('numeric settings are validated (no NaN disabling the session cap)', () => 
   assert.equal(loadConfig({}).maxSessions, 3);
 });
 
+test('ElevenLabs TTS model and the default meeting_speak backend: defaults, validation, fallback without a key', () => {
+  const KEY = { ELEVENLABS_API_KEY: 'el-key-0123456789' };
+  const d = loadConfig({});
+  assert.equal(d.ttsDefaultBackend, 'supertonic');
+  assert.equal(d.ttsWarning, null);
+  assert.equal(loadConfig(KEY).elevenlabs.ttsModel, 'eleven_v4_turbo');
+  assert.equal(loadConfig({ ...KEY, ELEVENLABS_TTS_MODEL: 'eleven_flash_v2_5' }).elevenlabs.ttsModel, 'eleven_flash_v2_5');
+  for (const bad of ['ab', 'Eleven_V4', 'eleven-v4', 'x'.repeat(61), 'a b c']) {
+    assert.throws(() => loadConfig({ ...KEY, ELEVENLABS_TTS_MODEL: bad }), /ELEVENLABS_TTS_MODEL must be/, bad);
+  }
+  assert.throws(() => loadConfig({ ELEVENLABS_TTS_MODEL: 'Bad!' }), /ELEVENLABS_TTS_MODEL must be/, 'checked also without a key');
+  assert.equal(loadConfig({ ...KEY, ELEVENLABS_VOICE: 'SAz9YHcvj6GT2YYXdXww' }).elevenlabs.voice, 'SAz9YHcvj6GT2YYXdXww');
+  assert.equal(loadConfig({ TTS_DEFAULT_BACKEND: 'supertonic' }).ttsDefaultBackend, 'supertonic');
+  const el = loadConfig({ ...KEY, TTS_DEFAULT_BACKEND: 'elevenlabs' });
+  assert.equal(el.ttsDefaultBackend, 'elevenlabs');
+  assert.equal(el.ttsWarning, null);
+  // elevenlabs without a key: supertonic, and a warning.
+  const fb = loadConfig({ TTS_DEFAULT_BACKEND: 'elevenlabs' });
+  assert.equal(fb.ttsDefaultBackend, 'supertonic');
+  assert.match(fb.ttsWarning, /TTS_DEFAULT_BACKEND=elevenlabs but ELEVENLABS_API_KEY is not set: meeting_speak uses supertonic/);
+  for (const bad of ['openai', 'ElevenLabs', ' supertonic']) assert.throws(() => loadConfig({ TTS_DEFAULT_BACKEND: bad }), /TTS_DEFAULT_BACKEND must be supertonic or elevenlabs/, bad);
+});
+
 test('isLoopbackHost', () => {
   for (const h of ['127.0.0.1', '127.1.2.3', 'localhost', '::1', '[::1]']) assert.ok(isLoopbackHost(h), h);
   for (const h of ['0.0.0.0', '::', '10.0.0.1', '192.168.1.2', 'example.com', '']) assert.ok(!isLoopbackHost(h), h);
@@ -99,4 +122,10 @@ test('the server process starts with a token and never logs it', async () => {
   assert.match(r.err, /MCP over WebSocket on 127\.0\.0\.1:\d+/);
   assert.ok(!r.err.includes(GOOD));
   assert.equal(r.code, 0); // SIGTERM -> clean shutdown
+});
+
+test('the server process warns at start when TTS_DEFAULT_BACKEND=elevenlabs has no ElevenLabs key', async () => {
+  const r = await run({ WS_PORT: '0', WS_HOST: '127.0.0.1', BROWSER_TOKEN: GOOD, TTS_DEFAULT_BACKEND: 'elevenlabs' }, /MCP over WebSocket/);
+  assert.match(r.err, /bosun: WARNING — TTS_DEFAULT_BACKEND=elevenlabs but ELEVENLABS_API_KEY is not set: meeting_speak uses supertonic/);
+  assert.equal(r.code, 0);
 });
