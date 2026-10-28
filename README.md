@@ -940,6 +940,54 @@ once the announcement is out.
   - Measured locally (stand-ins): the clip's audio starts about 0.4 s after the final reached the host, most of it the
     unmute click.
 
+**Turns, barge-in and stale answers (0.17.1).** At a 0.5 s pause, Scribe's VAD ends a segment in the middle of
+a sentence. In 0.17.0 the agent answered that fragment, and what the speaker added came in while it spoke.
+- **Turn hold:** a final is held `turn_hold_ms` (default 900) for more speech. When the speaker goes on, their
+  partials keep the turn open until their next final, and the agent gets one merged final: `metadata.merged_seqs`
+  lists the segments, `seq` is the last one. `held_ms` says how long the turn waited after its last final.
+  - A question, or a complete sentence (three or more words, a full stop, not trailing off with "…" or a word such as
+    "and", "the", "що", "und"), is held only `turn_hold_complete_ms` (default 300).
+  - Someone else's final ends the turn held before it. A turn goes at the latest at the first final 30 s after it
+    began.
+  - `turn_hold_ms: 0` turns the hold off, as in 0.17.0.
+  - The acknowledgement (`ack_on_final`) plays once, at the real end. `meeting_transcript` still has every segment.
+- **Barge-in** (`barge_in`, default true): someone else speaking while Bosun's audio plays stops it, as
+  `meeting_stop_speaking` would.
+  - What counts: at least `barge_in_min_words` (2) new words, where agreeing words ("mhm", "yeah", "ok", "так", "ja")
+    don't count; or one word while the page shows someone speaking for `barge_in_min_s` (0.6) since Bosun began.
+  - What happens: the microphone is muted again, and text from the channel still waiting is dropped.
+  - An uploaded audio file (`audio_file_id`) is never cut off this way, because there is no text to recognise its
+    echo by.
+  - What the agent hears: `bosun:meeting-speech` comes with `state: "interrupted"`, `barge_in: true`, `said` (the
+    text played so far) and `interrupted_by`. The channel gets a message tagged `bosun:meeting-interrupted`, author
+    `bosun`, `(interrupted at "...")`, with `said` and `unsaid` in its metadata. The interrupter's turn follows as
+    usual.
+- **Bosun's own voice never interrupts it.**
+  - Text that is mostly words Bosun is saying, or said in the last 8 s, is its own voice coming back through
+    someone's speakers. It never barges in, never extends a turn, and its final is marked `echo_suspected`.
+  - Where the page names speakers, someone other than Bosun must be shown speaking while Bosun's audio plays.
+- **Stale answers:** the acknowledgement of each `channels/publish` carries `superseded_by_new_speech`. It is true
+  when someone has spoken since the last turn the agent was given (a turn still held, or still being said). The text
+  is said all the same, and the agent decides whether to stop (`meeting_stop_speaking`) or go on. `last_turn_seq` is
+  the seq of that last turn, so an agent can tell when it is answering an older one.
+
+**Still thinking (0.17.1).** When the speaker goes on after their turn went to the agent but before the agent answered
+it (no publish and no `meeting_speak` for it yet), within `turn_extend_s` (default 20 s; 0 turns this off):
+- **At once:** the channel gets a message tagged `bosun:meeting-turn-extended`, author `bosun`, metadata `{turn_seq,
+  turn_text, text_so_far, speaker}`. Without the channel it comes as the live event `bosun:meeting-turn-extended`.
+- **The turn is reopened:** it is held again with what the speaker adds. When they are done it comes again as one
+  merged final: `extends_turn` names the old turn, and `merged_seqs` covers both parts.
+- **Publishes for the old turn:** with `superseded_publish: "drop"` (default) they are not said. The acknowledgement
+  is `delivered: false, dropped: true, reason: "superseded_by_new_speech"`, so a host counts it as not delivered.
+  With `"speak"` they are said, with `superseded_by_new_speech: true`.
+- **Which turn a publish answers:** the one current when it arrived (`turn_seq` in the acknowledgement). Finals carry
+  `turn_seq`, and a publish may pass `turn_seq` (in its params or `metadata`) to name the turn it answers.
+- **Acknowledgement:** an acknowledgement still waiting for the old turn (`ack_delay_ms`) is not played, and the
+  merged turn gets its own. A clip that already played can't be taken back, so the merged turn's clip then waits out
+  `ack_cooldown_s` as usual.
+- **Not reopened:** a turn the agent has answered (its answer may be playing, and barge-in handles that), a turn of
+  someone else, and a turn whose transcript was deleted.
+
 **Audio setup (Linux).** Each meeting gets a private PulseAudio server: its own `XDG_RUNTIME_DIR`, socket and
 config, with two null sinks:
 - **`bosun_out`:** the browser plays the meeting into it; ffmpeg records its monitor, and a second one reads it for

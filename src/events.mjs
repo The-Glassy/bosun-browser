@@ -25,7 +25,7 @@ export const MEETING_SET = 'bosun.meeting';
 export const MEETING_TAGS = {
   chat: 'bosun:meeting-chat', optout: 'bosun:meeting-optout', ended: 'bosun:meeting-ended', announce: 'bosun:meeting-announce',
   transcript: 'bosun:meeting-transcript', 'transcript-stopped': 'bosun:meeting-transcript-stopped', speech: 'bosun:meeting-speech',
-  'mic-open': 'bosun:meeting-mic-open',
+  'mic-open': 'bosun:meeting-mic-open', 'turn-extended': 'bosun:meeting-turn-extended',
 };
 export const CHANNEL_PREFIX = 'bosun:meeting:';
 export const DOWNLOAD_SET = 'bosun.download';
@@ -64,6 +64,7 @@ export const MANIFEST = {
           [MEETING_TAGS['transcript-stopped']]: { desc: 'the live transcript stopped while the meeting goes on (origin: reason daily-cap|error|opted-out|stopped|recording-failed|audio-ended, error)' },
           [MEETING_TAGS.speech]: { desc: 'an utterance of meeting_speak (or of text published to the meeting channel) ended (origin: utterance_id, state done|interrupted|failed, played_s, mic_open when not muted again)' },
           [MEETING_TAGS['mic-open']]: { desc: 'WARNING: Bosun could not mute its microphone again after speaking; it may still be on (origin: mute_error, gave_up when the retries are over). meeting_mute {on: true} takes it over' },
+          [MEETING_TAGS['turn-extended']]: { desc: 'the speaker went on after their turn reached the agent and before the agent answered it: the turn is reopened and comes again, merged, when they are done (origin: turn_seq, turn_text, text_so_far, speaker); publishes for the old turn are dropped unless superseded_publish is "speak"' },
         },
         keyed: { 'bosun:meeting': { open: true }, 'bosun:platform': { values: ['meet', 'zoom'] } },
       },
@@ -114,6 +115,7 @@ export function meetingEvent(kind, { meeting_id, platform, ...data }) {
     : kind === 'transcript' ? `Meeting ${meeting_id} ${data.final ? 'said' : 'is saying'} (#${data.seq}, ${data.start_s}-${data.end_s} s${data.speaker ? `, ${data.speaker}` : ''}): ${data.text}`
     : kind === 'transcript-stopped' ? `Meeting ${meeting_id}: the live transcript stopped (${data.reason}${data.error ? `: ${data.error}` : ''}); the meeting goes on.`
     : kind === 'speech' ? `${data.mute_error ? `WARNING: Bosun's microphone may still be ON in meeting ${meeting_id}. ` : ''}Meeting ${meeting_id}: utterance ${data.utterance_id} ${data.state} after ${data.played_s} s${data.error ? ` (${data.error})` : ''}.${data.mute_error ? ` Not muted again: ${data.mute_error}.` : ''}`
+    : kind === 'turn-extended' ? `Meeting ${meeting_id}: ${data.speaker || 'the speaker'} went on after turn #${data.turn_seq} ("${data.text_so_far}"); it comes again, merged, when they are done.`
     : kind === 'mic-open' ? `WARNING: Bosun's microphone may still be ON in meeting ${meeting_id}: ${data.mute_error}.${data.gave_up ? ' Bosun stopped retrying.' : ' Bosun keeps trying to mute it.'} meeting_mute {on: true} or meeting_leave if it must be off.`
     : kind === 'optout' ? `Meeting ${meeting_id}: ${data.sender || 'someone'} asked not to be recorded ("${data.text}"). The recording was stopped and deleted${data.left ? ' and Bosun left the meeting' : ''}.`
     : kind === 'announce' ? `Meeting ${meeting_id}: the recording announcement ${data.sent_to === 'host' ? 'went to the host only' : 'could not be posted in the chat'} (${data.reason}: ${data.error}). Bosun records anyway; a request not to be recorded in the chat still stops it.`
@@ -395,7 +397,7 @@ function channelSide(server, { bus, tenant, can }) {
   const publish = async (p) => {
     const ch = target(p, 'channels.publish');
     const r = await ch.handler.publish(textOf(p.content), p);
-    return { delivered: true, messageId: r.messageId };
+    return { delivered: true, ...r }; // messageId, and what the channel adds (a meeting: superseded_by_new_speech, last_turn_seq)
   };
   const any = z.object({}).passthrough().optional();
   server.setRequestHandler(z.object({ method: z.literal('channels/publish'), params: any }), async (req) => publish(req.params));
