@@ -329,6 +329,75 @@ test('an opt-out (staying in the call) closes the channel, cancels a pending ack
   });
 });
 
+test('an opt-out while text from the channel is still being synthesized: it never plays, and the microphone is muted again', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    const { id, code } = await admitted(c, { leave_on_optout: false });
+    const chId = `bosun:meeting:${id}`;
+    await until(() => c.registered.length === 1, 10_000);
+    el.st.ttsDelayMs = 1500;
+    try {
+      await c.publish(chId, 'This should never be heard.');
+      await sleep(200);
+      fake.say(code, 'Alex', "please don't record this");
+      await until(() => c.changed.length === 1, 10_000);
+      await sleep(2500);
+    } finally { el.st.ttsDelayMs = 0; }
+    assert.equal(audio.players.length, 0);
+    assert.notEqual(mics(code).at(-1), true, 'not left on');
+    assert.equal((await status(c, id)).speaking, undefined);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('a featureSets/update notification without capabilities keeps the channels; one that drops channels.register takes them back', async () => {
+  await withService(async (svc) => {
+    const c = await host(svc);
+    const { id } = await admitted(c);
+    await until(() => c.registered.length === 1, 10_000);
+    await c.notify('featureSets/update', { disabled: [] });
+    await sleep(500);
+    assert.equal(c.changed.length, 0);
+    assert.equal((await status(c, id)).channel.registered, true);
+    await c.notify('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'] });
+    await until(() => c.changed.length === 1);
+    assert.equal((await status(c, id)).channel.registered, false);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('chunk preparation is bounded (20 sentences at a time, none longer than 400 characters) and keyed by the exact text', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { channel_prepare_chunks: true });
+    const { id } = await admitted(c);
+    const chId = `bosun:meeting:${id}`;
+    await until(() => c.registered.length === 1, 10_000);
+    const n0 = el.st.speech.length;
+    el.st.ttsDelayMs = 1000;
+    try {
+      const many = Array.from({ length: 100 }, (_, i) => `Item ${i}.`).join(' ') + ' ';
+      await c.notify('channels/outgoing/chunk', { inferenceId: 'big', conversationId: 'x', channelId: chId, index: 0, delta: many });
+      await c.notify('channels/outgoing/chunk', { inferenceId: 'long', conversationId: 'x', channelId: chId, index: 1, delta: `${'word '.repeat(100)}end. ` });
+      await sleep(400);
+      assert.equal(el.st.speech.length - n0, 20);
+    } finally { el.st.ttsDelayMs = 0; }
+    await sleep(1500);
+    // The balance is -5, published as 5: the audio made ahead for "-5" is not used.
+    await c.notify('channels/outgoing/chunk', { inferenceId: 'neg', conversationId: 'x', channelId: chId, index: 2, delta: 'The balance is -5 dollars. ' });
+    await sleep(300);
+    const n1 = el.st.speech.length;
+    await c.publish(chId, 'The balance is 5 dollars.');
+    await until(() => ev.speech.length === 1, 20_000);
+    assert.equal(el.st.speech.length, n1 + 1);
+    assert.equal(el.st.speech.at(-1).input, 'The balance is 5 dollars.');
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
 test('grant matching per MCPL §5.4: a bare "*" grants no channel capability; channels.* does', async () => {
   await withService(async (svc, ev, audio) => {
     const c = await host(svc, { caps: ['*'] });

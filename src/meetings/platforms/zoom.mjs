@@ -208,7 +208,7 @@ const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha']
 // host is never clicked back on).
 const MIC_SCOPE = 'footer, [class*="footer"], [class*="toolbar"], [class*="join-audio-container"], [id*="audio" i]';
 const MIC_EL = 'button, [role="button"], [aria-label], .join-audio-container__btn';
-function readMic([{ on, off, scope, el, skip }, want]) {
+function readMic([{ on, off, scope, el, skip }, want, how = 'click']) {
   const ON = new RegExp(on, 'i'), OFF = new RegExp(off, 'i');
   const n = (s) => String(s || '').replace(/\s+/g, ' ').trim();
   for (const e of document.querySelectorAll(el)) {
@@ -217,23 +217,28 @@ function readMic([{ on, off, scope, el, skip }, want]) {
     const state = ON.test(label) ? 'on' : OFF.test(label) ? 'off' : null;
     if (!state) continue;
     const click = !!want && state !== want;
-    if (click) (e.closest('button, [role="button"]') || e).click();
+    if (click && how === 'key') { // Zoom's shortcut, sent to the page with nothing focused (not to the chat box)
+      document.activeElement?.blur?.();
+      for (const type of ['keydown', 'keyup']) document.dispatchEvent(new KeyboardEvent(type, { key: 'a', code: 'KeyA', altKey: true, bubbles: true, cancelable: true }));
+    } else if (click) (e.closest('button, [role="button"]') || e).click();
     return { state, label: label.slice(0, 60), kind: e.tagName.toLowerCase(), clicked: click };
   }
   return { state: null, label: null, kind: null, clicked: false };
 }
 const MIC_ARGS = { on: LABEL.micOff.source, off: LABEL.micOn.source, scope: MIC_SCOPE, el: MIC_EL, skip: '[class*="participants-item"], [class*="participants-li"], [class*="chat"], [role="list"], [role="listitem"]' };
-const micInPage = (page, want = null) => page.evaluate(readMic, [MIC_ARGS, want]).catch(() => ({ state: null, label: null, kind: null, clicked: false }));
+const micInPage = (page, want = null, how = 'click') => page.evaluate(readMic, [MIC_ARGS, want, how]).catch(() => ({ state: null, label: null, kind: null, clicked: false }));
 async function micSettles(page, want, ms) {
   for (const until = Date.now() + ms; Date.now() < until; await page.waitForTimeout(150)) if ((await micInPage(page)).state === want) return true;
   return false;
 }
 
 // When the toolbar's control can't be worked with Playwright's own clicks: the control as the page has it, clicked in
-// the page; then Zoom's shortcut Alt+A (with nothing focused, so it reaches Zoom and not the chat box), but only while
-// the page shows the microphone in the other state, and checked after. {state, changed, via} once it is as wanted;
-// else {state (what the page shows, or null), clicked}. Nothing is pressed blind: a shortcut that toggles must never
-// turn on a microphone that was already off.
+// the page; then Zoom's shortcut Alt+A (with nothing focused, so it reaches Zoom and not the chat box): first sent in
+// the page in the same step that reads the state, then pressed for real (Zoom may ignore a scripted key) right after
+// reading it again. Each only while the page shows the microphone in the other state, and checked after. {state,
+// changed, via} once it is as wanted; else {state (what the page shows, or null), clicked}. Nothing is pressed blind: a
+// shortcut toggles. The real key press is the one step that can't be tied to the read (a host muting Bosun in the
+// milliseconds between them would be undone; the next check sees it and tries again).
 async function micFallback(page, on) {
   const want = on ? 'on' : 'off';
   let seen = await micInPage(page);
@@ -248,10 +253,19 @@ async function micFallback(page, on) {
     seen = await micInPage(page);
   }
   if (seen.state && seen.state !== want) {
+    seen = await micInPage(page, want, 'key');
+    clicked ||= seen.clicked;
+    if (seen.state === want) return { state: want, changed: false, via: 'page' };
+    if (await micSettles(page, want, 700)) return { state: want, changed: true, via: 'alt+a' };
+    seen = await micInPage(page);
+  }
+  if (seen.state && seen.state !== want) {
     await page.evaluate(() => document.activeElement?.blur?.()).catch(() => {});
-    await page.keyboard.press('Alt+A').catch(() => {});
-    clicked = true;
-    if (await micSettles(page, want, 1000)) return { state: want, changed: true, via: 'alt+a' };
+    if ((await micInPage(page)).state === (want === 'on' ? 'off' : 'on')) {
+      await page.keyboard.press('Alt+A').catch(() => {});
+      clicked = true;
+      if (await micSettles(page, want, 1000)) return { state: want, changed: true, via: 'alt+a' };
+    }
     seen = await micInPage(page);
   }
   return { state: seen.state, label: seen.label, clicked };
@@ -715,7 +729,7 @@ export const zoom = {
   async setMic(page, on) {
     const answer = on ? async (p) => { const b = await firstVisible(button(p, LABEL.useMic)); if (b) await b.click({ timeout: 2000 }).catch(() => {}); } : null;
     try {
-      return await setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Zoom', answer, open: revealToolbar, reveal: revealToolbar, timeoutMs: on ? 10_000 : 2500 });
+      return await setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Zoom', answer, open: revealToolbar, reveal: revealToolbar, timeoutMs: on ? 10_000 : 2000 });
     } catch (e) {
       if (on && await declineDevices(page)) throw new Error('Zoom did not take the microphone when unmuting (it asked for one and offered no "Use microphone"); nothing can be said');
       const r = await micFallback(page, on);

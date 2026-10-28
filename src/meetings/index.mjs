@@ -51,7 +51,8 @@ const STREAM_IDLE_MS = 300; // an utterance from the channel waits this long aft
 const SPEAKER_POLL_MS = 300; // who the page shows as speaking is read this often
 const SPEAKER_LOG_MS = 600_000; // and kept this long
 const PREPARED_MS = 60_000; // a sentence synthesized ahead from chunks is kept this long for its publish
-const PREPARED_MAX = 20; // and this many at most per meeting
+const PREPARED_MAX = 20; // and this many at most per meeting (synthesized or still synthesizing)
+const PREPARE_SENTENCE_MAX = 400; // a longer sentence is not synthesized ahead (its publish synthesizes it)
 const PUBLISH_MAX = 2000; // characters in one publish to the channel (as meeting_speak's text)
 const CHANNEL_BACKLOG = 6000; // characters from the channel waiting to be synthesized, at most
 const CHANNEL_AHEAD_S = 120; // and seconds of its audio written but not played yet
@@ -466,22 +467,25 @@ export class Meetings {
     for (const t of sentences) this.prepare(m, t);
   }
 
+  // At most PREPARED_MAX sentences (synthesized or synthesizing) at a time, each at most PREPARE_SENTENCE_MAX
+  // characters: what doesn't fit is simply not prepared (its publish synthesizes it). Nothing is evicted while it is
+  // still being synthesized, so the number of requests is bounded too.
   prepare(m, text) {
-    const n = normalize(text);
-    if (!n || m.channelSaid.some((x) => this.now() - x.at < PREPARED_MS && x.norm.includes(n))) return;
+    const t = String(text || '').trim(), n = normalize(t);
+    if (!n || t.length > PREPARE_SENTENCE_MAX || m.channelSaid.some((x) => this.now() - x.at < PREPARED_MS && x.norm.includes(n))) return;
     let tts;
     try { tts = this.tts(m.tenant); } catch { return; }
-    const key = this.preparedKey(tts, text);
+    const key = this.preparedKey(tts, t);
     if (m.prepared.has(key)) return;
-    const e = { at: this.now(), wav: synthesizeWav(this.cfg, { text: String(text).trim(), ...tts }) };
-    e.wav.catch(() => m.prepared.delete(key));
+    for (const [k, x] of m.prepared) if (x.done && this.now() - x.at > PREPARED_MS) m.prepared.delete(k);
+    if (m.prepared.size >= PREPARED_MAX) return;
+    const e = { at: this.now(), done: false, wav: synthesizeWav(this.cfg, { text: t, ...tts }) };
+    e.wav.then(() => { e.done = true; }, () => { m.prepared.delete(key); });
     m.prepared.set(key, e);
-    for (const [k, x] of m.prepared) if (m.prepared.size > PREPARED_MAX || this.now() - x.at > PREPARED_MS) m.prepared.delete(k);
   }
 
-  // Which prepared audio fits a piece: same backend, model, language and words (the voice is the tenant's as at
-  // either time; a voice changed within PREPARED_MS may say one sentence in the old one).
-  preparedKey({ backend, model, lang }, text) { return JSON.stringify([backend, backend === 'elevenlabs' ? model : null, lang ?? null, normalize(text)]); }
+  // Which prepared audio fits a piece: exactly the same text (trimmed), backend, voice, model and language.
+  preparedKey({ backend, voice, model, lang }, text) { return JSON.stringify([String(text).trim(), backend, voice ?? null, backend === 'elevenlabs' ? model : null, lang ?? null]); }
 
   // A piece's audio: synthesized ahead from chunks (taken, once), else now.
   synth(m, { text, ...tts }) {
@@ -768,6 +772,9 @@ export class Meetings {
     clearTimeout(m.ackTimer);
     m.ackTimer = null;
     this.closeChannel(m);
+    m.prepared.clear();
+    const u = m.speech; // an acknowledgement, or text from the channel, preparing or playing: stopped (muted again)
+    if (u && (u.kind === 'ack' || u.kind === 'stream')) { u.cancelled = true; u.stopped = true; u.pieces.length = 0; u.wake?.(); u.player?.stop(); }
     // Both at once: the recording (stopped, deleted) and the live transcript (stopped, its text forgotten).
     const [, live] = await Promise.all([this.stopRecording(m, { del: true }), this.stopTranscript(m, 'opted-out', { clear: true })]);
     await this.page(m, (p) => this.say(m, p, live || m.live ? CONFIRM_DELETED_LIVE : CONFIRM_DELETED)).catch(() => {});
@@ -942,6 +949,7 @@ export class Meetings {
     if (kind !== 'ack') { clearTimeout(m.ackTimer); m.ackTimer = null; } // the agent speaks: no acknowledgement now
     const prev = m.speech;
     const t0 = this.now();
+    const consent = m.consentGen; // an opt-out meanwhile stops automatic speech (stream, ack) before it plays
     const pieces = text ? splitSpeech(text, { group: !(kind === 'stream' && this.prepareOn(m)) }) : null;
     const u = { id: `u${++m.speechSeq}`, kind, state: 'preparing', player: null, autoMute, cancelled: false, seconds: 0, t0, open: !!(text && open), pieces: pieces ? pieces.slice(1) : [], wake: null };
     u.finished = new Promise((r) => { u.finish = r; });
@@ -987,6 +995,7 @@ export class Meetings {
     const [a, b] = await Promise.allSettled([first, mic]);
     if (after) await Promise.race([after.player.done, sleep(after.seconds * 1000 + 2000)]);
     const prepMs = this.now() - t0;
+    if (kind !== 'speak' && consent !== m.consentGen) u.cancelled = true;
     const fail = a.status === 'rejected' ? a.reason : b.status === 'rejected' ? b.reason : u.cancelled || m.speech !== u ? new Error('stopped before it played')
       : m.state !== 'admitted' && m.state !== 'recording' ? new Error(`meeting ${m.id} is ${m.state}`) : null;
     if (fail) {

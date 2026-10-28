@@ -20,8 +20,13 @@
     `channel_prepare_chunks`, their sentences are synthesized ahead, and the publish that delivers them plays that
     audio at once. That pays off only with a host that streams before it publishes; connectome-host sends chunks
     after the publish, and those are not synthesized again.
-  - An opt-out (with `leave_on_optout: false`) closes the channel, cancels a pending acknowledgement and drops channel
-    text still waiting. `meeting_stop_speaking` also drops channel text still waiting.
+  - An opt-out (with `leave_on_optout: false`) closes the channel, stops an acknowledgement or channel text being
+    prepared or played (and mutes again), and drops channel text still waiting. `meeting_stop_speaking` also drops
+    channel text still waiting.
+  - Preparation from chunks is bounded: at most 20 sentences at a time, none longer than 400 characters. Prepared
+    audio is used only for exactly the same text and voice.
+  - A `featureSets/update` notification without `effectiveCapabilities` keeps the capabilities granted (MCPL §6.7).
+    Before, one carrying only `enabled` / `disabled` also cleared push events.
   - Capability matching follows MCPL §5.4: `*` matches one segment, so a bare `*` grants no `channels.*`.
   - Only channels registered on that connection, for that tenant, under the grant as it is now, are accepted. Others
     get `-32023` unknown channel or `-32002` capability denied. `channels/list` is answered.
@@ -66,7 +71,8 @@
   - `setMic` on Zoom now falls back when the toolbar's button can't be worked:
     1. It reads the control in the page itself (also a hidden one or a `<div>`, only in the toolbar, never in the
        participants list or the chat) and clicks it there (`element.click()`).
-    2. It presses Alt+A with nothing focused.
+    2. It sends Alt+A in the page, in the same step that reads the state.
+    3. It presses Alt+A for real, right after reading the state again (Zoom may ignore a scripted key).
   - The state is read back after each step. Alt+A is pressed only while the page shows the microphone in the other
     state: a toggle is never pressed blind.
   - Labels with a shortcut ("Mute (Alt+A)") and "mute audio" are recognised.

@@ -879,7 +879,8 @@ Chat text is kept only in memory, for the last 50 meetings.
   a 2.5 s utterance, and the microphone was left on. When the toolbar's button can't be worked, Bosun now:
   1. reads the control from the page itself, including a hidden one or a `<div>`, but only in the toolbar, and clicks
      it there;
-  2. then presses Alt+A, but only while the page shows the microphone still on.
+  2. then sends Alt+A (first in the page, in the same step that reads the state; then for real, right after reading
+     it again), but only while the page shows the microphone still on.
 
   Every step is checked by reading the state back. If nothing works: `mic_open: true` and a `mute_error`, a
   `bosun:meeting-speech` event starting "WARNING: Bosun's microphone may still be ON", and a queued

@@ -293,7 +293,10 @@ export function mcplConnection(server, { bus, tenant }) {
     return r.accepted === true || r.reason === 'duplicate';
   };
   const apply = (p, form) => {
-    const caps = Array.isArray(p?.effectiveCapabilities) ? p.effectiveCapabilities.filter((c) => typeof c === 'string') : [];
+    // A notification without effectiveCapabilities (only enabled/disabled, or nothing) keeps the capabilities granted
+    // (MCPL §6.7); a Request without them grants none.
+    const given = Array.isArray(p?.effectiveCapabilities);
+    const caps = given ? p.effectiveCapabilities.filter((c) => typeof c === 'string') : form === 'notification' && grant ? grant.caps : [];
     const denied = Array.isArray(p?.deniedCapabilities) ? p.deniedCapabilities : [];
     if (caps.some((c) => denied.some((d) => typeof d === 'string' && overlaps(c, d)))) { grant = { caps: [], enabled: new Set() }; return false; } // malformed: fail closed
     // Hosts resolve their recipe's patterns and send names; '*' and 'bosun.*' are accepted too.

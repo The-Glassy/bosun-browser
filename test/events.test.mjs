@@ -162,7 +162,7 @@ test('watch-changed goes out under bosun.watch only: a host that enabled just bo
   assert.deepEqual(p.tags, [WATCH_CHANGED, 'bosun:source=keepalive', 'bosun:profile=wh']);
   assert.deepEqual(p.origin, { server: 'bosun', source: 'keepalive', profile: 'wh', label: 'willhaben messages', old: 43, new: 45, url: change.url });
   assert.match(p.payload.content[0].text, /watch "willhaben messages" on profile "wh" changed: 43 -> 45/);
-  assert.equal(svc.events.pending.get('alice'), undefined);
+  await until(() => svc.events.pending.get('alice') === undefined); // once Bosun has the host's answer, not just sent it
   await c.close();
 });
 
