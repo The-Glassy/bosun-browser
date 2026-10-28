@@ -54,7 +54,9 @@ function launch(id, search) {
 // decoyMenu: a menu shown in the call with a participant named "Leave computer audio"; 'renames': that participant is
 // named "Leave computer audio" while the audio menu is open, and gone from that menu once it closes. menuHide 'visibility' / 'opacity': the audio menu
 // stays in the page when closed, hidden by visibility or opacity instead of display. captionClose: the captions
-// panel has a close button of its own (clicks logged as media {clicked: 'captions close'}).
+// panel has a close button of its own (clicks logged as media {clicked: 'captions close'}). autoHideMs: the toolbar fades
+// out after this long without the mouse moving (opacity 0, clicks go through to what is behind it) and comes back on
+// the next mouse move, as Zoom's web client does: its buttons still count as visible.
 function webClient(id, r) {
   if (r.expired) {
     return `<!doctype html><meta charset="utf-8"><title>Error - Zoom</title><nav><a href="/join">Join</a> <a href="/signin">Sign In</a></nav>
@@ -143,7 +145,7 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
   </aside>
 </div>
 <script>
-const R = ${JSON.stringify({ decoyMenu: r.decoyMenu || null, menuHide: r.menuHide || null, tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: r.dropSends || false, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micInCall: r.micInCall || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null, audioJoined: r.audioJoined || null })};
+const R = ${JSON.stringify({ decoyMenu: r.decoyMenu || null, menuHide: r.menuHide || null, tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: r.dropSends || false, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micInCall: r.micInCall || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null, autoHideMs: r.autoHideMs || 0, audioJoined: r.audioJoined || null })};
 const id = ${JSON.stringify(id)}, $ = (x) => document.getElementById(x);
 const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });
@@ -217,6 +219,13 @@ $('box').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftK
 $('send').onclick = sendBox;
 $('to').onclick = () => { $('toMenu').hidden = !$('toMenu').hidden; };
 for (const it of document.querySelectorAll('#toMenu [role=menuitem]')) it.onclick = () => { $('to').textContent = it.textContent; $('toMenu').hidden = true; };
+function autoHide() {
+  const f = document.querySelector('footer');
+  let t = null;
+  const show = () => { f.style.opacity = '1'; f.style.pointerEvents = ''; clearTimeout(t); t = setTimeout(() => { f.style.opacity = '0'; f.style.pointerEvents = 'none'; }, R.autoHideMs); };
+  document.addEventListener('mousemove', show);
+  show();
+}
 async function poll() {
   const s = await (await fetch('/api/state?id=' + id)).json();
   if (s.navigate) { location.href = s.navigate; return; }
@@ -226,7 +235,7 @@ async function poll() {
   $('notice').hidden = s.view !== 'notice';
   if (s.view === 'notice') $('noticeText').textContent = s.notice;
   if (s.view === 'call') {
-    if (!inCall) { inCall = true; $('audioDlg').hidden = !!R.audioJoined; if (R.recordedNotice) $('recDlg').hidden = false; micLabel(); }
+    if (!inCall) { inCall = true; $('audioDlg').hidden = !!R.audioJoined; if (R.recordedNotice) $('recDlg').hidden = false; micLabel(); if (R.autoHideMs) autoHide(); }
     const want = s.participants.join();
     if ($('tiles').dataset.p !== want) {
       $('tiles').dataset.p = want;

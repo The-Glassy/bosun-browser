@@ -1,21 +1,40 @@
 # Changelog
 
-## 0.15.1 — ElevenLabs as the meeting voice
-
-### Changed
-
-- `meeting_speak` with ElevenLabs uses **`eleven_v4_turbo`** (was `eleven_flash_v2_5`): about as quick to the first
-  audio (0.17–0.28 s to the first byte), 94 languages, Ukrainian as `language_code` `uk`. `ELEVENLABS_TTS_MODEL`
-  chooses another model (checked at start: `[a-z0-9_]`, 3–60 characters).
+## 0.16.0 — speech settings per tenant; ElevenLabs as the meeting voice; the microphone muted again on Zoom
 
 ### Added
 
-- `TTS_DEFAULT_BACKEND` (`supertonic`, default, or `elevenlabs`): the backend `meeting_speak` uses when the agent
-  passes none. `elevenlabs` without `ELEVENLABS_API_KEY` falls back to `supertonic`, with a warning at start.
+- **Speech settings per tenant:** `speech_settings_get` / `speech_settings_set` (`backend`, `elevenlabs_model`,
+  `elevenlabs_voice`, `supertonic_voice`, `vad_silence_s`; kept in `BROWSER_DATA/speech-settings/<tenant>.json`;
+  `null` removes one). Precedence: the call's argument, then the tenant's setting, then the env fallback, then Bosun's
+  default; `speech_settings_get` says where each value comes from. Read-only (ephemeral) tokens may get, not set:
+  their tool list grows by one (16).
+- `meeting_speak { model }`: the ElevenLabs model for this utterance (with `backend: "elevenlabs"` only).
+- `meeting_join { vad_silence_s }` (0.2–3 s): the pause that ends a live transcript segment;
+  `meeting_status` → `live_transcript.vad_silence_s`.
+- Env fallbacks: `TTS_DEFAULT_BACKEND` (`supertonic` | `elevenlabs`; `elevenlabs` without `ELEVENLABS_API_KEY` falls
+  back to `supertonic` with a warning at start), `ELEVENLABS_TTS_MODEL`, `LIVE_TRANSCRIPT_VAD_SILENCE_S`.
 - `meeting_speak` returns `gap_ms` for text in several pieces: the longest pause between pieces because synthesis fell
   behind. Measured with ElevenLabs `eleven_v4_turbo` (voice River) on three utterances (English, Ukrainian, short
   sentences): 0 ms; the next piece is there 0.5–0.9 s after the first starts, while the first lasts 1.3–2 s. Pieces were
   already synthesized while the one before played; nothing waits for playback.
+
+### Changed
+
+- ElevenLabs text-to-speech uses **`eleven_v4_turbo`** by default (was `eleven_flash_v2_5`): about as quick to the
+  first audio (0.17–0.28 s to the first byte), 94 languages, Ukrainian as `language_code` `uk`.
+- The live transcript ends a segment after **0.5 s** of silence by default (was 1 s): finals about 0.6 s sooner
+  (measured 0.83–0.97 s after the speaker stops, was 1.44–1.49 s). A pause of about 0.5 s inside a sentence now ends a
+  segment there; set `vad_silence_s` 0.7 for whole sentences at about 1.1 s.
+
+### Fixed
+
+- **The microphone left on after speaking on Zoom** (production 0.15.0): Zoom's toolbar fades out while the mouse is
+  still, and its "Mute" button, still counted as visible, let clicks through to what is behind it; three tries ran past
+  30 s, `wait: true` answered "still not over 30 s after it should have ended", and the event said "muting again took
+  longer than 30 s". Every click on the microphone (Zoom, Meet) now first moves the mouse over the toolbar; an open
+  menu is closed between tries; the end of an utterance waits at most 20 s, and a microphone still on is reported as
+  `mic_open: true` in `meeting_status` and tried again every 5 s (6 times) while nobody speaks.
 
 ## 0.15.0 — taking part in a call: live transcript and speaking
 

@@ -53,7 +53,15 @@ test('an ephemeral token lists only the ephemeral tools; a full token lists ever
     assert.deepEqual(names, [...EPHEMERAL_TOOLS].sort());
     assert.equal(e.getServerCapabilities()?.experimental?.mcpl, undefined);
     const full = (await f.listTools()).tools.map((t) => t.name);
-    for (const n of ['request_human', 'handoff_wait', 'keepalive_set', 'meeting_join', ...EPHEMERAL_TOOLS]) assert.ok(full.includes(n), n);
+    for (const n of ['request_human', 'handoff_wait', 'keepalive_set', 'meeting_join', 'speech_settings_set', ...EPHEMERAL_TOOLS]) assert.ok(full.includes(n), n);
+    // Speech settings: a read-only token may read them, not change them.
+    const got = await e.call('speech_settings_get');
+    assert.equal(got.isError, false, got.text);
+    assert.deepEqual(got.json().settings, {});
+    const set = await e.call('speech_settings_set', { backend: 'elevenlabs' });
+    assert.equal(set.isError, true);
+    assert.match(set.text, /speech_settings_set: /);
+    assert.deepEqual((await e.call('speech_settings_get')).json().settings, {});
   } finally { await e.close(); await f.close(); }
 });
 

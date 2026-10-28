@@ -28,7 +28,7 @@ const BYTES_PER_SEC = PCM_RATE * 2;
 const CHUNK_BYTES = BYTES_PER_SEC / 4; // 250 ms per message (ElevenLabs: 0.1 - 1 s)
 const BUFFER_SEC = 20; // audio kept while the connection is down
 const PARTIAL_MS = 500; // at most two partials a second
-const VAD_SILENCE_SEC = 1.0; // a pause this long ends a segment (ElevenLabs' default 1.5)
+const VAD_SILENCE_SEC = 0.5; // a pause this long ends a segment (ElevenLabs' default 1.5; vad_silence_s, 0.2-3)
 const FINAL_WAIT_MS = 1500; // committed_transcript without its timestamped copy: emitted after this
 const MAX_RETRIES = 8; // connection attempts in a row without a session
 // Errors after which another connection would fail the same way: the transcript stops.
@@ -40,10 +40,11 @@ const MAX_UNSENT_BYTES = 1024 * 1024; // audio the socket may hold unsent (about
 const STALL_MS = 15_000; // a socket that keeps that much unsent this long is given up and opened again
 
 // The realtime URL for a base URL (https://api.elevenlabs.io, or a test server).
-export function realtimeUrl(base, { zeroRetention = true } = {}) {
+export function realtimeUrl(base, { zeroRetention = true, vadSilenceS = VAD_SILENCE_SEC } = {}) {
   const u = new URL(EL_PATH, base);
   u.protocol = u.protocol === 'http:' ? 'ws:' : 'wss:';
-  const q = { model_id: EL_MODEL, audio_format: `pcm_${PCM_RATE}`, commit_strategy: 'vad', vad_silence_threshold_secs: String(VAD_SILENCE_SEC), include_timestamps: 'true', include_language_detection: 'true' };
+  if (typeof vadSilenceS !== 'number' || !(vadSilenceS >= 0.2 && vadSilenceS <= 3)) throw new Error('vad_silence_s must be seconds from 0.2 to 3');
+  const q = { model_id: EL_MODEL, audio_format: `pcm_${PCM_RATE}`, commit_strategy: 'vad', vad_silence_threshold_secs: String(vadSilenceS), include_timestamps: 'true', include_language_detection: 'true' };
   if (zeroRetention) q.enable_logging = 'false';
   for (const [k, v] of Object.entries(q)) u.searchParams.set(k, v);
   return u.href;
@@ -99,10 +100,10 @@ export class TranscriptUsage {
 // that a new connection would not fix (reason error), or when the audio ends (reason audio-ended).
 export class LiveTranscript {
   // limits (tests): {startMs, unsentBytes, stallMs, shortSessionMs}.
-  constructor({ apiKey, baseUrl, source, tenant, usage, on, partials = true, now = Date.now, retryMs = 1000, limits = {} }) {
-    Object.assign(this, { apiKey, baseUrl, source, tenant, usage, on, partials, now, retryMs });
+  constructor({ apiKey, baseUrl, source, tenant, usage, on, partials = true, now = Date.now, retryMs = 1000, limits = {}, vadSilenceS = VAD_SILENCE_SEC }) {
+    Object.assign(this, { apiKey, baseUrl, source, tenant, usage, on, partials, now, retryMs, vadSilenceS });
     this.limits = { startMs: START_MS, unsentBytes: MAX_UNSENT_BYTES, stallMs: STALL_MS, shortSessionMs: SHORT_SESSION_MS, ...limits };
-    this.url = realtimeUrl(baseUrl);
+    this.url = realtimeUrl(baseUrl, { vadSilenceS });
     this.state = 'connecting'; // connecting | live | reconnecting | stopped
     this.reason = null; this.error = null;
     this.startedAt = now();
@@ -375,7 +376,7 @@ export class LiveTranscript {
     const avg = this.lags.length ? this.lags.reduce((a, b) => a + b, 0) / this.lags.length : null;
     return {
       state: this.state, ...(this.reason ? { reason: this.reason } : {}), ...(this.error ? { error: this.error } : {}),
-      model: EL_MODEL, zero_retention: this.zeroRetention, ...(this.warnings.length ? { warnings: this.warnings } : {}),
+      model: EL_MODEL, vad_silence_s: this.vadSilenceS, zero_retention: this.zeroRetention, ...(this.warnings.length ? { warnings: this.warnings } : {}),
       segments: this.seq, streamed_min: round(this.streamedSec / 60), today_min: round(this.usage.used(this.tenant) / 60), daily_cap_min: round(this.usage.capSec / 60),
       ...(avg !== null ? { final_lag_s: { avg: round(avg), max: round(Math.max(...this.lags)) } } : {}),
       started_at: new Date(this.startedAt).toISOString(),

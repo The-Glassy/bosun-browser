@@ -183,8 +183,10 @@ export async function controlState(page, onLabel, offLabel) {
 // clicked: whether it clicked before giving up). A click that timed out counts as one: it may still have landed. One click, then up to a second
 // for the page to show the change (a second click too early would undo the first). open(page): makes the control
 // visible where it sits in a menu; called while no control is shown. answer(page): called on every round, for a
-// question the site asks in between (Zoom asking for the microphone).
-export async function setControl(page, { onLabel, offLabel, on, what, site, open = null, answer = null, timeoutMs = 6000 }) {
+// question the site asks in between (Zoom asking for the microphone). reveal(page): called before each click, for a
+// toolbar that fades out while the mouse is still (its buttons still count as visible, and a click on one goes to
+// what is behind it).
+export async function setControl(page, { onLabel, offLabel, on, what, site, open = null, answer = null, reveal = null, timeoutMs = 6000 }) {
   const want = on ? 'on' : 'off';
   const until = Date.now() + timeoutMs;
   let clicked = 0, clicks = 0;
@@ -195,6 +197,7 @@ export async function setControl(page, { onLabel, offLabel, on, what, site, open
     if (!s && open) await open(page);
     const b = s ? await firstVisible(button(page, s === 'on' ? onLabel : offLabel)) : null;
     if (b && Date.now() - clicked > 1000 && !(await disabled(b))) {
+      if (reveal) await reveal(page);
       clicks++;
       await b.click({ timeout: 3000 }).catch(() => {});
       clicked = Date.now();

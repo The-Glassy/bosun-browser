@@ -41,27 +41,26 @@ test('numeric settings are validated (no NaN disabling the session cap)', () => 
   assert.equal(loadConfig({}).maxSessions, 3);
 });
 
-test('ElevenLabs TTS model and the default meeting_speak backend: defaults, validation, fallback without a key', () => {
+test('speech env fallbacks: ELEVENLABS_TTS_MODEL, TTS_DEFAULT_BACKEND (warning without a key), LIVE_TRANSCRIPT_VAD_SILENCE_S', () => {
   const KEY = { ELEVENLABS_API_KEY: 'el-key-0123456789' };
   const d = loadConfig({});
-  assert.equal(d.ttsDefaultBackend, 'supertonic');
-  assert.equal(d.ttsWarning, null);
-  assert.equal(loadConfig(KEY).elevenlabs.ttsModel, 'eleven_v4_turbo');
-  assert.equal(loadConfig({ ...KEY, ELEVENLABS_TTS_MODEL: 'eleven_flash_v2_5' }).elevenlabs.ttsModel, 'eleven_flash_v2_5');
+  assert.deepEqual([d.ttsDefaultBackendEnv, d.elevenlabsTtsModelEnv, d.vadSilenceEnv, d.ttsWarning], [null, null, null, null]);
+  assert.equal(loadConfig({ ...KEY, ELEVENLABS_TTS_MODEL: 'eleven_flash_v2_5' }).elevenlabsTtsModelEnv, 'eleven_flash_v2_5');
   for (const bad of ['ab', 'Eleven_V4', 'eleven-v4', 'x'.repeat(61), 'a b c']) {
     assert.throws(() => loadConfig({ ...KEY, ELEVENLABS_TTS_MODEL: bad }), /ELEVENLABS_TTS_MODEL must be/, bad);
   }
   assert.throws(() => loadConfig({ ELEVENLABS_TTS_MODEL: 'Bad!' }), /ELEVENLABS_TTS_MODEL must be/, 'checked also without a key');
   assert.equal(loadConfig({ ...KEY, ELEVENLABS_VOICE: 'SAz9YHcvj6GT2YYXdXww' }).elevenlabs.voice, 'SAz9YHcvj6GT2YYXdXww');
-  assert.equal(loadConfig({ TTS_DEFAULT_BACKEND: 'supertonic' }).ttsDefaultBackend, 'supertonic');
+  assert.equal(loadConfig({ TTS_DEFAULT_BACKEND: 'supertonic' }).ttsDefaultBackendEnv, 'supertonic');
   const el = loadConfig({ ...KEY, TTS_DEFAULT_BACKEND: 'elevenlabs' });
-  assert.equal(el.ttsDefaultBackend, 'elevenlabs');
+  assert.equal(el.ttsDefaultBackendEnv, 'elevenlabs');
   assert.equal(el.ttsWarning, null);
-  // elevenlabs without a key: supertonic, and a warning.
-  const fb = loadConfig({ TTS_DEFAULT_BACKEND: 'elevenlabs' });
-  assert.equal(fb.ttsDefaultBackend, 'supertonic');
-  assert.match(fb.ttsWarning, /TTS_DEFAULT_BACKEND=elevenlabs but ELEVENLABS_API_KEY is not set: meeting_speak uses supertonic/);
+  // elevenlabs without a key: a warning (meeting_speak falls back to supertonic, src/meetings/settings.mjs).
+  assert.match(loadConfig({ TTS_DEFAULT_BACKEND: 'elevenlabs' }).ttsWarning, /TTS_DEFAULT_BACKEND=elevenlabs but ELEVENLABS_API_KEY is not set: meeting_speak uses supertonic/);
   for (const bad of ['openai', 'ElevenLabs', ' supertonic']) assert.throws(() => loadConfig({ TTS_DEFAULT_BACKEND: bad }), /TTS_DEFAULT_BACKEND must be supertonic or elevenlabs/, bad);
+  assert.equal(loadConfig({ LIVE_TRANSCRIPT_VAD_SILENCE_S: '0.5' }).vadSilenceEnv, 0.5);
+  assert.equal(loadConfig({ LIVE_TRANSCRIPT_VAD_SILENCE_S: '3' }).vadSilenceEnv, 3);
+  for (const bad of ['0.1', '3.5', 'abc', '-1', '1e0', '.5']) assert.throws(() => loadConfig({ LIVE_TRANSCRIPT_VAD_SILENCE_S: bad }), /LIVE_TRANSCRIPT_VAD_SILENCE_S must be seconds from 0.2 to 3/, bad);
 });
 
 test('isLoopbackHost', () => {

@@ -49,11 +49,13 @@ test('realtimeUrl: Scribe v2 Realtime, PCM 16 kHz, VAD commits, word times, lang
   assert.equal(u.host, 'api.elevenlabs.io');
   assert.equal(u.pathname, '/v1/speech-to-text/realtime');
   assert.deepEqual(Object.fromEntries(u.searchParams), {
-    model_id: EL_MODEL, audio_format: 'pcm_16000', commit_strategy: 'vad', vad_silence_threshold_secs: '1', include_timestamps: 'true',
+    model_id: EL_MODEL, audio_format: 'pcm_16000', commit_strategy: 'vad', vad_silence_threshold_secs: '0.5', include_timestamps: 'true',
     include_language_detection: 'true', enable_logging: 'false',
   });
   assert.equal(new URL(realtimeUrl('http://127.0.0.1:5')).protocol, 'ws:');
   assert.equal(u.searchParams.has('language_code'), false); // detected per segment
+  assert.equal(new URL(realtimeUrl('https://api.elevenlabs.io', { vadSilenceS: 1.2 })).searchParams.get('vad_silence_threshold_secs'), '1.2');
+  for (const bad of [0.1, 3.5, NaN, '1']) assert.throws(() => realtimeUrl('https://api.elevenlabs.io', { vadSilenceS: bad }), /vad_silence_s must be/, String(bad));
 });
 
 test('a stretch of speech: throttled partials with the coming seq, then one final with times and language; zero retention reported as not applied', async () => {
@@ -211,8 +213,9 @@ test('parseWav reads the header (also a LIST chunk first, a streamed size); synt
   assert.equal(req.voice, 'EXAVITQu4vr4xnSDxMaL');
   assert.deepEqual(req.query, { output_format: 'wav_24000', enable_logging: 'false' });
   assert.deepEqual(req.body, { text: 'Привіт', model_id: 'eleven_v4_turbo', language_code: 'uk' });
-  await synthesizeWav({ ...cfg, elevenlabs: { ...cfg.elevenlabs, ttsModel: 'eleven_flash_v2_5' } }, { text: 'Hi', backend: 'elevenlabs' });
+  await synthesizeWav(cfg, { text: 'Hi', backend: 'elevenlabs', model: 'eleven_flash_v2_5' });
   assert.equal(el.st.tts.at(-1).body.model_id, 'eleven_flash_v2_5');
+  await assert.rejects(synthesizeWav(cfg, { text: 'Hi', backend: 'elevenlabs', model: 'Eleven-V4' }), /model must be an ElevenLabs model id/);
   await assert.rejects(synthesizeWav({ ...cfg, elevenlabs: { ...cfg.elevenlabs, apiKey: 'wrong-key-0123456789' } }, { text: 'x', backend: 'elevenlabs' }), /ElevenLabs text-to-speech answered HTTP 401/);
   await assert.rejects(synthesizeWav({ ttsUrl: 'http://127.0.0.1:9' }, { text: 'x' }), /supertonic could not be reached/);
 });
