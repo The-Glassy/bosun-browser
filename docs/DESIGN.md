@@ -232,7 +232,8 @@ a busy CPU synthesizes at about real time, so time to first audio is the first p
 it can also fall behind, and the listener hears a pause between pieces. ElevenLabs (`ELEVENLABS_TTS_MODEL`, default
 `eleven_v4_turbo` since 0.15.1: 94 languages, `language_code` `uk`, 16-bit `wav_24000`) synthesizes a piece in 0.3–0.9 s,
 far less than the piece before it lasts, so the pieces play without a pause; `gap_ms` in the result is the longest
-pause there was (the time a piece was written minus the audio written before it, from the start of playback).
+pause there was (the time a piece was written minus when the audio before it ends, counted from the start of
+playback and moved on by each pause).
 `TTS_DEFAULT_BACKEND` picks the backend when the agent passes none (0.15.1); `elevenlabs` without a key falls back to
 `supertonic` and says so at start, rather than refusing every utterance.
 The microphone is unmuted through the platform's toolbar control (`setMic`), and muted again 0.4 s after the audio

@@ -309,10 +309,13 @@ test('TTS_DEFAULT_BACKEND=elevenlabs: meeting_speak without a backend speaks wit
       assert.ok(r.gap_ms < 150, `gap ${r.gap_ms} ms`);
       assert.equal(el.st.speech.length, ns, 'Supertonic was not asked');
       assert.deepEqual(el.st.tts.slice(nt).map((x) => [x.voice, x.body.model_id, x.body.language_code]), [['SAz9YHcvj6GT2YYXdXww', 'eleven_v4_turbo', 'en'], ['SAz9YHcvj6GT2YYXdXww', 'eleven_v4_turbo', 'en']]);
-      // Synthesis slower than the first piece lasts (0.9 s of audio, 1.5 s to synthesize the next): the pause is reported.
+      // Synthesis slower than a piece lasts (0.9 s of audio each, 1.5 s to synthesize the next): the pause is reported,
+      // the longest one, not the pauses added up.
       el.st.ttsDelayMs = 1500;
-      const slow = (await c.call('meeting_speak', { meeting_id: id, text: 'One two three. Four five six seven.', wait: true })).json();
-      assert.ok(slow.gap_ms >= 400 && slow.gap_ms < 1500, `gap ${slow.gap_ms} ms`);
+      const words = (c) => [1, 2, 3].map((i) => c.repeat(48) + i).join(' '); // 3 words (0.9 s), too long to share a piece
+      const slow = (await c.call('meeting_speak', { meeting_id: id, text: `One two three. ${words('a')}. ${words('b')}.`, wait: true })).json();
+      assert.equal(slow.pieces, 3);
+      assert.ok(slow.gap_ms >= 400 && slow.gap_ms < 1000, `gap ${slow.gap_ms} ms (about 600 each time)`);
     } finally { el.st.ttsDelayMs = 0; }
     // An explicit backend still wins.
     assert.equal((await c.call('meeting_speak', { meeting_id: id, text: 'Short.', backend: 'supertonic', wait: true })).json().source, 'supertonic');

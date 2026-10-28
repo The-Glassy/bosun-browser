@@ -727,16 +727,18 @@ export class Meetings {
     u.seconds = head.seconds;
     u.player.done.then((ok) => this.endUtterance(m, u, u.cancelled ? 'interrupted' : ok ? 'done' : 'failed', ok || u.cancelled ? null : new Error(u.player.error() || 'playback failed'), { t0, tail: ok }));
     // The rest, synthesized while the piece before plays (in the voice the first one got). gapMs: the longest silence
-    // between pieces, when a piece was written after what was written before it had played (counted from the start of
-    // playback, so a little more than the real one).
-    let error = null, gapMs = 0;
+    // between pieces, when a piece was written after what was written before it had played (playEnd: when that is,
+    // in ms from the start of playback, so a little later than the real one).
+    let error = null, gapMs = 0, playEnd = head.seconds * 1000;
     if (text) {
       for (const piece of pieces.slice(1)) {
         if (u.cancelled || u.state !== 'speaking') break;
         const w = await synthesizeWav(this.cfg, { text: piece, backend, voice: head.voice ?? voice, lang }).catch((e) => { error = e; return null; });
         if (!w || u.cancelled || u.state !== 'speaking') break;
         if (w.pcm.rate !== head.pcm.rate || w.pcm.channels !== head.pcm.channels) { error = new Error(`${backend} changed its audio format mid-text`); break; }
-        gapMs = Math.max(gapMs, Math.round(this.now() - u.startedAt - u.seconds * 1000));
+        const at = this.now() - u.startedAt;
+        gapMs = Math.max(gapMs, Math.round(at - playEnd));
+        playEnd = Math.max(at, playEnd) + w.seconds * 1000;
         u.player.write(w.data);
         u.seconds += w.seconds;
       }
