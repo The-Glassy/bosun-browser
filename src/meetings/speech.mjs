@@ -40,6 +40,21 @@ export function splitSpeech(text) {
   return out;
 }
 
+// Text that streams in (channels/outgoing/chunk deltas) -> the sentences complete so far, and the rest still open. A
+// sentence is complete once what ends it (. ! ? … or a line break) is followed by more text, so "3.5" or "e.g." in the
+// middle of a delta is not cut before its next character came.
+export function takeSentences(buf) {
+  const out = [];
+  const re = /[.!?…]+["'”»)]*\s+|\n+/g;
+  let from = 0;
+  for (let m; (m = re.exec(buf));) {
+    const s = buf.slice(from, m.index + m[0].length).trim();
+    if (s) out.push(s);
+    from = m.index + m[0].length;
+  }
+  return { done: out, rest: buf.slice(from) };
+}
+
 // A response body, read up to max bytes: more is cut off (cut: true) and the rest of the body is not read.
 async function readUpTo(r, max) {
   const parts = [];

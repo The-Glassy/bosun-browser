@@ -6,6 +6,13 @@
 // A connection receives push/event only if its client asked for MCPL at initialize (capabilities.experimental.mcpl)
 // and the host's featureSets/update Request granted pushEvents with the event's feature set enabled. Events for a
 // tenant with no such connection wait (bounded) for the next one.
+//
+// MCPL channels (spec §14): a meeting Bosun is in is a channel bosun:meeting:<id> (bidirectional), registered with
+// every connection of the tenant whose grant has channels.register. What is said in the meeting goes to the host as
+// channels/incoming (channels.incoming); what the host publishes to the channel (channels/publish, channels.publish)
+// is spoken there; channels/outgoing/chunk and complete (channels.streaming) are taken too (spoken only when the
+// tenant's speech settings say so: the spec has publish as the delivery). Channels are never queued for later: a
+// connection that comes later is told about the channels open then.
 import crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { z } from 'zod';
@@ -18,12 +25,15 @@ export const MEETING_SET = 'bosun.meeting';
 export const MEETING_TAGS = {
   chat: 'bosun:meeting-chat', optout: 'bosun:meeting-optout', ended: 'bosun:meeting-ended', announce: 'bosun:meeting-announce',
   transcript: 'bosun:meeting-transcript', 'transcript-stopped': 'bosun:meeting-transcript-stopped', speech: 'bosun:meeting-speech',
+  'mic-open': 'bosun:meeting-mic-open',
 };
+export const CHANNEL_PREFIX = 'bosun:meeting:';
 export const DOWNLOAD_SET = 'bosun.download';
 export const DOWNLOAD = 'bosun:download';
 export const MANIFEST = {
   version: '0.5',
   pushEvents: true,
+  channels: { register: true, incoming: true, publish: true, streaming: true },
   featureSets: {
     [FEATURE_SET]: {
       description: 'Push events when a human is needed: a kept-alive persistent profile is logged out or stuck at a bot check (then open the profile and call request_human).',
@@ -52,7 +62,8 @@ export const MANIFEST = {
           [MEETING_TAGS.announce]: { desc: 'the recording announcement reached only the host, or could not be posted (origin: mode, sent_to host|failed, reason, error); Bosun records anyway' },
           [MEETING_TAGS.transcript]: { desc: 'live transcript text (origin: meeting_id, seq, start_s, end_s, text, final, lang, speaker if known); partials (final false) carry the seq their final will have' },
           [MEETING_TAGS['transcript-stopped']]: { desc: 'the live transcript stopped while the meeting goes on (origin: reason daily-cap|error|opted-out|stopped|recording-failed|audio-ended, error)' },
-          [MEETING_TAGS.speech]: { desc: 'an utterance of meeting_speak ended (origin: utterance_id, state done|interrupted|failed, played_s)' },
+          [MEETING_TAGS.speech]: { desc: 'an utterance of meeting_speak (or of text published to the meeting channel) ended (origin: utterance_id, state done|interrupted|failed, played_s, mic_open when not muted again)' },
+          [MEETING_TAGS['mic-open']]: { desc: 'WARNING: Bosun could not mute its microphone again after speaking; it may still be on (origin: mute_error, gave_up when the retries are over). meeting_mute {on: true} takes it over' },
         },
         keyed: { 'bosun:meeting': { open: true }, 'bosun:platform': { values: ['meet', 'zoom'] } },
       },
@@ -102,7 +113,8 @@ export function meetingEvent(kind, { meeting_id, platform, ...data }) {
   const text = kind === 'chat' ? `Meeting ${meeting_id} chat — ${data.sender || 'someone'}: ${data.text}`
     : kind === 'transcript' ? `Meeting ${meeting_id} ${data.final ? 'said' : 'is saying'} (#${data.seq}, ${data.start_s}-${data.end_s} s${data.speaker ? `, ${data.speaker}` : ''}): ${data.text}`
     : kind === 'transcript-stopped' ? `Meeting ${meeting_id}: the live transcript stopped (${data.reason}${data.error ? `: ${data.error}` : ''}); the meeting goes on.`
-    : kind === 'speech' ? `Meeting ${meeting_id}: utterance ${data.utterance_id} ${data.state} after ${data.played_s} s${data.error ? ` (${data.error})` : ''}.${data.mute_error ? ` Not muted again: ${data.mute_error}.` : ''}`
+    : kind === 'speech' ? `${data.mute_error ? `WARNING: Bosun's microphone may still be ON in meeting ${meeting_id}. ` : ''}Meeting ${meeting_id}: utterance ${data.utterance_id} ${data.state} after ${data.played_s} s${data.error ? ` (${data.error})` : ''}.${data.mute_error ? ` Not muted again: ${data.mute_error}.` : ''}`
+    : kind === 'mic-open' ? `WARNING: Bosun's microphone may still be ON in meeting ${meeting_id}: ${data.mute_error}.${data.gave_up ? ' Bosun stopped retrying.' : ' Bosun keeps trying to mute it.'} meeting_mute {on: true} or meeting_leave if it must be off.`
     : kind === 'optout' ? `Meeting ${meeting_id}: ${data.sender || 'someone'} asked not to be recorded ("${data.text}"). The recording was stopped and deleted${data.left ? ' and Bosun left the meeting' : ''}.`
     : kind === 'announce' ? `Meeting ${meeting_id}: the recording announcement ${data.sent_to === 'host' ? 'went to the host only' : 'could not be posted in the chat'} (${data.reason}: ${data.error}). Bosun records anyway; a request not to be recorded in the chat still stops it.`
     : `Meeting ${meeting_id} ended for Bosun (${data.reason}) after ${data.duration_s} s.${data.recording ? ` Recording: ${data.recording.bytes} bytes, ${data.recording.path}.` : ' No recording.'}`;
@@ -144,6 +156,41 @@ export class EventBus extends EventEmitter {
     this.sinks = new Map(); // tenant -> Set<sink(params) => Promise<boolean>>
     this.pending = new Map(); // tenant -> [{params, refused: WeakSet<sink>}]
     this.passes = new Map(); // tenant -> tail of the delivery chain
+    this.channels = new Map(); // tenant -> Map<channel id, {descriptor, handler}>
+    this.channelConns = new Map(); // tenant -> Set<connection channel side {add, remove, incoming, ready}>
+  }
+
+  // A channel of the tenant (a meeting): announced to its connections now and to those that come later. handler:
+  // {publish(text, params) -> {messageId}, chunk(params), complete(params)}, called for what the host sends to it.
+  openChannel(tenant, descriptor, handler) {
+    if (!this.channels.has(tenant)) this.channels.set(tenant, new Map());
+    this.channels.get(tenant).set(descriptor.id, { descriptor, handler });
+    for (const c of this.channelConns.get(tenant) || []) c.add(descriptor);
+  }
+
+  closeChannel(tenant, id) {
+    if (!this.channels.get(tenant)?.delete(id)) return;
+    for (const c of this.channelConns.get(tenant) || []) c.remove(id);
+  }
+
+  channel(tenant, id) { return this.channels.get(tenant)?.get(id) || null; }
+
+  // A connection's channel side. Returns detach().
+  attachChannels(tenant, conn) {
+    if (!this.channelConns.has(tenant)) this.channelConns.set(tenant, new Set());
+    this.channelConns.get(tenant).add(conn);
+    for (const { descriptor } of this.channels.get(tenant)?.values() || []) conn.add(descriptor);
+    return () => this.channelConns.get(tenant)?.delete(conn);
+  }
+
+  // Whether some connection has the channel registered and may take incoming messages on it.
+  channelReady(tenant, id) { return [...(this.channelConns.get(tenant) || [])].some((c) => c.ready(id)); }
+
+  // channels/incoming to every connection that has the channel; true once one of them accepted all of messages.
+  async channelIncoming(tenant, id, messages) {
+    const conns = [...(this.channelConns.get(tenant) || [])].filter((c) => c.ready(id));
+    const r = await Promise.all(conns.map((c) => c.incoming(id, messages).catch(() => false)));
+    return r.some(Boolean);
   }
 
   // A connection that may receive pushes. Returns detach().
@@ -193,7 +240,7 @@ export class EventBus extends EventEmitter {
     return this.publish(e.tenant, needsHumanEvent(e));
   }
 
-  // From the meeting manager: kind chat | optout | announce | ended, e = {tenant, meeting_id, platform, ...}.
+  // From the meeting manager: kind chat | optout | announce | ended | speech | mic-open, e = {tenant, meeting_id, platform, ...}.
   meeting(kind, { tenant, ...e }) {
     this.emit(`meeting-${kind}`, { tenant, ...e });
     return this.publish(tenant, meetingEvent(kind, e));
@@ -255,9 +302,11 @@ export function mcplConnection(server, { bus, tenant }) {
   };
   // A new grant (Request) re-attaches with a fresh sink: events refused under the old grant (say, a feature set that
   // was not enabled yet) are offered again.
+  const chans = channelSide(server, { bus, tenant, can: (cap) => !!grant && wantsMcpl() && grants(grant.caps, cap) });
   const update = (regrant = false) => {
     if (pushAllowed() && (!detach || regrant)) { detach?.(); detach = bus.attach(tenant, (p) => sink(p)); }
     else if (!pushAllowed() && detach) { detach(); detach = null; }
+    chans.sync();
   };
   server.setRequestHandler(z.object({ method: z.literal('featureSets/update'), params: z.any().optional() }), async (req) => {
     if (!apply(req.params, 'request')) { update(); throw Object.assign(new Error('effectiveCapabilities and deniedCapabilities overlap; nothing is granted'), { code: -32602 }); }
@@ -269,5 +318,75 @@ export function mcplConnection(server, { bus, tenant }) {
   });
   server.setNotificationHandler(z.object({ method: z.literal('featureSets/update'), params: z.any().optional() }), async (n) => { apply(n.params, 'notification'); update(); }); // malformed: grant already cleared
   server.setRequestHandler(z.object({ method: z.literal('mcpl/manifest'), params: z.any().optional() }), async () => MANIFEST);
-  return { close: () => { detach?.(); detach = null; }, get pushAllowed() { return pushAllowed(); } };
+  return { close: () => { detach?.(); detach = null; chans.close(); }, get pushAllowed() { return pushAllowed(); }, channels: chans };
+}
+
+const REGISTER_TIMEOUT_MS = 15_000;
+const INCOMING_TIMEOUT_MS = 15_000;
+const textOf = (content) => (Array.isArray(content) ? content : []).filter((c) => c?.type === 'text' && typeof c.text === 'string').map((c) => c.text).join('\n');
+const channelError = (code, message, data) => Object.assign(new Error(message), { code, ...(data ? { data } : {}) });
+
+// One connection's side of the tenant's channels: registered with the host while the grant has channels.register (and
+// taken back with channels/changed when a meeting ends or the grant narrows); channels/incoming only on channels the
+// host accepted, checked against the grant as it is now; channels/publish, chunk and complete only for channels
+// registered on this connection.
+function channelSide(server, { bus, tenant, can }) {
+  const registered = new Set(); // channel ids the host accepted on this connection
+  let detach = null;
+  let queue = Promise.resolve(); // register and remove go out in order
+  const later = (fn) => { queue = queue.then(fn).catch(() => {}); return queue; };
+  const conn = {
+    add: (d) => later(async () => {
+      await new Promise((r) => setTimeout(r, 0)); // after the answer to the featureSets/update that granted it
+      if (!can('channels.register') || registered.has(d.id) || !bus.channel(tenant, d.id)) return;
+      const r = await server.request({ method: 'channels/register', params: { channels: [d] } }, z.object({}).passthrough(), { timeout: REGISTER_TIMEOUT_MS });
+      const item = Array.isArray(r.results) ? r.results.find((x) => x?.id === d.id) : null;
+      const ok = item ? item.accepted === true : Array.isArray(r.registered) && r.registered.includes(d.id);
+      if (ok && bus.channel(tenant, d.id)) registered.add(d.id);
+      else if (ok) conn.remove(d.id); // closed meanwhile
+    }),
+    remove: (id) => later(async () => {
+      if (!registered.delete(id)) return;
+      await server.notification({ method: 'channels/changed', params: { added: [], removed: [id], updated: [] } }).catch(() => {});
+    }),
+    ready: (id) => registered.has(id) && can('channels.incoming'),
+    async incoming(id, messages) {
+      if (!conn.ready(id)) return false;
+      const r = await server.request({ method: 'channels/incoming', params: { messages } }, z.object({}).passthrough(), { timeout: INCOMING_TIMEOUT_MS });
+      const results = Array.isArray(r.results) ? r.results : [];
+      return messages.every((m) => results.some((x) => x?.messageId === m.messageId && x.accepted === true));
+    },
+  };
+  // The grant changed: attach while channels.register is granted; channels registered under a grant that no longer
+  // has it are taken back.
+  const sync = () => {
+    if (can('channels.register')) { if (!detach) detach = bus.attachChannels(tenant, conn); }
+    else if (detach) { detach(); detach = null; for (const id of [...registered]) conn.remove(id); }
+  };
+  // What the host sends to a channel: only to one registered here, of this tenant, with the capability granted now.
+  const target = (p, cap) => {
+    if (!can(cap)) throw channelError(-32002, `capability denied: ${cap}`, { capability: cap });
+    const id = typeof p?.channelId === 'string' ? p.channelId : '';
+    const ch = registered.has(id) ? bus.channel(tenant, id) : null;
+    if (!ch) throw channelError(-32023, `unknown channel ${id.slice(0, 80)}`);
+    return ch;
+  };
+  const publish = async (p) => {
+    const ch = target(p, 'channels.publish');
+    const r = await ch.handler.publish(textOf(p.content), p);
+    return { delivered: true, messageId: r.messageId };
+  };
+  const any = z.object({}).passthrough().optional();
+  server.setRequestHandler(z.object({ method: z.literal('channels/publish'), params: any }), async (req) => publish(req.params));
+  server.setNotificationHandler(z.object({ method: z.literal('channels/publish'), params: any }), async (n) => { await publish(n.params).catch(() => {}); });
+  for (const [method, fn] of [['channels/outgoing/chunk', 'chunk'], ['channels/outgoing/complete', 'complete']]) {
+    server.setNotificationHandler(z.object({ method: z.literal(method), params: any }), async (n) => {
+      try { target(n.params, 'channels.streaming').handler[fn]?.(n.params); } catch {}
+    });
+  }
+  server.setRequestHandler(z.object({ method: z.literal('channels/list'), params: any }), async () => {
+    if (!can('channels.register')) throw channelError(-32002, 'capability denied: channels.register', { capability: 'channels.register' });
+    return { channels: [...registered].map((id) => bus.channel(tenant, id)?.descriptor).filter(Boolean) };
+  });
+  return { sync, close: () => { detach?.(); detach = null; registered.clear(); }, registered };
 }

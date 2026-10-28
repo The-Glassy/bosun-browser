@@ -18,6 +18,7 @@ import { meet } from '../src/meetings/platforms/meet.mjs';
 import { zoom, parseZoomUrl, zoomWebClientUrl } from '../src/meetings/platforms/zoom.mjs';
 import { announcement, CONFIRM_DELETED_LIVE } from '../src/meetings/index.mjs';
 import { MEETING_SET } from '../src/events.mjs';
+import { DEFAULTS } from '../src/meetings/settings.mjs';
 
 let fake, fz, el;
 before(async () => { [fake, fz, el] = await Promise.all([startFakeMeet(), startFakeZoom(), startFakeElevenLabs({ phrases: ['Hello Misha, this is a test.'] })]); });
@@ -332,7 +333,7 @@ test('speech settings per tenant: speech_settings_set changes what meeting_speak
     assert.equal(got.effective.vad_silence_s, 0.5);
     const set = await c.call('speech_settings_set', { backend: 'elevenlabs', elevenlabs_model: 'eleven_flash_v2_5', elevenlabs_voice: 'SAz9YHcvj6GT2YYXdXww', vad_silence_s: 0.8 });
     assert.equal(set.isError, false, set.text);
-    assert.deepEqual(set.json().from, { backend: 'tenant', elevenlabs_model: 'tenant', elevenlabs_voice: 'tenant', supertonic_voice: 'default', vad_silence_s: 'tenant' });
+    assert.deepEqual(set.json().from, { backend: 'tenant', elevenlabs_model: 'tenant', elevenlabs_voice: 'tenant', supertonic_voice: 'default', vad_silence_s: 'tenant', ...Object.fromEntries(Object.keys(DEFAULTS).map((k) => [k, 'default'])) });
     assert.match((await c.call('speech_settings_set', { vad_silence_s: 5 })).text, /vad_silence_s|less than or equal/i);
     assert.match((await c.call('speech_settings_set', { supertonic_voice: 'alloy' })).text, /supertonic_voice must be one of/);
     assert.equal((await b.call('speech_settings_get')).json().effective.backend, 'supertonic', 'tenant b keeps the defaults');

@@ -1,7 +1,9 @@
 // Speech settings per tenant (speech_settings_get / speech_settings_set): the backend meeting_speak uses, the ElevenLabs
-// model and voice, the Supertonic voice, and the pause that ends a live transcript segment. What a call passes wins,
-// then the tenant's setting, then the environment (TTS_DEFAULT_BACKEND, ELEVENLABS_TTS_MODEL, ELEVENLABS_VOICE,
-// TTS_VOICE, LIVE_TRANSCRIPT_VAD_SILENCE_S), then Bosun's own default.
+// model and voice, the Supertonic voice, and the pause that ends a live transcript segment; how a meeting talks with
+// the agent over its MCPL channel (meeting_channel, transcript_events, agent_partials, channel_speak_from); the
+// acknowledgement played when someone finishes (ack_*). What a call passes wins, then the tenant's setting, then the
+// environment (TTS_DEFAULT_BACKEND, ELEVENLABS_TTS_MODEL, ELEVENLABS_VOICE, TTS_VOICE, LIVE_TRANSCRIPT_VAD_SILENCE_S),
+// then Bosun's own default.
 // Stored under <BROWSER_DATA>/speech-settings/<tenant>.json (written atomically, 0600).
 import fs from 'fs';
 import path from 'path';
@@ -12,6 +14,11 @@ export const EL_VOICE_RE = /^[A-Za-z0-9]{10,40}$/;
 export const VAD_MIN_S = 0.2;
 export const VAD_MAX_S = 3;
 export const VAD_DEFAULT_S = 0.5;
+export const TRANSCRIPT_EVENTS = ['auto', 'always', 'never'];
+export const SPEAK_FROM = ['publish', 'chunks'];
+export const ACK_PHRASES_DEFAULT = ['Mhm.', 'One sec.', 'Okay.', 'Right.'];
+const LANG_RE = /^[a-z]{2,3}(?:-[A-Za-z]{2})?$/;
+const num = (v, min, max) => typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
 
 // Each setting: its check (returns an error or null).
 export const SETTINGS = {
@@ -20,6 +27,29 @@ export const SETTINGS = {
   elevenlabs_voice: (v) => (typeof v === 'string' && EL_VOICE_RE.test(v) ? null : 'elevenlabs_voice must be an ElevenLabs voice id ([A-Za-z0-9], 10-40 characters)'),
   supertonic_voice: (v) => (SUPERTONIC_VOICES.includes(v) ? null : `supertonic_voice must be one of ${SUPERTONIC_VOICES.join(', ')}`),
   vad_silence_s: (v) => (typeof v === 'number' && v >= VAD_MIN_S && v <= VAD_MAX_S ? null : `vad_silence_s must be a number of seconds from ${VAD_MIN_S} to ${VAD_MAX_S}`),
+  // A channel per meeting (bosun:meeting:<id>) on connections whose host grants MCPL channels.
+  meeting_channel: (v) => (typeof v === 'boolean' ? null : 'meeting_channel must be true or false'),
+  // The bosun:meeting-transcript push events: auto (only when no channel took the text), always, never.
+  transcript_events: (v) => (TRANSCRIPT_EVENTS.includes(v) ? null : `transcript_events must be one of ${TRANSCRIPT_EVENTS.join(', ')}`),
+  // Partial transcript text to the agent over the channel, at most every agent_partials_interval_s.
+  agent_partials: (v) => (typeof v === 'boolean' ? null : 'agent_partials must be true or false'),
+  agent_partials_interval_s: (v) => (num(v, 0.5, 10) ? null : 'agent_partials_interval_s must be a number of seconds from 0.5 to 10'),
+  // What on the channel is spoken: publish (channels/publish, the delivered text) or chunks (channels/outgoing/chunk as
+  // it streams; a publish of the same text is then not spoken again).
+  channel_speak_from: (v) => (SPEAK_FROM.includes(v) ? null : `channel_speak_from must be one of ${SPEAK_FROM.join(', ')}`),
+  // A short cached clip when a final ends someone's turn, unless the agent speaks first.
+  ack_on_final: (v) => (typeof v === 'boolean' ? null : 'ack_on_final must be true or false'),
+  ack_phrases: (v) => (Array.isArray(v) && v.length >= 1 && v.length <= 12 && v.every((p) => typeof p === 'string' && p.trim().length >= 1 && p.length <= 40)
+    ? null : 'ack_phrases must be 1 to 12 texts of at most 40 characters'),
+  ack_lang: (v) => (typeof v === 'string' && LANG_RE.test(v) ? null : 'ack_lang must be a language code such as en, uk, de'),
+  ack_delay_ms: (v) => (Number.isInteger(v) && v >= 0 && v <= 2000 ? null : 'ack_delay_ms must be a whole number of milliseconds from 0 to 2000'),
+  ack_min_words: (v) => (Number.isInteger(v) && v >= 1 && v <= 50 ? null : 'ack_min_words must be a whole number from 1 to 50'),
+  ack_cooldown_s: (v) => (num(v, 0, 300) ? null : 'ack_cooldown_s must be a number of seconds from 0 to 300'),
+};
+// Bosun's defaults for the settings without an environment fallback.
+export const DEFAULTS = {
+  meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_speak_from: 'publish',
+  ack_on_final: false, ack_phrases: ACK_PHRASES_DEFAULT, ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
 };
 
 export class SpeechSettings {
@@ -67,8 +97,8 @@ export class SpeechSettings {
   }
 
   // What a call without its own values gets: {backend, elevenlabs_model, elevenlabs_voice, supertonic_voice,
-  // vad_silence_s}, and where each comes from (tenant, env, default). backend elevenlabs without a key: supertonic,
-  // with a warning.
+  // vad_silence_s, and the channel and ack settings}, and where each comes from (tenant, env, default). backend
+  // elevenlabs without a key: supertonic, with a warning.
   effective(tenant) {
     const s = this.stored(tenant);
     const cfg = this.cfg;
@@ -80,6 +110,7 @@ export class SpeechSettings {
       elevenlabs_voice: pick('elevenlabs_voice', cfg.elevenlabs?.voice ?? null, EL_DEFAULT_VOICE),
       supertonic_voice: pick('supertonic_voice', cfg.ttsVoice ?? null, null),
       vad_silence_s: pick('vad_silence_s', cfg.vadSilenceEnv ?? null, VAD_DEFAULT_S),
+      ...Object.fromEntries(Object.entries(DEFAULTS).map(([k, def]) => [k, pick(k, null, def)])),
     })) { out[k] = v; from[k] = f; }
     let warning = null;
     if (out.backend === 'elevenlabs' && !cfg.elevenlabs) {

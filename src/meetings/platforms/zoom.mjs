@@ -8,8 +8,9 @@
 // and labels are also matched in German and Ukrainian (some Russian). These markers were written from Zoom's web
 // client as documented and seen in screenshots, and tested against a local stand-in (test/fakezoom.mjs), not yet
 // against live Zoom: a run against real Zoom that fails here is fixed here.
-import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, chatError, setControl, revealToolbar, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, challengeShown, chatError, setControl, revealToolbar, watchSpeakers, drainSpeakers, DIALOGS, HEADINGS } from './common.mjs';
 
+const SHORTCUT = '(?:[\\s,]*\\(?(?:alt|option|⌥)\\s*\\+\\s*a\\)?)?';
 const TEXT = {
   // The waiting room, or a meeting the host has not started yet (Zoom lets you in when it starts).
   waiting: any('please wait,? the meeting host will let you in soon', "we've let them know you're here", 'host has joined', 'wait(?:ing)? for the host to start',
@@ -35,9 +36,10 @@ const TEXT = {
   noCamera: any('no camera', 'camera not found', 'cannot detect (?:your |a )?camera', 'video cannot (?:be )?start', 'keine kamera', 'kamera nicht gefunden', 'камеру не знайдено', 'немає камери', 'камера не найдена'),
 };
 const LABEL = {
-  // Preview ("Mute" / "Stop Video") and toolbar ("mute my microphone" / "stop my video") controls.
-  micOff: any('^mute$', '^mute (?:my )?microphone$', '^stummschalten$', '^mikrofon stummschalten$', '^вимкнути (?:звук|мікрофон)$', '^выключить (?:звук|микрофон)$'), // it is on
-  micOn: any('^unmute$', '^unmute (?:my )?microphone$', '^stummschaltung aufheben$', '^увімкнути (?:звук|мікрофон)$', '^включить (?:звук|микрофон)$'), // it is off
+  // Preview ("Mute" / "Stop Video") and toolbar ("mute my microphone" / "stop my video") controls; a keyboard shortcut
+  // may follow the label ("Mute (Alt+A)", "mute my microphone, Alt+A").
+  micOff: any(`^mute(?: my)?(?: microphone| audio)?${SHORTCUT}$`, `^(?:mikrofon )?stummschalten${SHORTCUT}$`, `^вимкнути (?:звук|мікрофон)${SHORTCUT}$`, `^выключить (?:звук|микрофон)${SHORTCUT}$`), // it is on
+  micOn: any(`^unmute(?: my)?(?: microphone| audio)?${SHORTCUT}$`, `^stummschaltung aufheben${SHORTCUT}$`, `^увімкнути (?:звук|мікрофон)${SHORTCUT}$`, `^включить (?:звук|микрофон)${SHORTCUT}$`), // it is off
   camOff: any('^stop (?:my )?video$', '^(?:mein )?video (?:beenden|stoppen)$', '^зупинити відео$', '^вимкнути відео$', '^остановить видео$'),
   camOn: any('^start (?:my )?video$', '^(?:mein )?video starten$', '^почати відео$', '^увімкнути відео$', '^включить видео$', '^начать видео$'),
   join: any('^join$', '^join meeting$', '^join webinar$', '^beitreten$', '^meeting beitreten$', '^приєднатися$', '^присоединиться$'),
@@ -196,6 +198,60 @@ async function audioControls(page) {
     .filter((l) => /audio|mute|micro|mikro|мікро|микро|звук/i.test(l)).slice(0, 8)).catch(() => []);
 }
 const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha'];
+
+// The call's microphone control read from the page itself, also where Playwright doesn't count it as a visible button:
+// a toolbar faded out (or hidden by visibility), a control that is a <div> with an aria-label (live Zoom has had both
+// kinds), or Zoom's audio button by its class. Only in the toolbar: never a control in the participants list or the
+// chat. Returns {state: 'on'|'off'|null, label, kind} (the first labelled match), and with click: clicks it in the
+// page (element.click(), which reaches a control under a faded toolbar where a mouse click would not).
+const MIC_SCOPE = 'footer, [class*="footer"], [class*="toolbar"], [class*="join-audio-container"], [id*="audio" i]';
+const MIC_EL = 'button, [role="button"], [aria-label], .join-audio-container__btn';
+function readMic([{ on, off, scope, el, skip }, click]) {
+  const ON = new RegExp(on, 'i'), OFF = new RegExp(off, 'i');
+  const n = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  for (const e of document.querySelectorAll(el)) {
+    if (e.closest(skip) || !(e.closest(scope) || e.matches('.join-audio-container__btn'))) continue;
+    const label = n(e.getAttribute('aria-label') || e.getAttribute('title') || e.innerText);
+    const state = ON.test(label) ? 'on' : OFF.test(label) ? 'off' : null;
+    if (!state) continue;
+    if (click) (e.closest('button, [role="button"]') || e).click();
+    return { state, label: label.slice(0, 60), kind: e.tagName.toLowerCase() };
+  }
+  return { state: null, label: null, kind: null };
+}
+const MIC_ARGS = { on: LABEL.micOff.source, off: LABEL.micOn.source, scope: MIC_SCOPE, el: MIC_EL, skip: '[class*="participants-item"], [class*="participants-li"], [class*="chat"], [role="list"], [role="listitem"]' };
+const micInPage = (page, click = false) => page.evaluate(readMic, [MIC_ARGS, click]).catch(() => ({ state: null, label: null, kind: null }));
+async function micSettles(page, want, ms) {
+  for (const until = Date.now() + ms; Date.now() < until; await page.waitForTimeout(150)) if ((await micInPage(page)).state === want) return true;
+  return false;
+}
+
+// When the toolbar's control can't be worked with Playwright's own clicks: the control as the page has it, clicked in
+// the page; then Zoom's shortcut Alt+A (with nothing focused, so it reaches Zoom and not the chat box), but only while
+// the page shows the microphone in the other state, and checked after. {state, changed, via} once it is as wanted;
+// else {state (what the page shows, or null), clicked}. Nothing is pressed blind: a shortcut that toggles must never
+// turn on a microphone that was already off.
+async function micFallback(page, on) {
+  const want = on ? 'on' : 'off';
+  let seen = await micInPage(page);
+  if (seen.state === want) return { state: want, changed: false, via: 'page' };
+  let clicked = false;
+  if (seen.state) {
+    await revealToolbar(page);
+    seen = await micInPage(page, true);
+    clicked = true;
+    if (await micSettles(page, want, 1000)) return { state: want, changed: true, via: 'page' };
+    seen = await micInPage(page);
+  }
+  if (seen.state && seen.state !== want) {
+    await page.evaluate(() => document.activeElement?.blur?.()).catch(() => {});
+    await page.keyboard.press('Alt+A').catch(() => {});
+    clicked = true;
+    if (await micSettles(page, want, 1000)) return { state: want, changed: true, via: 'alt+a' };
+    seen = await micInPage(page);
+  }
+  return { state: seen.state, label: seen.label, clicked };
+}
 
 // A device question shown: answered "Continue without …". null if none is shown, else the question's text (its dialog,
 // or the nearest box around the answer with more text than it) and whether the answer took (clicked, and gone).
@@ -649,15 +705,27 @@ export const zoom = {
   // The toolbar's "Mute" / "Unmute". Bosun joined without giving Zoom the microphone, so the first unmute makes Zoom ask
   // "Do you want people to hear you…?": the agent asked to be heard, so "Use microphone" (and nothing with the camera).
   // A question that can't be answered that way is answered without it again, and the unmute fails.
+  // When the toolbar's buttons don't do it (real Zoom, 2026-10-28: "no microphone control found" muting again after
+  // speaking), the control is read and clicked in the page, then Alt+A is tried (micFallback); the state is always
+  // read back. Muting gives each way a short time, so three tries fit the 20 s an utterance's end waits for it.
   async setMic(page, on) {
     const answer = on ? async (p) => { const b = await firstVisible(button(p, LABEL.useMic)); if (b) await b.click({ timeout: 2000 }).catch(() => {}); } : null;
     try {
-      return await setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Zoom', answer, open: revealToolbar, reveal: revealToolbar, timeoutMs: on ? 10_000 : 6000 });
+      return await setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Zoom', answer, open: revealToolbar, reveal: revealToolbar, timeoutMs: on ? 10_000 : 2500 });
     } catch (e) {
       if (on && await declineDevices(page)) throw new Error('Zoom did not take the microphone when unmuting (it asked for one and offered no "Use microphone"); nothing can be said');
-      throw e;
+      const r = await micFallback(page, on);
+      if (r.via) return { state: r.state, changed: r.changed || !!e.clicked, via: r.via }; // a click of setControl's may have done it
+      const shown = r.state ? `the page shows it ${r.state === 'on' ? 'on' : 'off'} ("${r.label}")` : 'no microphone control in the page either';
+      throw Object.assign(new Error(`${e.message}; ${shown}${r.clicked ? ', and neither clicking it in the page nor Alt+A changed it' : ''}`), { clicked: e.clicked || r.clicked });
     }
   },
+
+  // Who Zoom shows as speaking: the speaker view's active tile (vexa's selectors, seen live 2026), or a gallery tile
+  // marked active, the name in its footer. Not shown in gallery views without an active mark, or while a screen is
+  // shared full size; then segments carry no speaker.
+  watchSpeakers: (page, key, opts) => watchSpeakers(page, key, ZOOM_SPEAKERS, opts),
+  drainSpeakers,
   // Opens the menu holding the hand (every 2 s at most, so an open menu isn't closed again), and closes it after.
   async setHand(page, on) {
     let openedAt = 0;
@@ -684,6 +752,12 @@ export const zoom = {
       await page.waitForTimeout(200);
     }
   },
+};
+
+const ZOOM_SPEAKERS = {
+  active: ['.speaker-active-container__video-frame', '.speaker-bar-container__video-frame--active', '[class*="single-"][class*="-container__video-frame"]',
+    '[class*="gallery-video-container__video-frame--active"]', '[class*="video-frame--active"]'],
+  activeName: '.video-avatar__avatar-footer, [class*="avatar-footer"], [class*="avatar-name"]',
 };
 
 export const _test = { TEXT, LABEL, norm, EVERYONE, HOSTS, TO_GROUP };
