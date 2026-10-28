@@ -63,6 +63,16 @@
 
 ### Fixed
 
+- **Zoom: the waiting room taken for the call** (production, live Zoom, 2026-10-28). Bosun said "admitted" 13 s after
+  the join while it sat in the waiting room for 44 min, and then "recorded" 1.2 MB of silence. The host never let it
+  in.
+  - The waiting room there had a chat with the host, and a chat button counted as being in the call.
+  - Now, before admission, the waiting room's own words decide first. Matched: "Please wait, the meeting host will
+    let you in soon", "Waiting for the host…", "waiting room", "host will let you in", and German, Ukrainian and
+    Russian variants. Text participants control, the meeting's title and captions don't count.
+  - "In the call" needs positive evidence: the participants button, or the call's microphone or audio control while
+    no Join button or name field is shown. A chat button or "Leave" alone is not enough.
+  - Nothing is announced, recorded or transcribed before that.
 - **Zoom: the microphone left on after speaking** (production, real Zoom, 2026-10-28, meeting m898739bebfdc, guest).
   After a 2.5 s utterance the event said `mute_error: "no microphone control found in Zoom"`. The 0.16.0 fix had
   only been tested on the local Zoom stand-in.

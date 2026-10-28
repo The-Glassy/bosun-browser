@@ -119,7 +119,9 @@ ${hy ? `<div id="hearq" role="dialog" aria-modal="true" hidden style="position:f
   <button id="hearUse"${hy[0] ? '' : ' hidden'}>${hy[0] || 'Use microphone'}</button><button id="hearNo">${hy[1]}</button></div></div>` : ''}
 ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10"><p>We use cookies.</p>
   <button id="onetrust-accept-btn-handler">Accept Cookies</button></div>` : ''}
-<div id="waiting" hidden><h2>Please wait, the meeting host will let you in soon.</h2><button>Leave</button></div>
+${r.waitingChat ? `<div id="waiting" hidden><div class="meeting-info-container__topic">${esc(r.title || 'Weekly sync')}</div><div class="wr-information"><span>${esc(r.waitingText || 'Please wait, the meeting host will let you in soon.')}</span></div>
+  <footer class="wr-footer"><button aria-label="open the chat panel">Chat</button><button aria-label="Leave">Leave</button></footer></div>`
+    : '<div id="waiting" hidden><h2>Please wait, the meeting host will let you in soon.</h2><button>Leave</button></div>'}
 <div id="notice" role="dialog" hidden><p id="noticeText"></p><button>OK</button></div>
 <div id="call" hidden>
   ${r.title ? `<div class="meeting-info-container__topic">${esc(r.title)}</div>` : ''}
@@ -179,6 +181,8 @@ $('join').onclick = () => {
   mic = pmic; cam = pcam;
   post('join', { name: $('input-for-name').value, pwd, mic: pmic, cam: pcam });
 };
+// waitingChat (room option): the waiting room as live Zoom showed it on 2026-10-28: the meeting's title, the notice
+// not as a heading (waitingText), and a footer with "Chat" (to the host) and "Leave".
 // micDiv: the in-call control is a <div class="join-audio-container__btn">, a button by role while the microphone is
 // off; 1.5 s after it went on (as while someone speaks) it loses the role, and Playwright's button lookups miss it.
 // micClickIgnored: clicks that would mute it do nothing (after the first, which the join makes). altA: Alt+A toggles the microphone. hideToolbar (with

@@ -1113,12 +1113,14 @@ export class Meetings {
     const live = () => gen === m.channelGen && (m.state === 'admitted' || m.state === 'recording');
     await m.announceDone.p;
     if (!live()) return;
-    const cur = m.speech;
-    if (cur?.kind === 'stream' && cur.open && !cur.cancelled) { cur.pieces.push(...splitSpeech(text, { group: !this.prepareOn(m) })); cur.wake?.(); return; }
-    // meeting_speak (or a stream that closed) is playing: this follows it, and the microphone is not muted in between.
-    // It waits as long as that utterance can last (its length as it grows, the watchdog's grace, muting again); one that
-    // still hasn't ended then is not cut off: this text is dropped instead.
-    for (let c = m.speech; c && c.kind !== 'ack' && !(c.kind === 'stream' && c.open); c = m.speech) {
+    // A stream from the channel that still takes text (open, not stopped or ending): this is added to it.
+    const appendable = (u) => u?.kind === 'stream' && u.open && !u.cancelled && !u.ending;
+    const append = (u) => { u.pieces.push(...splitSpeech(text, { group: !this.prepareOn(m) })); u.wake?.(); };
+    if (appendable(m.speech)) return append(m.speech);
+    // Anything else being said (meeting_speak, a stream that closed or is being stopped): this follows it, and the
+    // microphone is not muted in between. It waits as long as that utterance can last (its length as it grows, the
+    // watchdog's grace, muting again); one that still hasn't ended then is not cut off: this text is dropped instead.
+    for (let c = m.speech; c && c.kind !== 'ack' && !appendable(c); c = m.speech) {
       m.speechFollows++;
       try {
         const t0 = this.now();
@@ -1129,9 +1131,11 @@ export class Meetings {
         }
         await c.finished;
       } finally { m.speechFollows--; }
-      if (!live()) { if (!m.speech && m.speechUnmuted) await this.page(m, (p) => this.muteAgain(m, p)).catch(() => {}); return; }
+      // Dropped meanwhile (opt-out, meeting_stop_speaking): the microphone that utterance left on for this is muted
+      // again, as the end of an utterance would (retries, mic_open and the warning when it fails).
+      if (!live()) { if (!m.speech && !m.speechFollows) await this.muteAfterSpeech(m); return; }
     }
-    if (m.speech?.kind === 'stream' && m.speech.open) return this.channelUtter(m, text, gen);
+    if (appendable(m.speech)) return append(m.speech);
     let tts;
     try { tts = this.tts(m.tenant); } catch (e) { this.emit(m, 'speech', { utterance_id: null, kind: 'stream', state: 'failed', played_s: 0, error: oneLine(e) }); return; }
     // Not awaited: the utterance is m.speech at once (what comes next is added to it) and runs until it has played.
@@ -1157,12 +1161,7 @@ export class Meetings {
     if (m.speech === u) m.speech = null;
     if (m.ackPlaying === u) m.ackPlaying = null;
     // The last utterance mutes again what speaking turned on; one followed by another (interrupt) leaves it to that one.
-    let muteError = null;
-    if (u.autoMute && m.speechUnmuted && !m.speech && (!m.speechFollows || u.stopped) && (m.state === 'admitted' || m.state === 'recording')) {
-      const tried = this.page(m, (p) => this.muteAgain(m, p)).catch((e) => (m.muteError = oneLine(e)));
-      muteError = await Promise.race([tried, sleep(MUTE_WAIT_MS).then(() => `muting again took longer than ${MUTE_WAIT_MS / 1000} s`)]);
-      if (muteError) { m.muteError ??= muteError; this.keepMuting(m, tried); }
-    }
+    const muteError = u.autoMute && !m.speech && (!m.speechFollows || u.stopped) ? await this.muteAfterSpeech(m, { report: false }) : null;
     const played = u.startedAt ? Math.round((this.now() - u.startedAt) / 10) / 100 : 0;
     const r = {
       utterance_id: u.id, ...(u.kind !== 'speak' ? { kind: u.kind } : {}), state, played_s: Math.min(played, Math.round(u.seconds * 100) / 100 || played), ...(error ? { error: oneLine(error) } : {}),
@@ -1173,6 +1172,20 @@ export class Meetings {
     if (muteError) this.emit(m, 'mic-open', { utterance_id: u.id, mic_open: true, mute_error: muteError });
     u.finish(r);
     return r;
+  }
+
+  // Mutes again what speaking turned on (when nobody speaks and the meeting goes on): waits MUTE_WAIT_MS at most; one
+  // that fails is retried in the background (keepMuting) and returned (report: also a bosun:meeting-mic-open event).
+  async muteAfterSpeech(m, { report = true } = {}) {
+    if (!m.speechUnmuted || m.speech || (m.state !== 'admitted' && m.state !== 'recording')) return null;
+    const tried = this.page(m, (p) => this.muteAgain(m, p)).catch((e) => (m.muteError = oneLine(e)));
+    const muteError = await Promise.race([tried, sleep(MUTE_WAIT_MS).then(() => `muting again took longer than ${MUTE_WAIT_MS / 1000} s`)]);
+    if (muteError) {
+      m.muteError ??= muteError;
+      this.keepMuting(m, tried);
+      if (report) this.emit(m, 'mic-open', { mic_open: true, mute_error: muteError });
+    }
+    return muteError;
   }
 
   // A microphone that speaking turned on and that did not mute again: tried again (after the try still running, first)
@@ -1215,7 +1228,9 @@ export class Meetings {
   // Barge-in: the utterance playing now stops at once (and the microphone is muted again, if speaking turned it on).
   async stopSpeaking(tenant, id) {
     const m = this.get(tenant, id);
-    m.channelGen++; // text from the channel still waiting is dropped too
+    m.channelGen++; // text from the channel still waiting is dropped too, and an acknowledgement about to play
+    clearTimeout(m.ackTimer);
+    m.ackTimer = null;
     await this.stopAck(m);
     const u = m.speech;
     if (!u) return { meeting_id: id, stopped: false };

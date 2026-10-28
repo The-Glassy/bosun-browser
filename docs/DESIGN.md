@@ -287,6 +287,9 @@ called once the whole reply is written.
 **Bosun side.**
 - **Connections:** `EventBus` keeps the tenant's channels (`openChannel`, `closeChannel`) and each MCPL connection's
   channel side (`attachChannels`).
+  - Notifications narrow and never widen, as for push events. That includes `effectiveCapabilities`, which §6.7 says
+    to ignore in a notification. Narrowing on it is the deny-safe reading for a host that sends a reduction the
+    non-conforming way.
   - A connection attaches while its grant has `channels.register`. It registers every open channel, one
     `channels/register` each, in order, after the answer to the `featureSets/update` that granted it.
   - It takes channels back with `channels/changed` when the grant narrows or the meeting ends.
@@ -329,6 +332,10 @@ called once the whole reply is written.
     20 s an utterance's end waits.
   - The page click happens only if the control shows the other state at that moment (read and click in one
     evaluate), so a microphone the host muted meanwhile is never clicked back on.
+  - Waiting room (prod 2026-10-28, 44 min "admitted" in Zoom's waiting room): before admission `zoom.state` checks
+    the waiting room's texts first, over the page without participants' text, title and captions. "Admitted"
+    then needs the participants button, or a call audio control with no preview (Join / name field) shown. The chat
+    button counts only once admitted (it moved in the waiting room).
   - Not seen live: the web client refused a scripted guest on Zoom's own test meeting ("Automated bots aren't allowed
     to join this meeting"). Both causes that fit the message are reproduced in the stand-in.
 

@@ -456,6 +456,37 @@ test('a host that turned a channel down gets it offered again with its next gran
   });
 });
 
+test('meeting_stop_speaking during ack_delay_ms: the acknowledgement never plays; a publish while a stream is being stopped starts a new one', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { ack_on_final: true, ack_delay_ms: 1500, ack_min_words: 1, ack_cooldown_s: 0 });
+    const { id } = await admitted(c);
+    const chId = `bosun:meeting:${id}`;
+    await until(() => c.registered.length === 1, 10_000);
+    await until(async () => (await status(c, id)).acks === undefined);
+    audio.say(tonePcm(2));
+    await until(() => c.incoming.some((m) => m.metadata.final), 15_000);
+    await c.call('meeting_stop_speaking', { meeting_id: id });
+    await sleep(2000);
+    assert.equal(audio.players.length, 0, 'the armed acknowledgement was cancelled');
+    // A stream stopped while its next sentence is synthesizing; a publish meanwhile is said after it, once.
+    await c.call('speech_settings_set', { ack_on_final: false });
+    await c.publish(chId, 'First sentence here. Second sentence here.');
+    await until(() => audio.players.length === 1, 10_000);
+    el.st.ttsDelayMs = 1000;
+    try {
+      const stopping = c.call('meeting_stop_speaking', { meeting_id: id });
+      await sleep(100); // a publish that overtakes the tool call is dropped with what was waiting (it came before the stop)
+      await c.publish(chId, 'After the stop.');
+      await stopping;
+      await until(() => ev.speech.filter((e) => e.kind === 'stream').length === 2, 20_000).catch((e) => { throw new Error(`${e.message}: ${JSON.stringify(ev.speech)} players ${audio.players.length}`); });
+    } finally { el.st.ttsDelayMs = 0; }
+    assert.equal(audio.players.length, 2);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
 test('grant matching per MCPL §5.4: a bare "*" grants no channel capability; channels.* does', async () => {
   await withService(async (svc, ev, audio) => {
     const c = await host(svc, { caps: ['*'] });
@@ -543,6 +574,37 @@ test('speaker labels: Zoom\'s active speaker and Meet\'s speaking tile name the 
     await until(() => transcriptPushes(c).some((p) => p.origin.final && p.origin.meeting_id === z), 15_000);
     assert.equal(transcriptPushes(c).find((p) => p.origin.final && p.origin.meeting_id === z).origin.speaker, 'Host Person');
     await c.call('meeting_leave', { meeting_id: z });
+    await c.close();
+  });
+});
+
+// Live Zoom, 2026-10-28 (addendum item 6): "admitted" 13 s after the join while the bot sat in the waiting room for
+// 44 min, then "recording" silence. The waiting room there had a chat with the host.
+test('Zoom waiting room with a chat button: stays waiting (nothing announced, recorded or transcribed) until the host lets it in', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc, { caps: ['tools', 'pushEvents'] });
+    for (const waitingText of ['Please wait, the meeting host will let you in soon.', 'Waiting for the host to let you in']) {
+      const conns = el.conns.length;
+      const { id: zid, url } = fz.newRoom({ waitingChat: true, waitingText });
+      const j = await c.call('meeting_join', { url, live_transcript: true });
+      assert.equal(j.isError, false, j.text);
+      const id = j.json().meeting_id;
+      assert.equal(j.json().state, 'waiting', waitingText);
+      await sleep(4000);
+      const s = await status(c, id);
+      assert.equal(s.state, 'waiting', waitingText);
+      assert.equal(s.admitted_at, null);
+      assert.equal(fz.room(zid).chat.length, 0, 'nothing announced');
+      assert.equal(audio.recorders.length, 0, 'nothing recorded');
+      assert.equal(el.conns.length, conns, 'nothing transcribed');
+      // Let in: now the announcement, then the recording.
+      fz.admit(zid);
+      await until(async () => (await status(c, id)).state === 'recording', 20_000);
+      assert.ok(fz.room(zid).chat.length >= 1);
+      await c.call('meeting_leave', { meeting_id: id });
+      await until(() => ev.ended.length === (waitingText.startsWith('Please') ? 1 : 2), 10_000);
+      audio.recorders.length = 0;
+    }
     await c.close();
   });
 });

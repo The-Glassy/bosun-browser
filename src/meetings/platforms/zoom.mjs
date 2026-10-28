@@ -14,6 +14,7 @@ const SHORTCUT = '(?:[\\s,]*\\(?(?:alt|option|⌥)\\s*\\+\\s*a\\)?)?';
 const TEXT = {
   // The waiting room, or a meeting the host has not started yet (Zoom lets you in when it starts).
   waiting: any('please wait,? the meeting host will let you in soon', "we've let them know you're here", 'host has joined', 'wait(?:ing)? for the host to start',
+    'waiting for (?:the )?host', '(?:meeting )?host will (?:let you in|admit you)', 'you(?:\'re| are) in the waiting room', 'warten,? bis der host', 'der host lässt sie',
     'the meeting will begin when the host joins', 'meeting has not started', 'waiting room',
     'bitte warten sie,? der (?:meeting-)?host', 'lässt sie (?:in kürze|gleich) (?:ein|teilnehmen)', 'warten auf (?:den )?host', 'das meeting beginnt,? (?:wenn|sobald) der host', 'warteraum',
     'зачекайте,? організатор', 'організатор (?:незабаром|скоро) (?:впустить|додасть)', 'очікування організатора', 'зал очікування',
@@ -198,6 +199,11 @@ async function audioControls(page) {
     .filter((l) => /audio|mute|micro|mikro|мікро|микро|звук/i.test(l)).slice(0, 8)).catch(() => []);
 }
 const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha'];
+// Words in the page that are not Zoom's status: the meeting's title, captions and transcript.
+const NOT_STATUS = '[class*="topic"], [class*="meeting-info"], [class*="subtitle"], [class*="caption"], [class*="transcript"]';
+// The call's audio controls; the preview has look-alikes ("Mute"), so they count only where no Join button or name
+// field is shown.
+const IN_CALL_AUDIO = new RegExp([LABEL.micOff, LABEL.micOn, LABEL.joinAudio, LABEL.audioMenu].map((r) => r.source).join('|'), 'i');
 
 // The call's microphone control read from the page itself, also where Playwright doesn't count it as a visible button:
 // a toolbar faded out (or hidden by visibility), a control that is a <div> with an aria-label (live Zoom has had both
@@ -247,15 +253,15 @@ async function micFallback(page, on) {
   if (seen.state) {
     await revealToolbar(page);
     seen = await micInPage(page, want); // clicks only if it still shows the other state
-    if (seen.state === want) return { state: want, changed: false, via: 'page' };
-    clicked = seen.clicked;
+    if (seen.state === want) return { state: want, changed: clicked, via: 'page' };
+    clicked ||= seen.clicked;
     if (await micSettles(page, want, 1000)) return { state: want, changed: true, via: 'page' };
     seen = await micInPage(page);
   }
   if (seen.state && seen.state !== want) {
     seen = await micInPage(page, want, 'key');
     clicked ||= seen.clicked;
-    if (seen.state === want) return { state: want, changed: false, via: 'page' };
+    if (seen.state === want) return { state: want, changed: clicked, via: 'page' };
     if (await micSettles(page, want, 700)) return { state: want, changed: true, via: 'alt+a' };
     seen = await micInPage(page);
   }
@@ -556,8 +562,15 @@ export const zoom = {
   // redesign") are participants' words. Before that, the whole page counts.
   async state(page, { admitted = false } = {}) {
     try { if (/\/(?:postattendee|wc\/leave)\b/.test(new URL(page.url()).pathname)) return 'ended'; } catch {}
-    // In the call: the toolbar's participants or chat button (not "Leave" alone: the waiting room has one too).
-    const inCall = await firstVisible(button(page, LABEL.participants)) || await firstVisible(button(page, LABEL.chat));
+    // Before admission, the waiting room's own words (outside what participants control, the meeting's title and
+    // captions) keep it waiting whatever else is shown: live Zoom (2026-10-28) let a guest sit 44 min in the waiting
+    // room while Bosun took it for admitted (its chat with the host). Seen in: the call's toolbar with a control only
+    // the call has: the participants button or the microphone/audio control. A chat button or "Leave" alone is not
+    // (the waiting room can have both).
+    if (!admitted && TEXT.waiting.test(await textOutside(page, `${PARTICIPANT_CONTROLLED}, ${NOT_STATUS}`).catch(() => ''))) return 'waiting';
+    const preview = async () => await firstVisible(button(page, LABEL.join)) || firstVisible(page.locator(NAME_FIELD));
+    const inCall = await firstVisible(button(page, LABEL.participants)) || (await firstVisible(button(page, IN_CALL_AUDIO)) && !(await preview()))
+      || (admitted && await firstVisible(button(page, LABEL.chat)));
     const t = await pageText(page, inCall ? MODALS : admitted ? `${MODALS}, ${HEADINGS}` : null).catch(() => '');
     if (TEXT.removed.test(t)) return 'removed';
     if (TEXT.ended.test(t)) return 'ended';
