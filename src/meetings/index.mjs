@@ -66,6 +66,7 @@ const TRAILING_OFF = /(?:…|\.\.\.)["'”»)]*$/u;
 const TRAILING_WORD = /(?:^|[\s,])(?:and|or|but|so|because|the|a|an|to|of|for|with|that|if|when|then|i|і|й|та|а|але|що|бо|чи|и|но|что|или|und|oder|aber|weil|dass|der|die|das|ale|že|lebo|alebo|aj)\s*[.!]*["'”»)]*$/iu;
 const TURN_PARTIAL_WAIT_MS = 2500; // new speech in a held turn (partials) whose final doesn't come: the turn goes this long after the pause (vad_silence_s)
 const TURN_MAX_MS = 30_000; // a turn held this long since its first final goes at the next final, however much more comes
+const STALE_HEARD_MS = 5000; // speech heard this long ago that never became a turn (Scribe committed nothing) supersedes nothing
 const SAID_ECHO_MS = 8000; // what Bosun said counts as its own voice coming back this long after it ended
 const ECHO_SHARE = 0.6; // text that is at least this share words Bosun is saying (or just said) is its own voice
 const LABEL_FRESH_MS = 120_000; // speaker labels count as working this long after the page last named someone
@@ -301,7 +302,7 @@ export class Meetings {
       speakerKey: `__s${crypto.randomBytes(8).toString('hex')}`, speakerLog: [], speakerTimer: null, speakersSeen: false, lastNamedAt: 0,
       // Turns: finals held for more of the same turn (turn_hold_ms), speech heard since the last turn went to the agent,
       // the open segment's text (what a barge-in counts from), what Bosun said lately (its own voice coming back).
-      hold: null, lastHumanAt: 0, lastDeliveredAt: 0, lastTurnSeq: 0, partialNow: null, saidRecent: [], bargeIns: 0, interrupts: 0,
+      hold: null, lastHumanAt: 0, heardSeq: 0, lastTurnSeq: 0, partialNow: null, saidRecent: [], bargeIns: 0, interrupts: 0,
     };
     this.active.set(id, m);
     m.task = this.run(m).catch((e) => this.finish(m, 'error', e));
@@ -447,9 +448,10 @@ export class Meetings {
       metadata: { meeting_id: m.id, platform: m.platform.name, url: m.url },
     }, {
       // Said all the same; superseded_by_new_speech: someone has spoken since the last turn the agent was given (a
-      // turn still held, or still being said), so this may answer only part of it. last_turn_seq: that turn's seq.
+      // segment after it heard: a turn still held, or still being said), so this may answer only part of it.
+      // last_turn_seq: that turn's seq.
       publish: (text) => {
-        const superseded = m.lastHumanAt > m.lastDeliveredAt;
+        const superseded = m.heardSeq > m.lastTurnSeq && (!!m.hold || this.now() - m.lastHumanAt < STALE_HEARD_MS);
         this.sayOnChannel(m, text);
         return { messageId: `${m.id}:out${++m.channelMsgs}`, superseded_by_new_speech: superseded, last_turn_seq: m.lastTurnSeq };
       },
@@ -519,9 +521,10 @@ export class Meetings {
   onPartial(m, seg) {
     const d = this.settings.effective(m.tenant).values;
     this.maybeBargeIn(m, seg, d);
-    m.partialNow = { seq: seg.seq, text: seg.text };
+    const human = this.heard(m, seg);
+    this.openSegment(m, seg, human);
     // New speech while a turn is held: it waits for this speech's final (or TURN_PARTIAL_WAIT_MS after the pause).
-    if (this.heard(m, seg) && m.hold && seg.seq > m.hold.lastSeq) this.holdFor(m, Math.max(d.turn_hold_ms, m.vadSilenceS * 1000 + TURN_PARTIAL_WAIT_MS));
+    if (human && m.hold && seg.seq > m.hold.lastSeq) this.holdFor(m, this.partialWait(m, d));
     const onChannel = m.channelOpen && this.bus?.channelReady?.(m.tenant, m.channelId);
     if (m.partials && d.transcript_events !== 'never' && !(d.transcript_events === 'auto' && onChannel)) this.emitLive(m, 'transcript', seg);
     if (!onChannel || !d.agent_partials || this.now() - m.partialSentAt < d.agent_partials_interval_s * 1000) return;
@@ -537,8 +540,9 @@ export class Meetings {
     Object.assign(seg, this.speakerFor(m, seg));
     const d = this.settings.effective(m.tenant).values;
     this.maybeBargeIn(m, seg, d);
-    m.partialNow = { seq: seg.seq, text: seg.text };
-    if (!this.heard(m, seg)) { if (words(seg.text).length) seg.echo = true; return this.deliver(m, seg, d); }
+    const human = this.heard(m, seg);
+    this.openSegment(m, seg, human);
+    if (!human) { if (words(seg.text).length) seg.echo = true; return this.deliver(m, seg, d); }
     if (!d.turn_hold_ms || m.finishing || m.state === 'ended') { this.flushHold(m); return this.deliver(m, seg, d); }
     if (m.hold && m.hold.speaker && seg.speaker && m.hold.speaker !== seg.speaker) this.flushHold(m);
     const h = m.hold ??= { segs: [], timer: null, first: this.now(), gen: m.consentGen, speaker: null };
@@ -546,10 +550,20 @@ export class Meetings {
     h.lastSeq = seg.seq;
     h.lastAt = this.now();
     h.speaker ??= seg.speaker || null;
-    const ms = this.turnComplete(seg.text) ? Math.min(d.turn_hold_complete_ms, d.turn_hold_ms) : d.turn_hold_ms;
+    // A later segment already being said (its partial came before this final's timestamped copy) holds it like a
+    // partial during the hold would.
+    const later = m.partialNow && m.partialNow.seq > seg.seq && m.partialNow.human;
+    const ms = later ? this.partialWait(m, d) : this.turnComplete(seg.text) ? Math.min(d.turn_hold_complete_ms, d.turn_hold_ms) : d.turn_hold_ms;
     if (!ms || this.now() - h.first >= TURN_MAX_MS) return this.flushHold(m);
     this.holdFor(m, ms);
   }
+
+  // The newest segment heard (a final never replaces a later segment's partial): what a barge-in counts from.
+  openSegment(m, seg, human) {
+    if (!m.partialNow || seg.seq >= m.partialNow.seq) m.partialNow = { seq: seg.seq, text: seg.text, human };
+  }
+
+  partialWait(m, d) { return Math.max(d.turn_hold_ms, m.vadSilenceS * 1000 + TURN_PARTIAL_WAIT_MS); }
 
   // A final that clearly ends a sentence: a question, or a sentence of at least three words with a full stop that
   // doesn't trail off (… or a last word such as "and", "the", "що").
@@ -559,10 +573,11 @@ export class Meetings {
     return TURN_END.test(t) && !TRAILING_OFF.test(t) && !TRAILING_WORD.test(t) && words(t).length >= 3;
   }
 
-  // The held turn goes ms from now, unless more comes.
+  // The held turn goes ms from now, unless more comes; TURN_MAX_MS after its first final at the latest.
   holdFor(m, ms) {
     const h = m.hold;
     clearTimeout(h.timer);
+    ms = Math.max(0, Math.min(ms, h.first + TURN_MAX_MS - this.now()));
     h.timer = setTimeout(() => {
       if (m.hold !== h) return;
       try { this.flushHold(m); } catch (e) { console.error(`bosun meeting ${m.id}: turn: ${oneLine(e)}`); }
@@ -599,6 +614,7 @@ export class Meetings {
     const w = words(seg.text);
     if (!w.length || this.ownVoice(m, w)) return false;
     m.lastHumanAt = this.now();
+    m.heardSeq = Math.max(m.heardSeq, seg.seq);
     return true;
   }
 
@@ -622,18 +638,20 @@ export class Meetings {
   // started playing: at least barge_in_min_words new words (agreeing words such as "mhm", "yes" don't count), or one
   // while the page has shown someone speaking barge_in_min_s since then. Never Bosun's own voice coming back; where
   // the page names speakers, someone other than Bosun must be shown speaking during the segment.
+  // An acknowledgement playing in front of a reply still being prepared counts as Bosun speaking: both are stopped.
   maybeBargeIn(m, seg, d) {
+    const playing = (x) => x?.startedAt && x.base && !x.cancelled && !x.ending && x.state === 'speaking';
+    const p = playing(m.speech) ? m.speech : playing(m.ackPlaying) ? m.ackPlaying : null;
     const u = m.speech;
-    if (!d.barge_in || !u?.startedAt || !u.base || u.cancelled || u.ending || u.state !== 'speaking') return;
-    if (seg.seq < u.base.seq) return;
-    const w = words(seg.text).slice(seg.seq === u.base.seq ? u.base.n : 0);
+    if (!d.barge_in || !p || u?.cancelled || u?.ending || seg.seq < p.base.seq) return;
+    const w = words(seg.text).slice(seg.seq === p.base.seq ? p.base.n : 0);
     if (!w.length || this.ownVoice(m, w)) return;
     const labels = m.speakersSeen && (m.speakerLog.at(-1)?.name || this.now() - m.lastNamedAt < LABEL_FRESH_MS);
-    const who = labels ? this.speakersIn(m, u.startedAt, this.now()) : {}; // only while Bosun's audio plays
+    const who = labels ? this.speakersIn(m, p.startedAt, this.now()) : {}; // only while Bosun's audio plays
     if (labels && !who.speaker) return;
     const counted = w.filter((x) => !BACKCHANNEL.has(x)).length;
-    if (counted < d.barge_in_min_words && !(counted >= 1 && labels && this.shownMs(m, u.startedAt) >= d.barge_in_min_s * 1000)) return;
-    this.bargeIn(m, u, { heard: w.join(' '), speaker: who.speaker || null }).catch((e) => console.error(`bosun meeting ${m.id}: barge-in: ${oneLine(e)}`));
+    if (counted < d.barge_in_min_words && !(counted >= 1 && labels && this.shownMs(m, p.startedAt) >= d.barge_in_min_s * 1000)) return;
+    this.bargeIn(m, u || p, { heard: w.join(' '), speaker: who.speaker || null }).catch((e) => console.error(`bosun meeting ${m.id}: barge-in: ${oneLine(e)}`));
   }
 
   // How long since `from` the page has shown someone (not Bosun) speaking.
@@ -668,7 +686,7 @@ export class Meetings {
 
   noteInterrupted(m, u, { said, unsaid, speaker, heard }) {
     if (!m.channelOpen || !this.bus?.channelReady?.(m.tenant, m.channelId)) return;
-    const text = `(interrupted at "${said}"${speaker ? ` by ${speaker}` : ''}; the rest was not said)`;
+    const text = said ? `(interrupted at "${said}"${speaker ? ` by ${speaker}` : ''}; the rest was not said)` : `(interrupted${speaker ? ` by ${speaker}` : ''} before any of it was said)`;
     this.bus.channelIncoming(m.tenant, m.channelId, [{
       channelId: m.channelId, messageId: `${m.id}:int${++m.interrupts}`, threadId: m.id,
       author: { id: 'bosun', name: botName(m.name) }, timestamp: new Date(this.now()).toISOString(), content: [{ type: 'text', text }],
@@ -680,6 +698,8 @@ export class Meetings {
   // What of an utterance has played by now (by its pieces' times; a piece cut off counts as far as its whole words
   // went), and what had not: {said, unsaid}; said null for audio without text (a file).
   spokenSoFar(u) {
+    const join = (a) => a.map((x) => x?.trim()).filter(Boolean).join(' ');
+    if (!u.startedAt && u.head !== undefined) return { said: '', unsaid: join([u.head, u.synthPiece, ...u.pieces]) }; // not playing yet
     if (!u.timeline) return { said: null, unsaid: '' };
     const t = this.now() - u.startedAt, said = [], unsaid = [];
     for (const p of u.timeline) {
@@ -694,15 +714,13 @@ export class Meetings {
     }
     if (u.synthPiece) unsaid.push(u.synthPiece);
     unsaid.push(...u.pieces);
-    const join = (a) => a.map((x) => x.trim()).filter(Boolean).join(' ');
     return { said: join(said), unsaid: join(unsaid) };
   }
 
   // A turn to the agent: acknowledged (ack_on_final), sent on the meeting's channel, and as a bosun:meeting-transcript
   // event unless the channel took it (transcript_events).
   deliver(m, seg, d) {
-    m.lastDeliveredAt = this.now();
-    m.lastTurnSeq = seg.seq;
+    if (!seg.echo) m.lastTurnSeq = Math.max(m.lastTurnSeq, seg.seq); // Bosun's own voice is not someone's turn
     if (!seg.echo) this.maybeAck(m, seg, d);
     const onChannel = m.channelOpen && this.bus?.channelReady?.(m.tenant, m.channelId);
     if (!onChannel) { if (d.transcript_events !== 'never') this.emitLive(m, 'transcript', seg); return; }
@@ -1028,6 +1046,9 @@ export class Meetings {
       m.announceDone.resolve();
       clearInterval(m.speakerTimer);
       clearTimeout(m.ackTimer);
+      // What the transcript still had committed, and a turn still held, go to the agent before the channel closes.
+      const stoppingTranscript = this.stopTranscript(m, 'ended').catch(() => {});
+      try { this.flushHold(m); } catch {}
       this.closeChannel(m);
       const rec = m.rec;
       await Promise.all([
@@ -1035,10 +1056,9 @@ export class Meetings {
           if (rec) { m.rec = null; m.recMs += this.now() - rec.startedAt; m.stopping = rec; await rec.stop().catch(() => {}); }
           else if (m.stopping) await m.stopping.stop().catch(() => {});
         })(),
-        this.stopTranscript(m, 'ended').catch(() => {}),
+        stoppingTranscript,
         this.endSpeech(m).catch(() => {}),
       ]);
-      try { this.flushHold(m); } catch {} // a turn still held goes now (as an event: the channel is closed)
       if (m.session && !m.session.disposed) {
         if (wasIn && reason !== 'meeting-ended' && reason !== 'removed') {
           await Promise.race([this.page(m, (p) => m.platform.leave(p)).catch(() => {}), sleep(5000)]);
@@ -1164,7 +1184,7 @@ export class Meetings {
     const consent = m.consentGen; // an opt-out meanwhile stops automatic speech (stream, ack) before it plays
     const pieces = text ? splitSpeech(text, { group: !(kind === 'stream' && this.prepareOn(m)) }) : null;
     const u = { id: `u${++m.speechSeq}`, kind, state: 'preparing', player: null, autoMute, cancelled: false, seconds: 0, t0, open: !!(text && open), pieces: pieces ? pieces.slice(1) : [], wake: null,
-      words: new Set(words(text || clipText)) }; // its own voice, should it come back
+      words: new Set(words(text || clipText)), head: pieces ? pieces[0] : undefined }; // its own voice, should it come back
     u.finished = new Promise((r) => { u.finish = r; });
     m.speech = u;
     // The previous utterance stops without muting: this one takes the microphone over (m.speechUnmuted: whether
@@ -1381,7 +1401,7 @@ export class Meetings {
       ...(u.bargeIn ? { barge_in: true, ...(u.bargeIn.said !== null ? { said: u.bargeIn.said } : {}), ...(u.bargeIn.speaker ? { interrupted_by: u.bargeIn.speaker } : {}) } : {}),
     };
     if (u.kind === 'ack' && u.startedAt) m.acks++;
-    if (u.startedAt && u.kind !== 'ack') this.emit(m, 'speech', r);
+    if ((u.startedAt || u.bargeIn) && u.kind !== 'ack') this.emit(m, 'speech', r);
     if (muteError) this.emit(m, 'mic-open', { utterance_id: u.id, mic_open: true, mute_error: muteError });
     u.finish(r);
     return r;

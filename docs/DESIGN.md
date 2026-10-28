@@ -350,14 +350,17 @@ in a sentence is a final; the agent answers it; the rest arrives while she speak
 - **Holding:** a final goes into the meeting's hold and a timer starts: `turn_hold_ms`, or `turn_hold_complete_ms`
   when the final clearly ends a sentence (`turnComplete`). Each new final restarts the timer.
 - **New speech:** a partial of a later segment that is not Bosun's own voice holds the turn until that segment's
-  final. If the final never comes (Scribe committed nothing), the turn goes after
+  final. That includes a partial that came before the held final's own timestamped copy (Scribe may send it first).
+  A final never replaces a later segment's partial as the open segment (`openSegment`). If the final never comes (Scribe committed nothing), the turn goes after
   `max(turn_hold_ms, vad_silence_s + 2.5 s)`.
 - **Delivery:** `deliver` is what 0.17.0's `onFinal` did (acknowledgement, channel, events), now once per turn. A
   merged turn: text joined with spaces, `seq` and `messageId` of its last segment, `merged_seqs`, start of the first
   segment and end of the last, the speaker over the whole span.
+- **A hard limit:** a turn always goes 30 s after its first final, however many partials come (`holdFor` clamps).
 - **Not held:**
   - `turn_hold_ms` 0;
-  - a meeting ending (`finish` delivers a held turn at once, as an event, because the channel is closed);
+  - a meeting ending: `finish` stops the transcript (its committed text becomes finals) and delivers a held turn
+    before it closes the channel;
   - Bosun's own voice coming back (delivered at once, `echo_suspected`).
 - **Different speaker:** a final of someone else (both labelled, names differ) ends the held turn first.
 - **Consent:** an opt-out or a deletion forgets a held turn (`consentGen`), as it forgets the transcript.
@@ -391,6 +394,8 @@ in a sentence is a final; the agent answers it; the rest arrives while she speak
     It comes before the interrupter's turn, which is still held.
   - Always: `bosun:meeting-speech` with `barge_in`, `said` and `interrupted_by`.
   - An acknowledgement that is talked over just stops.
+  - An acknowledgement playing in front of a reply still being prepared counts as Bosun speaking. Both stop, and the
+    reply's message says nothing of it was said.
 - **Latency:** with the stand-in, 1.5 s from the start of the interruption. Its partials come every 0.5 s of speech,
   one word each, so two words take 1 s plus chunking. Scribe's partials carry several words each and come sooner.
 
@@ -411,8 +416,12 @@ in a sentence is a final; the agent answers it; the rest arrives while she speak
   - Someone who talks over Bosun using mostly Bosun's words is not heard as a barge-in until they add their own.
 
 **Stale answers.**
-- **The flag:** `superseded_by_new_speech = lastHumanAt > lastDeliveredAt`. Someone has spoken (a partial or final
-  that isn't echo) since the last turn went to the agent, so the agent is answering without that speech.
+- **The flag:** `superseded_by_new_speech = heardSeq > lastTurnSeq`, while that speech is in a held turn or was heard
+  in the last 5 s. `heardSeq` is the newest segment someone (not Bosun's echo) was heard in, from a partial or a
+  final. `lastTurnSeq` is the newest segment delivered as someone's turn. Segments are compared, not times, so:
+  - Bosun's own voice delivered meanwhile doesn't clear the flag.
+  - An older final delivered after a newer partial doesn't clear it either.
+  - The 5 s limit covers speech that Scribe never committed (a cough as a partial with words).
 - **The text is said anyway,** as the brief asks. The agent decides.
 - **Not detectable:** a publish answering turn K that comes after turn K+1 was already delivered. `channels/publish`
   carries no reference to the message it answers. `last_turn_seq` in the acknowledgement lets the agent compare

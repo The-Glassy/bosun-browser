@@ -306,3 +306,64 @@ test('stale answer: a publish while someone has spoken since the last turn (a tu
     await c.close();
   });
 });
+
+test('a turn still held when the meeting ends reaches the channel before it closes (transcript_events never)', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { turn_hold_ms: 5000, turn_hold_complete_ms: 5000, transcript_events: 'never' });
+    const { id } = await admitted(c);
+    phrases('Last words before I go.');
+    audio.say(tonePcm(1.5));
+    await until(async () => (await segments(c, id)).length === 1, 15_000);
+    assert.equal(c.finals().length, 0, 'held');
+    await c.call('meeting_leave', { meeting_id: id });
+    await until(() => c.finals().length === 1, 5000);
+    assert.equal(c.finals()[0].content[0].text, 'Last words before I go.');
+    await c.close();
+  });
+});
+
+test('Bosun\'s own voice delivered while someone\'s turn is held: the publish is still superseded, last_turn_seq doesn\'t move', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { turn_hold_ms: 5000, turn_hold_complete_ms: 5000 });
+    const { id, chId } = await admitted(c);
+    phrases('Here is my question for you.');
+    audio.say(tonePcm(1.5));
+    await until(async () => (await segments(c, id)).length === 1, 15_000);
+    const said = 'Hello Misha, this is a test of the echo in this meeting.';
+    const r1 = await c.publish(chId, said);
+    assert.equal(r1.superseded_by_new_speech, true);
+    await until(() => audio.players.length === 1, 10_000);
+    phrases(said);
+    audio.say(tonePcm(2));
+    await until(() => c.finals().some((f) => f.metadata.echo_suspected), 15_000);
+    assert.equal(c.finals().filter((f) => !f.metadata.echo_suspected).length, 0, 'the question still held');
+    const r2 = await c.publish(chId, 'More.');
+    assert.equal(r2.superseded_by_new_speech, true);
+    assert.equal(r2.last_turn_seq, 0);
+    await until(() => c.finals().some((f) => !f.metadata.echo_suspected), 10_000);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('a segment already being said when the final before it arrives (its timestamped copy late) holds that final until it ends: one turn', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    // Without the later segment the first one (a complete sentence) would go after 300 ms.
+    await c.call('speech_settings_set', { turn_hold_ms: 4000, turn_hold_complete_ms: 300 });
+    const { id } = await admitted(c);
+    el.st.stampDelayMs = 1200;
+    try {
+      phrases('Here is the first part.', 'And here comes the second part now.');
+      audio.say(Buffer.concat([tonePcm(1.5), silence(1.3), tonePcm(2.5)]));
+      await until(() => c.finals().length === 1, 20_000);
+      await sleep(1000);
+      assert.equal(c.finals().length, 1);
+      assert.equal(c.finals()[0].content[0].text, 'Here is the first part. And here comes the second part now.');
+    } finally { el.st.stampDelayMs = 0; }
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
