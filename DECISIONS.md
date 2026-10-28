@@ -28,3 +28,18 @@ Decisions made without asking (Misha: "use your judgment and decide yourself"), 
   already delivered when the answer to turn K arrives.
 - **The interruption message is a `channels/incoming` from author `bosun`, tagged `bosun:meeting-interrupted`.** A wake
   policy can filter it, and it arrives before the interrupter's (held) turn.
+- **Addendum, still thinking: the default is "drop", as asked.** A dropped publish answers `delivered: false` (no
+  `messageId`). connectome-host then reports a failed publish, which is honest: nothing was said. `delivered: true`
+  would make the host stream the text as said.
+- **A turn counts as answered once a publish for it is said, or `meeting_speak` is called.** After that the
+  speaker's next words are a new turn (barge-in handles an answer still playing). An acknowledgement is not an
+  answer.
+- **`turn_extend_s` = 20 s.** Glassy's thinking time before her first publish is several seconds. Beyond 20 s
+  without an answer, more speech is more likely a new thought. It is tunable, and 0 turns reopening off.
+- **An acknowledgement that already played for the first part is not repeated** for the merged turn within the
+  cooldown. One still waiting is cancelled, and its cooldown released.
+- **The extra receipt fields stay,** although connectome-host drops them today. Hosts that read receipts get them,
+  and the channel messages carry the same information for Glassy.
+- **No fourth Codex round for the addendum:** the brief caps Codex at 3 rounds. The addendum diff was reviewed by
+  hand. That review found a turn reopened with nothing new that stayed marked reopened, and a deleted transcript's
+  turn that could be reopened. Both are fixed.

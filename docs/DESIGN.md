@@ -430,6 +430,40 @@ in a sentence is a final; the agent answers it; the rest arrives while she speak
   carries no reference to the message it answers. `last_turn_seq` in the acknowledgement lets the agent compare
   against the seq it answered.
 
+**Still thinking (addendum, Misha 20:25: "not only while you're speaking, but also while you're thinking").**
+- **When:** `maybeExtend` runs on a partial or final of someone (not echo) with a seq after the last delivered turn
+  (`m.lastTurn`). All of these must hold:
+  - that turn is not answered (`answeredSeq`: set by a publish that is said, and by `meeting_speak`);
+  - nothing but an acknowledgement is playing;
+  - it was delivered within `turn_extend_s`;
+  - it was not reopened before;
+  - nothing is held now;
+  - the speaker is the same, or unknown;
+  - its text was not forgotten since (`gen`).
+- **What happens:**
+  - The last turn's finals (`seg.parts` of a merged turn) seed a new hold (`extends`), which waits as for a partial
+    during a hold.
+  - The agent gets a `turn-extended` message (channel) or live event.
+  - A pending acknowledgement is cancelled and its cooldown released.
+- **Delivery:** `flushHold` delivers the reopened turn as a merged final with `extends_turn`. If nothing new was
+  committed, it delivers the same turn again and takes it off the reopened list, so it can be answered.
+- **Publishes:** a publish belongs to `turn_seq` (named, or the last delivered turn when it came). If that turn was
+  reopened, `superseded_publish: "drop"` answers `{delivered: false, dropped: true, reason}` without speaking.
+  - `delivered: false` with no `messageId`: agent-framework 0.24's `publishReceiptOutcome` then reports the publish as
+    failed, which is true. A `delivered: true` would be a lie the host acts on (it streams the text as published).
+- **Host limit:** connectome-host (agent-framework 0.24.0, `publishReceiptOutcome`) keeps only `delivered` and
+  `messageId` of a receipt. `superseded_by_new_speech`, `turn_seq` and `dropped` don't reach the agent through it:
+  - A dropped publish shows up as "reported delivered:false".
+  - The messages Glassy actually sees are the channel messages: `bosun:meeting-turn-extended`,
+    `bosun:meeting-interrupted`, and the merged final with `extends_turn`.
+  - Surfacing the receipt's fields to the agent would be a host change.
+
+**Codex round 3 fixes.**
+- The echo vocabulary is only the pieces that have begun to play (`playedWords` from `u.timeline`), during playback
+  and in `saidRecent` after it. A piece still waiting or being synthesized can't come back yet.
+- A final whose audio ended before Bosun began to play (its timestamped copy came late) is no barge-in. Of a final
+  that began before, the share of its words before playback started is left out.
+
 ## 10. Deployment
 
 - Package: npm + Docker image (Chromium, Xvfb, fonts, the server).

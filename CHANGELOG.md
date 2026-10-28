@@ -21,7 +21,15 @@
   - Where the page names speakers, a barge-in also needs someone other than Bosun shown speaking.
 - **Stale answers.** The acknowledgement of `channels/publish` carries `superseded_by_new_speech`: true when someone
   has spoken since the last turn the agent was given. It also carries `last_turn_seq`. The text is said all the same.
-- `meeting_status` shows `barge_ins`.
+- **Still thinking** (`turn_extend_s`, default 20; `superseded_publish`, default `"drop"`). When the speaker goes on
+  after their turn reached the agent, before the agent answered it:
+  - The channel gets `bosun:meeting-turn-extended` at once (a live event without the channel).
+  - The turn is reopened and comes again merged (`extends_turn`).
+  - Publishes for the old turn are dropped (`delivered: false, dropped: true, reason: "superseded_by_new_speech"`),
+    or said with `"speak"`.
+  - Finals carry `turn_seq`; a publish may name the `turn_seq` it answers. A pending acknowledgement for the old turn
+    is not played.
+- `meeting_status` shows `barge_ins`, `turns_extended`, `publishes_dropped`.
 
 ### Changed
 

@@ -971,6 +971,23 @@ a sentence. In 0.17.0 the agent answered that fragment, and what the speaker add
   is said all the same, and the agent decides whether to stop (`meeting_stop_speaking`) or go on. `last_turn_seq` is
   the seq of that last turn, so an agent can tell when it is answering an older one.
 
+**Still thinking (0.17.1).** When the speaker goes on after their turn went to the agent but before the agent answered
+it (no publish and no `meeting_speak` for it yet), within `turn_extend_s` (default 20 s; 0 turns this off):
+- **At once:** the channel gets a message tagged `bosun:meeting-turn-extended`, author `bosun`, metadata `{turn_seq,
+  turn_text, text_so_far, speaker}`. Without the channel it comes as the live event `bosun:meeting-turn-extended`.
+- **The turn is reopened:** it is held again with what the speaker adds. When they are done it comes again as one
+  merged final: `extends_turn` names the old turn, and `merged_seqs` covers both parts.
+- **Publishes for the old turn:** with `superseded_publish: "drop"` (default) they are not said. The acknowledgement
+  is `delivered: false, dropped: true, reason: "superseded_by_new_speech"`, so a host counts it as not delivered.
+  With `"speak"` they are said, with `superseded_by_new_speech: true`.
+- **Which turn a publish answers:** the one current when it arrived (`turn_seq` in the acknowledgement). Finals carry
+  `turn_seq`, and a publish may pass `turn_seq` (in its params or `metadata`) to name the turn it answers.
+- **Acknowledgement:** an acknowledgement still waiting for the old turn (`ack_delay_ms`) is not played, and the
+  merged turn gets its own. A clip that already played can't be taken back, so the merged turn's clip then waits out
+  `ack_cooldown_s` as usual.
+- **Not reopened:** a turn the agent has answered (its answer may be playing, and barge-in handles that), a turn of
+  someone else, and a turn whose transcript was deleted.
+
 **Audio setup (Linux).** Each meeting gets a private PulseAudio server: its own `XDG_RUNTIME_DIR`, socket and
 config, with two null sinks:
 - **`bosun_out`:** the browser plays the meeting into it; ffmpeg records its monitor, and a second one reads it for

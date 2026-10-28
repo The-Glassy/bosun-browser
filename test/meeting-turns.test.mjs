@@ -103,10 +103,10 @@ test('two fragments within turn_hold_ms reach the agent as one merged final (one
   });
 });
 
-test('a fragment after turn_hold_ms is a turn of its own; turn_hold_ms 0 delivers every final at once (0.17.0)', async () => {
+test('a fragment after turn_hold_ms is a turn of its own (turn_extend_s 0: no reopening); turn_hold_ms 0 delivers every final at once (0.17.0)', async () => {
   await withService(async (svc, ev, audio) => {
     const c = await host(svc);
-    await c.call('speech_settings_set', { turn_hold_ms: 1000 });
+    await c.call('speech_settings_set', { turn_hold_ms: 1000, turn_extend_s: 0 });
     const { id } = await admitted(c);
     phrases('So I was thinking about the', 'budget for next year.');
     // Second stretch 3 s after the first: its final is 2 s after the first, which went after 1 s.
@@ -403,6 +403,127 @@ test('an uploaded audio file is never cut off by barge-in (no text to tell its e
     audio.say(tonePcm(2));
     await until(() => ev.speech.length === 1, 15_000);
     assert.equal(ev.speech[0].state, 'done');
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('still thinking: the speaker goes on after their turn went to the agent and before it answered: turn_extended at once, the publish for the old turn dropped, the merged turn later; one acknowledgement', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { turn_hold_ms: 300, ack_on_final: true, ack_phrases: ['Mhm.'], ack_delay_ms: 1500 });
+    const { id, chId } = await admitted(c);
+    phrases('I have a question about the budget.', 'And also about the timeline.');
+    audio.say(Buffer.concat([tonePcm(1.5), silence(1.8), tonePcm(1.5)]));
+    await until(() => c.finals().length === 1, 15_000);
+    const first = c.finals()[0];
+    assert.equal(first.content[0].text, 'I have a question about the budget.');
+    assert.equal(first.metadata.turn_seq, 1);
+    // The agent is still thinking; the speaker goes on.
+    await until(() => c.incoming.some((m) => m.tags.includes('bosun:meeting-turn-extended')), 10_000);
+    const ext = c.incoming.find((m) => m.tags.includes('bosun:meeting-turn-extended'));
+    assert.equal(ext.metadata.turn_seq, 1);
+    assert.equal(ext.metadata.turn_text, 'I have a question about the budget.');
+    assert.ok(ext.metadata.text_so_far.length > 0);
+    assert.equal(ext.author.id, 'bosun');
+    assert.ok(ext.at - first.at < 2500, `${ext.at - first.at} ms after the first part`);
+    // Its answer to the first part: not said.
+    const r = await c.publish(chId, 'Sure, the budget is fine.');
+    assert.deepEqual([r.delivered, r.dropped, r.reason, r.turn_seq], [false, true, 'superseded_by_new_speech', 1]);
+    assert.equal(r.messageId, undefined);
+    // The whole turn when they are done.
+    await until(() => c.finals().length === 2, 15_000);
+    const merged = c.finals()[1];
+    assert.equal(merged.content[0].text, 'I have a question about the budget. And also about the timeline.');
+    assert.equal(merged.metadata.extends_turn, 1);
+    assert.deepEqual(merged.metadata.merged_seqs, [1, 2]);
+    assert.equal(merged.metadata.turn_seq, 2);
+    // One clip, at the real end (the first part's was still waiting when they went on).
+    await until(() => audio.players.length === 1, 5000);
+    assert.ok(audio.players[0].startedAt >= merged.at, 'after the merged turn');
+    // The answer to the merged turn is said.
+    const r2 = await c.publish(chId, 'Both look fine.');
+    assert.equal(r2.delivered, true);
+    assert.equal(r2.superseded_by_new_speech, false);
+    assert.equal(r2.turn_seq, 2);
+    await until(() => ev.speech.length === 1, 15_000);
+    assert.equal(ev.speech[0].state, 'done');
+    // A late publish naming the old turn is still dropped.
+    assert.equal((await c.publish(chId, 'About the budget again.').catch((e) => e)).delivered, true, 'no turn_seq: the current turn');
+    const st = await status(c, id);
+    assert.equal(st.turns_extended, 1);
+    assert.equal(st.publishes_dropped, 1);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('superseded_publish "speak": the publish for the reopened turn is said, flagged; once answered, a turn is not reopened', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { turn_hold_ms: 300, superseded_publish: 'speak' });
+    const { id, chId } = await admitted(c);
+    phrases('I have a question about the budget.', 'And also about the timeline.');
+    audio.say(Buffer.concat([tonePcm(1.5), silence(1.8), tonePcm(1.5)]));
+    await until(() => c.incoming.some((m) => m.tags.includes('bosun:meeting-turn-extended')), 15_000);
+    const r = await c.publish(chId, 'Sure.');
+    assert.equal(r.delivered, true);
+    assert.equal(r.superseded_by_new_speech, true);
+    assert.equal(r.turn_seq, 1);
+    await until(() => audio.players.length === 1, 10_000); // said (and cut off by barge-in, as they are still talking)
+    await until(() => ev.speech.length === 1, 15_000);
+    await until(() => c.finals().length === 2, 15_000);
+    assert.equal(c.finals()[1].metadata.extends_turn, 1);
+    // Answered (a publish for turn 2) before they go on: their next words are a turn of their own.
+    await c.publish(chId, 'Okay.');
+    await until(() => ev.speech.length === 2, 15_000);
+    phrases('A completely new topic now.');
+    audio.say(tonePcm(1.5));
+    await until(() => c.finals().length === 3, 15_000);
+    assert.equal(c.finals()[2].metadata.extends_turn, undefined);
+    assert.equal(c.incoming.filter((m) => m.tags.includes('bosun:meeting-turn-extended')).length, 1);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('echo vocabulary is only what has begun to play: someone saying the words of a piece still being synthesized does barge in', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    const { id, chId } = await admitted(c);
+    await c.publish(chId, 'Let me check the figures first, and then I will come back to you with all of the details you asked for.');
+    await until(() => audio.players.length === 1, 10_000);
+    await sleep(300);
+    el.st.ttsDelayMs = 6000;
+    try {
+      await c.publish(chId, 'The budget for next year is approved.');
+      phrases('The budget for next year is approved.');
+      audio.say(tonePcm(2));
+      await until(() => ev.speech.length === 1, 15_000);
+      assert.equal(ev.speech[0].state, 'interrupted');
+      assert.equal(ev.speech[0].barge_in, true);
+    } finally { el.st.ttsDelayMs = 0; }
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('a final of speech that ended before Bosun began to play (its timestamped copy late) is no barge-in', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { turn_hold_ms: 300 });
+    const { id, chId } = await admitted(c);
+    el.st.stampDelayMs = 1400;
+    try {
+      phrases('One two three four five six seven.');
+      audio.say(tonePcm(1));
+      await sleep(1700); // the speech is over (its plain commit comes ~1 s after); the final comes ~1.4 s later
+      await c.publish(chId, 'Here is a long answer that keeps going for several seconds at least.');
+      await until(() => audio.players.length === 1, 10_000);
+      await until(async () => (await segments(c, id)).length === 1, 10_000);
+      await until(() => ev.speech.length === 1, 15_000);
+      assert.equal(ev.speech[0].state, 'done');
+    } finally { el.st.stampDelayMs = 0; }
     await c.call('meeting_leave', { meeting_id: id });
     await c.close();
   });
