@@ -48,7 +48,7 @@ const MUTE_WAIT_MS = 20_000;
 const MUTE_RETRY_MS = 5000;
 const MUTE_RETRIES = 6;
 const STREAM_IDLE_MS = 300; // an utterance from the channel waits this long after its audio for more text
-const SPEAKER_POLL_MS = 300; // who the page shows as speaking is read this often
+const SPEAKER_POLL_MS = 500; // who the page shows as speaking is read this often (the page logs changes every 200 ms)
 const SPEAKER_LOG_MS = 600_000; // and kept this long
 const PREPARED_MS = 60_000; // a sentence synthesized ahead from chunks is kept this long for its publish
 const PREPARED_MAX = 20; // and this many at most per meeting (synthesized or still synthesizing)
@@ -285,7 +285,7 @@ export class Meetings {
       // Speaking from the meeting's MCPL channel, acknowledgements, who the page shows as speaking.
       channelId: null, channelOpen: false, channelQueue: Promise.resolve(), channelGen: 0, channelBacklog: 0, channelSaid: [], chunkStreams: new Map(), prepared: new Map(),
       channelMsgs: 0, speechFollows: 0, consentGen: 0,
-      ackTimer: null, lastAck: 0, lastAckText: null, acks: 0, lastSpokeAt: 0, partialSentAt: 0,
+      ackTimer: null, ackPlaying: null, lastAck: 0, lastAckText: null, acks: 0, lastSpokeAt: 0, partialSentAt: 0,
       speakerKey: `__s${crypto.randomBytes(8).toString('hex')}`, speakerLog: [], speakerTimer: null, speakersSeen: false,
     };
     this.active.set(id, m);
@@ -394,8 +394,9 @@ export class Meetings {
       apiKey: this.cfg.elevenlabs.apiKey, baseUrl: this.cfg.elevenlabs.baseUrl, source: m.rig.capture(), tenant: m.tenant, usage: this.usage,
       partials: true, vadSilenceS: m.vadSilenceS, now: this.now,
       on: {
-        partial: (seg) => this.onPartial(m, seg),
-        final: (seg) => this.onFinal(m, seg),
+        // Never thrown into the transcript's socket or timers (that would end the process): the text is emitted as it was.
+        partial: (seg) => { try { this.onPartial(m, seg); } catch (e) { console.error(`bosun meeting ${m.id}: partial: ${oneLine(e)}`); } },
+        final: (seg) => { try { this.onFinal(m, seg); } catch (e) { console.error(`bosun meeting ${m.id}: final: ${oneLine(e)}`); this.emitLive(m, 'transcript', seg); } },
         // Not when the meeting ends (bosun:meeting-ended says that) or Bosun shuts down.
         stopped: ({ reason, error }) => { if (reason !== 'ended') this.emit(m, 'transcript-stopped', { reason, ...(error ? { error } : {}), minutes: m.transcript?.status().streamed_min ?? 0 }); },
       },
@@ -566,9 +567,10 @@ export class Meetings {
     const text = String(seg.text || '').trim();
     if (text.split(/\s+/).filter(Boolean).length < d.ack_min_words || !TURN_END.test(text)) return;
     if (this.now() - m.lastAck < d.ack_cooldown_s * 1000) return;
-    const ready = this.ackClips(m).filter((e) => e.clip);
+    const ready = [...new Map(this.ackClips(m).filter((e) => e.clip).map((e) => [e.text, e])).values()];
     if (!ready.length) return;
-    const pool = ready.length > 1 ? ready.filter((e) => e.text !== m.lastAckText) : ready;
+    const others = ready.filter((e) => e.text !== m.lastAckText);
+    const pool = others.length ? others : ready;
     const e = pool[Math.floor(Math.random() * pool.length)];
     m.lastAck = this.now();
     m.lastAckText = e.text;
@@ -773,8 +775,16 @@ export class Meetings {
     m.ackTimer = null;
     this.closeChannel(m);
     m.prepared.clear();
-    const u = m.speech; // an acknowledgement, or text from the channel, preparing or playing: stopped (muted again)
-    if (u && (u.kind === 'ack' || u.kind === 'stream')) { u.cancelled = true; u.stopped = true; u.pieces.length = 0; u.wake?.(); u.player?.stop(); }
+    // An acknowledgement or text from the channel, preparing or playing (also an acknowledgement still playing out
+    // behind a reply): ended now, and the microphone muted again, without waiting for its synthesis.
+    this.stopAck(m).catch(() => {});
+    const u = m.speech;
+    if (u && (u.kind === 'ack' || u.kind === 'stream')) {
+      Object.assign(u, { cancelled: true, stopped: true });
+      u.pieces.length = 0;
+      u.player?.stop();
+      this.endUtterance(m, u, 'interrupted', null).catch(() => {});
+    }
     // Both at once: the recording (stopped, deleted) and the live transcript (stopped, its text forgotten).
     const [, live] = await Promise.all([this.stopRecording(m, { del: true }), this.stopTranscript(m, 'opted-out', { clear: true })]);
     await this.page(m, (p) => this.say(m, p, live || m.live ? CONFIRM_DELETED_LIVE : CONFIRM_DELETED)).catch(() => {});
@@ -959,9 +969,10 @@ export class Meetings {
     // (it is short) and this one starts right after it; one still waiting for the microphone never plays.
     let after = null;
     if (prev) {
-      if (prev.kind === 'ack' && prev.player && !interrupt) after = prev;
+      if (prev.kind === 'ack' && prev.player && !interrupt) after = m.ackPlaying = prev; // still reachable (stopAck) while it plays out
       else { prev.cancelled = true; prev.wake?.(); await prev.player?.stop(); }
     }
+    if (!after) await this.stopAck(m); // an acknowledgement still playing behind the one replaced now stops too
     if (!autoMute) m.speechUnmuted = false; // the agent handles the microphone itself now
     const first = (async () => {
       if (clip) return clip;
@@ -1053,6 +1064,13 @@ export class Meetings {
     return end ? { ...started, ...end, speaking: false } : { ...started, error: 'still not over 30 s after it should have ended' };
   }
 
+  // An acknowledgement that plays out behind the reply that replaced it in m.speech: stopped.
+  async stopAck(m) {
+    const a = m.ackPlaying;
+    m.ackPlaying = null;
+    if (a && !a.ending) { a.cancelled = true; await a.player?.stop(); }
+  }
+
   // The next piece of text an utterance plays, or null when it is over: stopped, or nothing left and (open) nothing new
   // came by STREAM_IDLE_MS after what was written has played (then it is closed: more text starts a new one).
   async nextPiece(m, u, playEnd) {
@@ -1137,6 +1155,7 @@ export class Meetings {
     if (tail) await sleep(SPEECH_TAIL_MS);
     u.state = state;
     if (m.speech === u) m.speech = null;
+    if (m.ackPlaying === u) m.ackPlaying = null;
     // The last utterance mutes again what speaking turned on; one followed by another (interrupt) leaves it to that one.
     let muteError = null;
     if (u.autoMute && m.speechUnmuted && !m.speech && (!m.speechFollows || u.stopped) && (m.state === 'admitted' || m.state === 'recording')) {
@@ -1197,6 +1216,7 @@ export class Meetings {
   async stopSpeaking(tenant, id) {
     const m = this.get(tenant, id);
     m.channelGen++; // text from the channel still waiting is dropped too
+    await this.stopAck(m);
     const u = m.speech;
     if (!u) return { meeting_id: id, stopped: false };
     u.cancelled = true;
@@ -1210,6 +1230,7 @@ export class Meetings {
   }
 
   async endSpeech(m) {
+    await this.stopAck(m);
     const u = m.speech;
     if (!u) return;
     u.cancelled = true;

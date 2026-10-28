@@ -398,6 +398,64 @@ test('chunk preparation is bounded (20 sentences at a time, none longer than 400
   });
 });
 
+test('ack_phrases with duplicates: acknowledged again and again without failing (the process lives on)', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { ack_on_final: true, ack_phrases: ['Okay.', 'Okay.'], ack_delay_ms: 0, ack_cooldown_s: 0, ack_min_words: 1 });
+    const { id } = await admitted(c);
+    await until(() => c.registered.length === 1, 10_000);
+    for (let i = 1; i <= 3; i++) {
+      await until(async () => !(await status(c, id)).speaking);
+      audio.say(tonePcm(2));
+      await until(() => c.incoming.filter((m) => m.metadata.final).length === i, 15_000);
+      await until(async () => (await status(c, id)).acks === i, 5000);
+    }
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('an opt-out ends channel speech still being synthesized at once: the microphone is muted again without waiting for the synthesis', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    const { id, code } = await admitted(c, { leave_on_optout: false });
+    const chId = `bosun:meeting:${id}`;
+    await until(() => c.registered.length === 1, 10_000);
+    el.st.ttsDelayMs = 8000;
+    try {
+      await c.publish(chId, 'This should never be heard.');
+      await until(() => mics(code).at(-1) === true, 5000); // unmuted while it synthesizes
+      fake.say(code, 'Alex', "please don't record this");
+      await until(() => c.changed.length === 1, 10_000);
+      await until(() => mics(code).at(-1) === false, 4000);
+      assert.equal((await status(c, id)).speaking, undefined);
+    } finally { el.st.ttsDelayMs = 0; }
+    assert.equal(audio.players.length, 0);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('a host that turned a channel down gets it offered again with its next grant', async () => {
+  await withService(async (svc) => {
+    const c = await host(svc);
+    let refuse = true;
+    c.setRequestHandler(z.object({ method: z.literal('channels/register'), params: z.any() }), async (r) => {
+      if (!refuse) c.registered.push(...r.params.channels);
+      return { results: r.params.channels.map((d) => ({ id: d.id, accepted: !refuse, ...(refuse ? { reason: 'capability_denied' } : {}) })) };
+    });
+    const { id } = await admitted(c);
+    await sleep(800);
+    assert.equal((await status(c, id)).channel.registered, false);
+    refuse = false;
+    await c.request({ method: 'featureSets/update', params: { enabled: [MEETING_SET], effectiveCapabilities: ['tools', 'pushEvents', 'channels.*'] } }, z.any());
+    await until(() => c.registered.length === 1, 5000);
+    await until(async () => (await status(c, id)).channel.registered === true);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
 test('grant matching per MCPL §5.4: a bare "*" grants no channel capability; channels.* does', async () => {
   await withService(async (svc, ev, audio) => {
     const c = await host(svc, { caps: ['*'] });

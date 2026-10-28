@@ -20,14 +20,17 @@
     `channel_prepare_chunks`, their sentences are synthesized ahead, and the publish that delivers them plays that
     audio at once. That pays off only with a host that streams before it publishes; connectome-host sends chunks
     after the publish, and those are not synthesized again.
-  - An opt-out (with `leave_on_optout: false`) closes the channel, stops an acknowledgement or channel text being
-    prepared or played (and mutes again), and drops channel text still waiting. `meeting_stop_speaking` also drops
+  - An opt-out (with `leave_on_optout: false`) closes the channel, ends at once an acknowledgement or channel text
+    being prepared or played (also an acknowledgement playing out behind a reply), mutes again without waiting for
+    synthesis, and drops channel text still waiting. `meeting_stop_speaking` also drops
     channel text still waiting.
   - Preparation from chunks is bounded: at most 20 sentences at a time, none longer than 400 characters. Prepared
     audio is used only for exactly the same text and voice.
   - A `featureSets/update` notification without `effectiveCapabilities` keeps the capabilities granted (MCPL §6.7).
     Before, one carrying only `enabled` / `disabled` also cleared push events.
-  - Capability matching follows MCPL §5.4: `*` matches one segment, so a bare `*` grants no `channels.*`.
+  - Capability matching follows MCPL §5.4: `*` matches one segment, so a bare `*` grants no `channels.*`. The
+    overlap check between granted and denied patterns follows it too.
+  - A channel the host turned down is offered again with its next grant (Request).
   - Only channels registered on that connection, for that tenant, under the grant as it is now, are accepted. Others
     get `-32023` unknown channel or `-32002` capability denied. `channels/list` is answered.
 - **Speech settings** (per tenant, `speech_settings_set`; nothing is fixed in code):

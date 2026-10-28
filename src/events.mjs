@@ -275,8 +275,8 @@ const capGranted = (patterns, path) => {
   const want = path.split('.');
   return patterns.some((p) => { const s = p.split('.'); return s.length === want.length && s.every((x, i) => x === '*' || x === want[i]); });
 };
-// Two patterns overlap when some capability path matches both.
-const overlaps = (a, b) => grants([a], b) || grants([b], a);
+// Two capability patterns overlap when some path matches both (§5.4: equal segment counts, `*` one segment).
+const overlaps = (a, b) => { const x = a.split('.'), y = b.split('.'); return x.length === y.length && x.every((s, i) => s === '*' || y[i] === '*' || s === y[i]); };
 
 // MCPL on one MCP connection: the manifest is advertised statically (plain MCP clients ignore experimental); the
 // grant comes from featureSets/update. Attaches the connection to the bus once push is allowed for some feature set;
@@ -316,7 +316,7 @@ export function mcplConnection(server, { bus, tenant }) {
   const update = (regrant = false) => {
     if (pushAllowed() && (!detach || regrant)) { detach?.(); detach = bus.attach(tenant, (p) => sink(p)); }
     else if (!pushAllowed() && detach) { detach(); detach = null; }
-    chans.sync();
+    chans.sync(regrant);
   };
   server.setRequestHandler(z.object({ method: z.literal('featureSets/update'), params: z.any().optional() }), async (req) => {
     if (!apply(req.params, 'request')) { update(); throw Object.assign(new Error('effectiveCapabilities and deniedCapabilities overlap; nothing is granted'), { code: -32602 }); }
@@ -342,24 +342,30 @@ const channelError = (code, message, data) => Object.assign(new Error(message), 
 // registered on this connection.
 function channelSide(server, { bus, tenant, can }) {
   const registered = new Set(); // channel ids the host accepted on this connection
+  const asking = new Set(); // channel ids with a channels/register on its way
   let detach = null;
   let gen = 0; // bumped when the grant loses channels.register: a registration answered after that is taken back
   let queue = Promise.resolve(); // register and remove go out in order
   const later = (fn) => { queue = queue.then(fn).catch(() => {}); return queue; };
   const unregister = (id) => server.notification({ method: 'channels/changed', params: { added: [], removed: [id], updated: [] } }).catch(() => {});
+  const register = async (d) => {
+    const g = gen;
+    const r = await server.request({ method: 'channels/register', params: { channels: [d] } }, z.object({}).passthrough(), { timeout: REGISTER_TIMEOUT_MS });
+    const item = Array.isArray(r.results) ? r.results.find((x) => x?.id === d.id) : null;
+    const ok = item ? item.accepted === true : Array.isArray(r.registered) && r.registered.includes(d.id);
+    if (!ok) return;
+    // The meeting ended, or the grant lost channels.register, while the host answered: taken back at once.
+    if (g === gen && can('channels.register') && bus.channel(tenant, d.id)) registered.add(d.id);
+    else await unregister(d.id);
+  };
   const conn = {
     add: (d) => later(async () => {
       await new Promise((r) => setTimeout(r, 0)); // after the answer to the featureSets/update that granted it
-      if (!can('channels.register') || registered.has(d.id) || !bus.channel(tenant, d.id)) return;
-      const g = gen;
-      const r = await server.request({ method: 'channels/register', params: { channels: [d] } }, z.object({}).passthrough(), { timeout: REGISTER_TIMEOUT_MS });
-      const item = Array.isArray(r.results) ? r.results.find((x) => x?.id === d.id) : null;
-      const ok = item ? item.accepted === true : Array.isArray(r.registered) && r.registered.includes(d.id);
-      if (!ok) return;
-      // The meeting ended, or the grant lost channels.register, while the host answered: taken back at once.
-      if (g === gen && can('channels.register') && bus.channel(tenant, d.id)) registered.add(d.id);
-      else await unregister(d.id);
+      if (!can('channels.register') || registered.has(d.id) || asking.has(d.id) || !bus.channel(tenant, d.id)) return;
+      asking.add(d.id);
+      try { await register(d); } finally { asking.delete(d.id); }
     }),
+
     remove: (id) => later(async () => { if (registered.delete(id)) await unregister(id); }),
     ready: (id) => registered.has(id) && can('channels.incoming'),
     async incoming(id, messages) {
@@ -370,9 +376,12 @@ function channelSide(server, { bus, tenant, can }) {
     },
   };
   // The grant changed: attach while channels.register is granted; channels registered under a grant that no longer
-  // has it are taken back.
-  const sync = () => {
-    if (can('channels.register')) { if (!detach) detach = bus.attachChannels(tenant, conn); }
+  // has it are taken back. A new grant (Request) offers again what the host turned down before.
+  const sync = (regrant = false) => {
+    if (can('channels.register')) {
+      if (!detach) detach = bus.attachChannels(tenant, conn);
+      else if (regrant) for (const { descriptor } of bus.channels.get(tenant)?.values() || []) conn.add(descriptor);
+    }
     else if (detach) { gen++; detach(); detach = null; for (const id of [...registered]) conn.remove(id); }
   };
   // What the host sends to a channel: only to one registered here, of this tenant, with the capability granted now.
