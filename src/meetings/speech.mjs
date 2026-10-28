@@ -23,8 +23,9 @@ const FIRST_MIN = 12;
 const REST_MAX = 160;
 
 // Text -> the pieces it is synthesized in: sentences (after . ! ? … and line breaks), the first one also cut at a comma
-// or semicolon when it is long, so the first audio comes soon.
-export function splitSpeech(text) {
+// or semicolon when it is long, so the first audio comes soon. group false: one piece per sentence (to match sentences
+// synthesized ahead).
+export function splitSpeech(text, { group = true } = {}) {
   const parts = String(text).replace(/\s+\n|\n\s*/g, '\n').split(/(?<=[.!?…])\s+|\n+/).map((t) => t.trim()).filter(Boolean);
   if (parts[0]?.length > FIRST_MAX) {
     const m = /^(.{12,}?[,;:])\s+(.+)$/su.exec(parts[0]);
@@ -34,10 +35,25 @@ export function splitSpeech(text) {
   // After the first piece, sentences go together up to REST_MAX characters (fewer requests, steadier voice).
   const out = [parts[0]];
   for (const t of parts.slice(1)) {
-    if (out.length > 1 && out.at(-1).length + 1 + t.length <= REST_MAX) out[out.length - 1] += ` ${t}`;
+    if (group && out.length > 1 && out.at(-1).length + 1 + t.length <= REST_MAX) out[out.length - 1] += ` ${t}`;
     else out.push(t);
   }
   return out;
+}
+
+// Text that streams in (channels/outgoing/chunk deltas) -> the sentences complete so far, and the rest still open. A
+// sentence is complete once what ends it (. ! ? … or a line break) is followed by more text, so "3.5" or "e.g." in the
+// middle of a delta is not cut before its next character came.
+export function takeSentences(buf) {
+  const out = [];
+  const re = /[.!?…]+["'”»)]*\s+|\n+/g;
+  let from = 0;
+  for (let m; (m = re.exec(buf));) {
+    const s = buf.slice(from, m.index + m[0].length).trim();
+    if (s) out.push(s);
+    from = m.index + m[0].length;
+  }
+  return { done: out, rest: buf.slice(from) };
 }
 
 // A response body, read up to max bytes: more is cut off (cut: true) and the rest of the body is not read.

@@ -206,3 +206,57 @@ export async function setControl(page, { onLabel, offLabel, on, what, site, open
     await page.waitForTimeout(150);
   }
 }
+
+// Who the call shows as speaking, watched in the page: every 200 ms the platform's marks are read (spec below) and a
+// change is queued as {t: Date.now(), name} (name null: nobody shown) under a random, non-enumerable key, like the
+// chat. Our own tile (self: Bosun's names, or a tile the platform marks as ours) is never the speaker. drainSpeakers
+// returns what changed since the last call, or null when the page was replaced (watch again).
+// spec: {active: selectors of the box around the one speaker shown (Zoom's speaker view), activeName: the name inside
+// it; tiles: every participant's tile, tileName: the name in a tile, selfMark: what marks our own tile, speaking:
+// selectors of a speaking mark inside a tile (Meet)}.
+export async function watchSpeakers(page, key, spec, { self = [] } = {}) {
+  await page.evaluate(({ key, spec, self }) => {
+    if (window[key]) return;
+    const q = [];
+    const n = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const mine = new Set(self.map((x) => n(x).toLowerCase()));
+    const nameIn = (box, sel) => {
+      if (!box) return null;
+      const el = sel ? box.querySelector(sel) : box;
+      const t = n(el?.querySelector?.('span')?.textContent || el?.innerText || el?.textContent || el?.getAttribute?.('aria-label'));
+      return t && t.length <= 80 ? t : null;
+    };
+    const read = () => {
+      for (const sel of spec.active || []) {
+        for (const box of document.querySelectorAll(sel)) {
+          const name = nameIn(box, spec.activeName);
+          if (name && !mine.has(name.toLowerCase())) return name;
+        }
+      }
+      if (!spec.tiles) return null;
+      for (const tile of document.querySelectorAll(spec.tiles)) {
+        if (spec.selfMark && (tile.matches(spec.selfMark) || tile.querySelector(spec.selfMark))) continue;
+        if (!(spec.speaking || []).some((s) => tile.matches(s) || tile.querySelector(s))) continue;
+        const name = nameIn(tile, spec.tileName);
+        if (name && !mine.has(name.toLowerCase())) return name;
+      }
+      return null;
+    };
+    let last;
+    const tick = () => {
+      let name = null;
+      try { name = read(); } catch {}
+      if (name === last) return;
+      last = name;
+      q.push({ t: Date.now(), name });
+      if (q.length > 500) q.shift();
+    };
+    Object.defineProperty(window, key, { value: { q }, enumerable: false });
+    setInterval(tick, 200);
+    tick();
+  }, { key, spec, self });
+}
+
+export function drainSpeakers(page, key) {
+  return page.evaluate((key) => (window[key] ? window[key].q.splice(0) : null), key);
+}

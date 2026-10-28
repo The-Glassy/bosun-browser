@@ -138,8 +138,17 @@ async function poll() {
     const want = s.participants.join();
     if ($('tiles').dataset.p !== want) {
       $('tiles').dataset.p = want;
-      $('tiles').replaceChildren(...s.participants.map((p) => { const t = document.createElement('div'); t.className = 'tile'; t.dataset.participantId = p; t.textContent = p; return t; }));
+      $('tiles').replaceChildren(...s.participants.map((p) => {
+        const t = document.createElement('div'); t.className = 'tile'; t.dataset.participantId = p;
+        const n = document.createElement('span'); n.className = 'notranslate'; n.textContent = p;
+        const ind = document.createElement('div'); ind.className = 'ind';
+        if (p === 'self') { t.dataset.selfName = 'You'; ind.dataset.selfName = 'You'; }
+        t.append(n, ind);
+        return t;
+      }));
     }
+    // speaking: the tile of whoever speaks gets Meet's speaking-animation class (selfSpeaking: ours lights up too).
+    for (const t of document.querySelectorAll('#tiles [data-participant-id]')) t.querySelector('.ind').className = 'ind' + (s.speaking === t.dataset.participantId || (s.selfSpeaking && t.dataset.participantId === 'self') ? ' Oaajhc' : '');
     for (const m of s.chat) {
       if (shown.has(m.id)) { const d = document.querySelector('[data-message-id="' + m.id + '"]'); if (!LIVE_CHAT && d.textContent !== m.text) d.textContent = m.text; continue; }
       shown.add(m.id);
@@ -198,7 +207,7 @@ export async function startFakeMeet({ tone = false } = {}) {
       if (r.phase === 'pending' && Date.now() >= r.refuseAt) r.phase = 'refused';
       const view = r.over ? 'over' : ['waiting', 'denied', 'refused', 'pending'].includes(r.phase) ? r.phase : r.phase === 'admitted' ? 'call' : 'lobby';
       const chat = r.chat.map((m) => (m.fillAt && Date.now() < m.fillAt ? { ...m, text: '' } : m));
-      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone, caption: r.caption || null, play: r.play || null, micStuckOn: !!r.micStuckOn });
+      return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone, caption: r.caption || null, play: r.play || null, micStuckOn: !!r.micStuckOn, speaking: r.speaking || null, selfSpeaking: !!r.selfSpeaking });
     }
     if (/^\/fixture\/[a-z0-9-]+\.wav$/.test(u.pathname)) {
       const f = path.join(path.dirname(new URL(import.meta.url).pathname), 'fixtures', path.basename(u.pathname));

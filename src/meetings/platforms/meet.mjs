@@ -24,7 +24,7 @@
 // Ukrainian and Russian, so a UI that comes up in another of those languages works too. Markers are labels, roles
 // and texts a person sees; a run against real Meet that fails here is fixed here.
 
-import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, chatError, setControl, revealToolbar, DIALOGS, HEADINGS } from './common.mjs';
+import { norm, any, pageText as textOutside, visible, button, disabled, firstVisible, dismissOverlays, clickThrough, ensureOff, challengeShown, chatError, setControl, revealToolbar, DIALOGS, HEADINGS, watchSpeakers, drainSpeakers } from './common.mjs';
 
 const JOIN_LABELS = ['ask to join', 'join now', 'join', 'ask to join anyway', 'join anyway', 'join the call now', 'trotzdem teilnehmen', 'teilnahme erbitten', 'teilnahme anfragen', 'teilnehmen anfragen', 'jetzt teilnehmen', 'teilnehmen', 'beitreten',
   'požiadať o pripojenie', 'pripojiť sa', 'pripojiť sa teraz', 'попросити приєднатися', 'попросити дозволу приєднатися', 'приєднатися', 'приєднатися зараз',
@@ -63,6 +63,10 @@ const TEXT = {
   noCamera: any('camera not found', 'no camera found', 'kamera nicht gefunden', 'keine kamera gefunden', 'kamera sa nenašla', 'камеру не знайдено', 'камера не найдена'),
   // "Mic not found": the device picker ("Microphone: Mic not found").
   noMic: any('microphone not found', 'no microphone found', '\\bmic not found', 'mikrofon nicht gefunden', 'kein mikrofon gefunden', 'mikrofón sa nenašiel', 'мікрофон не знайдено', 'микрофон не найден'),
+};
+const MEET_SPEAKERS = {
+  tiles: '[data-participant-id]', tileName: 'span.notranslate', selfMark: '[data-self-name]',
+  speaking: ['[data-audio-level]:not([data-audio-level="0"])', '.Oaajhc', '.HX2H7', '.wEsLMd', '.OgVli'],
 };
 const LABEL = {
   micOff: any('^turn off microphone', '^mikrofon (?:deaktivieren|ausschalten)', '^vypnúť mikrofón', '^вимкнути мікрофон', '^выключить микрофон'), // it is on
@@ -348,6 +352,12 @@ export const meet = {
 
   // In the call the microphone button is named after what it does ("Turn on microphone (ctrl + d)" while muted).
   setMic: (page, on) => setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Meet', open: revealToolbar, reveal: revealToolbar }),
+  // Who Meet shows as speaking: a participant's tile (data-participant-id; not ours, which carries data-self-name)
+  // with a speaking mark: a non-zero data-audio-level, or one of the classes Meet's speaking animation has had (from
+  // vexa, seen live 2025-2026; Meet renames them). Names are the tile's span.notranslate. Best effort: no mark, no
+  // speaker.
+  watchSpeakers: (page, key, opts) => watchSpeakers(page, key, MEET_SPEAKERS, opts),
+  drainSpeakers,
   // Only through the button, whose name says the hand's state: Meet's shortcut toggles blindly (it would lower a hand
   // that is already up).
   setHand: (page, on) => setControl(page, { onLabel: LABEL.handUp, offLabel: LABEL.handDown, on, what: 'raised hand', site: 'Meet', open: revealToolbar }),

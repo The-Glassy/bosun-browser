@@ -81,7 +81,7 @@ function webClient(id, r) {
     <button id="parts" aria-label="open the participants list pane,[0] particpants"><span class="footer-button__number-counter" id="count">0</span>Participants</button>
     <button id="chatBtn" aria-label="open the chat panel">Chat</button><button aria-label="Chat Settings">${icon('zm-icon-chevron')}</button>
     <button id="react" aria-label="React">React</button><button aria-label="Share">Share</button><button aria-label="More meeting control">More</button>${handPop}`
-    : `<button id="mic" aria-label="join audio">Join Audio</button>
+    : `${r.micDiv ? '<div id="mic" class="join-audio-container__btn" role="button" tabindex="0" aria-label="join audio">Join Audio</div>' : '<button id="mic" aria-label="join audio">Join Audio</button>'}
     <button id="cam" aria-label="start my video">Start Video</button>
     <button id="parts" aria-label="open the manage participants list pane,[0] particpants"><span class="footer-button__number-counter" id="count">0</span>Participants</button>
     <button id="chatBtn" aria-label="open the chat panel">Chat</button>
@@ -119,11 +119,14 @@ ${hy ? `<div id="hearq" role="dialog" aria-modal="true" hidden style="position:f
   <button id="hearUse"${hy[0] ? '' : ' hidden'}>${hy[0] || 'Use microphone'}</button><button id="hearNo">${hy[1]}</button></div></div>` : ''}
 ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10"><p>We use cookies.</p>
   <button id="onetrust-accept-btn-handler">Accept Cookies</button></div>` : ''}
-<div id="waiting" hidden><h2>Please wait, the meeting host will let you in soon.</h2><button>Leave</button></div>
+${r.waitingChat ? `<div id="waiting" hidden><div class="meeting-info-container__topic">${esc(r.title || 'Weekly sync')}</div><div class="wr-information"><span>${esc(r.waitingText || 'Please wait, the meeting host will let you in soon.')}</span></div>
+  <footer class="wr-footer"><button aria-label="open the chat panel">Chat</button><button aria-label="Leave">Leave</button></footer></div>`
+    : '<div id="waiting" hidden><h2>Please wait, the meeting host will let you in soon.</h2><button>Leave</button></div>'}
 <div id="notice" role="dialog" hidden><p id="noticeText"></p><button>OK</button></div>
 <div id="call" hidden>
   ${r.title ? `<div class="meeting-info-container__topic">${esc(r.title)}</div>` : ''}
   <div id="tiles"></div>
+  <div class="speaker-active-container__video-frame"><div class="video-avatar__avatar-footer"><span id="activeName"></span></div></div>
   ${r.captionClose ? '<div class="live-transcription-subtitle__container"><div id="captions" class="live-transcription-subtitle__box"></div><button id="capClose" aria-label="close">×</button></div>'
     : '<div id="captions" class="live-transcription-subtitle__box"></div>'}
   ${r.decoyMenu ? `<div class="pin-dropdown-menu" role="menu"><div role="menuitem" id="decoy">${r.decoyMenu === 'renames' ? 'Guest Two' : 'Leave computer audio'}</div><div role="menuitem">Host Person</div></div>` : ''}
@@ -145,7 +148,7 @@ ${r.cookies ? `<div id="onetrust-banner-sdk" style="position:fixed;inset:0;backg
   </aside>
 </div>
 <script>
-const R = ${JSON.stringify({ decoyMenu: r.decoyMenu || null, menuHide: r.menuHide || null, tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: r.dropSends || false, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micInCall: r.micInCall || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null, autoHideMs: r.autoHideMs || 0, audioJoined: r.audioJoined || null })};
+const R = ${JSON.stringify({ decoyMenu: r.decoyMenu || null, menuHide: r.menuHide || null, tone: r.tone, recordedNotice: !!r.recordedNotice, enterNewline: !!r.enterNewline, dropSends: r.dropSends || false, liveChat: !!r.liveChat, hearYou: r.hearYou || null, micInCall: r.micInCall || null, micClick: r.micClick || null, hearDelayMs: r.hearDelayMs ?? null, autoHideMs: r.autoHideMs || 0, audioJoined: r.audioJoined || null, micDiv: !!r.micDiv, micClickIgnored: !!r.micClickIgnored, altA: !!r.altA, hideToolbar: !!r.hideToolbar })};
 const id = ${JSON.stringify(id)}, $ = (x) => document.getElementById(x);
 const params = new URL(location.href).searchParams;
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, ...b }) });
@@ -178,7 +181,18 @@ $('join').onclick = () => {
   mic = pmic; cam = pcam;
   post('join', { name: $('input-for-name').value, pwd, mic: pmic, cam: pcam });
 };
-const micLabel = () => { if (R.audioJoined) return; $('mic').setAttribute('aria-label', !audio ? 'join audio' : mic ? 'mute my microphone' : 'unmute my microphone'); $('mic').textContent = !audio ? 'Join Audio' : mic ? 'Mute' : 'Unmute'; };
+// waitingChat (room option): the waiting room as live Zoom showed it on 2026-10-28: the meeting's title, the notice
+// not as a heading (waitingText), and a footer with "Chat" (to the host) and "Leave".
+// micDiv: the in-call control is a <div class="join-audio-container__btn">, a button by role while the microphone is
+// off; 1.5 s after it went on (as while someone speaks) it loses the role, and Playwright's button lookups miss it.
+// micClickIgnored: clicks that would mute it do nothing (after the first, which the join makes). altA: Alt+A toggles the microphone. hideToolbar (with
+// autoHideMs): the faded toolbar is hidden (visibility) and a mouse move does not bring it back.
+let roleTimer = null, ignoreArmed = false;
+const micLabel = () => {
+  if (R.audioJoined) return;
+  $('mic').setAttribute('aria-label', !audio ? 'join audio' : mic ? 'mute my microphone' : 'unmute my microphone'); $('mic').textContent = !audio ? 'Join Audio' : mic ? 'Mute' : 'Unmute';
+  if (R.micDiv) { clearTimeout(roleTimer); $('mic').setAttribute('role', 'button'); if (audio && mic) roleTimer = setTimeout(() => $('mic').removeAttribute('role'), 1500); }
+};
 if (R.audioJoined) {
   audio = R.audioJoined !== 'notConnected'; // connected by Zoom itself, without a microphone
   const clicked = (what) => post('media', { clicked: what });
@@ -202,7 +216,8 @@ if (R.audioJoined) {
 let micGiven = R.micInCall !== 'ask';
 $('micUse').onclick = () => { micGiven = true; $('micAsk').hidden = true; mic = true; micLabel(); post('media', { mic, cam, asked: 'used' }); };
 $('micNo').onclick = () => { $('micAsk').hidden = true; post('media', { asked: 'declined' }); };
-$('mic').onclick = () => { if (!audio) { $('audioDlg').hidden = false; return; } if (!mic && !micGiven) { $('micAsk').hidden = false; return; } mic = !mic; micLabel(); post('media', { mic, cam }); };
+$('mic').onclick = () => { if (!audio) { $('audioDlg').hidden = false; return; } if (!mic && !micGiven) { $('micAsk').hidden = false; return; } if (R.micClickIgnored && mic && ignoreArmed) { post('media', { clicked: 'mic ignored' }); return; } if (mic) ignoreArmed = true; mic = !mic; micLabel(); post('media', { mic, cam }); };
+if (R.altA) document.addEventListener('keydown', (e) => { if (e.altKey && (e.code === 'KeyA' || e.key.toLowerCase() === 'a') && audio && micGiven) { mic = !mic; micLabel(); post('media', { mic, cam, via: 'alt+a' }); } });
 // Zoom may connect computer audio with the microphone live, whatever the preview said: Bosun has to mute it.
 $('byComputer').onclick = () => { audio = true; mic = true; $('audioDlg').hidden = true; micLabel(); post('media', { audio, mic, cam }); };
 $('cam').onclick = () => { cam = !cam; $('cam').setAttribute('aria-label', cam ? 'stop my video' : 'start my video'); post('media', { mic, cam }); };
@@ -222,7 +237,8 @@ for (const it of document.querySelectorAll('#toMenu [role=menuitem]')) it.onclic
 function autoHide() {
   const f = document.querySelector('footer');
   let t = null;
-  const show = () => { f.style.opacity = '1'; f.style.pointerEvents = ''; clearTimeout(t); t = setTimeout(() => { f.style.opacity = '0'; f.style.pointerEvents = 'none'; }, R.autoHideMs); };
+  let gone = false;
+  const show = () => { if (gone) return; f.style.opacity = '1'; f.style.pointerEvents = ''; clearTimeout(t); t = setTimeout(() => { f.style.opacity = '0'; f.style.pointerEvents = 'none'; if (R.hideToolbar) { f.style.visibility = 'hidden'; gone = true; } }, R.autoHideMs); };
   document.addEventListener('mousemove', show);
   show();
 }
@@ -244,6 +260,7 @@ async function poll() {
       $('parts').setAttribute('aria-label', 'open the ' + (R.audioJoined ? '' : 'manage ') + 'participants list pane,[' + s.participants.length + '] particpants');
     }
     $('captions').textContent = s.caption || '';
+    $('activeName').textContent = s.speaking || '';
     let prev = null;
     for (const m of s.chat) {
       if (shown.has(m.id)) { prev = m.sender; continue; }
@@ -313,7 +330,7 @@ export async function startFakeZoom({ tone = false } = {}) {
       const r = room(u.searchParams.get('id'));
       const view = r.over ? 'notice' : r.phase === 'admitted' ? 'call' : r.phase === 'waiting' ? 'waiting' : r.phase === 'rejected' ? 'notice' : 'preview';
       const notice = r.over ? NOTICES[r.over] : r.phase === 'rejected' ? NOTICES[r.rejected] : null;
-      return json({ view, notice, participants: [r.guest?.name || 'self', ...r.others], chat: r.chat, caption: r.caption || null });
+      return json({ view, notice, participants: [r.guest?.name || 'self', ...r.others], chat: r.chat, caption: r.caption || null, speaking: r.speaking || null });
     }
     if (req.method === 'POST') {
       const b = await body(req);

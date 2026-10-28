@@ -1,5 +1,104 @@
 # Changelog
 
+## 0.17.0 — the meeting as an MCPL channel: speech as soon as text is published; acknowledgements; speaker labels; Zoom mutes again
+
+### Added
+
+- **A channel per meeting** (MCPL §14). Bosun advertises `experimental.mcpl.channels`
+  `{register, incoming, publish, streaming}`. Once the announcement is out, it registers `bosun:meeting:<id>`
+  (bidirectional, `initiallyOpen`) with every connection of the tenant whose grant has `channels.register`. When the
+  meeting ends, `channels/changed` removes it.
+  - Transcript finals arrive as `channels/incoming`, with `author` (the speaker, when the page shows one) and
+    `metadata` `{meeting_id, seq, start_s, end_s, final, lang, speaker}`, tagged `bosun:meeting-transcript`.
+  - Text the host publishes (`channels/publish`, request or notification) is acknowledged at once
+    (`{delivered: true, messageId}`). It is spoken sentence by sentence through the pipelined TTS.
+  - Text published while an utterance from the channel plays is added to it, so the microphone stays on. Text
+    published while `meeting_speak` plays follows it, without muting in between.
+  - Publishes are limited to 2000 characters each, and to 6000 characters or 120 s of audio still waiting. Beyond
+    that a publish is refused before it is acknowledged.
+  - `channels/outgoing/chunk` / `complete` are never spoken: the spec makes publish the only delivery (§14.5). With
+    `channel_prepare_chunks`, their sentences are synthesized ahead, and the publish that delivers them plays that
+    audio at once. That pays off only with a host that streams before it publishes; connectome-host sends chunks
+    after the publish, and those are not synthesized again.
+  - An opt-out (with `leave_on_optout: false`) closes the channel, ends at once an acknowledgement or channel text
+    being prepared or played (also an acknowledgement playing out behind a reply), mutes again without waiting for
+    synthesis, and drops channel text still waiting. `meeting_stop_speaking` also drops
+    channel text still waiting.
+  - Preparation from chunks is bounded: at most 20 sentences at a time, none longer than 400 characters. Prepared
+    audio is used only for exactly the same text and voice.
+  - A `featureSets/update` notification without `effectiveCapabilities` keeps the capabilities granted (MCPL §6.7).
+    Before, one carrying only `enabled` / `disabled` also cleared push events.
+  - Capability matching follows MCPL §5.4: `*` matches one segment, so a bare `*` grants no `channels.*`. The
+    overlap check between granted and denied patterns follows it too.
+  - A channel the host turned down is offered again with its next grant (Request).
+  - Only channels registered on that connection, for that tenant, under the grant as it is now, are accepted. Others
+    get `-32023` unknown channel or `-32002` capability denied. `channels/list` is answered.
+- **Speech settings** (per tenant, `speech_settings_set`; nothing is fixed in code):
+  - `meeting_channel` (true).
+  - `transcript_events` `auto` | `always` | `never`. The default `auto` sends the `bosun:meeting-transcript` events
+    only when the channel did not take the text, so the agent does not get every final twice.
+  - `agent_partials` (false) and `agent_partials_interval_s` (1.5): partial text on the channel too, tagged
+    `bosun:partial`.
+  - `channel_prepare_chunks` (false).
+  - `ack_on_final` (false), `ack_phrases`, `ack_lang`, `ack_delay_ms` (100), `ack_min_words` (3), `ack_cooldown_s`
+    (8).
+- **Acknowledgement** (`ack_on_final`, opt-in). A final that ends someone's turn (at least `ack_min_words`, ending a
+  sentence) gets one of `ack_phrases` ("Mhm.", "One sec.", "Okay.", "Right." by default, never the same twice in a
+  row).
+  - The clips are synthesized once per voice at admission, and nothing ever waits for one.
+  - Not when something is being said, or when the agent starts speaking within `ack_delay_ms`.
+  - An agent reply that comes while the clip plays starts right after it, and the microphone stays on.
+  - Acknowledgements send no `bosun:meeting-speech` event. `meeting_status` counts them (`acks`).
+- **Speaker labels** (best effort). The page is read every 300 ms for who it shows speaking:
+  - Zoom: the speaker view's active tile and a gallery tile marked active, with the name in its footer.
+  - Meet: a participant tile with a non-zero `data-audio-level` or Meet's speaking-animation classes, with the name in
+    `span.notranslate`.
+  - Bosun's own tile never counts. A guest join is enough.
+  - Each segment gets `speaker`: whoever was shown speaking longest while it was said. `speakers` lists them all when
+    there were several. The label shows in events, `meeting_transcript`, the channel's `author`, and
+    `meeting_status.speaker_labels` (`seen` / `none-seen`).
+- **`bosun:meeting-mic-open`**: a queued event when the microphone could not be muted again after speaking, and again
+  when the retries run out (`gave_up`). Its text, and that of a `bosun:meeting-speech` event with a `mute_error`,
+  starts with "WARNING: Bosun's microphone may still be ON".
+
+### Fixed
+
+- **Zoom: the waiting room taken for the call** (production, live Zoom, 2026-10-28). Bosun said "admitted" 13 s after
+  the join while it sat in the waiting room for 44 min, and then "recorded" 1.2 MB of silence. The host never let it
+  in.
+  - The waiting room there had a chat with the host, and a chat button counted as being in the call.
+  - Now, before admission, the waiting room's own words decide first. Matched: "Please wait, the meeting host will
+    let you in soon", "Waiting for the host…", "waiting room", "host will let you in", and German, Ukrainian and
+    Russian variants. Text participants control, the meeting's title and captions don't count.
+  - "In the call" needs positive evidence: the participants button, or the call's microphone or audio control while
+    no Join button or name field is shown. A chat button or "Leave" alone is not enough.
+  - Nothing is announced, recorded or transcribed before that.
+- **Zoom: the microphone left on after speaking** (production, real Zoom, 2026-10-28, meeting m898739bebfdc, guest).
+  After a 2.5 s utterance the event said `mute_error: "no microphone control found in Zoom"`. The 0.16.0 fix had
+  only been tested on the local Zoom stand-in.
+  - Bosun could not see the real Zoom DOM: the web client refused a scripted guest ("Automated bots aren't allowed to
+    join this meeting"). Two causes fit the message and are both reproduced in the stand-in. In the first, the
+    control loses its button role once on (live Zoom's control has been a `<div>` with an `aria-label`, as other
+    meeting bots query it). In the second, the faded toolbar is hidden (visibility) and a mouse move does not bring
+    it back. 0.16.0 fails both exactly as production did.
+  - `setMic` on Zoom now falls back when the toolbar's button can't be worked:
+    1. It reads the control in the page itself (also a hidden one or a `<div>`, only in the toolbar, never in the
+       participants list or the chat) and clicks it there (`element.click()`).
+    2. It sends Alt+A in the page, in the same step that reads the state.
+    3. It presses Alt+A for real, right after reading the state again (Zoom may ignore a scripted key).
+  - The state is read back after each step. Alt+A is pressed only while the page shows the microphone in the other
+    state: a toggle is never pressed blind.
+  - Labels with a shortcut ("Mute (Alt+A)") and "mute audio" are recognised.
+  - The three tries still fit the 20 s an utterance's end waits.
+  - A microphone that stays on is `mic_open: true` (result, `meeting_status`), a speech event with the WARNING, and
+    `bosun:meeting-mic-open`.
+
+### Changed
+
+- `meeting_speak` while an acknowledgement plays is not refused: it starts right after it. `meeting_speak` still
+  refuses while an utterance from the channel plays (unless `interrupt`).
+- `bosun:meeting-speech` carries `kind` (`stream`) for text from the channel.
+
 ## 0.16.0 — speech settings per tenant; ElevenLabs as the meeting voice; the microphone muted again on Zoom
 
 ### Added

@@ -281,6 +281,15 @@ export class LiveTranscript {
 
   sentPos() { return this.sentAt.length ? this.sentAt.at(-1)[0] : this.segStart; }
 
+  // When (wall clock, ms) the audio at `sec` seconds of the transcript was sent to ElevenLabs, a quarter second or so
+  // after it was heard (a chunk is sent once it is full); null when that is no longer known.
+  wallAt(sec) {
+    const i = this.sentAt.findIndex(([s]) => s >= sec - 1e-6);
+    if (i < 0) return this.sentAt.length ? this.sentAt.at(-1)[1] : null;
+    const [s, w] = this.sentAt[i];
+    return i === 0 && sec < s - CHUNK_BYTES / BYTES_PER_SEC ? null : w - (s - sec) * 1000;
+  }
+
   // The final from committed_transcript alone (no word times; it ends where the audio sent was when it came); its
   // timestamped copy, should it still come, is dropped. Earlier ones waiting go first, in order.
   commitFallback(c) {
