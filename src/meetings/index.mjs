@@ -867,9 +867,14 @@ export class Meetings {
     this.inCall(m, on ? 'muting' : 'unmuting');
     await m.announceDone.p;
     this.inCall(m, on ? 'muting' : 'unmuting');
-    const r = await this.page(m, (p) => m.platform.setMic(p, !on));
-    m.speechUnmuted = false; // the agent decides now: speaking leaves the microphone as it is
-    m.muteError = null;
+    // The agent decides now: speaking leaves the microphone as it is. Said inside the page operation, so that a retry of
+    // muting again queued behind it (keepMuting) already sees it.
+    const r = await this.page(m, async (p) => {
+      const s = await m.platform.setMic(p, !on);
+      m.speechUnmuted = false;
+      m.muteError = null;
+      return s;
+    });
     return { meeting_id: id, muted: r.state === 'off' };
   }
 
