@@ -270,6 +270,7 @@ test('meeting_speak: refused before admission; unmutes, plays the synthesized te
     assert.deepEqual(el.st.speech.slice(n).map((x) => x.input), ['First sentence here.', 'Second one follows! And a third?']);
     assert.equal(m2.duration_s, 0.9 + 1.8);
     assert.equal(audio.players.at(-1).bytes.length, Math.round(2.7 * 24000) * 2);
+    assert.equal(m2.gap_ms, 0, 'the second piece was there before the first one had played');
     assert.deepEqual(media(code, 'mic'), [true, false, true, false]);
     // wait: answers once it has played.
     const w = (await c.call('meeting_speak', { meeting_id: id, text: 'Short.', wait: true })).json();
@@ -288,6 +289,80 @@ test('meeting_speak: refused before admission; unmutes, plays the synthesized te
     assert.equal((await status(c, id)).speaking, undefined);
     await c.close();
   }, { env: { TTS_VOICE: '' } });
+});
+
+test('TTS_DEFAULT_BACKEND=elevenlabs: meeting_speak without a backend speaks with ElevenLabs (model, voice); gap_ms says when synthesis fell behind', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    const id = (await c.call('meeting_join', { url })).json().meeting_id;
+    fake.admit(code);
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    const [nt, ns] = [el.st.tts.length, el.st.speech.length];
+    // Three sentences, ElevenLabs answering in 300 ms (about what eleven_v4_turbo takes): no pause between the pieces.
+    el.st.ttsDelayMs = 300;
+    try {
+      const r = (await c.call('meeting_speak', { meeting_id: id, text: 'Hi everyone, thanks for having me. I took notes on the first part. Shall I sum up now?', lang: 'en', wait: true })).json();
+      assert.equal(r.source, 'elevenlabs');
+      assert.equal(r.voice, 'SAz9YHcvj6GT2YYXdXww');
+      assert.equal(r.pieces, 2);
+      assert.ok(r.gap_ms < 150, `gap ${r.gap_ms} ms`);
+      assert.equal(el.st.speech.length, ns, 'Supertonic was not asked');
+      assert.deepEqual(el.st.tts.slice(nt).map((x) => [x.voice, x.body.model_id, x.body.language_code]), [['SAz9YHcvj6GT2YYXdXww', 'eleven_v4_turbo', 'en'], ['SAz9YHcvj6GT2YYXdXww', 'eleven_v4_turbo', 'en']]);
+      // Synthesis slower than a piece lasts (0.9 s of audio each, 1.5 s to synthesize the next): the pause is reported,
+      // the longest one, not the pauses added up.
+      el.st.ttsDelayMs = 1500;
+      const words = (c) => [1, 2, 3].map((i) => c.repeat(48) + i).join(' '); // 3 words (0.9 s), too long to share a piece
+      const slow = (await c.call('meeting_speak', { meeting_id: id, text: `One two three. ${words('a')}. ${words('b')}.`, wait: true })).json();
+      assert.equal(slow.pieces, 3);
+      assert.ok(slow.gap_ms >= 400 && slow.gap_ms < 1000, `gap ${slow.gap_ms} ms (about 600 each time)`);
+    } finally { el.st.ttsDelayMs = 0; }
+    // An explicit backend still wins.
+    assert.equal((await c.call('meeting_speak', { meeting_id: id, text: 'Short.', backend: 'supertonic', wait: true })).json().source, 'supertonic');
+    await c.close();
+  }, { env: { TTS_DEFAULT_BACKEND: 'elevenlabs', ELEVENLABS_VOICE: 'SAz9YHcvj6GT2YYXdXww', TTS_VOICE: '' } });
+});
+
+test('speech settings per tenant: speech_settings_set changes what meeting_speak and meeting_join use; a call\'s own value wins; other tenants keep theirs', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    const b = await connect(svc, TOKEN_B);
+    const got = (await c.call('speech_settings_get')).json();
+    assert.equal(got.effective.backend, 'supertonic');
+    assert.equal(got.effective.vad_silence_s, 0.5);
+    const set = await c.call('speech_settings_set', { backend: 'elevenlabs', elevenlabs_model: 'eleven_flash_v2_5', elevenlabs_voice: 'SAz9YHcvj6GT2YYXdXww', vad_silence_s: 0.8 });
+    assert.equal(set.isError, false, set.text);
+    assert.deepEqual(set.json().from, { backend: 'tenant', elevenlabs_model: 'tenant', elevenlabs_voice: 'tenant', supertonic_voice: 'default', vad_silence_s: 'tenant' });
+    assert.match((await c.call('speech_settings_set', { vad_silence_s: 5 })).text, /vad_silence_s|less than or equal/i);
+    assert.match((await c.call('speech_settings_set', { supertonic_voice: 'alloy' })).text, /supertonic_voice must be one of/);
+    assert.equal((await b.call('speech_settings_get')).json().effective.backend, 'supertonic', 'tenant b keeps the defaults');
+
+    const { id, code } = await admitted(c);
+    // The live transcript asked ElevenLabs for the tenant's pause; meeting_status says which.
+    await until(() => el.conns.length && el.conns.at(-1).query.vad_silence_threshold_secs);
+    assert.equal(el.conns.at(-1).query.vad_silence_threshold_secs, '0.8');
+    assert.equal((await status(c, id)).live_transcript.vad_silence_s, 0.8);
+    const nt = el.st.tts.length;
+    const r = (await c.call('meeting_speak', { meeting_id: id, text: 'Hello.', wait: true })).json();
+    assert.deepEqual([r.source, r.voice, r.model], ['elevenlabs', 'SAz9YHcvj6GT2YYXdXww', 'eleven_flash_v2_5']);
+    assert.equal(el.st.tts.at(-1).body.model_id, 'eleven_flash_v2_5');
+    // The call's own model and voice win.
+    const r2 = (await c.call('meeting_speak', { meeting_id: id, text: 'Hello.', model: 'eleven_v4_turbo', voice: 'EXAVITQu4vr4xnSDxMaL', wait: true })).json();
+    assert.deepEqual([r2.voice, r2.model], ['EXAVITQu4vr4xnSDxMaL', 'eleven_v4_turbo']);
+    assert.deepEqual(el.st.tts.slice(nt).map((x) => [x.voice, x.body.model_id]), [['SAz9YHcvj6GT2YYXdXww', 'eleven_flash_v2_5'], ['EXAVITQu4vr4xnSDxMaL', 'eleven_v4_turbo']]);
+    assert.match((await c.call('meeting_speak', { meeting_id: id, text: 'x', backend: 'supertonic', model: 'eleven_v4_turbo' })).text, /only with backend "elevenlabs"/);
+    assert.match((await c.call('meeting_speak', { meeting_id: id, text: 'x', model: 'Bad-Model' })).text, /model/);
+    await c.call('meeting_leave', { meeting_id: id });
+    // meeting_join's own vad_silence_s wins over the setting.
+    const n = el.conns.length;
+    const { id: id2 } = await admitted(c, { vad_silence_s: 0.3 });
+    await until(() => el.conns.length > n);
+    assert.equal(el.conns.at(-1).query.vad_silence_threshold_secs, '0.3');
+    await c.call('meeting_leave', { meeting_id: id2 });
+    // null: back to the default.
+    assert.equal((await c.call('speech_settings_set', { backend: null })).json().effective.backend, 'supertonic');
+    await c.close(); await b.close();
+  });
 });
 
 test('barge-in: meeting_stop_speaking cuts it off and mutes; interrupt replaces it; auto_mute false leaves the microphone alone; an uploaded file', async () => {
@@ -412,13 +487,36 @@ test('a microphone that will not mute again: reported in the result, the event a
     const r = (await c.call('meeting_speak', { meeting_id: id, text: 'Hello.', wait: true })).json();
     assert.equal(r.state, 'done');
     assert.match(r.mute_error, /^the microphone may still be on: could not turn the microphone off in Meet/);
+    assert.equal(r.mic_open, true);
     assert.match(ev.speech.at(-1).mute_error, /may still be on/);
-    assert.match((await status(c, id)).mute_error, /may still be on/);
+    let st = await status(c, id);
+    assert.match(st.mute_error, /may still be on/);
+    assert.equal(st.mic_open, true);
+    // Tried again in the background (every 5 s): once the control works, it is muted without anyone speaking.
+    fake.set(code, { micStuckOn: false });
+    await until(async () => (await status(c, id)).mic_open === undefined, 12_000);
+    st = await status(c, id);
+    assert.equal(st.mute_error, undefined);
+    assert.equal(media(code, 'mic').at(-1), false);
+    // The next utterance tries again too.
+    fake.set(code, { micStuckOn: true });
+    assert.equal((await c.call('meeting_speak', { meeting_id: id, text: 'Hello.', wait: true })).json().mic_open, true);
     fake.set(code, { micStuckOn: false });
     const r2 = (await c.call('meeting_speak', { meeting_id: id, text: 'Again.', wait: true })).json();
     assert.equal(r2.mute_error, undefined);
     assert.equal(media(code, 'mic').at(-1), false);
     assert.equal((await status(c, id)).mute_error, undefined);
+    // The agent takes the microphone over (meeting_mute on: false) while a retry is pending: it stays on.
+    fake.set(code, { micStuckOn: true });
+    assert.equal((await c.call('meeting_speak', { meeting_id: id, text: 'Hello.', wait: true })).json().mic_open, true);
+    assert.deepEqual((await c.call('meeting_mute', { meeting_id: id, on: false })).json(), { meeting_id: id, muted: false });
+    fake.set(code, { micStuckOn: false });
+    const n = media(code, 'mic').length;
+    await sleep(7000);
+    assert.deepEqual(media(code, 'mic').slice(n), [], 'no retry muted it after meeting_mute');
+    st = await status(c, id);
+    assert.equal(st.mic_open, undefined);
+    assert.equal(st.mute_error, undefined);
     await c.close();
   });
 });
@@ -462,6 +560,33 @@ test('Zoom: mute and unmute in the toolbar, the hand in the Reactions menu', asy
     const w = (await c.call('meeting_speak', { meeting_id: id, text: 'Hello Zoom.', wait: true })).json();
     assert.equal(w.state, 'done');
     assert.deepEqual(zm().filter((m) => 'mic' in m).slice(-2).map((m) => m.mic), [true, false]);
+    await c.close();
+  });
+});
+
+// Production 0.15.0 (Zoom, 2026-10-28): a 9.2 s utterance in three pieces, wait: true, answered "still not over 30 s
+// after it should have ended", then "muting again took longer than 30 s": the toolbar had faded out while it played,
+// its "Mute" still counted as visible, and every click on it went to what was behind it. Shorter utterances before it
+// had muted again fine (the toolbar was still there from the unmute).
+test('Zoom: the toolbar faded out while it spoke: muted again all the same, in time; a microphone that stays on is mic_open in meeting_status until it is muted', async () => {
+  await withService(async (svc, ev) => {
+    const c = await connect(svc);
+    const s = await c.open({ profile: 'zoom', engine: ENGINE === 'patchright' ? 'patchright' : 'chromium' });
+    await c.call('session_close', { session: s });
+    const { id: zid, url } = fz.newRoom({ signedIn: true, open: true, micInCall: 'ask', autoHideMs: 1500 });
+    const id = (await c.call('meeting_join', { url, profile: 'zoom' })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 20_000);
+    const mics = () => fz.room(zid).media.filter((m) => 'mic' in m).map((m) => m.mic);
+    const t = Date.now();
+    const w = (await c.call('meeting_speak', { meeting_id: id, text: 'One two three four five six. Seven eight nine ten eleven twelve.', wait: true })).json();
+    assert.equal(w.state, 'done', JSON.stringify(w));
+    assert.equal(w.error, undefined);
+    assert.equal(w.mute_error, undefined);
+    assert.ok(Date.now() - t < 15_000, `took ${Date.now() - t} ms`);
+    assert.deepEqual(mics().slice(-2), [true, false]);
+    const st = await status(c, id);
+    assert.equal(st.mic_open, undefined);
+    assert.equal(st.mute_error, undefined);
     await c.close();
   });
 });

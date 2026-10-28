@@ -426,7 +426,7 @@ async function putFiles(page, l, paths, method, { mainWorld = false, until = Dat
 // meetings or handoff.
 // Macros: list, get and run (the steps are held to the same set), but not save or delete.
 export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for', 'screenshot', 'sessions',
-  'macro_list', 'macro_get', 'macro_run']);
+  'macro_list', 'macro_get', 'macro_run', 'speech_settings_get']);
 
 export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn = { inflight: 0 }, uploadBase = null }) {
   const ephemeral = policy === 'ephemeral';
@@ -438,7 +438,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.15.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.16.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -864,11 +864,12 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         alone_leave_sec: z.number().int().min(5).max(3600).optional().describe('leave this long after everyone else left (default 30); before anyone else has joined, Bosun waits 2 min'),
         live_transcript: z.boolean().optional().describe(`transcribe the meeting live (default false): bosun:meeting-transcript events {seq, start_s, end_s, text, final, lang} as people speak (only to connections there at the time), all finals with meeting_transcript. At most ${cfg.liveTranscriptDailyMin ?? 180} min a day`),
         transcript_partials: z.boolean().optional().describe('with live_transcript: also send partial text while someone is still speaking (default true; at most 2 a second, final false); false sends finals only'),
+        vad_silence_s: z.number().min(0.2).max(3).optional().describe('with live_transcript: a pause this long (seconds) ends a segment and sends its final; shorter answers sooner but may cut sentences (default: your speech setting, else 0.5)'),
         dry_run: z.boolean().optional().describe('only load the meeting page (same profile, engine and devices) and report what Bosun sees: lobby kind, the join button it would click, microphone/camera, a shown captcha; joins nothing') },
       async (a) => ok(a.dry_run ? await meetings.inspect(tenant, { url: a.url, profile: a.profile, engine: a.engine }) : await meetings.join(tenant, {
         url: a.url, name: a.name || 'Glassy (notetaker)', announceText: a.announce_text, announce: a.announce ?? 'chat', maxWaitAdmitMin: a.max_wait_admit_min ?? 10,
         profile: a.profile, engine: a.engine, leaveOnOptOut: a.leave_on_optout ?? true, aloneLeaveSec: a.alone_leave_sec ?? null,
-        liveTranscript: a.live_transcript ?? false, transcriptPartials: a.transcript_partials ?? true,
+        liveTranscript: a.live_transcript ?? false, transcriptPartials: a.transcript_partials ?? true, vadSilenceS: a.vad_silence_s,
       })));
     tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), platform (meet, zoom), joined_as (account, guest), participants if visible, recorded seconds, announce {mode, sent_to: everyone|host|none|failed, reason and failures when it fell short}, live_transcript {state, zero_retention, minutes, lag} if asked for, speaking; without meeting_id all your meetings.',
       { meeting_id: z.string().max(20).optional() }, async (a) => ok(meetings.status(tenant, a.meeting_id)));
@@ -878,11 +879,19 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       async (a) => ok(await meetings.chatSend(tenant, a.meeting_id, a.text)));
     tool('meeting_transcript', 'Final segments of the live transcript so far (since = the last seq you have): {seq, start_s, end_s, text, lang, speaker if known}. Times are seconds since the transcript started. Only for a meeting joined with live_transcript.',
       { ...mid, since: z.number().int().min(0).optional() }, async (a) => ok(meetings.transcript(tenant, a.meeting_id, a.since ?? 0)));
-    tool('meeting_speak', `Say something in the meeting: text (synthesized; backend "supertonic" (default, voices supertonic-F1..F5, supertonic-M1..M5) or "elevenlabs" (voice = an ElevenLabs voice id)) or an uploaded audio file (audio_file_id from upload_create). The microphone is unmuted for it and muted again after (auto_mute=false: leave it as it is; use meeting_mute). Returns once the audio plays, with duration_s (wait=true: once it has played); bosun:meeting-speech says when it ended. While one utterance plays another is refused unless interrupt=true. meeting_stop_speaking cuts it off. Only once admitted and after the announcement; you decide when to speak.`,
+    tool('meeting_speak', `Say something in the meeting: text (synthesized; backend "supertonic" (voices supertonic-F1..F5, supertonic-M1..M5) or "elevenlabs" (voice = an ElevenLabs voice id, model = an ElevenLabs model id); what you leave out comes from speech_settings_get) or an uploaded audio file (audio_file_id from upload_create). The microphone is unmuted for it and muted again after (auto_mute=false: leave it as it is; use meeting_mute). Returns once the audio plays, with duration_s (wait=true: once it has played); bosun:meeting-speech says when it ended. While one utterance plays another is refused unless interrupt=true. meeting_stop_speaking cuts it off. Only once admitted and after the announcement; you decide when to speak.`,
       { ...mid, text: z.string().min(1).max(2000).optional(), audio_file_id: z.string().max(40).optional(), voice: z.string().max(60).optional(),
         lang: z.string().regex(/^[a-z]{2,3}(?:-[A-Za-z]{2})?$/).optional().describe('language of text, e.g. uk, en, de (supertonic speaks it better when told)'),
-        backend: z.enum(['supertonic', 'elevenlabs']).optional(), auto_mute: z.boolean().optional(), interrupt: z.boolean().optional(), wait: z.boolean().optional() },
-      async (a) => ok(await meetings.speak(tenant, a.meeting_id, { text: a.text, audioFileId: a.audio_file_id, voice: a.voice, lang: a.lang, backend: a.backend ?? 'supertonic', autoMute: a.auto_mute ?? true, interrupt: a.interrupt ?? false, wait: a.wait ?? false })));
+        backend: z.enum(['supertonic', 'elevenlabs']).optional(), model: z.string().regex(/^[a-z0-9_]{3,60}$/).optional().describe('ElevenLabs model id (backend elevenlabs), e.g. eleven_v4_turbo, eleven_flash_v2_5'),
+        auto_mute: z.boolean().optional(), interrupt: z.boolean().optional(), wait: z.boolean().optional() },
+      async (a) => ok(await meetings.speak(tenant, a.meeting_id, { text: a.text, audioFileId: a.audio_file_id, voice: a.voice, lang: a.lang, backend: a.backend, model: a.model, autoMute: a.auto_mute ?? true, interrupt: a.interrupt ?? false, wait: a.wait ?? false })));
+    tool('speech_settings_get', 'Your speech settings and what meeting_speak / meeting_join use when a call leaves them out: effective {backend, elevenlabs_model, elevenlabs_voice, supertonic_voice, vad_silence_s} and where each comes from (tenant: you set it; env: this Bosun\'s configuration; default). settings: only what you set. A call\'s own value always wins.', {},
+      async () => ok(meetings.settings.get(tenant)));
+    tool('speech_settings_set', 'Change your speech settings (kept across restarts, for this token\'s tenant only); null removes one (back to this Bosun\'s default). backend: what meeting_speak uses without one; elevenlabs_model / elevenlabs_voice: ElevenLabs model and voice ids; supertonic_voice; vad_silence_s: the pause that ends a live transcript segment (shorter: finals sooner, sentences cut more often). Returns what speech_settings_get does.',
+      { backend: z.enum(['supertonic', 'elevenlabs']).nullable().optional(), elevenlabs_model: z.string().regex(/^[a-z0-9_]{3,60}$/).nullable().optional(),
+        elevenlabs_voice: z.string().regex(/^[A-Za-z0-9]{10,40}$/).nullable().optional(), supertonic_voice: z.string().max(40).nullable().optional(),
+        vad_silence_s: z.number().min(0.2).max(3).nullable().optional() },
+      async (a) => ok(meetings.settings.set(tenant, a)));
     tool('meeting_stop_speaking', 'Stop what Bosun is saying in the meeting at once (barge-in); the microphone is muted again if meeting_speak unmuted it.', mid,
       async (a) => ok(await meetings.stopSpeaking(tenant, a.meeting_id)));
     tool('meeting_mute', 'Mute (on=true) or unmute (on=false) Bosun\'s microphone in the meeting.', { ...mid, on: z.boolean() },

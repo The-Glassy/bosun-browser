@@ -50,9 +50,16 @@ export function loadConfig(env = process.env) {
     // test server; nothing else gets the key.
     liveTranscriptDailyMin: int(env, 'LIVE_TRANSCRIPT_DAILY_MIN', 180, 1, 24 * 60),
     elevenlabs: null,
-    // Speaking in meetings (meeting_speak with text): the local OpenAI-style TTS service (Supertonic), its default voice.
+    // Speaking in meetings (meeting_speak with text): the local OpenAI-style TTS service (Supertonic) and its default
+    // voice. The env fallbacks of the speech settings (src/meetings/settings.mjs; null: not set): the backend
+    // meeting_speak uses when none is passed (TTS_DEFAULT_BACKEND; elevenlabs without a key falls back to supertonic,
+    // and ttsWarning says so at start), the ElevenLabs model, the pause that ends a live transcript segment.
     ttsUrl: null,
     ttsVoice: env.TTS_VOICE || null,
+    ttsDefaultBackendEnv: null,
+    elevenlabsTtsModelEnv: null,
+    vadSilenceEnv: null,
+    ttsWarning: null,
     tokens: parseTokens(env),
     // Features a deployment can switch off. FEATURES_MEETINGS=0: no meeting tools, handlers or recordings directory.
     // FEATURES_UPLOADS=0: no upload tools and no PUT endpoint.
@@ -116,6 +123,16 @@ export function loadConfig(env = process.env) {
   // Session cap of each tenant with policy "ephemeral".
   cfg.ephemeralMaxSessions = int(env, 'BROWSER_EPHEMERAL_MAX_SESSIONS', Math.min(2, cfg.maxSessionsPerTenant), 1, cfg.maxSessionsPerTenant);
 
+  // Speech fallbacks (checked also without a key, so that a typo shows at start).
+  if (env.ELEVENLABS_TTS_MODEL) {
+    if (!/^[a-z0-9_]{3,60}$/.test(env.ELEVENLABS_TTS_MODEL)) throw new Error('ELEVENLABS_TTS_MODEL must be an ElevenLabs model id such as eleven_v4_turbo');
+    cfg.elevenlabsTtsModelEnv = env.ELEVENLABS_TTS_MODEL;
+  }
+  if (env.LIVE_TRANSCRIPT_VAD_SILENCE_S) {
+    const s = Number(env.LIVE_TRANSCRIPT_VAD_SILENCE_S);
+    if (!/^\d+(?:\.\d+)?$/.test(env.LIVE_TRANSCRIPT_VAD_SILENCE_S) || s < 0.2 || s > 3) throw new Error('LIVE_TRANSCRIPT_VAD_SILENCE_S must be seconds from 0.2 to 3');
+    cfg.vadSilenceEnv = s;
+  }
   if (env.ELEVENLABS_API_KEY) {
     const key = String(env.ELEVENLABS_API_KEY).trim();
     if (!/^[\x21-\x7e]{10,200}$/.test(key)) throw new Error('ELEVENLABS_API_KEY is not a valid API key');
@@ -127,6 +144,12 @@ export function loadConfig(env = process.env) {
     const voice = env.ELEVENLABS_VOICE || null;
     if (voice && !/^[A-Za-z0-9]{10,40}$/.test(voice)) throw new Error('ELEVENLABS_VOICE must be an ElevenLabs voice id');
     cfg.elevenlabs = { apiKey: key, baseUrl: base.origin, voice };
+  }
+  if (env.TTS_DEFAULT_BACKEND) {
+    const backend = env.TTS_DEFAULT_BACKEND;
+    if (!['supertonic', 'elevenlabs'].includes(backend)) throw new Error(`TTS_DEFAULT_BACKEND must be supertonic or elevenlabs (got "${backend}")`);
+    cfg.ttsDefaultBackendEnv = backend;
+    if (backend === 'elevenlabs' && !cfg.elevenlabs) cfg.ttsWarning = 'TTS_DEFAULT_BACKEND=elevenlabs but ELEVENLABS_API_KEY is not set: meeting_speak uses supertonic';
   }
   if (env.TTS_URL) {
     let u;

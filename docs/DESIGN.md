@@ -193,7 +193,7 @@ download). A macro stores such a flow once, per tenant, and `macro_run` replays 
   draft). A recorded `click { ref }` must become role+name at record time, which the a11y snapshot gives only for
   elements with a role and a unique name (Plaud's "Generate" is a bare `div`), and it hooks every tool call.
 
-## 9b. Live transcript and speaking in meetings (0.15.0)
+## 9b. Live transcript and speaking in meetings (0.15.0, settings 0.16.0)
 
 Goal: the agent takes part in a call: it hears it as a live transcript and can speak into it. Bosun provides only
 the mechanism; when to speak (or raise a hand) is decided by the agent, never by Bosun.
@@ -228,7 +228,33 @@ ElevenLabs grants it only to enterprise and trial plans and otherwise says so in
 **Speaking.** `meeting_speak` splits text into pieces (sentences; a long first sentence at its first comma; later
 ones grouped up to 160 characters), synthesizes the first, and starts one ffmpeg player on stdin while unmuting in
 parallel; the remaining pieces are synthesized and written into the same player while it plays. A local Supertonic on
-a busy CPU synthesizes at about real time, so time to first audio is the first piece's synthesis, not the whole text's.
+a busy CPU synthesizes at about real time, so time to first audio is the first piece's synthesis, not the whole text's;
+it can also fall behind, and the listener hears a pause between pieces. ElevenLabs (`ELEVENLABS_TTS_MODEL`, default
+`eleven_v4_turbo` since 0.15.1: 94 languages, `language_code` `uk`, 16-bit `wav_24000`) synthesizes a piece in 0.3–0.9 s,
+far less than the piece before it lasts, so the pieces play without a pause; `gap_ms` in the result is the longest
+pause there was (the time a piece was written minus when the audio before it ends, counted from the start of
+playback and moved on by each pause).
+**Settings (0.16.0).** Every speech value can be set by the agent: per call (`meeting_speak` `backend`, `voice`,
+`model`; `meeting_join` `vad_silence_s`), per tenant (`speech_settings_set`, a JSON file per tenant under
+`BROWSER_DATA/speech-settings/`, 0600, validated on read too), and as env fallbacks for the deployment
+(`TTS_DEFAULT_BACKEND`, `ELEVENLABS_TTS_MODEL`, `ELEVENLABS_VOICE`, `TTS_VOICE`, `LIVE_TRANSCRIPT_VAD_SILENCE_S`).
+Precedence: call > tenant > env > built-in (`supertonic`, `eleven_v4_turbo`, Sarah, the service's voice, 0.5 s).
+`elevenlabs` without a key falls back to `supertonic` and says so (start-up warning for the env value, `warning` in
+`speech_settings_get`) rather than refusing every utterance. Read-only tokens may read the settings, not change them.
+
+**VAD pause (0.16.0).** The Scribe segment ends after `vad_silence_s` of silence (was a fixed 1 s; ElevenLabs' own
+default is 1.5 s). Measured on real Scribe with TTS speech (River, `eleven_v4_turbo`) in English and Ukrainian, pauses
+inside sentences 0.15–0.6 s plus the clips' own edges: a final comes 0.83–0.97 s after the speaker stops at 0.5 s,
+1.06–1.11 s at 0.7 s, 1.44–1.49 s at 1.0 s. At 0.5 s, fluent sentences stay whole; clause pauses of about 0.5 s or
+more split a sentence into finals (nothing lost). 0.5 s is the default because a reply waits on the final.
+
+**Muting again (0.16.0).** Production 0.15.0 on Zoom: after a 9.2 s utterance the microphone stayed on ("muting
+again took longer than 30 s", and `wait` gave up first). Zoom's toolbar fades out after a few seconds without mouse
+movement; "Mute" stays in the page with its size, so it counts as visible, but a click on it lands on what is behind
+it, and Playwright's click waits 3 s for that to change, 10 s of tries, three times. Short utterances muted fine
+because the unmute had just moved the mouse there. Now every click on the control is preceded by a mouse move over
+the toolbar; between the three tries an open menu is closed (Escape); the utterance's end waits 20 s (so `wait`
+answers in time), and a microphone still on is `mic_open` in `meeting_status` and tried again every 5 s, 6 times.
 The microphone is unmuted through the platform's toolbar control (`setMic`), and muted again 0.4 s after the audio
 ends, only if speaking turned it on. Zoom: a microphone Zoom never got makes Zoom ask "Do you want people to hear you?"
 on unmute; since the agent asked to be heard, "Use microphone" is answered then (the lobby still declines it).

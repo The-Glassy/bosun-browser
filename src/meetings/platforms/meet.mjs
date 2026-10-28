@@ -347,7 +347,7 @@ export const meet = {
   },
 
   // In the call the microphone button is named after what it does ("Turn on microphone (ctrl + d)" while muted).
-  setMic: (page, on) => setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Meet', open: revealToolbar }),
+  setMic: (page, on) => setControl(page, { onLabel: LABEL.micOff, offLabel: LABEL.micOn, on, what: 'microphone', site: 'Meet', open: revealToolbar, reveal: revealToolbar }),
   // Only through the button, whose name says the hand's state: Meet's shortcut toggles blindly (it would lower a hand
   // that is already up).
   setHand: (page, on) => setControl(page, { onLabel: LABEL.handUp, offLabel: LABEL.handDown, on, what: 'raised hand', site: 'Meet', open: revealToolbar }),
