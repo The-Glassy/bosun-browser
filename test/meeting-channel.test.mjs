@@ -609,6 +609,17 @@ test('Zoom waiting room with a chat button: stays waiting (nothing announced, re
   });
 });
 
+test('Zoom: a participant named "Waiting Room" on the active tile does not keep Bosun out of the call', async () => {
+  await withService(async (svc) => {
+    const c = await host(svc, { caps: ['tools', 'pushEvents'] });
+    const { url } = fz.newRoom({ open: true, speaking: 'Waiting Room' });
+    const id = (await c.call('meeting_join', { url })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 20_000);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
 // Zoom muting again after speaking (live Zoom, 2026-10-28: "no microphone control found in Zoom", the microphone left
 // on): the in-call control turned out to be one Playwright's button lookups miss.
 async function zoomSpeak(svc, room) {

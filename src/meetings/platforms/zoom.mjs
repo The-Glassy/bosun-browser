@@ -199,8 +199,8 @@ async function audioControls(page) {
     .filter((l) => /audio|mute|micro|mikro|мікро|микро|звук/i.test(l)).slice(0, 8)).catch(() => []);
 }
 const TERMINAL = ['denied', 'ended', 'removed', 'invalid', 'sign-in', 'captcha'];
-// Words in the page that are not Zoom's status: the meeting's title, captions and transcript.
-const NOT_STATUS = '[class*="topic"], [class*="meeting-info"], [class*="subtitle"], [class*="caption"], [class*="transcript"]';
+// Words in the page that are not Zoom's status: the meeting's title, captions and transcript, names on video tiles.
+const NOT_STATUS = '[class*="topic"], [class*="meeting-info"], [class*="subtitle"], [class*="caption"], [class*="transcript"], [class*="avatar-footer"], [class*="video-avatar"]';
 // The call's audio controls; the preview has look-alikes ("Mute"), so they count only where no Join button or name
 // field is shown.
 const IN_CALL_AUDIO = new RegExp([LABEL.micOff, LABEL.micOn, LABEL.joinAudio, LABEL.audioMenu].map((r) => r.source).join('|'), 'i');
