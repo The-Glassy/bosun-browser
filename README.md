@@ -680,6 +680,7 @@ meeting_speak({ "meeting_id": "…", "text": "…", "lang": "en" })    // voice,
                                                                    // audio_file_id, auto_mute (true), interrupt, wait
 speech_settings_get({})   speech_settings_set({ "backend": "elevenlabs", "elevenlabs_voice": "…", "vad_silence_s": 0.5 })
 meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "…", "on": true })   meeting_raise_hand({ "meeting_id": "…", "on": true })
+meeting_draft({ "meeting_id": "…", "text": "…", "ready": true, "for_turn_seq": 7 })   // draft_enabled; text "" clears
 ```
 
 **How a meeting runs:**
