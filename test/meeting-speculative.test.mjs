@@ -466,3 +466,48 @@ test('review fixes 2: a stream that skipped the drafted sentence and was cancell
     await c.close();
   });
 });
+
+test('review fixes 3: a stream whose sentence waits behind meeting_speak is never evicted (its cancel still holds); a stream the full queue paused settles on its publish without repeating what it said', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { speculative_speech: true });
+    const { id, chId } = await admitted(c);
+    const M = svc.manager.meetings.active.get(id);
+    // meeting_speak plays ~4 s; the stream's sentence waits in the channel queue behind it; nine more streams; cancel.
+    await c.call('meeting_speak', { meeting_id: id, text: 'One two three four five six seven eight nine ten eleven twelve thirteen.' });
+    await until(() => audio.players.length === 1, 10_000);
+    const a = c.stream(chId, 'z_a');
+    await a.chunk('Waiting behind it. ');
+    await sleep(100);
+    const xs = Array.from({ length: 9 }, (_, i) => c.stream(chId, `z_x${i}`));
+    for (const x of xs) await x.chunk('Open text without an end');
+    assert.ok(M.specStreams.has('z_a'), 'not evicted while its sentence is queued');
+    await a.cancel();
+    for (const x of xs) await x.cancel();
+    await until(() => ev.speech.length === 1, 15_000);
+    await sleep(1500);
+    assert.equal(audio.players.length, 1, 'the cancelled sentence never played');
+    // More than the queue takes (6000 characters): the stream pauses; its publish says only what it had not.
+    const sentences = Array.from({ length: 22 }, (_, i) => `Sentence ${i + 1} ${'word '.repeat(60).trim()}.`);
+    el.st.ttsDelayMs = 2000;
+    try {
+      const b = c.stream(chId, 'z_b');
+      await b.chunk(`${sentences.join(' ')} `);
+      await until(() => M.speech?.kind === 'stream', 5000);
+      const st = M.specStreams.get('z_b');
+      assert.equal(st.paused, true);
+      assert.ok(st.sent.length > 0 && st.sent.length < 22, `${st.sent.length} accepted`);
+      // Room again: half the accepted text is taken back by a hand-made stop of the queue, as playback would free it.
+      M.speech.pieces.splice(0);
+      const r = await c.publish(chId, sentences.join(' '), { streamId: 'z_b' });
+      assert.equal(r.spoken, 'settled');
+      await sleep(300);
+      const queued = [M.speech?.head, ...(M.speech?.pieces || [])].filter(Boolean).join(' ');
+      for (const t of st.sent.slice(1)) assert.ok(!queued.includes(t), 'an accepted sentence is not queued again');
+      assert.ok(queued.includes(sentences[21]), 'the rest is queued');
+    } finally { el.st.ttsDelayMs = 0; }
+    await c.call('meeting_stop_speaking', { meeting_id: id });
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});

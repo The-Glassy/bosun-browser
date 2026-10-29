@@ -605,7 +605,7 @@ export class Meetings {
     // Full: the oldest stream that has nothing being said and is no longer open (or open but silent for a minute)
     // makes room; a stream with speech under way is never forgotten (its cancel must still find it). None: refused.
     if (m.specStreams.size >= SPEC_STREAMS) {
-      const busy = (x) => (x.u && !x.u.ending && !x.u.cancelled) || (x.state === 'open' && this.now() - x.at < 60_000);
+      const busy = (x) => x.queued > 0 || (x.u && !x.u.ending && !x.u.cancelled) || (x.state === 'open' && this.now() - x.at < 60_000);
       const old = [...m.specStreams.values()].find((x) => !busy(x));
       if (!old) return null;
       m.specStreams.delete(old.id);
@@ -660,10 +660,13 @@ export class Meetings {
       st.draftSkipped = true; // m.draftSaid stays until a publish (or complete) of the stream uses it up
       return;
     }
+    // The queue is full: nothing more of the stream is said now, but it stays open, so its publish (or complete)
+    // settles it against what was said and says the rest.
+    if (st.paused) return;
     try {
       this.prepare(m, text);
       this.sayOnChannel(m, text, { whole: true, spec: { st, i } });
-    } catch { st.state = 'dropped'; return; }
+    } catch { st.paused = true; return; }
     st.sent.push(text);
     m.specSpoken++;
     m.answeredSeq = Math.max(m.answeredSeq, st.turn);
@@ -1730,13 +1733,15 @@ export class Meetings {
     u.playEnd = playEnd;
     if (text) {
       for (let piece; (piece = await this.nextPiece(m, u, () => playEnd)) !== null;) {
-        const no = u.taken++;
+        const no = u.taken - 1;
         if (!piece.trim()) continue; // taken back (specCut)
         u.synthPiece = piece;
         u.synthNo = no;
         const w = await this.synth(m, { text: piece, backend, voice: head.voice ?? voice, lang, model }).catch((e) => { error = e; return null; });
         if (!w || u.cancelled || u.state !== 'speaking') break;
         u.synthPiece = null;
+        const owner = u.owners.get(no);
+        if (owner && owner.i >= owner.st.stopAt) continue; // its stream took it back meanwhile
         if (w.pcm.rate !== head.pcm.rate || w.pcm.channels !== head.pcm.channels) { error = new Error(`${backend} changed its audio format mid-text`); break; }
         const at = this.now() - u.startedAt;
         gapMs = Math.max(gapMs, Math.round(at - playEnd));
@@ -1782,7 +1787,7 @@ export class Meetings {
   async nextPiece(m, u, playEnd) {
     for (;;) {
       if (u.cancelled || u.state !== 'speaking') return null;
-      if (u.pieces.length) return u.pieces.shift();
+      if (u.pieces.length) { u.taken++; return u.pieces.shift(); } // numbered as taken in the same step (specCut)
       if (!u.open) return null;
       const left = playEnd() + STREAM_IDLE_MS - (this.now() - u.startedAt);
       if (left <= 0) { u.open = false; return null; }
@@ -1813,7 +1818,8 @@ export class Meetings {
     if (m.channelSaid.length > 50) m.channelSaid.shift();
     m.channelBacklog += t.length;
     const gen = m.channelGen;
-    m.channelQueue = m.channelQueue.then(() => this.channelUtter(m, t, gen, { whole, spec })).catch(() => {}).finally(() => { m.channelBacklog -= t.length; });
+    if (spec) spec.st.queued = (spec.st.queued || 0) + 1; // a stream with text still in the queue is never evicted
+    m.channelQueue = m.channelQueue.then(() => this.channelUtter(m, t, gen, { whole, spec })).catch(() => {}).finally(() => { m.channelBacklog -= t.length; if (spec) spec.st.queued--; });
   }
 
   // gen: m.channelGen when the text came; an opt-out or meeting_stop_speaking since then drops it (and a speculative
