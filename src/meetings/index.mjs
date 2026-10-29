@@ -602,10 +602,22 @@ export class Meetings {
   specStream(m, id) {
     let st = m.specStreams.get(id);
     if (st) return st;
+    // Full: the oldest stream that has nothing being said and is no longer open (or open but silent for a minute)
+    // makes room; a stream with speech under way is never forgotten (its cancel must still find it). None: refused.
+    if (m.specStreams.size >= SPEC_STREAMS) {
+      const busy = (x) => (x.u && !x.u.ending && !x.u.cancelled) || (x.state === 'open' && this.now() - x.at < 60_000);
+      const old = [...m.specStreams.values()].find((x) => !busy(x));
+      if (!old) return null;
+      m.specStreams.delete(old.id);
+    }
     st = { id, turn: m.lastTurnSeq, gen: m.channelGen, at: this.now(), buf: '', next: 0, early: new Map(), sent: [], nos: [], u: null, stopAt: Infinity, state: 'open', final: null, finalNorm: null, finalAt: 0 };
     m.specStreams.set(id, st);
-    while (m.specStreams.size > SPEC_STREAMS) m.specStreams.delete(m.specStreams.keys().next().value);
     return st;
+  }
+
+  // A stream that skipped the drafted sentence was published (or completed): the publish check for it is used up.
+  useDraftSaid(m, st) {
+    if (st.draftSkipped && m.draftSaid?.turnSeq === st.turn) m.draftSaid = null;
   }
 
   // The stream's turn was reopened since and superseded_publish is "drop": nothing more of it is said.
@@ -618,7 +630,7 @@ export class Meetings {
   specChunk(m, p) {
     if (!m.channelOpen || typeof p?.streamId !== 'string' || !p.streamId) return;
     const st = this.specStream(m, p.streamId.slice(0, 200));
-    if (st.state !== 'open') return;
+    if (!st || st.state !== 'open') return;
     st.at = this.now();
     const delta = typeof p.content === 'string' ? p.content : typeof p.delta === 'string' ? p.delta : '';
     const seq = Number.isInteger(p.seq) ? p.seq : Number.isInteger(p.index) ? p.index : st.next;
@@ -645,8 +657,7 @@ export class Meetings {
     const ds = m.draftSaid;
     if (i === 0 && ds && ds.turnSeq === st.turn && this.now() - ds.at < DRAFT_SAID_MS && normalize(text) === ds.norm) {
       st.sent.push(text);
-      st.draftSkipped = true;
-      m.draftSaid = null;
+      st.draftSkipped = true; // m.draftSaid stays until a publish (or complete) of the stream uses it up
       return;
     }
     try {
@@ -667,15 +678,17 @@ export class Meetings {
     if (!st) return;
     const text = typeof p.content === 'string' ? p.content : Array.isArray(p.content) ? p.content.filter((c) => c?.type === 'text' && typeof c.text === 'string').map((c) => c.text).join('\n') : '';
     if (p.cancelled === true || !text.trim()) {
-      if (st.state !== 'open') return;
+      if (st.state === 'final' || st.state === 'cancelled') return; // a publish settled it: that counts
       st.state = 'cancelled';
       m.specCancelled++;
-      this.specCut(m, st, 0, { stop: true });
+      this.specCut(m, st, 0, { stop: true }); // also what a stream dropped or interrupted half-way still has under way
       return;
     }
     if (st.state === 'final' && normalize(text) === st.finalNorm) return;
     if (st.state === 'open' && this.specSuperseded(m, st)) st.state = 'dropped';
-    if (st.state === 'open' || st.state === 'final') { try { this.specSettle(m, st, text); } catch {} }
+    if (st.state === 'open' || st.state === 'final') {
+      try { this.specSettle(m, st, text); this.useDraftSaid(m, st); } catch {}
+    }
     else Object.assign(st, { final: text, finalNorm: normalize(text), finalAt: this.now() }); // a publish of it is not said either
   }
 
@@ -687,7 +700,6 @@ export class Meetings {
     if (!st.sent.length && ds && ds.turnSeq === st.turn && this.now() - ds.at < DRAFT_SAID_MS && afterPrefix(text, ds.text) >= 0) {
       st.sent.push(ds.text);
       st.draftSkipped = true;
-      m.draftSaid = null;
     }
     let at = 0, k = 0;
     for (; k < st.sent.length; k++) {
@@ -717,11 +729,22 @@ export class Meetings {
     const nos = st.nos.slice(k).filter((x) => x !== undefined);
     if (!nos.length) return;
     if (Math.min(...nos) < u.taken) {
+      // What else the utterance had not begun to play (another stream's sentences, published text) is said again
+      // after it, in order, with its stream's records moved along.
+      const mine = (no) => { const o = u.owners.get(no); return o?.st === st && o.i >= k; };
+      const played = u.startedAt ? this.now() - u.startedAt : 0;
+      const left = [];
+      if (u.startedAt) for (const x of u.timeline || []) { if (x.start >= played && x.no !== undefined) left.push([x.no, x.text]); }
+      else if (u.head) left.push([0, u.head]);
+      if (u.synthPiece) left.push([u.synthNo, u.synthPiece]);
+      u.pieces.forEach((t, pos) => left.push([u.taken + pos, t]));
+      const keep = left.filter(([no, t]) => t && t.trim() && !mine(no));
       Object.assign(u, { cancelled: true, ...(stop ? { stopped: true } : {}) });
       u.pieces.length = 0;
       u.wake?.();
       u.player?.stop();
       this.endUtterance(m, u, 'interrupted', null).catch(() => {});
+      for (const [no, t] of keep) { try { this.sayOnChannel(m, t, { whole: true, spec: u.owners.get(no) || null }); } catch {} }
       return;
     }
     for (let j = k; j < st.sent.length; j++) {
@@ -744,22 +767,26 @@ export class Meetings {
     if (!st && !id) {
       const recent = (x) => this.now() - Math.max(x.at, x.finalAt) < SPEC_MATCH_MS;
       const said = (x) => normalize([...x.sent, x.buf].join(' '));
+      // An open stream's buffer may end in the middle of a word ("The bud"): then a character prefix will do.
+      const starts = (x) => { const a = said(x); return !!a && (norm === a || norm.startsWith(`${a} `) || (/\S$/.test(x.buf) && norm.startsWith(a))); };
       st = [...m.specStreams.values()].reverse().find((x) => !x.published && x.turn === turn && recent(x) && (x.final !== null ? x.finalNorm === norm
-        : (x.state === 'open' || x.state === 'interrupted') && !!said(x) && (norm === said(x) || norm.startsWith(`${said(x)} `)))) || null;
+        : (x.state === 'open' || x.state === 'interrupted') && starts(x))) || null;
     }
     if (st && (st.state === 'open' || st.state === 'dropped') && this.specSuperseded(m, st)) { st.state = 'dropped'; st.published = true; return { dropped: true, turn: st.turn, stream_id: st.id }; }
     if (!st || st.state === 'dropped' || st.state === 'cancelled') return null;
-    st.published = true; // a stream delivers one publish: the same text published again is said
     const base = { speculative: true, stream_id: st.id, ...(st.draftSkipped ? { draft_prefix_skipped: true } : {}) };
     if (st.state === 'open' && st.gen !== m.channelGen) st.state = 'interrupted'; // meeting_stop_speaking since
+    // A stream delivers one publish: the same text published again is said. Marked only once settled (a publish the
+    // queue refuses can be sent again and still match).
+    const done = (r) => { st.published = true; this.useDraftSaid(m, st); return { ...base, ...(st.draftSkipped ? { draft_prefix_skipped: true } : {}), ...r }; };
     if (st.state === 'interrupted') {
       Object.assign(st, { final: text, finalNorm: norm, finalAt: this.now() });
-      return { ...base, spoken: 'interrupted' };
+      return done({ spoken: 'interrupted' });
     }
-    if (st.state === 'final' && st.finalNorm === norm) return { ...base, spoken: 'already_spoken' };
-    if (st.state === 'final' && st.gen !== m.channelGen) return { ...base, spoken: 'interrupted' };
+    if (st.state === 'final' && st.finalNorm === norm) return done({ spoken: 'already_spoken' });
+    if (st.state === 'final' && st.gen !== m.channelGen) return done({ spoken: 'interrupted' });
     const again = this.specSettle(m, st, text);
-    return { ...base, ...(st.draftSkipped ? { draft_prefix_skipped: true } : {}), spoken: 'settled', ...(again ? { said_after_stream: again.length } : {}) };
+    return done({ spoken: 'settled', ...(again ? { said_after_stream: again.length } : {}) });
   }
 
   // meeting_draft: the agent's draft reply to the turn still being said. ready: its first sentence is synthesized now,
@@ -1629,7 +1656,7 @@ export class Meetings {
     const pieces = text ? (whole ? [String(text).trim()] : splitSpeech(text, { group: !(kind === 'stream' && this.prepareOn(m)) })) : null;
     // taken: pieces taken up for synthesis so far (the first one at once): the piece at pieces[i] is number taken + i.
     const u = { id: `u${++m.speechSeq}`, kind, state: 'preparing', player: null, autoMute, cancelled: false, seconds: 0, t0, open: !!(text && open), pieces: pieces ? pieces.slice(1) : [], wake: null,
-      head: pieces ? pieces[0] : undefined, taken: 1 };
+      head: pieces ? pieces[0] : undefined, taken: 1, owners: new Map() }; // owners: piece number -> {st, i} of a speculative stream
     u.finished = new Promise((r) => { u.finish = r; });
     m.speech = u;
     // The previous utterance stops without muting: this one takes the microphone over (m.speechUnmuted: whether
@@ -1692,7 +1719,7 @@ export class Meetings {
     // What a barge-in counts from: the words of the open segment already heard when this started playing.
     u.base = { seq: m.partialNow?.seq ?? 0, n: words(m.partialNow?.text).length };
     // When each piece plays (ms from the start), for what was said of it when it is cut off.
-    u.timeline = text || clipText ? [{ text: text ? pieces[0] : clipText, start: 0, end: head.seconds * 1000 }] : null;
+    u.timeline = text || clipText ? [{ text: text ? pieces[0] : clipText, start: 0, end: head.seconds * 1000, no: 0 }] : null;
     m.lastSpokeAt = u.startedAt;
     u.player.done.then((ok) => this.endUtterance(m, u, u.cancelled ? 'interrupted' : ok ? 'done' : 'failed', ok || u.cancelled ? null : new Error(u.player.error() || 'playback failed'), { t0, tail: ok }));
     // The rest, synthesized while the piece before plays (in the voice the first one got). gapMs: the longest silence
@@ -1703,9 +1730,10 @@ export class Meetings {
     u.playEnd = playEnd;
     if (text) {
       for (let piece; (piece = await this.nextPiece(m, u, () => playEnd)) !== null;) {
-        u.taken++;
+        const no = u.taken++;
         if (!piece.trim()) continue; // taken back (specCut)
         u.synthPiece = piece;
+        u.synthNo = no;
         const w = await this.synth(m, { text: piece, backend, voice: head.voice ?? voice, lang, model }).catch((e) => { error = e; return null; });
         if (!w || u.cancelled || u.state !== 'speaking') break;
         u.synthPiece = null;
@@ -1714,7 +1742,7 @@ export class Meetings {
         gapMs = Math.max(gapMs, Math.round(at - playEnd));
         const from = Math.max(at, playEnd);
         playEnd = from + w.seconds * 1000;
-        u.timeline.push({ text: piece, start: from, end: playEnd });
+        u.timeline.push({ text: piece, start: from, end: playEnd, no });
         u.playEnd = playEnd;
         u.player.write(w.data);
         u.seconds += w.seconds;
@@ -1797,7 +1825,7 @@ export class Meetings {
     // A stream from the channel that still takes text (open, not stopped or ending): this is added to it.
     const appendable = (u) => u?.kind === 'stream' && u.open && !u.cancelled && !u.ending;
     const append = (u) => {
-      if (spec) { spec.st.u = u; spec.st.nos[spec.i] = u.taken + u.pieces.length; }
+      if (spec) { const no = u.taken + u.pieces.length; spec.st.u = u; spec.st.nos[spec.i] = no; u.owners.set(no, spec); }
       u.pieces.push(...(whole ? [text] : splitSpeech(text, { group: !this.prepareOn(m) })));
       u.wake?.();
     };
@@ -1827,7 +1855,7 @@ export class Meetings {
     this.utter(m, { text, ...tts, kind: 'stream', open: true, whole }).catch((e) => {
       this.emit(m, 'speech', { utterance_id: null, kind: 'stream', state: 'failed', played_s: 0, error: oneLine(e) });
     });
-    if (spec && m.speech?.head === text) { spec.st.u = m.speech; spec.st.nos[spec.i] = 0; }
+    if (spec && m.speech?.head === text) { spec.st.u = m.speech; spec.st.nos[spec.i] = 0; m.speech.owners.set(0, spec); }
   }
 
   prepareOn(m) {

@@ -386,3 +386,83 @@ test('review fixes: the drafted sentence is skipped when the stream settles with
     await c.close();
   });
 });
+
+test('review fixes 2: a cancel still stops a stream the queue cut short, and one that more streams came after; another stream\'s sentence survives a cut; a buffer ending mid-word matches its publish', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { speculative_speech: true });
+    const { id, code, chId } = await admitted(c);
+    el.st.ttsDelayMs = 2500;
+    try {
+      // Too much for the queue (6000 characters): the stream is cut short; its cancel still stops it and mutes.
+      const a = c.stream(chId, 'q_a');
+      const long = `${'word '.repeat(70).trim()}.`;
+      await a.chunk(`${Array.from({ length: 18 }, () => long).join(' ')} `);
+      await until(() => mics(code).length === 1, 5000);
+      await a.cancel();
+      await until(() => mics(code).length === 2, 2000);
+      // Eight more streams with open text after one whose first sentence is synthesizing: its cancel still finds it.
+      const b = c.stream(chId, 'q_b');
+      await b.chunk('Bravo is first. ');
+      await until(() => mics(code).length === 3, 5000);
+      const xs = Array.from({ length: 9 }, (_, i) => c.stream(chId, `q_x${i}`));
+      for (const x of xs) await x.chunk('Open text without an end');
+      await b.cancel();
+      await until(() => mics(code).length === 4, 2000);
+      for (const x of xs) await x.cancel(); // (eight open streams fill the table: a ninth is refused, and its publish said as usual)
+      await sleep(3000);
+      assert.equal(audio.players.length, 0, 'neither played');
+    } finally { el.st.ttsDelayMs = 0; }
+    assert.deepEqual(mics(code), [true, false, true, false]);
+    // A's first sentence synthesizing, B's appended behind it; A cancelled: B is still said.
+    el.st.ttsDelayMs = 1000;
+    try {
+      const a = c.stream(chId, 'w_a'), b = c.stream(chId, 'w_b');
+      await a.chunk('Alpha first. ');
+      await sleep(100);
+      await b.chunk('Bravo second. ');
+      await sleep(100);
+      await a.cancel();
+      await until(() => ev.speech.some((e) => e.state === 'done'), 15_000);
+    } finally { el.st.ttsDelayMs = 0; }
+    assert.equal(audio.players.length, 1);
+    assert.ok(Math.abs(seconds(audio.players[0]) - 0.6) < 0.05, `Bravo only: ${seconds(audio.players[0])} s`);
+    // "First sentence. The bud" open; the publish without streamId has the whole text: matched, nothing said twice.
+    const n1 = el.st.speech.length;
+    const s = c.stream(chId, 'w_c');
+    await s.chunk('First sentence. The bud');
+    const r = await c.publish(chId, 'First sentence. The budget is fine.');
+    assert.equal(r.spoken, 'settled');
+    await s.complete('First sentence. The budget is fine.');
+    await until(() => ev.speech.filter((e) => e.state === 'done').length === 2, 15_000);
+    await sleep(500);
+    assert.deepEqual(synthesized(n1), ['First sentence.', 'The budget is fine.']);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('review fixes 2: a stream that skipped the drafted sentence and was cancelled leaves the publish check for it in place', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { speculative_speech: true, draft_enabled: true, transcript_events: 'always', turn_hold_ms: 300, turn_hold_complete_ms: 300 });
+    const { id, chId } = await admitted(c);
+    const n0 = el.st.speech.length;
+    phrases('Is the plan ready for review?');
+    audio.say(tonePcm(3.5));
+    await until(() => ev.transcript.some((x) => !x.final && x.text.split(' ').length >= 5), 15_000);
+    await c.call('meeting_draft', { meeting_id: id, text: 'Yes, it is ready.', ready: true });
+    await until(() => c.finals().length === 1, 15_000);
+    assert.equal(c.finals()[0].metadata.draft, 'spoken');
+    const s = c.stream(chId, 'call_h');
+    await s.chunk('Yes, it is ready. ');
+    await s.cancel();
+    const r = await c.publish(chId, 'Yes, it is ready. The review starts Monday.');
+    assert.equal(r.draft_prefix_skipped, true);
+    await until(() => synthesized(n0).includes('The review starts Monday.'), 15_000);
+    await sleep(800);
+    assert.equal(synthesized(n0).filter((t) => t === 'Yes, it is ready.').length, 1, 'the drafted sentence once');
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
