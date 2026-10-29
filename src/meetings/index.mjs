@@ -722,10 +722,11 @@ export class Meetings {
     if (!st && !id) {
       const recent = (x) => this.now() - Math.max(x.at, x.finalAt) < SPEC_MATCH_MS;
       const said = (x) => normalize([...x.sent, x.buf].join(' '));
-      st = [...m.specStreams.values()].reverse().find((x) => recent(x) && (x.final !== null ? x.finalNorm === norm
+      st = [...m.specStreams.values()].reverse().find((x) => !x.published && recent(x) && (x.final !== null ? x.finalNorm === norm
         : (x.state === 'open' || x.state === 'interrupted') && x.sent.length > 0 && (norm === said(x) || norm.startsWith(`${said(x)} `)))) || null;
     }
     if (!st || st.state === 'dropped' || st.state === 'cancelled') return null;
+    st.published = true; // a stream delivers one publish: the same text published again is said
     const base = { speculative: true, stream_id: st.id, ...(st.draftSkipped ? { draft_prefix_skipped: true } : {}) };
     if (st.state === 'open' && st.gen !== m.channelGen) st.state = 'interrupted'; // meeting_stop_speaking since
     if (st.state === 'interrupted') {

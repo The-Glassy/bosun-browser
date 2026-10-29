@@ -988,6 +988,27 @@ it (no publish and no `meeting_speak` for it yet), within `turn_extend_s` (defau
 - **Not reopened:** a turn the agent has answered (its answer may be playing, and barge-in handles that), a turn of
   someone else, and a turn whose transcript was deleted.
 
+**Drafts (0.18.0, `draft_enabled`).** The agent can prepare its answer while the speaker still talks (with
+`agent_partials` it sees the turn as it is said). `meeting_draft {meeting_id, text, ready, for_turn_seq}` sets the
+draft, and `text: ""` clears it.
+- **Ready:** the first sentence is synthesized now. When the turn reaches the agent (after the turn hold), Bosun says
+  it at once, so no synthesis time is spent then.
+- **Dropped** when the final added more than `draft_max_new_words` (4) words to what was heard when the draft was
+  marked ready, or a "not"/"but" among them, or the draft was for another turn, not ready, or something else is being
+  said. A barge-in or a reopened turn drops the draft too.
+- **The final says what happened:** `metadata.draft` is `spoken` (with `draft_text`), `dropped` (with `draft_reason`)
+  or `none`, and a second text block says it in words.
+- **The publish:** one for that turn that starts with the sentence skips it (`draft_prefix_skipped: true`). One that
+  starts otherwise is said in full.
+- Measured locally (stand-ins): the sentence's audio starts about 0.4 s after the final reached the host, nearly all
+  of it the unmute click.
+
+**Speculative speech (0.18.0, `speculative_speech`).** The meeting channel declares `streaming: {speculative: true}`.
+A host that supports it streams the `content` of the agent's `channel_publish` while the model writes it, and Bosun
+speaks each sentence as soon as it is complete. `complete` with `cancelled` stops it at once, and the publish that
+follows is not said twice. The contract is in [docs/STREAMING.md](docs/STREAMING.md). Measured locally: the first
+audio starts about 0.4 s after the chunk that completes the first sentence.
+
 **Audio setup (Linux).** Each meeting gets a private PulseAudio server: its own `XDG_RUNTIME_DIR`, socket and
 config, with two null sinks:
 - **`bosun_out`:** the browser plays the meeting into it; ffmpeg records its monitor, and a second one reads it for

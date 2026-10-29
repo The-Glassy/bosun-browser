@@ -464,6 +464,42 @@ in a sentence is a final; the agent answers it; the rest arrives while she speak
 - A final whose audio ended before Bosun began to play (its timestamped copy came late) is no barge-in. Of a final
   that began before, the share of its words before playback started is left out.
 
+## 9e. Drafts and speculative speech (0.18.0)
+
+**Why.** Glassy's answer in a call waits for: the speaker's final, the turn hold, her generation of the whole
+`channel_publish` call, and then synthesis. Two opt-in shortcuts cut that.
+
+**Drafts (`setDraft`, `draftOutcome`).**
+- `m.draft` holds `{text, sentence, ready, forTurnSeq, setAt, heard, wav}`.
+  - `heard` is `heardSoFar()` when the draft was marked ready: the finals held for the turn plus the open partial.
+  - `wav` is the first sentence's synthesis, started at once.
+- `deliver()` calls `draftOutcome()` for each new turn while `draft_enabled` holds.
+  - It matches the draft to the turn: `for_turn_seq` within the turn's segments, or, without one, set after the
+    turn's first partial (`m.firstHeard`).
+  - It counts the new words, `addedWords()` (LCS) of `heard` against the final.
+  - It refuses a "not"/"but" among them (`MEANING_FLIP`), and refuses when Bosun is speaking.
+  - Then it puts the WAV into `m.prepared` and calls `sayOnChannel(sentence, {whole: true})`.
+- `m.draftSaid` lets the next publish for that turn skip the sentence (`afterPrefix()`, normalized words).
+- The outcome goes into the final's metadata and a second text block, and `maybeAck` is skipped when the draft was
+  said.
+
+**Speculative streams (`onStream` → `specChunk` → `specSay`; `specComplete`, `specSettle`, `specCut`, `specPublish`).**
+- A stream is keyed by `streamId`. Chunks are put in `seq` order and cut with `takeSentences()`. Each sentence is
+  prepared ahead and queued as channel text with `spec {st, i}`.
+- `channelUtter` records where each sentence went: `st.u` is the utterance, and `st.nos[i]` is its piece number
+  there. `u.taken` counts the pieces an utterance has taken up for synthesis.
+- A sentence not yet taken up can be spliced out of `u.pieces` silently. One taken up means its audio exists or is
+  coming, so the utterance is stopped. Sentences still in the channel queue are skipped by `st.stopAt`.
+- Cancel cuts from sentence 0 and mutes again. A final text (from `complete` or the publish) cuts from the first
+  differing sentence and says the rest.
+- The 0.17.1 rules hold on top:
+  - `channelGen` (barge-in, `meeting_stop_speaking`, opt-out) marks a stream interrupted.
+  - A reopened turn with `superseded_publish: "drop"` drops it.
+  - Its first sentence equal to `m.draftSaid` is skipped.
+
+**Settings per meeting.** `meeting_join` may set `draft_enabled`, `draft_max_new_words` and `speculative_speech`
+(`PER_CALL`). They are kept on the meeting as `m.overrides`, and `opts(m)` merges them over the tenant's settings.
+
 ## 10. Deployment
 
 - Package: npm + Docker image (Chromium, Xvfb, fonts, the server).
