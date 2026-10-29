@@ -88,6 +88,10 @@ When the host can, it passes the same `streamId` on the `channels/publish` it ma
   `"drop"`, its sentences are not spoken. The publish is then dropped as before.
 - **A draft.** When Bosun already said the drafted sentence for this turn (`meeting_draft`), a stream whose first
   sentence is that sentence skips it.
+- **Limits.** Bosun keeps 8 streams per meeting. A stream that still has text queued, being synthesized or playing is
+  never forgotten, so its cancel always finds it. One that has been open and silent for a minute can make room. When
+  all 8 are busy, a new stream is refused, and its publish is spoken as usual. When the speech queue is full (6000
+  characters), the stream pauses but stays open. Its publish or `complete` then says only what it had not said yet.
 
 ## The publish receipt
 

@@ -32,6 +32,11 @@ Decisions made without asking (Misha: "use your judgment and decide yourself"), 
   synthesized or played stops the utterance, as the brief says. An audible cut is only needed for audio that exists.
 - **A publish matched to a stream a barge-in stopped is not said** (`spoken: "interrupted"`). The person spoke over
   that text; saying it again when the publish lands would ignore them.
+- **A full stream table refuses the new stream instead of forgetting a busy one.** Forgetting a stream with speech
+  under way would make its cancel unfindable, and the microphone could stay on. A refused stream loses only the
+  head start: its publish is spoken as usual.
+- **A full speech queue pauses a stream instead of dropping it.** The publish then says the rest. Dropping it would
+  either lose the rest or repeat what was already said.
 - **Speculative chunks with the setting off are treated as plain §14.3 chunks** (prepared ahead with
   `channel_prepare_chunks`, never spoken).
 
