@@ -280,3 +280,109 @@ test('with a spoken draft, a stream that starts with the drafted sentence skips 
     await c.close();
   });
 });
+
+test('review fixes: a cancel while the first sentence is synthesized mutes at once; taking back queued sentences of two streams; a one-sentence stream without streamId is said once; no match across turns', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { speculative_speech: true, transcript_events: 'always', turn_hold_ms: 300, turn_hold_complete_ms: 300 });
+    const { id, code, chId } = await admitted(c);
+    const n0 = el.st.speech.length;
+    // Cancelled while the first sentence is still being synthesized (3 s): the microphone is muted again at once.
+    el.st.ttsDelayMs = 3000;
+    try {
+      const a = c.stream(chId, 'r_a');
+      await a.chunk('Slow first sentence. ');
+      await until(() => mics(code).length === 1, 5000);
+      const t0 = Date.now();
+      await a.cancel();
+      await until(() => mics(code).length === 2, 2500);
+      assert.deepEqual(mics(code), [true, false]);
+      console.log(`MEASURE speculative cancel during synthesis: muted again ${Date.now() - t0} ms after complete {cancelled}`);
+      await sleep(3200);
+      assert.equal(audio.players.length, 0, 'never played');
+    } finally { el.st.ttsDelayMs = 0; }
+    // Two streams' sentences queued behind a head still synthesizing; both cancelled: neither plays.
+    el.st.ttsDelayMs = 1500;
+    try {
+      const h = c.stream(chId, 'r_h'), b = c.stream(chId, 'r_b'), s3 = c.stream(chId, 'r_c');
+      await h.chunk('Head sentence. ');
+      await sleep(100);
+      await b.chunk('Bee one. ');
+      await s3.chunk('Sea two. ');
+      await sleep(200);
+      await b.cancel();
+      await s3.cancel();
+      await h.complete('Head sentence.');
+      await until(() => audio.players.length === 1 && audio.players[0].bytes.length > 0, 10_000);
+      await until(() => ev.speech.length === 1, 15_000);
+    } finally { el.st.ttsDelayMs = 0; }
+    assert.ok(Math.abs(seconds(audio.players[0]) - 0.6) < 0.05, `the head only: ${seconds(audio.players[0])} s`);
+    // One sentence with no space after it (never cut by the chunks): the publish without streamId says it once.
+    const n1 = el.st.speech.length;
+    const o = c.stream(chId, 'r_o');
+    await o.chunk('Okay.');
+    const r = await c.publish(chId, 'Okay.');
+    assert.equal(r.spoken, 'settled');
+    await o.complete('Okay.');
+    await until(() => ev.speech.length === 2, 15_000);
+    await sleep(500);
+    assert.deepEqual(synthesized(n1), ['Okay.']);
+    // A stream of turn 0 that said "Sure." and never completed; then a new turn: its publish starting with "Sure." is
+    // not taken for that stream.
+    const s = c.stream(chId, 'r_s');
+    await s.chunk('Sure. ');
+    await until(() => ev.speech.length === 3, 15_000);
+    phrases('Can you give me the new numbers?');
+    audio.say(tonePcm(2));
+    await until(() => c.finals().length === 1, 15_000);
+    const n2 = el.st.speech.length;
+    const r2 = await c.publish(chId, 'Sure. Here is the new answer.');
+    assert.equal(r2.speculative, undefined);
+    await until(() => ev.speech.length === 4, 15_000);
+    assert.deepEqual(synthesized(n2), ['Sure.', 'Here is the new answer.']);
+    assert.ok(synthesized(n0).length > 0);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('review fixes: the drafted sentence is skipped when the stream settles with it (no space after it); a stream of a reopened turn is dropped with its publish', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    await c.call('speech_settings_set', { speculative_speech: true, draft_enabled: true, transcript_events: 'always', turn_hold_ms: 300, turn_hold_complete_ms: 300 });
+    const { id, chId } = await admitted(c);
+    const n0 = el.st.speech.length;
+    phrases('Is the plan ready for review?', 'And the budget as well?');
+    audio.say(tonePcm(3.5));
+    await until(() => ev.transcript.some((x) => !x.final && x.text.split(' ').length >= 5), 15_000);
+    await c.call('meeting_draft', { meeting_id: id, text: 'Yes, it is ready.', ready: true });
+    await until(() => c.finals().length === 1, 15_000);
+    assert.equal(c.finals()[0].metadata.draft, 'spoken');
+    const s = c.stream(chId, 'call_f');
+    await s.chunk('Yes, it is ready.');
+    await s.complete('Yes, it is ready.');
+    const r = await c.publish(chId, 'Yes, it is ready.', { streamId: 'call_f' });
+    assert.equal(r.spoken, 'already_spoken');
+    assert.equal(r.draft_prefix_skipped, true);
+    await until(() => ev.speech.length === 1, 15_000);
+    await sleep(500);
+    assert.deepEqual(synthesized(n0), ['Yes, it is ready.'], 'said once');
+    // Turn 2 reaches the agent; a stream for it has only an open sentence when the speaker goes on (turn reopened).
+    audio.say(tonePcm(2.5));
+    await until(() => c.finals().length === 2, 15_000);
+    const t2 = c.stream(chId, 'call_g');
+    await t2.chunk('The budget is');
+    phrases('And one more thing.');
+    audio.say(tonePcm(2));
+    await until(() => c.incoming.some((m) => m.tags.includes('bosun:meeting-turn-extended')), 15_000);
+    await t2.chunk(' fine too.');
+    const r2 = await c.publish(chId, 'The budget is fine too.', { streamId: 'call_g' });
+    assert.equal(r2.delivered, false);
+    assert.equal(r2.dropped, true);
+    await t2.complete('The budget is fine too.');
+    await sleep(800);
+    assert.ok(!synthesized(n0).includes('The budget is fine too.'), 'never said');
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
