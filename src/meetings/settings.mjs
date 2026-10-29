@@ -3,7 +3,8 @@
 // the agent over its MCPL channel (meeting_channel, transcript_events, agent_partials, channel_prepare_chunks); the
 // acknowledgement played when someone finishes (ack_*); how long a final is held for more of the same turn (turn_hold_*)
 // and whether someone speaking over Bosun stops it (barge_in*); a turn reopened while the agent is still thinking
-// (turn_extend_s, superseded_publish). What a call passes wins, then the tenant's setting, then the
+// (turn_extend_s, superseded_publish); a reply drafted while the speaker still talks (draft_*) and text spoken as the
+// host streams it (speculative_speech). What a call passes wins, then the tenant's setting, then the
 // environment (TTS_DEFAULT_BACKEND, ELEVENLABS_TTS_MODEL, ELEVENLABS_VOICE, TTS_VOICE, LIVE_TRANSCRIPT_VAD_SILENCE_S),
 // then Bosun's own default.
 // Stored under <BROWSER_DATA>/speech-settings/<tenant>.json (written atomically, 0600).
@@ -60,13 +61,22 @@ export const SETTINGS = {
   // turn is reopened (turn_extended), and what the agent publishes for it is dropped (or, "speak", said all the same).
   turn_extend_s: (v) => (num(v, 0, 300) ? null : 'turn_extend_s must be a number of seconds from 0 to 300'),
   superseded_publish: (v) => (SUPERSEDED_PUBLISH.includes(v) ? null : `superseded_publish must be one of ${SUPERSEDED_PUBLISH.join(', ')}`),
+  // meeting_draft: the first sentence of a reply drafted (ready) during the turn is said as soon as the turn ends,
+  // unless the final added more than draft_max_new_words words to what was heard when it was marked ready.
+  draft_enabled: (v) => (typeof v === 'boolean' ? null : 'draft_enabled must be true or false'),
+  draft_max_new_words: (v) => (Number.isInteger(v) && v >= 0 && v <= 50 ? null : 'draft_max_new_words must be a whole number from 0 to 50'),
+  // The meeting channel declares streaming {speculative: true}: text the host streams while the agent writes its
+  // publish (channels/outgoing/chunk with speculative: true) is spoken sentence by sentence before the publish lands.
+  speculative_speech: (v) => (typeof v === 'boolean' ? null : 'speculative_speech must be true or false'),
 };
+// Settings a meeting_join may set for that meeting only (over the tenant's).
+export const PER_CALL = ['draft_enabled', 'draft_max_new_words', 'speculative_speech'];
 // Bosun's defaults for the settings without an environment fallback.
 export const DEFAULTS = {
   meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
   ack_on_final: false, ack_phrases: ACK_PHRASES_DEFAULT, ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
   turn_hold_ms: 900, turn_hold_complete_ms: 300, barge_in: true, barge_in_min_words: 2, barge_in_min_s: 0.6,
-  turn_extend_s: 20, superseded_publish: 'drop',
+  turn_extend_s: 20, superseded_publish: 'drop', draft_enabled: false, draft_max_new_words: 4, speculative_speech: false,
 };
 
 export class SpeechSettings {
