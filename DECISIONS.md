@@ -2,6 +2,44 @@
 
 Decisions made without asking (Misha: "use your judgment and decide yourself"), with the reason. Newest first.
 
+## 0.18.0 (2026-10-30): drafts and speculative speech
+
+- **A "not" or "but" among the new words drops the draft, however few words came.** The brief's rule is "at most
+  `draft_max_new_words` (4) new words". Its own example, "... but not today", adds only three words and would pass. A
+  wrong first sentence said aloud is worse than a second of silence, so these words always drop the draft. The list
+  is short (EN/DE/UK/RU/SK negations and "but") and only checked among the words the final added.
+- **New words are counted against a word alignment (LCS), not a prefix.** Scribe revises words between partial and
+  final ("meat" to "meet"). A changed word counts as one new word. Words the final dropped count as nothing.
+- **"What was heard" is the turn so far:** the finals held for it plus the open partial after them. A turn held
+  across a pause would otherwise look like all new words.
+- **A draft is used up at the turn it is checked against,** whatever the outcome. A draft for a later turn
+  (`for_turn_seq` beyond it) waits. Without `for_turn_seq`, "set after the turn started" means after the first partial
+  of the turn's first segment.
+- **A draft for a turn that already reached the agent is refused (`too_late`)** instead of being kept. It could only
+  ever be dropped, and the agent should publish.
+- **The drafted sentence is said as channel text** (the same utterance, queue and barge-in as a publish), so the
+  publish's remaining text joins the same utterance without the microphone going off in between.
+- **A spoken draft counts as the turn's answer.** More speech after it is a barge-in or a new turn, not a reopened
+  turn: Bosun has started answering.
+- **The draft's result goes in the metadata and in a second text block.** The block says "already said ... go on
+  after it", so Glassy sees it even where a host shows only the text.
+- **The speculative opt-in is on the descriptor (`capabilities.streaming.speculative`) and in `metadata.streaming`.**
+  MCPL 0.5 has no per-channel capabilities field. Hosts that keep only the metadata still see it.
+- **Publish before `complete` is the usual order** (connectome sends `complete` after the publish succeeded), so the
+  publish settles an open stream. Without a `streamId`, Bosun matches it when its text starts with what the stream has
+  sent so far, within 10 s. A stream matches one publish only. The same text published again is said.
+- **A sentence that differs but has not been taken up for synthesis is dropped silently.** One already being
+  synthesized or played stops the utterance, as the brief says. An audible cut is only needed for audio that exists.
+- **A publish matched to a stream a barge-in stopped is not said** (`spoken: "interrupted"`). The person spoke over
+  that text; saying it again when the publish lands would ignore them.
+- **A full stream table refuses the new stream instead of forgetting a busy one.** Forgetting a stream with speech
+  under way would make its cancel unfindable, and the microphone could stay on. A refused stream loses only the
+  head start: its publish is spoken as usual.
+- **A full speech queue pauses a stream instead of dropping it.** The publish then says the rest. Dropping it would
+  either lose the rest or repeat what was already said.
+- **Speculative chunks with the setting off are treated as plain §14.3 chunks** (prepared ahead with
+  `channel_prepare_chunks`, never spoken).
+
 ## 0.17.1 (2026-10-28): turns, barge-in, stale answers
 
 - **The defaults are 900 ms and 300 ms, from the brief.** Scribe ends a segment after 0.5 s of silence and its final

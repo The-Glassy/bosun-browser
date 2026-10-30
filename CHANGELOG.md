@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.18.0: a drafted first sentence at the end of the turn; speculative channel speech
+
+Both are off by default. A tenant turns them on in its speech settings, or `meeting_join` turns them on for one
+meeting. Tenants that change nothing behave as in 0.17.1.
+
+### Added
+
+- **`meeting_draft`** (`draft_enabled`, default false; `draft_max_new_words`, default 4). While someone still speaks,
+  the agent sets a draft reply: `{meeting_id, text, ready, for_turn_seq?}`, and `text: ""` clears it.
+  - Once `ready`, the draft's first sentence is synthesized at once. When the turn reaches the agent (after the turn
+    hold), Bosun says that sentence right away.
+  - Bosun drops it when the final added more than `draft_max_new_words` words to what was heard when the draft was
+    marked ready, or when one of the new words is a "not" or "but" (EN/DE/UK/RU/SK).
+  - Bosun also drops it when it was set for another turn, was never marked ready, or something else is being said.
+  - The final's channel message says what happened: `metadata.draft` is `spoken`, `dropped` or `none`, with
+    `draft_text`, `draft_reason` and `draft_new_words`, a tag `bosun:draft-spoken|dropped`, and a second text block.
+  - A publish for that turn that starts with the sentence skips it (`draft_prefix_skipped` in the receipt).
+  - A barge-in or a reopened turn drops the draft.
+- **Speculative channel speech** (`speculative_speech`, default false). The meeting channel's descriptor declares
+  `capabilities.streaming.speculative`. Bosun speaks the host's `channels/outgoing/chunk {streamId, seq, content,
+  speculative: true}` sentence by sentence, before the publish lands.
+  - `complete` with `cancelled: true` stops it at once.
+  - `complete`, or the publish, with other text stops what differs and says the rest.
+  - The publish of the same text is not said twice. Bosun matches it by `streamId`, or by its text within 10 s.
+  - The contract is in `docs/STREAMING.md`.
+- `meeting_join` takes `draft_enabled`, `draft_max_new_words` and `speculative_speech` for that meeting.
+- `meeting_status` shows the meeting's own settings, the current draft, `drafts {spoken, dropped}` and
+  `speculative {sentences, cancelled}`.
+
 ## 0.17.1 — don't answer half a turn: turn hold and merge, barge-in, stale-answer flag
 
 ### Added

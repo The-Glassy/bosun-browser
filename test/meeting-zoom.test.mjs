@@ -200,7 +200,8 @@ test('Zoom without the passcode, with a wrong one, sign-in required, a captcha, 
     await until(async () => (await status(c, id)).state === 'ended', 10_000);
     assert.equal((await status(c, id)).reason, 'denied');
     await until(() => ev.ended.length === 5, 10_000);
-    assert.deepEqual(ev.ended.map((e) => e.reason), ['invalid-meeting', 'invalid-meeting', 'sign-in-required', 'captcha', 'denied']);
+    // Five meetings end on their own: their ended events may come in any order (a guest's session takes longer to close).
+    assert.deepEqual(ev.ended.map((e) => e.reason).sort(), ['captcha', 'denied', 'invalid-meeting', 'invalid-meeting', 'sign-in-required']);
     assert.equal(audio.recorders.length, 0);
     await until(() => svc.manager.used === 0, 10_000);
     await c.close();
