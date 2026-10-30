@@ -166,14 +166,14 @@ test('watch-changed goes out under bosun.watch only: a host that enabled just bo
   await c.close();
 });
 
-test('meeting events go out under bosun.meeting: chat, opt-out, an announcement that fell short, and the end with a resource_link to the recording', async () => {
+test('meeting events go out under bosun.meeting: chat, opt-out, an announcement that fell short, and the end with the size of the recording and the hint to fetch it', async () => {
   svc.events.pending.clear();
   const c = await host();
   await c.grant({ enabled: [MEETING_SET], effectiveCapabilities: ['pushEvents'] });
   const base = { tenant: 'alice', meeting_id: 'm0123456789ab', platform: 'meet' };
   await svc.events.meeting('chat', { ...base, sender: 'Alex Example', text: 'Hello' });
   await svc.events.meeting('optout', { ...base, sender: 'Alex Example', text: 'please do not record', left: true });
-  const recording = { path: '/data/recordings/alice/m0123456789ab.ogg', uri: 'file:///data/recordings/alice/m0123456789ab.ogg', bytes: 4096, mime_type: 'audio/ogg', seconds: 60 };
+  const recording = { path: '/data/recordings/alice/m0123456789ab.ogg', bytes: 4096, mime_type: 'audio/ogg', seconds: 60, next: 'call recording_get { meeting_id: "m0123456789ab" }' };
   await svc.events.meeting('ended', { ...base, reason: 'left', duration_s: 61, recording, bytes: 4096 });
   const failures = [{ to: 'everyone', reason: 'chat-restricted', error: "the Zoom chat can't be sent to everyone" }, { to: 'host', reason: 'host-unreachable', error: 'no Host and co-hosts' }];
   await svc.events.meeting('announce', { ...base, platform: 'zoom', mode: 'chat', sent_to: 'failed', reason: 'chat-restricted', error: failures[0].error, failures });
@@ -186,7 +186,9 @@ test('meeting events go out under bosun.meeting: chat, opt-out, an announcement 
   assert.match(optout.payload.content[0].text, /stopped and deleted and Bosun left/);
   assert.equal(ended.tags[0], MEETING_TAGS.ended);
   assert.deepEqual(ended.origin.recording, recording);
-  assert.deepEqual(ended.payload.content[1], { type: 'resource_link', uri: recording.uri, name: 'm0123456789ab.ogg', mimeType: 'audio/ogg', size: 4096 });
+  // No resource_link: a file:// URI in the container is not something a host can fetch (recording_get is).
+  assert.equal(ended.payload.content.length, 1);
+  assert.match(ended.payload.content[0].text, /4096 bytes, \/data\/recordings\/alice\/m0123456789ab\.ogg.*recording_get \{ meeting_id: "m0123456789ab" \}/);
   assert.deepEqual(announce.tags, [MEETING_TAGS.announce, 'bosun:meeting=m0123456789ab', 'bosun:platform=zoom']);
   assert.deepEqual([announce.origin.mode, announce.origin.sent_to, announce.origin.reason, announce.origin.failures], ['chat', 'failed', 'chat-restricted', failures]);
   assert.match(announce.payload.content[0].text, /could not be posted in the chat \(chat-restricted: .*\)\. Bosun records anyway/);
