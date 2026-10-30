@@ -477,7 +477,7 @@ export const zoom = {
     // Signed in by Zoom's own account page; without that answer, by the prefilled name.
     info.joinedAs = profile && (info.signedIn === true || (info.signedIn === null && (!field || prefilled))) ? 'account' : 'guest';
     info.selfName = field ? (await field.inputValue().catch(() => name)).trim() : null;
-    if (info.signedIn === false) info.warning = `profile ${profile} is not signed in to Zoom any more: joined as a guest named "${info.selfName || name}" (Zoom turns most guests away). Sign it in again: session_open({profile: "${profile}"}), navigate https://zoom.us/signin, request_human, session_close.`;
+    if (info.signedIn === false) info.warning = `profile ${profile} is not signed in to Zoom any more: joined as a guest named "${info.selfName || name}" (Zoom may turn a guest away). Sign it in again: session_open({profile: "${profile}"}), navigate https://zoom.us/signin, request_human, session_close.`;
     // The passcode comes with the link (pwd, an encrypted token, not the passcode people type). A page that still
     // asks for it stops the join: the token typed into the field would only be refused.
     const pass = await firstVisible(page.locator(PASSCODE_FIELD));

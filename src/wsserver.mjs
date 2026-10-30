@@ -74,6 +74,7 @@ export async function startWsServer({ cfg, manager }) {
       if (secrets && Secrets.owns(req) && await secrets.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
       if (uploads && await uploads.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
       if (downloads && await downloads.handle(req, res, { authTenant })) return;
+      if (manager.meetings && await manager.meetings.links.handle(req, res, { authTenant })) return;
     } catch {
       return res.destroy();
     }

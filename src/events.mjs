@@ -52,7 +52,7 @@ export const MANIFEST = {
       },
     },
     [MEETING_SET]: {
-      description: 'Push events from a meeting Bosun attends as a notetaker (meeting_join): every chat message, a participant opting out of the recording (recording stopped and deleted), an announcement that reached fewer people than asked (the host only, or nobody), the end of the meeting with a reference to the audio recording; with live_transcript the transcript as it is spoken (partials and finals, only to connections there at the time) and its end; the end of what Bosun said with meeting_speak.',
+      description: 'Push events from a meeting Bosun attends as a notetaker (meeting_join): every chat message, a participant opting out of the recording (recording stopped and deleted), an announcement that reached fewer people than asked (the host only, or nobody), the end of the meeting with the size of the audio recording (fetch it with recording_get); with live_transcript the transcript as it is spoken (partials and finals, only to connections there at the time) and its end; the end of what Bosun said with meeting_speak.',
       uses: ['pushEvents'],
       tagOntology: {
         tags: {
@@ -119,11 +119,8 @@ export function meetingEvent(kind, { meeting_id, platform, ...data }) {
     : kind === 'mic-open' ? `WARNING: Bosun's microphone may still be ON in meeting ${meeting_id}: ${data.mute_error}.${data.gave_up ? ' Bosun stopped retrying.' : ' Bosun keeps trying to mute it.'} meeting_mute {on: true} or meeting_leave if it must be off.`
     : kind === 'optout' ? `Meeting ${meeting_id}: ${data.sender || 'someone'} asked not to be recorded ("${data.text}"). The recording was stopped and deleted${data.left ? ' and Bosun left the meeting' : ''}.`
     : kind === 'announce' ? `Meeting ${meeting_id}: the recording announcement ${data.sent_to === 'host' ? 'went to the host only' : 'could not be posted in the chat'} (${data.reason}: ${data.error}). Bosun records anyway; a request not to be recorded in the chat still stops it.`
-    : `Meeting ${meeting_id} ended for Bosun (${data.reason}) after ${data.duration_s} s.${data.recording ? ` Recording: ${data.recording.bytes} bytes, ${data.recording.path}.` : ' No recording.'}`;
+    : `Meeting ${meeting_id} ended for Bosun (${data.reason}) after ${data.duration_s} s.${data.recording ? ` Recording: ${data.recording.bytes} bytes, ${data.recording.path} (in the browser container); call recording_get { meeting_id: "${meeting_id}" } to fetch it.` : ' No recording.'}`;
   const content = [{ type: 'text', text }];
-  if (kind === 'ended' && data.recording) {
-    content.push({ type: 'resource_link', uri: data.recording.uri, name: `${meeting_id}.ogg`, mimeType: 'audio/ogg', size: data.recording.bytes });
-  }
   return {
     featureSet: MEETING_SET,
     eventId: `bosun:${crypto.randomUUID()}`,

@@ -26,14 +26,14 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
   `macro_save` / `macro_list` / `macro_get` / `macro_delete` / `macro_run`,
   and (unless `FEATURES_MEETINGS=0`) `meeting_join` /
   `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
-  `meeting_leave` / `meeting_recording_delete`.
+  `meeting_leave` / `meeting_recording_delete` / `recording_get`.
 - **Keepalive** for persistent profiles: scheduled visits keep sliding login sessions alive without a model, and a
   logged-out profile raises an MCPL `bosun:needs-human` push event. A visit can also **watch** one value (say, a
   "43 neue Nachrichten" counter) and push `bosun:watch-changed` when it goes up. See
   [Keeping logins alive](#keeping-logins-alive) and [Watching a value](#watching-a-value).
 - **Meetings (PoC):** joins a Google Meet (as a guest or signed in) or a Zoom meeting (signed in, in Zoom's web
-  client) as a notetaker, announces itself in the chat, records the audio to a file and leaves; a "please don't record" in the chat stops and deletes the recording. Transcription happens later,
-  from the file. See [Meetings (PoC)](#meetings-poc).
+  client) as a notetaker, announces itself in the chat, records the audio to a file and leaves; a "please don't record" in the chat stops and deletes the recording. The agent fetches the file with
+  `recording_get` and transcribes it with any tool, or takes part with a live transcript and speech. See [Meetings (PoC)](#meetings-poc).
 - **File uploads** into pages: the agent sends the file with one `curl -T` to a one-time URL on the MCP port
   (streamed to disk, up to 300 MB), then `upload` puts it into a file input, answers the file chooser a button
   opens, or drops it on a drop zone. See [Uploading files](#uploading-files).
@@ -650,15 +650,50 @@ arrived on average and up to about 40 minutes after (longer in quiet hours). Sev
 > `FEATURES_MEETINGS=0` switches meetings off: the tools are not listed and their handlers are not wired, and nothing
 > of the below runs — no recordings directory, no audio server. Read the consent notes before using them.
 
-Bosun can attend a **Google Meet** or a **Zoom** meeting as a notetaker, record its audio and leave.
-- **Meet:** as an **unauthenticated guest**, or with a Bosun profile **signed in to a Google account**.
-- **Zoom:** in Zoom's web client, with a Bosun profile **signed in to a Zoom account**. Zoom turns most anonymous
-  browser guests away, so a guest join usually ends with `sign-in-required` or `captcha`.
+Bosun can attend a **Google Meet** or a **Zoom** meeting, record its audio and leave. There are two ways to use it.
 
-The agent gets the recording when the meeting ends. With `live_transcript: true` it also gets the text **while people
-speak** (ElevenLabs Scribe realtime), and it can **speak into the call** itself, mute and unmute, and raise a hand
-(see [Live transcript and speaking](#live-transcript-and-speaking)). When to speak is always the agent's call: Bosun
-only provides the mechanism. Teams is not supported yet. Each platform lives in one file under `src/meetings/platforms/`
+**Mode 1, notetaker (record only).** `meeting_join { url }` and nothing else. No ElevenLabs key, no voice, and the
+microphone is never unmuted. Bosun announces itself in the chat, records, and leaves when the meeting ends. Afterwards
+the agent calls **`recording_get { meeting_id }`**, downloads the file with the `curl` line it returns, and transcribes
+it with any tool (whisper, Plaud, ElevenLabs batch, …). This is the mode for a passive notetaker agent.
+
+```jsonc
+meeting_join({ "url": "https://meet.google.com/abc-defg-hij" })      // -> { "meeting_id": "m1a2b3c4d5e6", "state": "waiting", ... }
+// … the call happens; bosun:meeting-ended arrives, or meeting_status says "ended" …
+recording_get({ "meeting_id": "m1a2b3c4d5e6" })
+//  -> { "get_url": "http://<host>:<port>/recording/m1a2b3c4d5e6?t=…", "size": 10874213, "seconds": 905, "valid_min": 15,
+//       "curl": "curl -sS --fail-with-body -o 'm1a2b3c4d5e6.ogg' 'http://<host>:<port>/recording/m1a2b3c4d5e6?t=…'" }
+```
+
+`recording_get` gives the calling tenant's own recording only, as a **one-time GET URL** on the MCP port, valid
+`DOWNLOAD_URL_TTL_SEC` (15 min). It is refused while the recording is still being written and once it is deleted. The
+file is **not** deleted by the fetch (the retention sweep and `meeting_recording_delete` do that): call `recording_get`
+again for a new URL. A read-only (`ephemeral`) token may call it. There is no inline mode; the audio is binary. The
+recording's path in `meeting_status` and `bosun:meeting-ended` is a path inside the browser container: an agent host
+cannot open it, so fetch it with `recording_get`.
+
+**Mode 2, participant.** `meeting_join { url, live_transcript: true }` and the speaking tools: the agent hears the
+call as text while people speak, and can speak, mute and unmute, raise a hand, answer on the meeting channel, prepare
+a draft and speak speculatively (see [Live transcript and speaking](#live-transcript-and-speaking)). It needs
+`ELEVENLABS_API_KEY` for the live transcript (Scribe realtime); the Supertonic voice speaks without the key, only the
+live transcript does not work without it. When to speak is always the agent's call: Bosun only provides the
+mechanism. The recording is made in this mode too.
+
+| Tool | Mode 1 (notetaker) | Mode 2 (participant) |
+|---|---|---|
+| `meeting_join` (`url`, `profile`, `announce`, …) | yes | yes, with `live_transcript: true` |
+| `meeting_status`, `meeting_chat_read`, `meeting_chat_send` | yes | yes |
+| `meeting_stop_recording`, `meeting_leave`, `meeting_recording_delete` | yes | yes |
+| **`recording_get`** | **yes: how the agent gets the audio** | yes |
+| `meeting_transcript`, the `bosun:meeting-transcript` events | no (needs a live transcript) | yes, needs `ELEVENLABS_API_KEY` |
+| `meeting_speak`, `meeting_stop_speaking`, `meeting_mute`, `meeting_raise_hand` | not used (the microphone stays muted) | yes (`meeting_speak` with the Supertonic voice needs no key; the ElevenLabs voice does) |
+| `speech_settings_get` / `speech_settings_set`, the meeting channel, `meeting_draft`, speculative speech | not used | yes |
+
+Platforms:
+- **Meet:** as an **unauthenticated guest**, or with a Bosun profile **signed in to a Google account**.
+- **Zoom:** in Zoom's web client, with a Bosun profile **signed in to a Zoom account**, or as a guest. Zoom may turn an
+  anonymous browser guest away (`sign-in-required` or `captcha`); it admitted guests in our tests, so try a guest join
+  first and use a profile when Zoom refuses. Teams is not supported yet. Each platform lives in one file under `src/meetings/platforms/`
 (`meet.mjs`, `zoom.mjs`) behind a small interface, and the meeting flow around it is shared.
 
 ```jsonc
@@ -762,10 +797,12 @@ meeting_draft({ "meeting_id": "…", "text": "…", "ready": true, "for_turn_seq
      everyone else left (`alone_leave_sec`), or 2 minutes if nobody else has joined yet.
    - The agent can leave with `meeting_leave`.
    - On leaving, `bosun:meeting-ended` carries `meeting_id`, `reason`, `duration_s`, `bytes` and the `recording`:
-     path, a `file://` URI and size. The payload also has it as an MCP `resource_link`.
+     path (inside the browser container), size and the hint `call recording_get { meeting_id }`. There is no `file://`
+     link: an agent host refuses it, and nothing outside the container can open it. `meeting_status` (ended) has the
+     same `path` and hint.
 
 **Signed-in profile.** Google turns away anonymous automated guests far more often than signed-in users, and Zoom
-admits almost no anonymous browser guests at all.
+may turn anonymous browser guests away (it admitted them in our tests, but a profile is the dependable way in).
 - **Setup:** `session_open({ "profile": "google" })`, `navigate` to `https://accounts.google.com` (Zoom:
   `https://zoom.us/signin`), `request_human` so a person signs in, `session_close`.
 - **Joining:** `meeting_join({ "url": "…", "profile": "google" })` or `{ …, "profile": "zoom" }`.
@@ -799,6 +836,8 @@ recording`, `bitte nicht aufnehmen`, `не записуй`, `не записыв
 
 **Recordings:** `BROWSER_DATA/recordings/<tenant>/<meeting_id>.ogg`, mode 0600, Ogg/Opus 16 kHz mono 24 kbps (about
 11 MB per hour). They are deleted after `RECORDING_RETENTION_DAYS` (default 30), or with `meeting_recording_delete`.
+The agent gets one with `recording_get` (see *Mode 1*), after the meeting ended or the recording was stopped without `delete`.
+A deletion leaves an empty marker `<meeting_id>.deleted` beside it, for the same retention period.
 Chat text is kept only in memory, for the last 50 meetings.
 
 ### Live transcript and speaking

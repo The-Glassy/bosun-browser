@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.18.1: recording_get, and two modes in the docs
+
+A tenant's agent could not get its own meeting recording. `bosun:meeting-ended` and `meeting_status` gave a path and a
+`file://` URI inside the browser container, which an agent host refuses ("scheme not allowed") and cannot reach. It
+never worked: the `file://` link was added with the first meetings commit (0.9 PoC, `b0e2c4d`, 2026-10-19) and nothing
+has ever served a recording. This release does.
+
+### Added
+
+- **`recording_get { meeting_id }`** returns a one-time GET URL (`/recording/<meeting_id>?t=…` on the MCP port, valid
+  `DOWNLOAD_URL_TTL_SEC`, 15 min) and a ready `curl -o` line, for the calling tenant's own recording.
+  - Another tenant's meeting, an unknown id and a malformed id all answer `no recording for meeting …`. Presenting the
+    URL with another tenant's token is refused (403) and does not spend it.
+  - Refused while the recording is still being written (the meeting is recording), and once it is deleted (opt-out,
+    `meeting_stop_recording`, `meeting_recording_delete`). A URL issued before the deletion stops working, and a
+    transfer in progress is cut off.
+  - The URL is spent by its first use; a new `recording_get` replaces it. The file stays (retention applies), unlike a
+    download. Works for recordings of earlier runs of the service too (looked up by tenant and id).
+  - Allowed for read-only (`ephemeral`) tokens. No inline mode (audio).
+  - A deletion unlinks the file before it stops the recorder and leaves a marker `<meeting_id>.deleted` next to it
+    (removed after `RECORDING_RETENTION_DAYS`). A file of an earlier run that reappeared under a marked id (a late
+    recorder after a crash) is never served and the sweep removes it. A file of an earlier run that changed in the last
+    minute is not served yet.
+  - The retention sweep and every deletion also cut a URL out for that recording and a transfer under way.
+- README, Meetings: two explicit modes (**notetaker**: record only, no ElevenLabs key, no voice, microphone never
+  unmuted; **participant**: live transcript and speech, needs `ELEVENLABS_API_KEY` for the live transcript), and a
+  table of which tool belongs to which.
+
+### Changed
+
+- `bosun:meeting-ended` and `meeting_status` (ended) keep `path` and add the hint `call recording_get { meeting_id }`.
+  The `file://` `uri` and the MCP `resource_link` are gone: they advertised a URI nobody could fetch.
+- The README no longer says Zoom usually turns guests away; it may (it admitted guests in our tests). The same in the
+  `meeting_join` description and the signed-out warning.
+
+### Tests
+
+- `test/recording-get.test.mjs`: the notetaker flow with no ElevenLabs key against the stand-ins (join, record, leave,
+  `recording_get`, download, ffprobe: Opus, mono, duration), one-time use, expiry, tenant isolation, in progress
+  refused, deleted refused (also a URL out at the time), an earlier run's file, a read-only token, meetings off.
+
 ## 0.18.0: a drafted first sentence at the end of the turn; speculative channel speech
 
 Both are off by default. A tenant turns them on in its speech settings, or `meeting_join` turns them on for one
