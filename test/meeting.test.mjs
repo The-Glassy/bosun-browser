@@ -75,7 +75,8 @@ test('join as a guest: mic and camera off, name, ask to join; waiting until admi
     assert.ok(e.bytes > 4);
     assert.equal(e.recording.path, s.recording.path);
     assert.equal(e.recording.bytes, e.bytes);
-    assert.match(e.recording.uri, /^file:\/\/.*\.ogg$/);
+    assert.equal(e.recording.uri, undefined); // a file:// URI inside the container can't be fetched by anyone
+    assert.match(e.recording.next, /recording_get/);
     assert.equal(audio.recorders[0].killed, false); // stopped cleanly, file finalized
     assert.equal(svc.manager.used, 0);
     await Promise.all([b.close(), c2.close()]);

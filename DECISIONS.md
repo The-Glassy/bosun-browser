@@ -2,6 +2,27 @@
 
 Decisions made without asking (Misha: "use your judgment and decide yourself"), with the reason. Newest first.
 
+## 0.18.1 (2026-10-30): recording_get
+
+- **It never worked, so there was no regression to fix.** The `file://` URI and the MCP `resource_link` were added in
+  the first meetings commit (`b0e2c4d`, 2026-10-19) and are unchanged since; no tool or route ever served a recording.
+  Speaking (0.15) did not break anything here. It was only noticed now, because passive notetaker agents need the file.
+- **A route of its own, `/recording/<meeting_id>`, not `/download/<id>`.** A recording is not a download: it lives on
+  in `BROWSER_DATA/recordings` (retention, not "gone once fetched"), it exists for tenants that have no download hosts,
+  and its owner is looked up by tenant and meeting id, also after a restart. It shares the port, the token binding,
+  the TTL (`DOWNLOAD_URL_TTL_SEC`), the one-time rule and the per-tenant cap of four transfers with downloads.
+- **The URL secret is required; a bearer token alone is not enough.** `/download/` accepts either. For audio of a
+  meeting, the one-time URL is the credential; a token, if sent, must belong to the same tenant.
+- **The file is looked up again at fetch time.** A recording deleted after the URL was issued (an opt-out is the case
+  that matters) must not be served: the delete paths revoke the link and abort a transfer under way.
+- **The fetch does not delete the file.** The agent may need it again (a failed transcription); the retention sweep
+  (30 days) and `meeting_recording_delete` remain the ways it goes.
+- **Allowed while the meeting goes on if recording was stopped without delete.** The file is finished then.
+- **Read-only tokens may call it** (the brief). A read-only tenant cannot join meetings, so it can only ever get a
+  file under its own tenant name; another tenant's answer is the same as for an id that never existed.
+- **No `file://` replacement.** Dropped from the event and from `meeting_status`; the hint to call `recording_get`
+  replaces it. The `path` stays (it is where the file is, for logs and for stdio use, where `recording_get` returns it).
+
 ## 0.18.0 (2026-10-30): drafts and speculative speech
 
 - **A "not" or "but" among the new words drops the draft, however few words came.** The brief's rule is "at most

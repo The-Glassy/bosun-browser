@@ -13,7 +13,6 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { pathToFileURL } from 'url';
 import { httpUrl } from '../sessions.mjs';
 import { readProfileMeta } from '../engines.mjs';
 import { TENANT_RE } from '../auth.mjs';
@@ -26,6 +25,7 @@ import { LiveTranscript, TranscriptUsage, nodeDebugOn, NODE_DEBUG_REFUSED } from
 import { synthesizeWav, splitSpeech, takeSentences, probeSeconds, audioFormat } from './speech.mjs';
 import { SpeechSettings, SETTINGS, PER_CALL } from './settings.mjs';
 import { CHANNEL_PREFIX } from '../events.mjs';
+import { RecordingLinks } from './recording-links.mjs';
 
 export const ID_RE = /^m[0-9a-f]{12}$/;
 export const ANNOUNCE_MODES = ['chat', 'host', 'none'];
@@ -213,12 +213,14 @@ export class Meetings {
     this.settings = new SpeechSettings(cfg);
     this.ackCache = new Map(); // acknowledgement clips: JSON [tts, phrase] -> {text, clip, error, failedAt}
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    this.links = new RecordingLinks({ cfg, resolve: (tenant, id) => this.recordingFile(tenant, id).file });
     this.sweep();
     this.sweeper = setInterval(() => this.sweep(), 3_600_000);
     this.sweeper.unref();
   }
 
   sweep() {
+    this.links.sweep();
     const keep = new Set([...this.active.values()].filter((m) => m.rec).map((m) => m.file));
     return sweepRecordings(this.dir, this.cfg.recordingRetentionDays, { now: this.now(), keep });
   }
@@ -1493,6 +1495,7 @@ export class Meetings {
     }
     let bytes = null;
     if (del && m.file) {
+      this.links.revoke(m.id);
       fs.rmSync(m.file, { force: true });
       m.deleted = true;
       m.file = null;
@@ -1541,7 +1544,7 @@ export class Meetings {
       this.emit(m, 'ended', {
         reason, ...(m.error ? { error: m.error } : {}),
         duration_s: Math.round(((m.endedAt - (m.admittedAt ?? m.endedAt))) / 1000),
-        recording: m.file && bytes ? { path: m.file, uri: pathToFileURL(m.file).href, bytes, mime_type: 'audio/ogg', seconds: Math.round(m.recMs / 1000) } : null,
+        recording: m.file && bytes ? { path: m.file, bytes, mime_type: 'audio/ogg', seconds: Math.round(m.recMs / 1000), next: `call recording_get { meeting_id: "${m.id}" }` } : null,
         bytes,
       });
     })();
@@ -1557,7 +1560,7 @@ export class Meetings {
       ...(m.info.warning ? { warning: m.info.warning } : {}),
       ...(m.reason ? { reason: m.reason } : {}), ...(m.error ? { error: m.error } : {}),
       participants: m.participants, recording_seconds: Math.round(recMs / 1000),
-      recording: m.file ? { path: m.file, bytes } : m.deleted ? 'deleted' : null,
+      recording: m.file ? { path: m.file, bytes, ...(m.state === 'ended' && bytes ? { next: `call recording_get { meeting_id: "${m.id}" }` } : {}) } : m.deleted ? 'deleted' : null,
       ...(m.recError ? { recording_error: m.recError } : {}),
       ...(m.optedOut ? { opted_out: { sender: m.optedOut.sender, at: m.optedOut.at } } : {}),
       announce: { mode: m.announceMode, sent_to: m.announced.sent_to, ...(m.announced.failures.length ? { reason: m.announced.failures[0].reason, failures: m.announced.failures } : {}) },
@@ -2009,6 +2012,26 @@ export class Meetings {
     return this.view(m);
   }
 
+  // The finished recording of the tenant's meeting (also one of an earlier run, not in memory any more): its file and
+  // size. Not another tenant's, not while it is being written, not a deleted one.
+  recordingFile(tenant, id) {
+    if (!ID_RE.test(String(id))) throw new Error(`no recording for meeting ${id}`);
+    const m = this.active.get(id) || this.ended.get(id);
+    if (m && m.tenant !== tenant) throw new Error(`no recording for meeting ${id}`);
+    if (m && (m.rec || m.stopping) && this.active.has(id)) throw new Error(`meeting ${id} is still recording; call recording_get once it has ended (meeting_leave) or its recording was stopped without delete`);
+    if (m?.deleted) throw new Error(`the recording of meeting ${id} was deleted`);
+    const file = this.file(tenant, id);
+    const bytes = fs.statSync(file, { throwIfNoEntry: false })?.size ?? 0;
+    if (!bytes) throw new Error(`no recording for meeting ${id}`);
+    return { file, bytes, seconds: m ? Math.round(m.recMs / 1000) : null };
+  }
+
+  // recording_get: a one-time GET URL for the recording.
+  recordingGet(tenant, id) {
+    const r = this.recordingFile(tenant, id);
+    return { ...r, secret: this.links.issue(tenant, id) };
+  }
+
   // Deletes a recording: a meeting still recording stops first. Works for recordings of earlier runs too.
   async deleteRecording(tenant, id) {
     if (!ID_RE.test(String(id))) throw new Error(`no meeting ${id}`);
@@ -2019,6 +2042,7 @@ export class Meetings {
     if (m && (m.rec || m.stopping)) { m.noRecord = true; return { ...(await this.stopRecording(m, { del: true })), meeting_id: id }; }
     const f = this.file(tenant, id);
     const existed = fs.existsSync(f);
+    this.links.revoke(id);
     fs.rmSync(f, { force: true });
     if (m && m.file === f) { m.file = null; m.deleted = true; }
     if (!existed && !m) throw new Error(`no recording for meeting ${id}`);

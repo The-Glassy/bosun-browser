@@ -423,10 +423,10 @@ async function putFiles(page, l, paths, method, { mainWorld = false, until = Dat
 }
 
 // The tools a token with policy "ephemeral" may call: ephemeral sessions and page tools. No profiles, keepalive,
-// meetings or handoff.
+// meetings or handoff. recording_get only reads: a URL for the token's own recording.
 // Macros: list, get and run (the steps are held to the same set), but not save or delete.
 export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for', 'screenshot', 'sessions',
-  'macro_list', 'macro_get', 'macro_run', 'speech_settings_get']);
+  'macro_list', 'macro_get', 'macro_run', 'speech_settings_get', 'recording_get']);
 
 export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn = { inflight: 0 }, uploadBase = null }) {
   const ephemeral = policy === 'ephemeral';
@@ -438,7 +438,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.18.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.18.1' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -853,7 +853,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const meetings = manager.meetings;
   if (meetings) {
     const mid = { meeting_id: z.string().max(20) };
-    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom refuses most guests). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. announce: "chat" (default) posts to everyone; where the host allows chat with the host only, to the host instead; if neither works it records anyway and says so (meeting_status announce.sent_to "failed", a bosun:meeting-announce event). "host" posts to the host only. "none" posts nothing and records without any announcement: use it only when the meeting owner told you so; you are then responsible for everyone knowing they are recorded. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or everyone else has left (after alone_leave_sec, default 30; 2 min while nobody else has joined yet); then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. live_transcript=true: the audio is also transcribed as it is spoken (ElevenLabs realtime; starts and stops with the recording, under the same announcement, which then says so; an opt-out stops both), as bosun:meeting-transcript events and meeting_transcript. Otherwise transcription is up to you, after the meeting. Once in, you can speak (meeting_speak), mute (meeting_mute) and raise a hand (meeting_raise_hand): when to do so is your call. Where your host grants MCPL channels, the meeting is also a channel bosun:meeting:<id> once the announcement is out: live transcript finals arrive on it (with speaker when the page shows who speaks), and text you publish to it (channel_publish) is spoken at once, sentence by sentence (speech settings: meeting_channel, transcript_events, agent_partials, ack_on_final). dry_run=true only checks the lobby (nothing is joined).',
+    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom may turn a guest away). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. announce: "chat" (default) posts to everyone; where the host allows chat with the host only, to the host instead; if neither works it records anyway and says so (meeting_status announce.sent_to "failed", a bosun:meeting-announce event). "host" posts to the host only. "none" posts nothing and records without any announcement: use it only when the meeting owner told you so; you are then responsible for everyone knowing they are recorded. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or everyone else has left (after alone_leave_sec, default 30; 2 min while nobody else has joined yet); then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. live_transcript=true: the audio is also transcribed as it is spoken (ElevenLabs realtime; starts and stops with the recording, under the same announcement, which then says so; an opt-out stops both), as bosun:meeting-transcript events and meeting_transcript. Otherwise (the notetaker mode, no ElevenLabs key needed, the microphone is never unmuted) transcription is up to you: after the meeting call recording_get for the audio file. Once in, you can speak (meeting_speak), mute (meeting_mute) and raise a hand (meeting_raise_hand): when to do so is your call. Where your host grants MCPL channels, the meeting is also a channel bosun:meeting:<id> once the announcement is out: live transcript finals arrive on it (with speaker when the page shows who speaks), and text you publish to it (channel_publish) is spoken at once, sentence by sentence (speech settings: meeting_channel, transcript_events, agent_partials, ack_on_final). dry_run=true only checks the lobby (nothing is joined).',
       { url: z.string().max(2048).url().describe('https://meet.google.com/abc-defg-hij or https://zoom.us/j/<id>?pwd=… (any *.zoom.us, /w/ and /wc/ links too)'), name: str(60).optional().describe('display name for a guest (default "Glassy (notetaker)"); a signed-in profile joins under the account name'),
         announce_text: str(1000).optional(),
         announce: z.enum(ANNOUNCE_MODES).optional().describe('who is told about the recording in the chat before it starts: "chat" (default: everyone, else the host), "host" (the host only), "none" (nobody; only when the meeting owner told you so). Opt-outs in the chat are heard in every mode'),
@@ -919,6 +919,19 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     tool('meeting_stop_recording', 'Stop recording (delete=true, default: also delete the file); a live transcript stops too (delete: its text is forgotten). The meeting goes on unrecorded.', { ...mid, delete: z.boolean().optional() },
       async (a) => ok(await meetings.stopRecordingTool(tenant, a.meeting_id, a.delete ?? true)));
     tool('meeting_leave', 'Leave the meeting; the recording is finished and kept (bosun:meeting-ended).', mid, async (a) => ok(await meetings.leave(tenant, a.meeting_id)));
+    tool('recording_get', `Fetch the audio recording of one of your meetings (Ogg/Opus, mono): returns a one-time GET URL (valid ${Math.round(cfg.downloadUrlTtlMs / 60000)} min, this token only) and a ready curl -o line; transcribe the file with any tool. Only once the recording is finished (the meeting ended, or meeting_stop_recording with delete=false) and not deleted. The file is kept (deleted after ${cfg.recordingRetentionDays ?? 30} days or with meeting_recording_delete); call recording_get again for a new URL.`,
+      mid, async (a) => {
+        const r = meetings.recordingGet(tenant, a.meeting_id);
+        const meta = { meeting_id: a.meeting_id, filename: `${a.meeting_id}.ogg`, size: r.bytes, mime: 'audio/ogg', ...(r.seconds ? { seconds: r.seconds } : {}) };
+        if (!cfg.ws) return ok({ ...meta, path: r.file, note: 'no MCP port (stdio): read the file at path' });
+        const where = `/recording/${a.meeting_id}?t=${r.secret}`;
+        const url = uploadBase ? `${uploadBase}${where}` : null;
+        return ok({
+          ...meta, get_url: url ?? where, ...(url ? {} : { get_url_note: 'GET from the host:port of your MCP URL, http, with this path' }),
+          curl: `curl -sS --fail-with-body -o ${shq(meta.filename)} ${shq(url ?? `http://<mcp host:port>${where}`)}`,
+          valid_min: Math.round(cfg.downloadUrlTtlMs / 60000), next: 'GET it once (curl), then transcribe it; call recording_get again for another URL',
+        });
+      });
     tool('meeting_recording_delete', `Delete a meeting's recording and its live transcript (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
       async (a) => ok(await meetings.deleteRecording(tenant, a.meeting_id)));
   }
