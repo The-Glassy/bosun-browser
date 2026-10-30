@@ -53,6 +53,17 @@ async function withService(fn, env = {}) {
   try { return await fn(svc); } finally { await svc.stop(); }
 }
 
+// A recording of an earlier run of the service (not in memory), last written `ageMin` minutes ago.
+function earlierRun(svc, tenant, id, ageMin = 10) {
+  const dir = path.join(svc.dataDir, 'recordings', tenant);
+  fs.mkdirSync(dir, { recursive: true });
+  const f = path.join(dir, `${id}.ogg`);
+  fs.copyFileSync(ogg, f);
+  const t = new Date(Date.now() - ageMin * 60_000);
+  fs.utimesSync(f, t, t);
+  return f;
+}
+
 const get = (url, headers = {}) => new Promise((resolve, reject) => {
   http.get(url, { headers }, (res) => {
     const parts = [];
@@ -229,8 +240,7 @@ test('a recording of an earlier run (meeting no longer in memory) is fetched by 
     const c = await connect(svc);
     const id = 'mfad1e5795d34';
     const dir = path.join(svc.dataDir, 'recordings', 'alice');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.copyFileSync(ogg, path.join(dir, `${id}.ogg`));
+    earlierRun(svc, 'alice', id);
     const g = await c.call('recording_get', { meeting_id: id });
     assert.equal(g.isError, false, g.text);
     assert.equal((await get(g.json().get_url)).body.length, fs.statSync(ogg).size);
@@ -240,6 +250,81 @@ test('a recording of an earlier run (meeting no longer in memory) is fetched by 
     }
     fs.writeFileSync(path.join(dir, 'm111111111111.ogg'), '');
     assert.match((await c.call('recording_get', { meeting_id: 'm111111111111' })).text, /no recording/);
+    await c.close();
+  });
+});
+
+test('a file of an earlier run that changed a moment ago may still be written by an orphaned recorder: refused until it is quiet', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    earlierRun(svc, 'alice', 'm222222222222', 0);
+    const r = await c.call('recording_get', { meeting_id: 'm222222222222' });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /written to a moment ago/);
+    earlierRun(svc, 'alice', 'm222222222222', 2);
+    assert.equal((await c.call('recording_get', { meeting_id: 'm222222222222' })).isError, false);
+    await c.close();
+  });
+});
+
+test('another tenant deleting an id it does not own does not cut alice\'s URL or transfer', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc), b = await connect(svc, TOKEN_B);
+    const id = 'm333333333333';
+    earlierRun(svc, 'alice', id);
+    const url = (await c.call('recording_get', { meeting_id: id })).json().get_url;
+    const r = await b.call('meeting_recording_delete', { meeting_id: id });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /no recording for meeting/);
+    assert.equal((await get(url)).status, 200); // alice's URL still works
+    // The same through the links object directly: a revoke by bob names bob's tenant only.
+    const url2 = (await c.call('recording_get', { meeting_id: id })).json().get_url;
+    svc.manager.meetings.links.revoke('bob', id);
+    assert.equal((await get(url2)).status, 200);
+    await Promise.all([c.close(), b.close()]);
+  });
+});
+
+test('the retention sweep deleting a recording kills its URL (and a transfer of it)', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    const id = 'm444444444444';
+    const f = earlierRun(svc, 'alice', id, 31 * 24 * 60);
+    const url = (await c.call('recording_get', { meeting_id: id })).json().get_url;
+    assert.deepEqual(svc.manager.meetings.sweep(), [f]);
+    assert.equal(fs.existsSync(f), false);
+    assert.equal((await get(url)).status, 404);
+    assert.match((await c.call('recording_get', { meeting_id: id })).text, /no recording for meeting/);
+    await c.close();
+  });
+});
+
+test('a transfer under way is cut off when the recording is deleted', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    const id = 'm555555555555';
+    const f = earlierRun(svc, 'alice', id);
+    fs.appendFileSync(f, Buffer.alloc(8 * 1024 * 1024, 5)); // big enough that the socket buffers do not take it all
+    const t = new Date(Date.now() - 10 * 60_000);
+    fs.utimesSync(f, t, t);
+    const url = (await c.call('recording_get', { meeting_id: id })).json().get_url;
+    const got = await new Promise((resolve) => {
+      let n = 0;
+      const req = http.get(url, (res) => {
+        res.pause();
+        setTimeout(async () => {
+          await c.call('meeting_recording_delete', { meeting_id: id });
+          res.on('data', (d) => { n += d.length; });
+          res.on('close', () => resolve({ n, complete: res.complete }));
+          res.on('error', () => {});
+          res.resume();
+        }, 300);
+      });
+      req.on('error', () => resolve({ n, complete: false }));
+    });
+    assert.equal(got.complete, false);
+    assert.ok(got.n < 8 * 1024 * 1024);
+    assert.equal(svc.manager.meetings.links.transfers.size, 0);
     await c.close();
   });
 });
@@ -256,9 +341,7 @@ test('a read-only (ephemeral) token lists recording_get and may call it; it only
     assert.match(r.text, /no recording for meeting/);
     assert.doesNotMatch(r.text, /not allowed for this token/);
     // Its own tenant's file (one that exists on disk) is served.
-    const dir = path.join(svc.dataDir, 'recordings', 'swarm');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.copyFileSync(ogg, path.join(dir, 'maaaaaaaaaaaa.ogg'));
+    earlierRun(svc, 'swarm', 'maaaaaaaaaaaa');
     const mine = await e.call('recording_get', { meeting_id: 'maaaaaaaaaaaa' });
     assert.equal(mine.isError, false, mine.text);
     assert.equal((await get(mine.json().get_url)).status, 200);

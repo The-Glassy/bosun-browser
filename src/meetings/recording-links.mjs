@@ -26,10 +26,11 @@ export class RecordingLinks {
     return secret;
   }
 
-  // The recording is gone (deleted): no URL works any more and a transfer under way is cut off.
-  revoke(id) {
-    this.links.delete(id);
-    for (const t of this.transfers) if (t.id === id) t.abort();
+  // The tenant's recording is gone (deleted): no URL works any more and a transfer under way is cut off. Another
+  // tenant's links and transfers are not touched, whatever id it names.
+  revoke(tenant, id) {
+    if (this.links.get(id)?.tenant === tenant) this.links.delete(id);
+    for (const t of this.transfers) if (t.id === id && t.tenant === tenant) t.abort();
   }
 
   sweep(now = Date.now()) {
