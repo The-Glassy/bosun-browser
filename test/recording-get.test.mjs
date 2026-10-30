@@ -329,6 +329,31 @@ test('a transfer under way is cut off when the recording is deleted', async () =
   });
 });
 
+test('a deletion leaves a marker: a file that comes back under the id (a late recorder) is never served and the sweep removes it', async () => {
+  await withService(async (svc) => {
+    const c = await connect(svc);
+    const id = 'm666666666666';
+    const f = earlierRun(svc, 'alice', id);
+    assert.equal((await c.call('meeting_recording_delete', { meeting_id: id })).isError, false);
+    assert.equal(fs.existsSync(f), false);
+    assert.equal(fs.existsSync(f.replace(/\.ogg$/, '.deleted')), true);
+    earlierRun(svc, 'alice', id); // the recorder opens its output only now
+    const r = await c.call('recording_get', { meeting_id: id });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /was deleted/);
+    assert.deepEqual(svc.manager.meetings.sweep(), [f]);
+    assert.equal(fs.existsSync(f), false);
+    assert.equal(fs.existsSync(f.replace(/\.ogg$/, '.deleted')), true); // kept for the retention period
+    // Opt-out of a live recording leaves the marker too, and no URL for it.
+    const { id: live } = await recording(svc, c);
+    assert.equal((await c.call('meeting_stop_recording', { meeting_id: live, delete: true })).isError, false);
+    assert.equal(fs.existsSync(path.join(svc.dataDir, 'recordings', 'alice', `${live}.deleted`)), true);
+    assert.equal(fs.existsSync(path.join(svc.dataDir, 'recordings', 'alice', `${live}.ogg`)), false);
+    await c.call('meeting_leave', { meeting_id: live });
+    await c.close();
+  });
+});
+
 test('a read-only (ephemeral) token lists recording_get and may call it; it only ever sees its own tenant', async () => {
   assert.ok(EPHEMERAL_TOOLS.has('recording_get'));
   await withService(async (svc) => {

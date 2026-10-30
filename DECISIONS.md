@@ -20,6 +20,18 @@ Decisions made without asking (Misha: "use your judgment and decide yourself"), 
 - **Allowed while the meeting goes on if recording was stopped without delete.** The file is finished then.
 - **Read-only tokens may call it** (the brief). A read-only tenant cannot join meetings, so it can only ever get a
   file under its own tenant name; another tenant's answer is the same as for an id that never existed.
+- **A deletion is unlinked first, and leaves a marker (`<meeting_id>.deleted`).** Codex found that a crash between
+  "stop the recorder" and "unlink" (or a recorder that opens its output only after the unlink) could bring an opted-out
+  recording back, because a restarted service finds files on disk. Now the marker is written, the file unlinked, and only
+  then the recorder killed (ffmpeg holds its output by file descriptor, so it keeps writing to nothing). `recordingFile`
+  refuses a marked id and the sweep removes any file that reappeared under it; the marker itself goes after
+  `RECORDING_RETENTION_DAYS`.
+- **Accepted (Codex round 2, P2): a file of an earlier run is served once it has been quiet for 60 s,** with no proof that
+  its recorder is gone. A completion marker would lock out every recording made before 0.18.1 (the one this release is
+  for among them). An orphaned ffmpeg cannot outlive the service here: the unit uses the default
+  `KillMode=control-group` and Bosun spawns ffmpeg undetached, so systemd ends it with the service.
+- **Two Codex rounds, as the brief allows.** Round 1: one P1, two P2, all fixed. Round 2: one P1 (the marker above) and
+  the P2 above; no third round.
 - **No `file://` replacement.** Dropped from the event and from `meeting_status`; the hint to call `recording_get`
   replaces it. The `path` stays (it is where the file is, for logs and for stdio use, where `recording_get` returns it).
 

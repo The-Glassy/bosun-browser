@@ -190,6 +190,16 @@ export function sweepRecordings(dir, days, { now = Date.now(), keep = new Set() 
     try { files = fs.readdirSync(path.join(dir, t)); } catch { continue; }
     for (const f of files) {
       const p = path.join(dir, t, f);
+      // A deletion marker (see Meetings.forget): a file that came back under its name is removed (a recorder that opened
+      // it after the unlink), and the marker itself goes once no copy of the recording could be left.
+      if (/^m[0-9a-f]{12}\.deleted$/.test(f)) {
+        const ogg = p.replace(/\.deleted$/, '.ogg');
+        try {
+          if (!keep.has(ogg) && fs.existsSync(ogg)) { fs.rmSync(ogg, { force: true }); removed.push(ogg); }
+          if (!keep.has(ogg) && now - fs.statSync(p).mtimeMs > days * 86_400_000) fs.rmSync(p, { force: true });
+        } catch {}
+        continue;
+      }
       if (!/^m[0-9a-f]{12}\.ogg$/.test(f) || keep.has(p)) continue;
       try { if (now - fs.statSync(p).mtimeMs > days * 86_400_000) { fs.rmSync(p, { force: true }); removed.push(p); } } catch {}
     }
@@ -230,6 +240,16 @@ export class Meetings {
   }
 
   file(tenant, id) { return path.join(this.dir, tenant, `${id}.ogg`); }
+
+  // Deletes a recording for good. The marker is written first and stays (RECORDING_RETENTION_DAYS): a recorder that
+  // opens its file only after the unlink, or a crash before it is stopped, cannot bring the recording back, because
+  // recordingFile refuses a marked id and the sweep removes what reappeared under it.
+  forget(tenant, id) {
+    const f = this.file(tenant, id);
+    fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(f.replace(/\.ogg$/, '.deleted'), '', { mode: 0o600 });
+    fs.rmSync(f, { force: true });
+  }
 
   emit(m, kind, data) {
     Promise.resolve().then(() => this.bus?.meeting(kind, { tenant: m.tenant, meeting_id: m.id, platform: m.platform.name, ...data })).catch(() => {});
@@ -1497,7 +1517,7 @@ export class Meetings {
     // file for the next run to serve (recordingFile looks at the disk).
     if (del && m.file) {
       this.links.revoke(m.tenant, m.id);
-      fs.rmSync(m.file, { force: true });
+      this.forget(m.tenant, m.id);
       m.deleted = true;
       m.file = null;
     }
@@ -2026,8 +2046,8 @@ export class Meetings {
     const m = this.active.get(id) || this.ended.get(id);
     if (m && m.tenant !== tenant) throw new Error(`no recording for meeting ${id}`);
     if (m && (m.rec || m.stopping) && this.active.has(id)) throw new Error(`meeting ${id} is still recording; call recording_get once it has ended (meeting_leave) or its recording was stopped without delete`);
-    if (m?.deleted) throw new Error(`the recording of meeting ${id} was deleted`);
     const file = this.file(tenant, id);
+    if (m?.deleted || fs.existsSync(file.replace(/\.ogg$/, '.deleted'))) throw new Error(`the recording of meeting ${id} was deleted`);
     const st = fs.statSync(file, { throwIfNoEntry: false });
     if (!st?.size) throw new Error(`no recording for meeting ${id}`);
     // Not in memory (a run before a restart): the file may still be written by a recorder that outlived Bosun.
@@ -2052,7 +2072,8 @@ export class Meetings {
     const f = this.file(tenant, id);
     const existed = fs.existsSync(f);
     if (existed || m) this.links.revoke(tenant, id); // only the tenant's own
-    fs.rmSync(f, { force: true });
+    if (existed) this.forget(tenant, id);
+    else fs.rmSync(f, { force: true });
     if (m && m.file === f) { m.file = null; m.deleted = true; }
     if (!existed && !m) throw new Error(`no recording for meeting ${id}`);
     return { meeting_id: id, deleted: existed };

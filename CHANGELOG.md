@@ -19,6 +19,11 @@ has ever served a recording. This release does.
   - The URL is spent by its first use; a new `recording_get` replaces it. The file stays (retention applies), unlike a
     download. Works for recordings of earlier runs of the service too (looked up by tenant and id).
   - Allowed for read-only (`ephemeral`) tokens. No inline mode (audio).
+  - A deletion unlinks the file before it stops the recorder and leaves a marker `<meeting_id>.deleted` next to it
+    (removed after `RECORDING_RETENTION_DAYS`). A file of an earlier run that reappeared under a marked id (a late
+    recorder after a crash) is never served and the sweep removes it. A file of an earlier run that changed in the last
+    minute is not served yet.
+  - The retention sweep and every deletion also cut a URL out for that recording and a transfer under way.
 - README, Meetings: two explicit modes (**notetaker**: record only, no ElevenLabs key, no voice, microphone never
   unmuted; **participant**: live transcript and speech, needs `ELEVENLABS_API_KEY` for the live transcript), and a
   table of which tool belongs to which.

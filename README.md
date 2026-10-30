@@ -837,6 +837,7 @@ recording`, `bitte nicht aufnehmen`, `не записуй`, `не записыв
 **Recordings:** `BROWSER_DATA/recordings/<tenant>/<meeting_id>.ogg`, mode 0600, Ogg/Opus 16 kHz mono 24 kbps (about
 11 MB per hour). They are deleted after `RECORDING_RETENTION_DAYS` (default 30), or with `meeting_recording_delete`.
 The agent gets one with `recording_get` (see *Mode 1*), after the meeting ended or the recording was stopped without `delete`.
+A deletion leaves an empty marker `<meeting_id>.deleted` beside it, for the same retention period.
 Chat text is kept only in memory, for the last 50 meetings.
 
 ### Live transcript and speaking

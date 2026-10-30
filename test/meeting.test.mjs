@@ -166,7 +166,8 @@ test('opt-out in natural language: the recording stops and is deleted at once, c
     const s = await status(c, id);
     assert.deepEqual([s.state, s.recording, s.opted_out.sender], ['ended', 'deleted', 'Alex Example']);
     assert.ok(fake.room(code).left);
-    assert.equal(fs.readdirSync(path.join(svc.dataDir, 'recordings', 'alice')).length, 0);
+    // No audio is left, only the marker that keeps a recorder's late file from coming back (Meetings.forget).
+    assert.deepEqual(fs.readdirSync(path.join(svc.dataDir, 'recordings', 'alice')).filter((f) => !f.endsWith('.deleted')), []);
     await c.close();
   });
 });
