@@ -10,6 +10,7 @@ import { startBosun, connect, until, sleep } from './helpers.mjs';
 import { startFakeMeet, fakeAudio } from './fakemeet.mjs';
 import { startFakeElevenLabs, tonePcm } from './fakeelevenlabs.mjs';
 import { meet } from '../src/meetings/platforms/meet.mjs';
+import { afterPrefix } from '../src/meetings/index.mjs';
 import { MEETING_SET } from '../src/events.mjs';
 
 let fake, el;
@@ -71,6 +72,15 @@ async function admitted(c, more = {}) {
   return { id, code, chId: `bosun:meeting:${id}` };
 }
 const mics = (code) => fake.room(code).media.filter((m) => 'mic' in m).map((m) => m.mic);
+
+test('afterPrefix: where a text goes on after the sentences a stream said already', () => {
+  assert.equal(afterPrefix('The budget is fine. It was approved.', 'the budget is FINE'), 'The budget is fine. '.length);
+  assert.equal(afterPrefix('Yes, absolutely. More.', 'Yes.'), 'Yes, '.length);
+  assert.equal(afterPrefix('The budget is fine.', 'The budget is fine.'), 'The budget is fine.'.length);
+  assert.equal(afterPrefix('The budgets are fine.', 'The budget is fine.'), -1);
+  assert.equal(afterPrefix('The budget', 'The budget is fine.'), -1);
+  assert.equal(afterPrefix('Anything', ''), 0);
+});
 
 test('the channel declares streaming {speculative: true} only with speculative_speech (tenant, or meeting_join for one meeting)', async () => {
   await withService(async (svc) => {
@@ -247,23 +257,24 @@ test('a barge-in stops speculative speech; the stream says nothing more and its 
   });
 });
 
-test('with a spoken draft, a stream that starts with the drafted sentence skips it; speculative_speech off: speculative chunks are never spoken', async () => {
+test('a stream answering a turn is said once, whole (the final carries nothing about drafts); speculative_speech off: speculative chunks are never spoken', async () => {
   await withService(async (svc, ev, audio) => {
     const c = await host(svc);
-    await c.call('speech_settings_set', { speculative_speech: true, draft_enabled: true, transcript_events: 'always', turn_hold_ms: 300, turn_hold_complete_ms: 300 });
+    await c.call('speech_settings_set', { speculative_speech: true, transcript_events: 'always', turn_hold_ms: 300, turn_hold_complete_ms: 300 });
     const { id, chId } = await admitted(c);
     const n0 = el.st.speech.length;
     phrases('Is the plan ready for review?');
     audio.say(tonePcm(3.5));
-    await until(() => ev.transcript.some((x) => !x.final && x.text.split(' ').length >= 5), 15_000);
-    await c.call('meeting_draft', { meeting_id: id, text: 'Yes, it is ready.', ready: true });
     await until(() => c.finals().length === 1, 15_000);
-    assert.equal(c.finals()[0].metadata.draft, 'spoken');
+    const f = c.finals()[0];
+    assert.equal(f.content.length, 1);
+    assert.ok(!Object.keys(f.metadata).some((k) => k.startsWith('draft')), JSON.stringify(f.metadata));
+    assert.ok(!f.tags.some((t) => t.startsWith('bosun:draft')));
     const s = c.stream(chId, 'call_d');
     await s.chunk('Yes, it is ready. The review can start tomorrow. ');
     const r = await c.publish(chId, 'Yes, it is ready. The review can start tomorrow.', { streamId: 'call_d' });
     assert.equal(r.spoken, 'settled');
-    assert.equal(r.draft_prefix_skipped, true);
+    assert.equal(r.draft_prefix_skipped, undefined);
     await s.complete('Yes, it is ready. The review can start tomorrow.');
     await until(() => ev.speech.length === 1, 20_000);
     assert.deepEqual(synthesized(n0), ['Yes, it is ready.', 'The review can start tomorrow.']);
@@ -346,24 +357,20 @@ test('review fixes: a cancel while the first sentence is synthesized mutes at on
   });
 });
 
-test('review fixes: the drafted sentence is skipped when the stream settles with it (no space after it); a stream of a reopened turn is dropped with its publish', async () => {
+test('review fixes: a one-sentence stream settled by complete (no space after it) is said once; a stream of a reopened turn is dropped with its publish', async () => {
   await withService(async (svc, ev, audio) => {
     const c = await host(svc);
-    await c.call('speech_settings_set', { speculative_speech: true, draft_enabled: true, transcript_events: 'always', turn_hold_ms: 300, turn_hold_complete_ms: 300 });
+    await c.call('speech_settings_set', { speculative_speech: true, transcript_events: 'always', turn_hold_ms: 300, turn_hold_complete_ms: 300 });
     const { id, chId } = await admitted(c);
     const n0 = el.st.speech.length;
     phrases('Is the plan ready for review?', 'And the budget as well?');
     audio.say(tonePcm(3.5));
-    await until(() => ev.transcript.some((x) => !x.final && x.text.split(' ').length >= 5), 15_000);
-    await c.call('meeting_draft', { meeting_id: id, text: 'Yes, it is ready.', ready: true });
     await until(() => c.finals().length === 1, 15_000);
-    assert.equal(c.finals()[0].metadata.draft, 'spoken');
     const s = c.stream(chId, 'call_f');
     await s.chunk('Yes, it is ready.');
     await s.complete('Yes, it is ready.');
     const r = await c.publish(chId, 'Yes, it is ready.', { streamId: 'call_f' });
     assert.equal(r.spoken, 'already_spoken');
-    assert.equal(r.draft_prefix_skipped, true);
     await until(() => ev.speech.length === 1, 15_000);
     await sleep(500);
     assert.deepEqual(synthesized(n0), ['Yes, it is ready.'], 'said once');
@@ -437,31 +444,6 @@ test('review fixes 2: a cancel still stops a stream the queue cut short, and one
     await until(() => ev.speech.filter((e) => e.state === 'done').length === 2, 15_000);
     await sleep(500);
     assert.deepEqual(synthesized(n1), ['First sentence.', 'The budget is fine.']);
-    await c.call('meeting_leave', { meeting_id: id });
-    await c.close();
-  });
-});
-
-test('review fixes 2: a stream that skipped the drafted sentence and was cancelled leaves the publish check for it in place', async () => {
-  await withService(async (svc, ev, audio) => {
-    const c = await host(svc);
-    await c.call('speech_settings_set', { speculative_speech: true, draft_enabled: true, transcript_events: 'always', turn_hold_ms: 300, turn_hold_complete_ms: 300 });
-    const { id, chId } = await admitted(c);
-    const n0 = el.st.speech.length;
-    phrases('Is the plan ready for review?');
-    audio.say(tonePcm(3.5));
-    await until(() => ev.transcript.some((x) => !x.final && x.text.split(' ').length >= 5), 15_000);
-    await c.call('meeting_draft', { meeting_id: id, text: 'Yes, it is ready.', ready: true });
-    await until(() => c.finals().length === 1, 15_000);
-    assert.equal(c.finals()[0].metadata.draft, 'spoken');
-    const s = c.stream(chId, 'call_h');
-    await s.chunk('Yes, it is ready. ');
-    await s.cancel();
-    const r = await c.publish(chId, 'Yes, it is ready. The review starts Monday.');
-    assert.equal(r.draft_prefix_skipped, true);
-    await until(() => synthesized(n0).includes('The review starts Monday.'), 15_000);
-    await sleep(800);
-    assert.equal(synthesized(n0).filter((t) => t === 'Yes, it is ready.').length, 1, 'the drafted sentence once');
     await c.call('meeting_leave', { meeting_id: id });
     await c.close();
   });

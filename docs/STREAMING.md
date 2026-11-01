@@ -86,8 +86,6 @@ When the host can, it passes the same `streamId` on the `channels/publish` it ma
   `bosun:meeting-interrupted` message. `meeting_stop_speaking` and an opt-out stop a stream the same way.
 - **A reopened turn.** When the stream's turn was reopened (`bosun:meeting-turn-extended`) and `superseded_publish` is
   `"drop"`, its sentences are not spoken. The publish is then dropped as before.
-- **A draft.** When Bosun already said the drafted sentence for this turn (`meeting_draft`), a stream whose first
-  sentence is that sentence skips it.
 - **Limits.** Bosun keeps 8 streams per meeting. A stream that still has text queued, being synthesized or playing is
   never forgotten, so its cancel always finds it. One that has been open and silent for a minute can make room. When
   all 8 are busy, a new stream is refused, and its publish is spoken as usual. When the speech queue is full (6000
@@ -103,7 +101,6 @@ A publish matched to a stream answers `delivered: true` with the usual fields an
 | `stream_id` | the stream's id |
 | `spoken` | `"settled"`: the stream was still open, and this text settled it. `"already_spoken"`: `complete` came first with this text. `"interrupted"`: a barge-in or `meeting_stop_speaking` stopped it, and the rest is not said. |
 | `said_after_stream` | with `"settled"`: characters said after what the stream had spoken (its open last sentence, or a corrected part) |
-| `draft_prefix_skipped` | `true` when the stream's first sentence was the drafted one, already said |
 
 connectome-host 0.19 keeps only `delivered` and `messageId` of a receipt. The other fields are there for hosts that
 read them.

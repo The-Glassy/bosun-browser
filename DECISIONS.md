@@ -2,6 +2,24 @@
 
 Decisions made without asking (Misha: "use your judgment and decide yourself"), with the reason. Newest first.
 
+## 0.19.0 (2026-11-01): meeting_draft removed
+
+- **The removed keys stay in the two tool schemas, as arguments that only fail.** The MCP SDK strips arguments a
+  schema doesn't name, so without them `speech_settings_set {draft_enabled: true}` would answer success and do
+  nothing: the caller would believe drafts are on. They are listed as `removed in 0.19.0 ... passing it is an error`.
+- **`speech_settings_set` with `null` for a removed key is accepted.** `null` asks for "not set", which is what is
+  true now; failing would only break an old cleanup call. Any other value fails.
+- **`meeting_join` refuses them even with `dry_run`,** before anything is loaded, so a caller learns it from the
+  cheap call too.
+- **No migration of stored files.** Unknown keys were already ignored when reading, and every write rebuilds the file
+  from the known keys, so a 0.18 file loads as is and loses the keys at the tenant's next write. The brief says not to
+  touch tenants' settings, and nothing needs to.
+- **`afterPrefix` stays** (speculative streams settle with it); `addedWords`, `sentencesOf`, `MEANING_FLIP`,
+  `heardSoFar`, `putPrepared` and the per-segment first-heard times existed only for drafts and are gone.
+- **History is kept.** The 0.18.0 entries in CHANGELOG and below stay as they were (they describe that release); the
+  README, DESIGN and STREAMING describe the current state and only say drafts were removed.
+- **Minor version (0.19.0),** as the brief says: a tool is removed.
+
 ## 0.18.1 (2026-10-30): recording_get
 
 - **It never worked, so there was no regression to fix.** The `file://` URI and the MCP `resource_link` were added in
@@ -36,6 +54,8 @@ Decisions made without asking (Misha: "use your judgment and decide yourself"), 
   replaces it. The `path` stays (it is where the file is, for logs and for stdio use, where `recording_get` returns it).
 
 ## 0.18.0 (2026-10-30): drafts and speculative speech
+
+(The draft decisions here no longer apply: `meeting_draft` was removed in 0.19.0.)
 
 - **A "not" or "but" among the new words drops the draft, however few words came.** The brief's rule is "at most
   `draft_max_new_words` (4) new words". Its own example, "... but not today", adds only three words and would pass. A

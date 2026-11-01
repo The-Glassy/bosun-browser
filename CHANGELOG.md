@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.19.0: meeting_draft removed
+
+The live test on 30 Oct (15 min) showed the draft fired once, too early, and gave nothing speculative speech doesn't
+already give. Misha: remove it. Speculative speech, turn hold and extend, barge-in, acknowledgements, partials and the
+meeting channel are unchanged.
+
+### Removed
+
+- **The `meeting_draft` tool** and everything behind it: the draft state, the first sentence synthesized ahead and
+  said at the end of the turn, the final's `metadata.draft` / `draft_text` / `draft_reason` / `draft_new_words`, its
+  second text block and `bosun:draft-*` tag, the publish (and speculative stream) skipping the drafted sentence
+  (`draft_prefix_skipped`, `draft_said`), and `meeting_status.draft` / `drafts`.
+- **The speech settings `draft_enabled` and `draft_max_new_words`**, also as per-meeting `meeting_join` arguments.
+  `speech_settings_get` no longer lists them.
+
+### Changed
+
+- **Old callers get a clear error.** `speech_settings_set` or `meeting_join` (also with `dry_run`) with
+  `draft_enabled` or `draft_max_new_words` fails with "`<key>` was removed in Bosun 0.19.0 with meeting_draft; leave
+  it out". `speech_settings_set` with `null` for one is accepted (it is gone already). Nothing is saved or joined by a
+  refused call.
+- **Stored settings that still have them load fine.** A tenant's `speech-settings/<tenant>.json` written by 0.18 is
+  read without the removed keys, and the tenant's next `speech_settings_set` writes the file without them. Bosun does
+  not rewrite tenants' files itself.
+
+### Tests
+
+- `test/meeting-draft-removed.test.mjs` (MCP): the tool is not listed, `speech_settings_get` has no draft keys with a
+  0.18 file on disk, old `speech_settings_set` / `meeting_join` calls fail with the removal message and change
+  nothing, the next write drops the keys.
+- `test/speech-settings.test.mjs`: the same at the settings level, including `null`.
+- `test/meeting-speculative.test.mjs`: the draft cases became their non-draft counterparts (a stream answering a turn
+  is said once; a one-sentence stream settled by `complete`); the `afterPrefix` unit test moved here.
+  `test/meeting-draft.test.mjs` is gone.
+
 ## 0.18.1: recording_get, and two modes in the docs
 
 A tenant's agent could not get its own meeting recording. `bosun:meeting-ended` and `meeting_status` gave a path and a

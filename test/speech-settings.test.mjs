@@ -23,7 +23,7 @@ test('defaults without env or settings; env fallbacks; the tenant\'s settings ov
     meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
     ack_on_final: false, ack_phrases: ['Mhm.', 'One sec.', 'Okay.', 'Right.'], ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
     turn_hold_ms: 900, turn_hold_complete_ms: 300, barge_in: true, barge_in_min_words: 2, barge_in_min_s: 0.6,
-    turn_extend_s: 20, superseded_publish: 'drop', draft_enabled: false, draft_max_new_words: 4, speculative_speech: false,
+    turn_extend_s: 20, superseded_publish: 'drop', speculative_speech: false,
   });
   const s = settings({ ...KEY, TTS_DEFAULT_BACKEND: 'elevenlabs', ELEVENLABS_TTS_MODEL: 'eleven_flash_v2_5', ELEVENLABS_VOICE: 'SAz9YHcvj6GT2YYXdXww', TTS_VOICE: 'supertonic-F2', LIVE_TRANSCRIPT_VAD_SILENCE_S: '0.8' });
   assert.deepEqual(s.get('a').effective, { backend: 'elevenlabs', elevenlabs_model: 'eleven_flash_v2_5', elevenlabs_voice: 'SAz9YHcvj6GT2YYXdXww', supertonic_voice: 'supertonic-F2', vad_silence_s: 0.8, ...DEFAULTS });
@@ -92,7 +92,24 @@ test('channel and acknowledgement settings: validated, set and removed per tenan
     ['turn_hold_ms', 5001, /turn_hold_ms/], ['turn_hold_ms', 0.5, /turn_hold_ms/], ['turn_hold_complete_ms', -1, /turn_hold_complete_ms/],
     ['barge_in', 'yes', /barge_in/], ['barge_in_min_words', 0, /barge_in_min_words/], ['barge_in_min_s', 0.1, /barge_in_min_s/],
     ['turn_extend_s', 301, /turn_extend_s/], ['superseded_publish', 'queue', /superseded_publish must be one of drop, speak/],
-    ['draft_enabled', 'yes', /draft_enabled must be true or false/], ['draft_max_new_words', 51, /draft_max_new_words/], ['draft_max_new_words', 1.5, /draft_max_new_words/],
     ['speculative_speech', 1, /speculative_speech must be true or false/],
   ]) assert.throws(() => s.set('a', { [k]: v }), re, `${k}=${JSON.stringify(v)}`);
+});
+
+test('settings removed in 0.19.0 (draft_enabled, draft_max_new_words): a stored file that has them loads, the next write drops them; setting one says it was removed', () => {
+  const s = settings(KEY);
+  const f = path.join(s.cfg.dataDir, 'speech-settings', 'a.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify({ backend: 'elevenlabs', draft_enabled: true, draft_max_new_words: 2, speculative_speech: true }));
+  const g = s.get('a');
+  assert.deepEqual(g.settings, { backend: 'elevenlabs', speculative_speech: true });
+  assert.ok(!('draft_enabled' in g.effective) && !('draft_max_new_words' in g.effective) && !('draft_enabled' in g.from));
+  for (const [k, v] of [['draft_enabled', true], ['draft_enabled', false], ['draft_max_new_words', 4]]) {
+    assert.throws(() => s.set('a', { [k]: v, ack_on_final: true }), new RegExp(`^Error: ${k} was removed in Bosun 0\\.19\\.0 with meeting_draft`), `${k}=${v}`);
+  }
+  assert.deepEqual(JSON.parse(fs.readFileSync(f, 'utf8')).draft_enabled, true, 'a refused call writes nothing');
+  // null asks for what is so already: accepted, and the write leaves both out.
+  const r = s.set('a', { draft_enabled: null, ack_on_final: true });
+  assert.deepEqual(r.settings, { backend: 'elevenlabs', speculative_speech: true, ack_on_final: true });
+  assert.deepEqual(JSON.parse(fs.readFileSync(f, 'utf8')), { backend: 'elevenlabs', speculative_speech: true, ack_on_final: true });
 });
