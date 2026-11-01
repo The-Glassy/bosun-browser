@@ -30,21 +30,30 @@ test('meeting_draft is gone; stored draft settings load and are dropped at the n
     assert.equal(g.isError, false, g.text);
     assert.doesNotMatch(g.text, /draft/);
     assert.deepEqual(g.json().settings, { turn_hold_ms: 500 });
-    // Old callers.
-    for (const a of [{ draft_enabled: true }, { draft_enabled: false, ack_on_final: true }, { draft_max_new_words: 4 }]) {
+    // Old callers: refused, and nothing in the file or the effective settings changes.
+    const file0 = fs.readFileSync(f, 'utf8');
+    for (const a of [{ draft_enabled: true }, { draft_enabled: false, ack_on_final: true }, { draft_max_new_words: 4 }, { draft_max_new_words: 4, draft_enabled: null }]) {
       const r = await c.call('speech_settings_set', a);
       assert.equal(r.isError, true, JSON.stringify(a));
       assert.match(r.text, /draft_(enabled|max_new_words) was removed in Bosun 0\.19\.0 with meeting_draft/);
+      assert.equal(fs.readFileSync(f, 'utf8'), file0, `nothing written by ${JSON.stringify(a)}`);
+      assert.deepEqual((await c.call('speech_settings_get', {})).json(), g.json());
     }
-    assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).draft_enabled, true, 'nothing written by a refused call');
+    // null for both (an old cleanup call): accepted, changes nothing that is in effect.
+    const n = await c.call('speech_settings_set', { draft_enabled: null, draft_max_new_words: null });
+    assert.equal(n.isError, false, n.text);
+    assert.deepEqual(n.json().effective, g.json().effective);
+    assert.deepEqual(n.json().settings, { turn_hold_ms: 500 });
     const { url } = fake.newRoom();
-    for (const a of [{ url, draft_enabled: true }, { url, draft_max_new_words: 2 }, { url, draft_enabled: false, dry_run: true }]) {
+    for (const a of [{ url, draft_enabled: true }, { url, draft_max_new_words: 2 }, { url, draft_enabled: false, dry_run: true },
+      { url, draft_enabled: null }, { url, draft_max_new_words: null, dry_run: true }]) {
       const r = await c.call('meeting_join', a);
       assert.equal(r.isError, true, JSON.stringify(a));
       assert.match(r.text, /draft_(enabled|max_new_words) was removed in Bosun 0\.19\.0 with meeting_draft/);
     }
     assert.deepEqual((await c.call('meeting_status', {})).json(), [], 'no meeting was joined');
-    // The next write drops the removed keys from the file.
+    // That accepted call was a write: the removed keys are gone from the file, and stay gone.
+    assert.deepEqual(JSON.parse(fs.readFileSync(f, 'utf8')), { turn_hold_ms: 500 });
     const w = await c.call('speech_settings_set', { ack_on_final: true });
     assert.equal(w.isError, false, w.text);
     assert.deepEqual(JSON.parse(fs.readFileSync(f, 'utf8')), { turn_hold_ms: 500, ack_on_final: true });

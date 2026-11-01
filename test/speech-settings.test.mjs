@@ -104,12 +104,13 @@ test('settings removed in 0.19.0 (draft_enabled, draft_max_new_words): a stored 
   const g = s.get('a');
   assert.deepEqual(g.settings, { backend: 'elevenlabs', speculative_speech: true });
   assert.ok(!('draft_enabled' in g.effective) && !('draft_max_new_words' in g.effective) && !('draft_enabled' in g.from));
+  const file0 = fs.readFileSync(f, 'utf8');
   for (const [k, v] of [['draft_enabled', true], ['draft_enabled', false], ['draft_max_new_words', 4]]) {
     assert.throws(() => s.set('a', { [k]: v, ack_on_final: true }), new RegExp(`^Error: ${k} was removed in Bosun 0\\.19\\.0 with meeting_draft`), `${k}=${v}`);
+    assert.equal(fs.readFileSync(f, 'utf8'), file0, 'a refused call writes nothing');
   }
-  assert.deepEqual(JSON.parse(fs.readFileSync(f, 'utf8')).draft_enabled, true, 'a refused call writes nothing');
   // null asks for what is so already: accepted, and the write leaves both out.
-  const r = s.set('a', { draft_enabled: null, ack_on_final: true });
+  const r = s.set('a', { draft_enabled: null, draft_max_new_words: null, ack_on_final: true });
   assert.deepEqual(r.settings, { backend: 'elevenlabs', speculative_speech: true, ack_on_final: true });
   assert.deepEqual(JSON.parse(fs.readFileSync(f, 'utf8')), { backend: 'elevenlabs', speculative_speech: true, ack_on_final: true });
 });
