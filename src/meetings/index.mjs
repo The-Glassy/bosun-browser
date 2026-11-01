@@ -23,7 +23,7 @@ import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
 import { LiveTranscript, TranscriptUsage, nodeDebugOn, NODE_DEBUG_REFUSED } from './transcript.mjs';
 import { synthesizeWav, splitSpeech, takeSentences, probeSeconds, audioFormat } from './speech.mjs';
-import { SpeechSettings, SETTINGS, PER_CALL } from './settings.mjs';
+import { SpeechSettings, SETTINGS, PER_CALL, REMOVED, removedSetting } from './settings.mjs';
 import { CHANNEL_PREFIX } from '../events.mjs';
 import { RecordingLinks } from './recording-links.mjs';
 
@@ -74,22 +74,9 @@ const LABEL_FRESH_MS = 120_000; // speaker labels count as working this long aft
 // Words that never count towards barge_in_min_words (someone agreeing while Bosun speaks is no interruption).
 const BACKCHANNEL = new Set(['mhm', 'mhmm', 'mm', 'hm', 'hmm', 'uh', 'huh', 'um', 'yeah', 'yes', 'yep', 'ok', 'okay', 'right', 'sure', 'ага', 'угу', 'так', 'да', 'ну', 'ja', 'jo', 'genau', 'áno', 'hej']);
 const words = (text) => normalize(text || '').split(' ').filter(Boolean);
-const DRAFT_SENTENCE_MAX = 400; // a drafted first sentence longer than this is refused (it would not be quick to say)
-const DRAFT_SAID_MS = 120_000; // a publish this long after a drafted sentence was said is no longer checked for it
-// Words that, added by the final after a draft was marked ready, may turn the meaning around ("... but not today"):
-// the draft is not said, however few words came.
-const MEANING_FLIP = new Set(['not', 'no', 'never', 'dont', "don't", 'doesnt', "doesn't", 'didnt', "didn't", 'cant', "can't", 'wont', "won't", 'isnt', "isn't", 'arent', "aren't",
-  'but', 'however', 'except', 'unless', 'instead', 'nicht', 'kein', 'keine', 'keinen', 'nie', 'niemals', 'nein', 'aber', 'sondern', 'außer',
-  'не', 'ні', 'нет', 'ніколи', 'никогда', 'але', 'но', 'однак', 'однако', 'ale', 'však', 'okrem', 'nikdy']);
 const SPEC_MATCH_MS = 10_000; // a publish this long after its speculative stream's last chunk or complete is matched by its text
 const SPEC_STREAMS = 8; // speculative streams kept per meeting
 const SPEC_EARLY_MAX = 200; // chunks that came ahead of a missing one, kept per stream
-
-// The sentences of a text: as takeSentences cuts them, the open rest as the last one.
-export function sentencesOf(text) {
-  const { done, rest } = takeSentences(String(text || ''));
-  return rest.trim() ? [...done, rest.trim()] : done;
-}
 
 // Where `text` goes on after a prefix that says the same words as `prefix` (case, punctuation and spacing aside): the
 // index after it (and the space after it), or -1 when text doesn't start with those words. An empty prefix: 0.
@@ -103,22 +90,6 @@ export function afterPrefix(text, prefix) {
     if (n && !want.startsWith(n)) return -1;
   }
   return -1;
-}
-
-// The words of `after` left over once it is lined up with `before` (longest common subsequence, in order): what the
-// final added to (or changed in) what had been heard.
-export function addedWords(before, after) {
-  const a = before, b = after;
-  if (!a.length) return [...b];
-  if (a.length * b.length > 250_000) return [...b];
-  const L = Array.from({ length: a.length + 1 }, () => new Uint16Array(b.length + 1));
-  for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--) L[i][j] = a[i] === b[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
-  const out = [];
-  let i = 0, j = 0;
-  while (j < b.length) {
-    if (i < a.length && a[i] === b[j]) { i++; j++; } else if (i < a.length && L[i + 1][j] >= L[i][j + 1]) i++; else out.push(b[j++]);
-  }
-  return out;
 }
 
 // state: joining -> waiting -> admitted -> recording -> ended (recording -> admitted when it is stopped early).
@@ -348,6 +319,7 @@ export class Meetings {
     // Speech settings for this meeting only (PER_CALL), over the tenant's.
     const overrides = {};
     for (const [k, v] of Object.entries(perCall || {})) {
+      if (v !== undefined && Object.hasOwn(REMOVED, k)) throw new Error(removedSetting(k));
       if (v === undefined || v === null) continue;
       if (!PER_CALL.includes(k)) throw new Error(`${k} cannot be set per meeting`);
       const err = SETTINGS[k](v);
@@ -386,9 +358,8 @@ export class Meetings {
       hold: null, lastHumanAt: 0, heardSeq: 0, lastTurnSeq: 0, partialNow: null, saidRecent: [], bargeIns: 0, interrupts: 0,
       // The last turn the agent was given ({seq, segs, speaker, at}), the newest turn it answered, turns reopened.
       lastTurn: null, answeredSeq: 0, extendedSeqs: new Set(), turnsExtended: 0, publishesDropped: 0,
-      // meeting_draft: the agent's draft for the turn still being said, the drafted sentence said for a turn (a publish
-      // starting with it skips it), when each segment was first heard. Speculative streams (speculative_speech).
-      overrides, draft: null, draftSaid: null, firstHeard: new Map(), draftsSpoken: 0, draftsDropped: 0, specStreams: new Map(), specSpoken: 0, specCancelled: 0,
+      // Speech settings for this meeting only (meeting_join), speculative streams (speculative_speech).
+      overrides, specStreams: new Map(), specSpoken: 0, specCancelled: 0,
     };
     this.active.set(id, m);
     m.task = this.run(m).catch((e) => this.finish(m, 'error', e));
@@ -543,8 +514,7 @@ export class Meetings {
       // last_turn_seq: that turn's seq.
       // A publish answers the turn current when it came (or the turn_seq it names). That turn reopened since
       // (turn_extended): dropped with superseded_publish "drop" (delivered: false, so the host doesn't count it as said).
-      // Text already said from a speculative stream of the same text (speculative) is not said again; a publish that
-      // starts with the drafted sentence said for its turn (meeting_draft) skips it (draft_prefix_skipped).
+      // Text already said from a speculative stream of the same text (speculative) is not said again.
       publish: (text, p) => {
         const named = [p?.turn_seq, p?.metadata?.turn_seq].find((x) => Number.isInteger(x) && x >= 0 && x <= m.lastTurnSeq);
         const turn = named ?? m.lastTurnSeq;
@@ -562,17 +532,9 @@ export class Meetings {
           m.publishesDropped++;
           return { delivered: false, dropped: true, reason: 'superseded_by_new_speech', superseded_by_new_speech: true, turn_seq: turn, last_turn_seq: m.lastTurnSeq };
         }
-        let say = text, draft = {};
-        const ds = m.draftSaid;
-        if (ds && ds.turnSeq === turn && this.now() - ds.at < DRAFT_SAID_MS) {
-          const at = afterPrefix(text, ds.text);
-          draft = { draft_prefix_skipped: at >= 0, draft_said: ds.text };
-          if (at >= 0) say = String(text).slice(at);
-        }
-        this.sayOnChannel(m, say);
-        if (ds && draft.draft_said) m.draftSaid = null; // checked once: the publish after it may repeat the words
+        this.sayOnChannel(m, text);
         m.answeredSeq = Math.max(m.answeredSeq, turn);
-        return receipt(draft);
+        return receipt();
       },
       chunk: (p) => this.onStream(m, p, false),
       complete: (p) => this.onStream(m, p, true),
@@ -622,7 +584,7 @@ export class Meetings {
   }
 
   // A speculative stream (docs/STREAMING.md): {id, turn it answers, buf (text not yet a sentence), next seq, early
-  // (chunks ahead of a missing one), sent (sentences handed to speech; skipped: the drafted one, said already), nos
+  // (chunks ahead of a missing one), sent (sentences handed to speech), nos
   // (each one's piece number in its utterance), u (that utterance), stopAt (sentences from here on not to be said),
   // state open | final | cancelled | interrupted | dropped, final text and when}.
   specStream(m, id) {
@@ -639,11 +601,6 @@ export class Meetings {
     st = { id, turn: m.lastTurnSeq, gen: m.channelGen, at: this.now(), buf: '', next: 0, early: new Map(), sent: [], nos: [], u: null, stopAt: Infinity, state: 'open', final: null, finalNorm: null, finalAt: 0 };
     m.specStreams.set(id, st);
     return st;
-  }
-
-  // A stream that skipped the drafted sentence was published (or completed): the publish check for it is used up.
-  useDraftSaid(m, st) {
-    if (st.draftSkipped && m.draftSaid?.turnSeq === st.turn) m.draftSaid = null;
   }
 
   // The stream's turn was reopened since and superseded_publish is "drop": nothing more of it is said.
@@ -673,19 +630,12 @@ export class Meetings {
   }
 
   // One sentence of a speculative stream to speech. Not when the stream was stopped since it began (a barge-in,
-  // meeting_stop_speaking, an opt-out: channelGen) or its turn was reopened (superseded_publish "drop"). The sentence
-  // Bosun already said from the draft for that turn is not said again.
+  // meeting_stop_speaking, an opt-out: channelGen) or its turn was reopened (superseded_publish "drop").
   specSay(m, st, text) {
     if (st.state !== 'open') return;
     if (st.gen !== m.channelGen) { st.state = 'interrupted'; return; }
     if (this.specSuperseded(m, st)) { st.state = 'dropped'; return; }
     const i = st.sent.length;
-    const ds = m.draftSaid;
-    if (i === 0 && ds && ds.turnSeq === st.turn && this.now() - ds.at < DRAFT_SAID_MS && normalize(text) === ds.norm) {
-      st.sent.push(text);
-      st.draftSkipped = true; // m.draftSaid stays until a publish (or complete) of the stream uses it up
-      return;
-    }
     // The queue is full: nothing more of the stream is said now, but it stays open, so its publish (or complete)
     // settles it against what was said and says the rest.
     if (st.paused) return;
@@ -716,7 +666,7 @@ export class Meetings {
     if (st.state === 'final' && normalize(text) === st.finalNorm) return;
     if (st.state === 'open' && this.specSuperseded(m, st)) st.state = 'dropped';
     if (st.state === 'open' || st.state === 'final') {
-      try { this.specSettle(m, st, text); this.useDraftSaid(m, st); } catch {}
+      try { this.specSettle(m, st, text); } catch {}
     }
     else Object.assign(st, { final: text, finalNorm: normalize(text), finalAt: this.now() }); // a publish of it is not said either
   }
@@ -724,12 +674,6 @@ export class Meetings {
   // The full text of a stream: what was said of it that differs from the text is stopped (from the first sentence
   // that differs), and the text from there on is said. Returns what was said again ('' when nothing).
   specSettle(m, st, text) {
-    // The drafted sentence said for this turn, at the start of a stream that has said nothing yet: skipped.
-    const ds = m.draftSaid;
-    if (!st.sent.length && ds && ds.turnSeq === st.turn && this.now() - ds.at < DRAFT_SAID_MS && afterPrefix(text, ds.text) >= 0) {
-      st.sent.push(ds.text);
-      st.draftSkipped = true;
-    }
     let at = 0, k = 0;
     for (; k < st.sent.length; k++) {
       const n = afterPrefix(text.slice(at), st.sent[k]);
@@ -803,11 +747,11 @@ export class Meetings {
     }
     if (st && (st.state === 'open' || st.state === 'dropped') && this.specSuperseded(m, st)) { st.state = 'dropped'; st.published = true; return { dropped: true, turn: st.turn, stream_id: st.id }; }
     if (!st || st.state === 'dropped' || st.state === 'cancelled') return null;
-    const base = { speculative: true, stream_id: st.id, ...(st.draftSkipped ? { draft_prefix_skipped: true } : {}) };
+    const base = { speculative: true, stream_id: st.id };
     if (st.state === 'open' && st.gen !== m.channelGen) st.state = 'interrupted'; // meeting_stop_speaking since
     // A stream delivers one publish: the same text published again is said. Marked only once settled (a publish the
     // queue refuses can be sent again and still match).
-    const done = (r) => { st.published = true; this.useDraftSaid(m, st); return { ...base, ...(st.draftSkipped ? { draft_prefix_skipped: true } : {}), ...r }; };
+    const done = (r) => { st.published = true; return { ...base, ...r }; };
     if (st.state === 'interrupted') {
       Object.assign(st, { final: text, finalNorm: norm, finalAt: this.now() });
       return done({ spoken: 'interrupted' });
@@ -816,77 +760,6 @@ export class Meetings {
     if (st.state === 'final' && st.gen !== m.channelGen) return done({ spoken: 'interrupted' });
     const again = this.specSettle(m, st, text);
     return done({ spoken: 'settled', ...(again ? { said_after_stream: again.length } : {}) });
-  }
-
-  // meeting_draft: the agent's draft reply to the turn still being said. ready: its first sentence is synthesized now,
-  // and said the moment the turn reaches the agent (draftOutcome), if the final added at most draft_max_new_words words
-  // to what had been heard when it was marked ready. text "" clears it.
-  setDraft(tenant, id, { text, ready = false, forTurnSeq }) {
-    const m = this.get(tenant, id);
-    this.inCall(m, 'drafting');
-    if (!this.opts(m).draft_enabled) throw new Error('drafts are off: speech_settings_set {draft_enabled: true}, or meeting_join with draft_enabled');
-    const t = String(text ?? '').trim();
-    if (!t) { const had = !!m.draft; m.draft = null; return { meeting_id: id, draft: had ? 'cleared' : 'none' }; }
-    const inHold = (q) => !!m.hold && (m.hold.extends === q || m.hold.segs.some((x) => x.seq === q));
-    if (forTurnSeq !== undefined && forTurnSeq !== null && forTurnSeq <= m.lastTurnSeq && !inHold(forTurnSeq)) {
-      return { meeting_id: id, draft: 'too_late', turn_seq: forTurnSeq, last_turn_seq: m.lastTurnSeq, note: 'that turn has reached you already: publish your answer' };
-    }
-    const sentence = sentencesOf(t)[0] || t;
-    if (sentence.length > DRAFT_SENTENCE_MAX) throw new Error(`the first sentence is longer than ${DRAFT_SENTENCE_MAX} characters; make it short, it is said as soon as the turn ends`);
-    const prev = m.draft;
-    const d = { text: t, sentence, ready: !!ready, forTurnSeq: forTurnSeq ?? null, setAt: this.now(), heard: null, readyAt: 0, key: null, wav: null };
-    if (d.ready) {
-      // What had been heard when it was marked ready (kept while the same draft is sent again).
-      const same = prev?.ready && prev.text === t && prev.forTurnSeq === d.forTurnSeq;
-      Object.assign(d, same ? { heard: prev.heard, readyAt: prev.readyAt, setAt: prev.setAt } : { heard: this.heardSoFar(m), readyAt: this.now() });
-      let tts = null;
-      try { tts = this.tts(m.tenant); } catch {}
-      if (tts) {
-        d.key = this.preparedKey(tts, sentence);
-        if (prev?.key === d.key && prev.wav) d.wav = prev.wav;
-        else { d.wav = synthesizeWav(this.cfg, { text: sentence, ...tts }); d.wav.catch(() => {}); }
-      }
-    }
-    m.draft = d;
-    return { meeting_id: id, draft: 'set', ready: d.ready, sentence, ...(d.forTurnSeq !== null ? { for_turn_seq: d.forTurnSeq } : {}), ...(d.ready ? { heard_words: words(d.heard).length } : {}), last_turn_seq: m.lastTurnSeq };
-  }
-
-  // The text of the turn still being said: the finals held for it and the open segment after them.
-  heardSoFar(m) {
-    const parts = [];
-    let last = m.lastTurnSeq;
-    if (m.hold) { parts.push(...m.hold.segs.map((x) => x.text)); last = Math.max(last, m.hold.lastSeq ?? last); }
-    const p = m.partialNow;
-    if (p?.human && p.seq > last) parts.push(p.text);
-    return parts.join(' ');
-  }
-
-  // A turn reaches the agent (draft_enabled): what became of the draft for it. Said ("spoken") when it was ready, set
-  // for this turn (for_turn_seq one of its segments; without one: set after the turn began) and the final added at most
-  // draft_max_new_words words (none of them a "not" or "but") to what had been heard when it was marked ready, and
-  // nothing else is being said. A draft for a later turn stays; any other is used up.
-  draftOutcome(m, seg, d) {
-    const dr = m.draft;
-    if (!dr) return { draft: 'none' };
-    const segs = seg.parts || [seg];
-    const last = seg.seq;
-    if (dr.forTurnSeq !== null && dr.forTurnSeq > last) return { draft: 'none' };
-    m.draft = null;
-    const drop = (reason, extra = {}) => { m.draftsDropped++; return { draft: 'dropped', draft_reason: reason, draft_text: dr.sentence, ...extra }; };
-    const began = Math.min(...segs.map((x) => m.firstHeard.get(x.seq) ?? Infinity));
-    if (dr.forTurnSeq !== null ? !segs.some((x) => x.seq === dr.forTurnSeq) : Number.isFinite(began) && dr.setAt < began) return drop('other_turn');
-    if (!dr.ready) return drop('not_ready');
-    const added = addedWords(words(dr.heard), words(seg.text));
-    if (added.length > d.draft_max_new_words) return drop('new_words', { draft_new_words: added.length });
-    if (added.some((w) => MEANING_FLIP.has(w))) return drop('meaning_may_change', { draft_new_words: added.length });
-    if ((m.speech && m.speech.kind !== 'ack') || m.channelBacklog > 0) return drop('speaking');
-    if (!m.rig?.play || (m.state !== 'admitted' && m.state !== 'recording')) return drop('cannot_speak');
-    if (dr.wav && dr.key) this.putPrepared(m, dr.key, dr.wav);
-    try { this.sayOnChannel(m, dr.sentence, { whole: true }); } catch (e) { return drop('cannot_speak', { error: oneLine(e) }); }
-    m.draftSaid = { turnSeq: seg.seq, text: dr.sentence, norm: normalize(dr.sentence), at: this.now() };
-    m.answeredSeq = Math.max(m.answeredSeq, seg.seq);
-    m.draftsSpoken++;
-    return { draft: 'spoken', draft_text: dr.sentence, draft_new_words: added.length };
   }
 
   // At most PREPARED_MAX sentences (synthesized or synthesizing) at a time, each at most PREPARE_SENTENCE_MAX
@@ -903,16 +776,6 @@ export class Meetings {
     if (m.prepared.size >= PREPARED_MAX) return;
     const e = { at: this.now(), done: false, wav: synthesizeWav(this.cfg, { text: t, ...tts }) };
     e.wav.then(() => { e.done = true; }, () => { m.prepared.delete(key); });
-    m.prepared.set(key, e);
-  }
-
-  // Audio synthesized elsewhere (a draft) put among the prepared, under the same bounds: expired entries go first,
-  // then the oldest if it is still full; a failed synthesis is removed.
-  putPrepared(m, key, wav) {
-    for (const [k, x] of m.prepared) if (x.done && this.now() - x.at > PREPARED_MS) m.prepared.delete(k);
-    while (m.prepared.size >= PREPARED_MAX) m.prepared.delete(m.prepared.keys().next().value);
-    const e = { at: this.now(), done: false, wav };
-    wav.then(() => { e.done = true; }, () => { if (m.prepared.get(key) === e) m.prepared.delete(key); });
     m.prepared.set(key, e);
   }
 
@@ -993,7 +856,6 @@ export class Meetings {
     m.extendedSeqs.add(t.seq);
     if (m.extendedSeqs.size > 50) m.extendedSeqs.delete(m.extendedSeqs.values().next().value);
     m.turnsExtended++;
-    m.draft = null; // a draft made for the turn as it was is not said for the longer one
     if (m.ackTimer) m.lastAck = 0; // a clip that never played doesn't hold back the real end's (one played already does)
     clearTimeout(m.ackTimer);
     m.ackTimer = null;
@@ -1066,10 +928,6 @@ export class Meetings {
     if (!w.length || this.ownVoice(m, w)) return false;
     m.lastHumanAt = this.now();
     m.heardSeq = Math.max(m.heardSeq, seg.seq);
-    if (!m.firstHeard.has(seg.seq)) {
-      m.firstHeard.set(seg.seq, this.now());
-      if (m.firstHeard.size > 200) m.firstHeard.delete(m.firstHeard.keys().next().value);
-    }
     return true;
   }
 
@@ -1143,7 +1001,6 @@ export class Meetings {
   // bosun:meeting-interrupted message. An acknowledgement just stops.
   async bargeIn(m, u, by) {
     m.bargeIns++;
-    m.draft = null; // a draft waiting for the turn is dropped: the interrupter's turn comes next
     for (const st of m.specStreams.values()) if (st.state === 'open') st.state = 'interrupted';
     const { said, unsaid } = this.spokenSoFar(u);
     u.bargeIn = { said, speaker: by.speaker };
@@ -1194,45 +1051,34 @@ export class Meetings {
 
   // A turn to the agent: acknowledged (ack_on_final), sent on the meeting's channel, and as a bosun:meeting-transcript
   // event unless the channel took it (transcript_events).
-  // With draft_enabled, a new turn first says the drafted sentence (draftOutcome), and the turn carries what became of
-  // the draft (draft, draft_text, draft_reason).
   deliver(m, seg, d) {
-    let draft = null;
     if (!seg.echo && seg.seq >= m.lastTurnSeq) { // Bosun's own voice is not someone's turn
       m.lastTurnSeq = seg.seq;
       m.lastTurn = { seq: seg.seq, segs: seg.merged_seqs ? (seg.parts || [seg]) : [seg], speaker: seg.speaker || null, at: this.now(), gen: m.consentGen };
-      const o = this.opts(m);
-      if (o.draft_enabled) draft = this.draftOutcome(m, seg, o);
     }
-    if (!seg.echo && draft?.draft !== 'spoken') this.maybeAck(m, seg, d);
-    const out = draft ? { ...seg, ...draft } : seg;
+    if (!seg.echo) this.maybeAck(m, seg, d);
     const onChannel = m.channelOpen && this.bus?.channelReady?.(m.tenant, m.channelId);
-    if (!onChannel) { if (d.transcript_events !== 'never') this.emitLive(m, 'transcript', out); return; }
-    if (d.transcript_events === 'always') this.emitLive(m, 'transcript', out);
+    if (!onChannel) { if (d.transcript_events !== 'never') this.emitLive(m, 'transcript', seg); return; }
+    if (d.transcript_events === 'always') this.emitLive(m, 'transcript', seg);
     // A text forgotten meanwhile (an opt-out, a deletion) is not sent as the event after all.
     const gen = m.consentGen;
-    this.incoming(m, seg, draft).then((ok) => { if (!ok && d.transcript_events === 'auto' && gen === m.consentGen) this.emitLive(m, 'transcript', out); }, () => {});
+    this.incoming(m, seg).then((ok) => { if (!ok && d.transcript_events === 'auto' && gen === m.consentGen) this.emitLive(m, 'transcript', seg); }, () => {});
   }
 
   // A transcript segment as channels/incoming on the meeting's channel. Partials carry the seq of their final and
   // final: false (tag bosun:partial), so a wake policy can tell them apart.
-  // draft: what became of the agent's draft for this turn (deliver), in the metadata and, when it was said or dropped,
-  // as a second text block.
-  async incoming(m, seg, draft = null) {
+  async incoming(m, seg) {
     const who = seg.speaker || null;
-    const note = draft?.draft === 'spoken' ? `(Bosun has already said the first sentence of your draft: "${draft.draft_text}" Go on after it; a publish that starts with it skips it.)`
-      : draft?.draft === 'dropped' ? `(your draft was not said: ${draft.draft_reason}${draft.draft_new_words !== undefined ? `, ${draft.draft_new_words} new words` : ''}; answer in full)` : null;
     const msg = {
       channelId: m.channelId, messageId: `${m.id}:${seg.seq}${seg.final ? '' : `:p${Math.round(this.now() % 1e9)}`}`, threadId: m.id,
       author: { id: who ? `speaker:${who}` : 'meeting', name: who || 'Meeting' }, timestamp: seg.at || new Date(this.now()).toISOString(),
-      content: [{ type: 'text', text: seg.text }, ...(note ? [{ type: 'text', text: note }] : [])],
+      content: [{ type: 'text', text: seg.text }],
       metadata: {
         meeting_id: m.id, platform: m.platform.name, seq: seg.seq, start_s: seg.start_s, end_s: seg.end_s, final: !!seg.final, ...(seg.lang ? { lang: seg.lang } : {}), ...(who ? { speaker: who } : {}), ...(seg.speakers ? { speakers: seg.speakers } : {}),
         ...(seg.final && !seg.echo ? { turn_seq: seg.seq } : {}), ...(seg.extends_turn ? { extends_turn: seg.extends_turn } : {}),
         ...(seg.merged_seqs ? { merged_seqs: seg.merged_seqs } : {}), ...(seg.held_ms !== undefined ? { held_ms: seg.held_ms } : {}), ...(seg.echo ? { echo_suspected: true } : {}),
-        ...(draft || {}),
       },
-      tags: ['bosun:meeting-transcript', `bosun:meeting=${m.id}`, ...(seg.final ? [] : ['bosun:partial']), ...(seg.echo ? ['bosun:echo-suspected'] : []), ...(draft && draft.draft !== 'none' ? [`bosun:draft-${draft.draft}`] : [])],
+      tags: ['bosun:meeting-transcript', `bosun:meeting=${m.id}`, ...(seg.final ? [] : ['bosun:partial']), ...(seg.echo ? ['bosun:echo-suspected'] : [])],
     };
     return this.bus.channelIncoming(m.tenant, m.channelId, [msg]);
   }
@@ -1483,8 +1329,6 @@ export class Meetings {
     clearTimeout(m.hold?.timer);
     m.hold = null; // a turn still held is forgotten with the transcript, and one given can't be reopened
     m.lastTurn = null;
-    m.draft = null;
-    m.draftSaid = null;
     m.specStreams.clear();
     this.closeChannel(m);
     m.prepared.clear();
@@ -1598,8 +1442,6 @@ export class Meetings {
       ...(m.channelId ? { channel: { id: m.channelId, open: m.channelOpen, ...(m.channelOpen ? { registered: !!this.bus?.channelReady?.(m.tenant, m.channelId) } : {}), published: m.channelMsgs } } : {}),
       ...(m.acks ? { acks: m.acks } : {}), ...(m.bargeIns ? { barge_ins: m.bargeIns } : {}),
       ...(Object.keys(m.overrides || {}).length ? { settings: m.overrides } : {}),
-      ...(m.draft ? { draft: { ready: m.draft.ready, sentence: m.draft.sentence, ...(m.draft.forTurnSeq !== null ? { for_turn_seq: m.draft.forTurnSeq } : {}) } } : {}),
-      ...(m.draftsSpoken || m.draftsDropped ? { drafts: { spoken: m.draftsSpoken, dropped: m.draftsDropped } } : {}),
       ...(m.speculative ? { speculative: { sentences: m.specSpoken, cancelled: m.specCancelled } } : {}), ...(m.turnsExtended ? { turns_extended: m.turnsExtended } : {}), ...(m.publishesDropped ? { publishes_dropped: m.publishesDropped } : {}),
       ...(m.platform.drainSpeakers && m.admittedAt ? { speaker_labels: m.speakersSeen ? 'seen' : 'none-seen' } : {}),
       chat_messages: m.chatSeq, joined_at: iso(m.createdAt), admitted_at: iso(m.admittedAt), ended_at: iso(m.endedAt),

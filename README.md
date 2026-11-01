@@ -673,8 +673,8 @@ recording's path in `meeting_status` and `bosun:meeting-ended` is a path inside 
 cannot open it, so fetch it with `recording_get`.
 
 **Mode 2, participant.** `meeting_join { url, live_transcript: true }` and the speaking tools: the agent hears the
-call as text while people speak, and can speak, mute and unmute, raise a hand, answer on the meeting channel, prepare
-a draft and speak speculatively (see [Live transcript and speaking](#live-transcript-and-speaking)). It needs
+call as text while people speak, and can speak, mute and unmute, raise a hand, answer on the meeting channel and speak
+speculatively (see [Live transcript and speaking](#live-transcript-and-speaking)). It needs
 `ELEVENLABS_API_KEY` for the live transcript (Scribe realtime); the Supertonic voice speaks without the key, only the
 live transcript does not work without it. When to speak is always the agent's call: Bosun only provides the
 mechanism. The recording is made in this mode too.
@@ -687,7 +687,7 @@ mechanism. The recording is made in this mode too.
 | **`recording_get`** | **yes: how the agent gets the audio** | yes |
 | `meeting_transcript`, the `bosun:meeting-transcript` events | no (needs a live transcript) | yes, needs `ELEVENLABS_API_KEY` |
 | `meeting_speak`, `meeting_stop_speaking`, `meeting_mute`, `meeting_raise_hand` | not used (the microphone stays muted) | yes (`meeting_speak` with the Supertonic voice needs no key; the ElevenLabs voice does) |
-| `speech_settings_get` / `speech_settings_set`, the meeting channel, `meeting_draft`, speculative speech | not used | yes |
+| `speech_settings_get` / `speech_settings_set`, the meeting channel, speculative speech | not used | yes |
 
 Platforms:
 - **Meet:** as an **unauthenticated guest**, or with a Bosun profile **signed in to a Google account**.
@@ -715,7 +715,6 @@ meeting_speak({ "meeting_id": "…", "text": "…", "lang": "en" })    // voice,
                                                                    // audio_file_id, auto_mute (true), interrupt, wait
 speech_settings_get({})   speech_settings_set({ "backend": "elevenlabs", "elevenlabs_voice": "…", "vad_silence_s": 0.5 })
 meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "…", "on": true })   meeting_raise_hand({ "meeting_id": "…", "on": true })
-meeting_draft({ "meeting_id": "…", "text": "…", "ready": true, "for_turn_seq": 7 })   // draft_enabled; text "" clears
 ```
 
 **How a meeting runs:**
@@ -1028,20 +1027,10 @@ it (no publish and no `meeting_speak` for it yet), within `turn_extend_s` (defau
 - **Not reopened:** a turn the agent has answered (its answer may be playing, and barge-in handles that), a turn of
   someone else, and a turn whose transcript was deleted.
 
-**Drafts (0.18.0, `draft_enabled`).** The agent can prepare its answer while the speaker still talks (with
-`agent_partials` it sees the turn as it is said). `meeting_draft {meeting_id, text, ready, for_turn_seq}` sets the
-draft, and `text: ""` clears it.
-- **Ready:** the first sentence is synthesized now. When the turn reaches the agent (after the turn hold), Bosun says
-  it at once, so no synthesis time is spent then.
-- **Dropped** when the final added more than `draft_max_new_words` (4) words to what was heard when the draft was
-  marked ready, or a "not"/"but" among them, or the draft was for another turn, not ready, or something else is being
-  said. A barge-in or a reopened turn drops the draft too.
-- **The final says what happened:** `metadata.draft` is `spoken` (with `draft_text`), `dropped` (with `draft_reason`)
-  or `none`, and a second text block says it in words.
-- **The publish:** one for that turn that starts with the sentence skips it (`draft_prefix_skipped: true`). One that
-  starts otherwise is said in full.
-- Measured locally (stand-ins): the sentence's audio starts about 0.4 s after the final reached the host, nearly all
-  of it the unmute click.
+**Drafts: removed in 0.19.0.** `meeting_draft` and the settings `draft_enabled` / `draft_max_new_words` (0.18.0)
+are gone: in a live test the draft fired once, too early, and gave nothing speculative speech doesn't. Setting
+either one (`speech_settings_set`, `meeting_join`) is an error that says so; stored settings that still have them
+load without them.
 
 **Speculative speech (0.18.0, `speculative_speech`).** The meeting channel declares `streaming: {speculative: true}`.
 A host that supports it streams the `content` of the agent's `channel_publish` while the model writes it, and Bosun
