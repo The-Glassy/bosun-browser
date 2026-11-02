@@ -131,3 +131,15 @@ test('Meet chat in a frame: an objection posted there is heard (opt-out), not on
     await until(async () => (await status(c, id)).state === 'ended', 10_000);
   });
 });
+
+test('Meet chat with live bubbles (own messages without a sender, others under a header line, the panel titled): ours are confirmed, someone else\'s same words are not', async () => {
+  await withService(async (svc, c) => {
+    const ok = await join(c, { liveChat: true });
+    assert.equal(ok.s.announce.sent_to, 'everyone', JSON.stringify(ok.s.announce));
+    const { code, id } = await join(c, { liveChat: true, chatUi: 'lost' });
+    setTimeout(() => fake.say(code, 'Alex Example', 'Same words again.'), 600);
+    const r = await c.call('meeting_chat_send', { meeting_id: id, text: 'Same words again.' });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /did not show up in the chat/);
+  });
+});

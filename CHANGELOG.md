@@ -13,15 +13,17 @@ preset or tool. Finals now say whether they name the agent, and the README says 
   embedded chat), not only the page itself. It clicks the chat button only while the button says the panel is closed
   (`aria-pressed`): the button toggles, and 0.19.0 could close a panel it had just opened. A click that doesn't
   open the panel is repeated every 3 s with the toolbar shown and overlays closed, then Meet's Ctrl+Alt+C is tried.
-  A panel open for 10 s without a box is closed and opened once more. The button may carry text after its name
+  An open panel is never closed to "retry" (a slow embedded chat gets the whole time to load). The button may carry
+  text after its name
   ("Chat with everyone, 2 new messages"). It gives up after 20 s, or 5 s
   when the chat already failed to open at the join, so the recording waits 25 s at most instead of 40 s.
 - **A chat this participant may not post in** ("Let participants send messages" off, "Only hosts can send messages",
   an organisation that keeps outsiders out of its chat) is `chat-restricted`, not `chat-unavailable`.
 - **Meet posts are confirmed.** A message counts as posted once a new message element holds its whole text (as
-  rendered, so a link inside it is fine) and is not marked as someone else's. In a chat without message elements, the
-  text must show up once more than before. Enter goes first. The send button is used only while the text is still in
-  the box and nothing new showed up, so a slow Enter is never sent twice (`not-sent` if the button fails too). A
+  rendered, so a link inside it is fine) and is not shown under someone else's name. In a chat without message
+  elements, the text must show up once more than before, outside the text boxes. Enter goes first and gets 5 s. The
+  send button is used only after that, while the text is still in the box and nothing new showed up, so a slow Enter
+  is not sent twice (`not-sent` if the button fails too). A
   message that never shows up is `not-confirmed`. A blank message is refused before anything is typed. 0.19.0
   pressed Enter and assumed success.
 - **The Meet chat is watched in frames too**, so an objection posted in an embedded chat stops the recording like

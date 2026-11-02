@@ -18,7 +18,13 @@ Decisions made without asking (Misha: "use your judgment and decide yourself"), 
   checked its posts since 0.9.0). Live Meet shows no sender on Bosun's own messages, so "not someone else's" is the
   check that works there. Someone else posting the very same words, unmarked, in the same seconds would still count:
   rare, and a false `not-confirmed` would be worse (the announcement would then go to the host and fail). Codex
-  round 1 found the first version (text counted anywhere in the panel, cut at 200 characters) too loose.
+  round 1 found the first version (text counted anywhere in the panel, cut at 200 characters) too loose; round 2
+  added the sender header live Meet shows (not only `data-sender-name`), drafts left out of the count, and frames
+  compared by identity.
+- **No close-and-reopen of an open chat panel.** Meet's side panel has no tabs any more, and Codex showed a reopen
+  can kill a slow embedded chat that was still loading. Waiting the whole 20 s is safer.
+- **Enter gets 5 s before the send button is tried.** An Enter that is still pending after that could be sent twice;
+  waiting longer only delays the not-sent case, and Meet posts within a second live.
 - **The second open attempt is 5 s, not 20 s.** The join already waited 20 s. Recording and the transcript wait for
   the announcement, and 40 s of an unrecorded call is too much for a second try that rarely helps.
 - **The `addressed` matcher compares a loose key, not spellings.** Scribe writes the name as it heard it, in the

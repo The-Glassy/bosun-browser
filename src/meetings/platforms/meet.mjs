@@ -226,17 +226,35 @@ async function chatDiag(page) {
 const flat = (t) => String(t || '').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ').trim();
 async function chatSnapshot(page, text) {
   const needle = flat(text);
-  const out = [];
+  const out = new Map(); // frame -> {msgs, count}: frames compared by identity, not by place
   for (const f of frames(page)) {
-    out.push(await f.evaluate(({ needle, panel }) => {
+    out.set(f, await f.evaluate(({ needle, panel }) => {
       const n = (t) => String(t || '').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ').trim();
-      // [id, text, sender named on it (data-sender-name) or null]
-      const msgs = [...document.querySelectorAll('[data-message-id]')].map((e) => [e.getAttribute('data-message-id'), n(e.innerText || e.textContent), e.closest('[data-sender-name]')?.getAttribute('data-sender-name') ?? null]);
+      // The sender a message is shown under: data-sender-name, else (live Meet) the header line of its group, as
+      // watchChat reads it; a time or the pin control's text is no name. null: no sender shown (Bosun's own).
+      const ui = /^(?:\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?|hover over a message to pin it|pin message|unpin message|keep|keep_off|push_pin|more_vert)$/i;
+      const sender = (el) => {
+        const named = el.closest('[data-sender-name]');
+        if (named) return named.getAttribute('data-sender-name');
+        const own = new Set((el.innerText || '').split('\n').map((x) => x.trim()));
+        for (let g = el.parentElement, i = 0; g && i < 3; g = g.parentElement, i++) {
+          if (g.querySelector('h1, h2, h3, [role="heading"], [role="switch"]')) break; // the panel, no message group
+          const first = (g.innerText || '').split('\n').map((x) => x.trim()).find((l) => l && !ui.test(l));
+          const name = first?.replace(/\s+\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?$/i, '').trim();
+          if (name && !own.has(first) && name.length <= 80) return name;
+        }
+        return null;
+      };
+      const msgs = [...document.querySelectorAll('[data-message-id]')].map((e) => [e.getAttribute('data-message-id'), n(e.innerText || e.textContent), sender(e)]);
       let count = 0;
       if (!msgs.length && needle) {
+        // The panel's text without what is still in a text box (an unsent draft is no message).
+        const occ = (hay) => { let c = 0; for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + needle.length)) c++; return c; };
         const roots = [...document.querySelectorAll(panel)];
-        const hay = (roots.length ? roots : [document.body]).map((r) => n(r.innerText)).join(' ');
-        for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + needle.length)) count++;
+        for (const r of roots.length ? roots : [document.body]) {
+          count += occ(n(r.innerText));
+          for (const b of r.querySelectorAll('textarea, input, [contenteditable="true"], [role="textbox"]')) count -= occ(n('value' in b ? '' : b.innerText));
+        }
       }
       return { msgs, count };
     }, { needle, panel: CHAT_PANEL }).catch(() => ({ msgs: [], count: 0 })));
@@ -244,20 +262,22 @@ async function chatSnapshot(page, text) {
   return out;
 }
 // Whether the chat shows the message as newly posted since `before` (a chatSnapshot): a message element that was not
-// there before, holds the whole text and is not marked as someone else's (live Meet puts no sender on Bosun's own
-// messages; a sender that is "You" or one of `self` is ours), or, in a chat without message elements, the text once
-// more than before. Someone else posting the very same words in those seconds, unmarked, would still count.
+// there before, holds the whole text and is not shown under someone else's name (live Meet shows no sender on Bosun's
+// own messages; "You" or one of `self` is ours too), or, in a chat without message elements, the text once more than
+// before outside the text boxes. Someone else posting the very same words in those seconds with no name shown would
+// still count.
 const SELF = /^(?:you|me|du|ich|ви|вы|я)$/i;
 async function posted(page, text, before, self = []) {
   const needle = flat(text);
   const now = await chatSnapshot(page, text);
   const ours = (sender) => sender === null || SELF.test(flat(sender)) || self.includes(flat(sender));
-  return now.some((fr, i) => {
-    const old = before[i] || { msgs: [], count: 0 };
+  for (const [f, fr] of now) {
+    const old = before.get(f) || { msgs: [], count: 0 };
     const seen = new Set(old.msgs.map(([id]) => id));
     if (fr.msgs.some(([id, t, sender]) => !seen.has(id) && t.includes(needle) && ours(sender))) return true;
-    return !fr.msgs.length && fr.count > old.count;
-  });
+    if (!fr.msgs.length && fr.count > old.count) return true;
+  }
+  return false;
 }
 const boxText = (box) => box.evaluate((e) => ('value' in e ? e.value : e.innerText)).then((t) => norm(t).trim());
 
@@ -392,7 +412,7 @@ export const meet = {
   // chat-unavailable (with what the page showed) when no box turns up within timeoutMs.
   async openChat(page, { timeoutMs = 20_000 } = {}) {
     const until = Date.now() + timeoutMs;
-    let clicks = 0, last = 0, keyed = false, openSince = 0, hidden = 0, reopened = false;
+    let clicks = 0, last = 0, keyed = false, hidden = 0;
     for (;;) {
       const box = await chatBox(page);
       if (box) return box;
@@ -400,7 +420,6 @@ export const meet = {
       const open = await pressed(b);
       const blocked = (open || clicks) ? await chatBlocked(page) : null;
       if (blocked) throw chatError('chat-restricted', blocked);
-      if (open) openSince ||= Date.now(); else openSince = 0;
       if (Date.now() - last > 3000) {
         if (!b) {
           // No button to be seen: show the toolbar (it fades out), and on the next round try the shortcut once.
@@ -414,13 +433,6 @@ export const meet = {
           if (clicks >= 2 && !keyed) { keyed = true; await page.keyboard.press('Control+Alt+KeyC').catch(() => {}); }
           else { await b.click({ timeout: 3000 }).catch(() => {}); clicks++; }
           last = Date.now();
-        } else if (Date.now() - openSince > 10_000 && !reopened) {
-          // Open for 10 s without a box (a slow embedded chat gets that long): close it and open it once more.
-          reopened = true;
-          await b.click({ timeout: 3000 }).catch(() => {});
-          await page.waitForTimeout(500);
-          await b.click({ timeout: 3000 }).catch(() => {});
-          clicks += 2; last = Date.now(); openSince = 0;
         }
       }
       if (Date.now() > until) {
@@ -445,8 +457,8 @@ export const meet = {
     await box.fill(text, { timeout: 5000 });
     await box.press('Enter', { timeout: 5000 });
     const left = () => boxText(box).catch(() => '');
-    // Up to 3 s for Enter to take: posted (done), or the box emptied (then wait for the message below).
-    for (let i = 0; i < 12; i++) {
+    // Up to 5 s for Enter to take: posted (done), or the box emptied (then wait for the message below).
+    for (let i = 0; i < 20; i++) {
       if (await posted(page, text, before, self)) return;
       if (!(await left())) break;
       await page.waitForTimeout(250);
@@ -488,6 +500,8 @@ export const meet = {
         const ui = /^(?:\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?|hover over a message to pin it|pin message|unpin message|keep|keep_off|push_pin|more_vert)$/i;
         const own = new Set((el.innerText || '').split('\n').map((s) => s.trim()));
         for (let g = el.parentElement, i = 0; g && i < 3; g = g.parentElement, i++) {
+          // A box with a heading or a switch is the panel (its title, "Let participants send messages"), no group.
+          if (g.querySelector('h1, h2, h3, [role="heading"], [role="switch"]')) break;
           const first = (g.innerText || '').split('\n').map((s) => s.trim()).find((l) => l && !ui.test(l));
           const name = first?.replace(/\s+\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?$/i, '').trim();
           if (name && !own.has(first) && name.length <= 80) return name;
