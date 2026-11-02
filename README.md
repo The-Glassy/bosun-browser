@@ -1082,7 +1082,8 @@ Meetings need a **headful** browser (headless Chromium plays no audio), so run t
   failed to post with "the Meet chat panel did not open" and could not be reproduced with Glassy's account, whose
   plan has no continuous chat. 0.20.0 looks for the chat box in frames too, clicks the chat button only while the
   panel is closed (it toggles), retries with the toolbar shown and Meet's Ctrl+Alt+C, reports a chat the host or
-  their organisation keeps closed as `chat-restricted`, and confirms that each message shows up. When it still
+  their organisation keeps closed as `chat-restricted`, confirms that each message shows up as a new message, and
+  watches the chat in frames too, so an objection there is heard. When it still
   fails, the error says what the page showed (chat button, side panel heading, text boxes, frames), so the next
   failure can be fixed from `meeting_status` alone.
 - **One mixed audio track.** There is no speaker separation, also not in the live transcript.
@@ -1102,7 +1103,8 @@ too much.
 finished sentence is a turn, so "Mhm" after each one is noise.
 
 **Shorter hold after a complete sentence.** `speech_settings_set({ "turn_hold_complete_ms": 300 })` (the default; the
-group call ran with 800). The hold adds exactly its value to every answer: measured with the stand-ins
+group call ran with 800). A turn that ends with a complete sentence reaches the agent that much later, when nothing
+merges into it: measured with the stand-ins
 (`node scripts/measure-turn-hold.mjs`, results in `docs/measurements/turn-hold.json`), the first final reached the
 agent 0, 150, 300, 500 and 800 ms after Scribe ended it for those settings, within 11 ms. The rest of the wait is
 Scribe itself. In the Zoom call of 2026-11-02 a final reached Bosun 0.64 to 1.54 s after the speaker stopped (median
@@ -1112,9 +1114,9 @@ Scribe itself. In the Zoom call of 2026-11-02 a final reached Bosun 0.64 to 1.54
   Taking Scribe's first partial as 0.3 to 0.5 s into new speech, 800 ms merged all 8, 500 ms merged 4 to 7, 300 ms 1
   to 4, and 0 ms none or one.
 - Why 300 anyway: in a group the agent answers few turns (see below), so a split mostly costs nothing. When it does
-  hit a turn the agent is answering, `turn_extend_s` (default 20) reopens the turn and drops the stale answer. Each
-  answer comes 0.5 s sooner than at 800. Go lower than 300 only if the agent waits for `addressed` before it
-  answers anything.
+  hit a turn the agent is answering, `turn_extend_s` (default 20) reopens the turn and drops the stale answer. Such
+  a turn reaches the agent 0.5 s sooner than at 800. The agent's own thinking and speech come on top and were not
+  part of this measurement. Go lower than 300 only if the agent waits for `addressed` before it answers anything.
 - `turn_hold_ms` (900) stays as it is. It applies after a fragment ("so I was thinking about the"), where the speaker
   almost always goes on. It also caps `turn_hold_complete_ms`.
 
@@ -1126,7 +1128,8 @@ message shows up in the chat; see `meeting_status.announce` and `chat_error` whe
 **Speak only when addressed.** Every final carries `metadata.addressed: true | false` (also in
 `bosun:meeting-transcript` events). It is true when the text names the agent: the join `name` (a bracketed note such
 as "(notetaker)" is left out, and the first word of a longer name counts on its own), the account name the call
-shows, or one of the speech setting `name_aliases` (up to 20). Case, accents, spelling ("Glassi") and Ukrainian or
+shows (Meet: the name on Bosun's own tile, read once Bosun is in with a signed-in profile), or one of the speech
+setting `name_aliases` (up to 20). Case, accents, spelling ("Glassi") and Ukrainian or
 Russian forms ("Гласі", "Глассі", "Гласси" for "Glassy") don't matter. Add the nicknames people actually use:
 `speech_settings_set({ "name_aliases": ["Гласька", "Glassy AI"] })`. Bosun only marks finals and never answers by
 itself.

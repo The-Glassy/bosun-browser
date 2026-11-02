@@ -11,7 +11,7 @@
 //   state(page)           'lobby' | 'waiting' | 'admitted' | 'denied' | 'refused' | 'removed' | 'ended' | 'unknown'
 //   afterAdmit(page)      optional: what has to happen once in the call before the chat (Zoom joins computer audio)
 //   messages              optional: {refused, invalid, signIn, captcha} texts for those outcomes
-//   openChat(page), sendChat(page, text, {selfName, to, openTimeoutMs})  to: 'everyone' | 'host'; a message not posted throws a
+//   openChat(page), sendChat(page, text, {selfName, names, to, openTimeoutMs})  to: 'everyone' | 'host'; a message not posted throws a
 //                         chatError (common.mjs) whose code says why
 //   watchChat(page, key)  install a MutationObserver that queues new chat messages; drainChat(page, key) -> [{id, sender, text}]
 //   participants(page)    number of people in the call (incl. the bot), or null if the page doesn't show it
@@ -220,30 +220,44 @@ async function chatDiag(page) {
   return out.join('; ');
 }
 
-// How often the posted text shows up in the chat (outside any text box), in the page and its frames; texts are compared
-// with whitespace collapsed, so the line breaks of a bubble don't matter.
-async function chatCount(page, text) {
-  const needle = norm(text).trim().slice(0, 200);
-  let n = 0;
+// What the chat shows now, to tell a new message from what was there: per frame, the ids of the message elements
+// ([data-message-id]) with their text, and (for a chat without such elements) how often the text appears in the panel.
+// Texts are compared as rendered (innerText: a link inside a sentence stays where it was), with whitespace collapsed.
+const flat = (t) => String(t || '').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ').trim();
+async function chatSnapshot(page, text) {
+  const needle = flat(text);
+  const out = [];
   for (const f of frames(page)) {
-    n += await f.evaluate(({ needle, panel }) => {
-      const roots = [...document.querySelectorAll(panel)];
-      const parts = [];
-      for (const root of roots.length ? roots : [document.body]) {
-        const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-        for (let t = w.nextNode(); t; t = w.nextNode()) {
-          const el = t.parentElement;
-          if (!el || el.closest('textarea, input, [contenteditable="true"], [role="textbox"], [aria-hidden="true"], [role="tooltip"]')) continue;
-          parts.push(t.nodeValue);
-        }
+    out.push(await f.evaluate(({ needle, panel }) => {
+      const n = (t) => String(t || '').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ').trim();
+      // [id, text, sender named on it (data-sender-name) or null]
+      const msgs = [...document.querySelectorAll('[data-message-id]')].map((e) => [e.getAttribute('data-message-id'), n(e.innerText || e.textContent), e.closest('[data-sender-name]')?.getAttribute('data-sender-name') ?? null]);
+      let count = 0;
+      if (!msgs.length && needle) {
+        const roots = [...document.querySelectorAll(panel)];
+        const hay = (roots.length ? roots : [document.body]).map((r) => n(r.innerText)).join(' ');
+        for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + needle.length)) count++;
       }
-      const hay = parts.join(' ').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ');
-      let c = 0;
-      for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + needle.length)) c++;
-      return c;
-    }, { needle, panel: CHAT_PANEL }).catch(() => 0);
+      return { msgs, count };
+    }, { needle, panel: CHAT_PANEL }).catch(() => ({ msgs: [], count: 0 })));
   }
-  return n;
+  return out;
+}
+// Whether the chat shows the message as newly posted since `before` (a chatSnapshot): a message element that was not
+// there before, holds the whole text and is not marked as someone else's (live Meet puts no sender on Bosun's own
+// messages; a sender that is "You" or one of `self` is ours), or, in a chat without message elements, the text once
+// more than before. Someone else posting the very same words in those seconds, unmarked, would still count.
+const SELF = /^(?:you|me|du|ich|ви|вы|я)$/i;
+async function posted(page, text, before, self = []) {
+  const needle = flat(text);
+  const now = await chatSnapshot(page, text);
+  const ours = (sender) => sender === null || SELF.test(flat(sender)) || self.includes(flat(sender));
+  return now.some((fr, i) => {
+    const old = before[i] || { msgs: [], count: 0 };
+    const seen = new Set(old.msgs.map(([id]) => id));
+    if (fr.msgs.some(([id, t, sender]) => !seen.has(id) && t.includes(needle) && ours(sender))) return true;
+    return !fr.msgs.length && fr.count > old.count;
+  });
 }
 const boxText = (box) => box.evaluate((e) => ('value' in e ? e.value : e.innerText)).then((t) => norm(t).trim());
 
@@ -378,7 +392,7 @@ export const meet = {
   // chat-unavailable (with what the page showed) when no box turns up within timeoutMs.
   async openChat(page, { timeoutMs = 20_000 } = {}) {
     const until = Date.now() + timeoutMs;
-    let clicks = 0, last = 0, keyed = false, openSince = 0, hidden = 0;
+    let clicks = 0, last = 0, keyed = false, openSince = 0, hidden = 0, reopened = false;
     for (;;) {
       const box = await chatBox(page);
       if (box) return box;
@@ -400,8 +414,9 @@ export const meet = {
           if (clicks >= 2 && !keyed) { keyed = true; await page.keyboard.press('Control+Alt+KeyC').catch(() => {}); }
           else { await b.click({ timeout: 3000 }).catch(() => {}); clicks++; }
           last = Date.now();
-        } else if (Date.now() - openSince > 6000 && clicks < 4) {
-          // Open for 6 s without a box: close it and open it again (a panel that came up on another tab or half-rendered).
+        } else if (Date.now() - openSince > 10_000 && !reopened) {
+          // Open for 10 s without a box (a slow embedded chat gets that long): close it and open it once more.
+          reopened = true;
           await b.click({ timeout: 3000 }).catch(() => {});
           await page.waitForTimeout(500);
           await b.click({ timeout: 3000 }).catch(() => {});
@@ -416,20 +431,28 @@ export const meet = {
     }
   },
 
-  // Meet's chat goes to everyone; there is no message to the host alone. Posted means: the box emptied and the text
-  // showed up in the chat once more than before (Enter, else the send button); otherwise this throws not-sent or
-  // not-confirmed.
-  async sendChat(page, text, { to = 'everyone', openTimeoutMs } = {}) {
+  // Meet's chat goes to everyone; there is no message to the host alone. Posted means: a new message with the whole
+  // text showed up in the chat (posted()); Enter first, the send button only while the text is still in the box and
+  // nothing new showed up (so a slow Enter is never sent twice). Otherwise this throws not-sent or not-confirmed.
+  async sendChat(page, text, { to = 'everyone', openTimeoutMs, selfName = null, names = [] } = {}) {
     if (to === 'host') throw chatError('host-unreachable', "Google Meet's chat has no way to write to the host alone");
+    if (!flat(text)) throw chatError('not-sent', 'an empty chat message is not sent');
     const box = await this.openChat(page, openTimeoutMs ? { timeoutMs: openTimeoutMs } : {});
     // The host turned chat off for participants: the box is there, disabled.
     if (await disabled(box)) throw chatError('chat-restricted', 'the Meet chat is turned off for participants (the host allows no chat messages)');
-    const before = await chatCount(page, text);
+    const before = await chatSnapshot(page, text);
+    const self = [selfName, ...names].filter(Boolean).map(flat);
     await box.fill(text, { timeout: 5000 });
     await box.press('Enter', { timeout: 5000 });
     const left = () => boxText(box).catch(() => '');
-    for (let i = 0; i < 10 && await left(); i++) await page.waitForTimeout(150);
+    // Up to 3 s for Enter to take: posted (done), or the box emptied (then wait for the message below).
+    for (let i = 0; i < 12; i++) {
+      if (await posted(page, text, before, self)) return;
+      if (!(await left())) break;
+      await page.waitForTimeout(250);
+    }
     if (await left()) {
+      if (await posted(page, text, before, self)) return; // it went out after all: never send twice
       await box.fill(text, { timeout: 5000 }); // Enter may have added a line break
       for (const f of frames(page)) {
         const send = await firstVisible(f.getByRole('button', { name: LABEL.chatSend }));
@@ -439,16 +462,21 @@ export const meet = {
       if (await left()) throw chatError('not-sent', 'the Meet chat message was not sent (still in the chat box)');
     }
     for (let i = 0; i < 32; i++) {
-      if (await chatCount(page, text) > before) return;
+      if (await posted(page, text, before, self)) return;
       await page.waitForTimeout(250);
     }
     throw chatError('not-confirmed', 'the Meet chat message left the box but did not show up in the chat');
   },
 
   // New chat messages are queued in the page under a random, non-enumerable key; drainChat empties the queue.
-  // Messages already in the panel when the watch starts are queued too (they arrived before we could listen).
+  // Messages already in the panel when the watch starts are queued too (they arrived before we could listen). The
+  // watch runs in every frame of the page, so a chat embedded in a frame is heard too (and an objection in it counts).
   async watchChat(page, key) {
-    await page.evaluate((key) => {
+    for (const f of frames(page)) await this.watchFrame(f, key).catch((e) => { if (f === page.mainFrame()) throw e; });
+  },
+
+  async watchFrame(frame, key) {
+    await frame.evaluate((key) => {
       if (window[key]) return;
       const q = [];
       const seen = new Map(); // id -> text queued last; a message rendered empty first, or changed, is queued again
@@ -483,13 +511,41 @@ export const meet = {
     }, key);
   },
 
+  // null: the page itself was replaced (watch again). A frame that came (or was reloaded) since is watched from now on;
+  // its messages get ids of their own (prefixed with the frame's host and path), so two frames never share one.
   async drainChat(page, key) {
-    return page.evaluate((key) => {
-      const w = window[key];
-      if (!w) return null; // the page was replaced: watch again
-      w.scan();
-      return w.q.splice(0);
-    }, key);
+    const out = [];
+    for (const f of frames(page)) {
+      let tag = 'frame';
+      try { const u = new URL(f.url()); tag = `${u.host}${u.pathname}`.slice(0, 80); } catch {}
+      const main = f === page.mainFrame();
+      const got = await f.evaluate((key) => {
+        const w = window[key];
+        if (!w) return null;
+        w.scan();
+        return w.q.splice(0);
+      }, key).catch(() => (main ? Promise.reject(new Error('the Meet page is gone')) : []));
+      if (got === null) {
+        if (main) return null;
+        await this.watchFrame(f, key).catch(() => {});
+        const first = await f.evaluate((key) => (window[key] ? (window[key].scan(), window[key].q.splice(0)) : []), key).catch(() => []);
+        out.push(...first.map((m) => ({ ...m, id: `${tag}#${m.id}` })));
+      } else out.push(...(main ? got : got.map((m) => ({ ...m, id: `${tag}#${m.id}` }))));
+    }
+    return out;
+  },
+
+  // The name the call shows for Bosun (a signed-in profile: the account's name, whatever `name` was asked for): our own
+  // tile's name, or its data-self-name when that is a name and not "You". null when the page doesn't show it.
+  async selfName(page) {
+    return page.evaluate(() => {
+      const tile = [...document.querySelectorAll('[data-participant-id]')].find((t) => t.matches('[data-self-name]') || t.querySelector('[data-self-name]'));
+      if (!tile) return null;
+      const mark = tile.matches('[data-self-name]') ? tile : tile.querySelector('[data-self-name]');
+      const n = (x) => String(x || '').replace(/\s+/g, ' ').trim();
+      return [n(tile.querySelector('span.notranslate')?.textContent), n(mark.getAttribute('data-self-name'))]
+        .find((x) => x && x.length <= 80 && !/^(?:you|du|sie|ich|me|vy|ty|ви|вы|ти|ты|я)$/i.test(x)) || null;
+    }).catch(() => null);
   },
 
   async participants(page) {

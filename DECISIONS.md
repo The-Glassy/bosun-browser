@@ -14,8 +14,11 @@ Decisions made without asking (Misha: "use your judgment and decide yourself"), 
   09:00:30.2), so the click worked and no box was found both times. So: frames are searched, the toggle is
   respected, clicks are retried with a shortcut fallback, restriction is recognised, and a failure reports what was
   on the page. The README lists it as not verified live.
-- **Posts are confirmed by the text showing up in the chat**, counted before and after (as Zoom has done since
-  0.9.0). Counting, not just finding the text, means a repeated message is not confirmed by an older copy.
+- **Posts are confirmed by a new message element with the whole text that is not someone else's** (Zoom has
+  checked its posts since 0.9.0). Live Meet shows no sender on Bosun's own messages, so "not someone else's" is the
+  check that works there. Someone else posting the very same words, unmarked, in the same seconds would still count:
+  rare, and a false `not-confirmed` would be worse (the announcement would then go to the host and fail). Codex
+  round 1 found the first version (text counted anywhere in the panel, cut at 200 characters) too loose.
 - **The second open attempt is 5 s, not 20 s.** The join already waited 20 s. Recording and the transcript wait for
   the announcement, and 40 s of an unrecorded call is too much for a second try that rarely helps.
 - **The `addressed` matcher compares a loose key, not spellings.** Scribe writes the name as it heard it, in the
@@ -26,6 +29,8 @@ Decisions made without asking (Misha: "use your judgment and decide yourself"), 
 - **The account name the call shows counts as a name too.** With a signed-in profile Meet shows the account's name
   ("Glassy Notetaker"), and people address what they see. The first word of a longer name counts on its own,
   because people say "Glassy", not "Glassy Notetaker". A bracketed note ("Glassy (notetaker)") is no part of a name.
+- **The Meet account name comes from Bosun's own tile, only for signed-in joins.** A guest's tile shows the join
+  name anyway. A tile labelled "You" is no name.
 - **`addressed` only on finals.** Partials change while they come in, and the agent decides on turns.
 - **No `addressed_as` or position field.** The brief asked for true or false, and the agent has the text.
 - **`turn_hold_complete_ms` 300 is the recommendation, and the default stays 300.** The hold adds exactly its value

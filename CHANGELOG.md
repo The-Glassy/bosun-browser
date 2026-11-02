@@ -13,14 +13,19 @@ preset or tool. Finals now say whether they name the agent, and the README says 
   embedded chat), not only the page itself. It clicks the chat button only while the button says the panel is closed
   (`aria-pressed`): the button toggles, and 0.19.0 could close a panel it had just opened. A click that doesn't
   open the panel is repeated every 3 s with the toolbar shown and overlays closed, then Meet's Ctrl+Alt+C is tried.
-  The button may carry text after its name ("Chat with everyone, 2 new messages"). It gives up after 20 s, or 5 s
+  A panel open for 10 s without a box is closed and opened once more. The button may carry text after its name
+  ("Chat with everyone, 2 new messages"). It gives up after 20 s, or 5 s
   when the chat already failed to open at the join, so the recording waits 25 s at most instead of 40 s.
 - **A chat this participant may not post in** ("Let participants send messages" off, "Only hosts can send messages",
   an organisation that keeps outsiders out of its chat) is `chat-restricted`, not `chat-unavailable`.
-- **Meet posts are confirmed.** A message counts as posted only once the box is empty and the text shows up in the
-  chat once more than before. Enter that leaves the text in the box falls back to the send button (`not-sent` if that
-  fails too). A message that leaves the box but never shows up is `not-confirmed`. 0.19.0 pressed Enter and assumed
-  success.
+- **Meet posts are confirmed.** A message counts as posted once a new message element holds its whole text (as
+  rendered, so a link inside it is fine) and is not marked as someone else's. In a chat without message elements, the
+  text must show up once more than before. Enter goes first. The send button is used only while the text is still in
+  the box and nothing new showed up, so a slow Enter is never sent twice (`not-sent` if the button fails too). A
+  message that never shows up is `not-confirmed`. A blank message is refused before anything is typed. 0.19.0
+  pressed Enter and assumed success.
+- **The Meet chat is watched in frames too**, so an objection posted in an embedded chat stops the recording like
+  any other.
 - **The error says what the page showed** when the chat won't open: the chat button's name and `pressed` state, the
   side panel's heading, the text boxes in it, and frames from other hosts. That goes to `meeting_status` (`announce`
   failures, `chat_error`), so the next live failure can be fixed from the status alone.
@@ -29,7 +34,8 @@ preset or tool. Finals now say whether they name the agent, and the README says 
 
 - **`addressed: true | false` on every final** (channel metadata and `bosun:meeting-transcript` events; partials
   carry none). It is true when the text names the agent by the join `name` (a bracketed note left out, and the first
-  word of a longer name on its own), the account name the call shows, or the new speech setting **`name_aliases`**
+  word of a longer name on its own), the account name the call shows (Meet: Bosun's own tile, read for signed-in
+  joins), or the new speech setting **`name_aliases`**
   (up to 20 names). The matcher ignores case and accents, transliterates Cyrillic and compares a loose key
   (`src/meetings/addressed.mjs`), so "Glassi", "Гласі", "Глассі" and "Гласси" all match "Glassy" without being listed.
   Bosun's own voice coming back is never addressed. Bosun only marks finals and does nothing else with the mark.
@@ -54,11 +60,13 @@ preset or tool. Finals now say whether they name the agent, and the README says 
 - `test/meeting-chat-open.test.mjs`: the announcement and a later `meeting_chat_send` go out with a click Meet ignores
   for 2.5 s, a toolbar hidden until the mouse moves, no chat button (Ctrl+Alt+C), the chat in a frame, Enter that
   adds a line break. Plus a blocked chat (`chat-restricted` with the panel's words), a lost message
-  (`not-confirmed`) and a panel that never opens (`chat-unavailable` with the diagnosis, settled in under 38 s).
+  (`not-confirmed`), someone else posting the same words meanwhile (still `not-confirmed`), Enter that empties the
+  box late (one copy), a link in the message, a blank message, an opt-out in the frame chat, and a panel that never
+  opens (`chat-unavailable` with the diagnosis, settled in under 38 s).
   `test/fakemeet.mjs`: the chat button toggles (`aria-pressed`) as on live Meet, Ctrl+Alt+C, and those variants.
 - `test/meeting-addressed.test.mjs`: the matcher (Latin, accents, Cyrillic forms, possessive, multi-word aliases, no
   hits on "glasses", "a glass", "AI"), `addressed` on channel finals and events through MCP, `name_aliases`
-  validation and `null`.
+  validation and `null`, and the account name from Meet's own tile with a signed-in profile.
 
 ## 0.19.0: meeting_draft removed
 

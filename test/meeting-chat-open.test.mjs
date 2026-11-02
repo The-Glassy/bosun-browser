@@ -16,8 +16,9 @@ after(async () => { await fake.close(); });
 async function withService(fn) {
   const audio = fakeAudio();
   const svc = await startBosun({ KEEPALIVE: '0' }, { meetings: { audio, platformFor: (u) => (u.startsWith(fake.base) ? meet : null), pollMs: 200 } });
-  const ev = { announce: [] };
+  const ev = { announce: [], optout: [] };
   svc.events.on('meeting-announce', (e) => ev.announce.push(e));
+  svc.events.on('meeting-optout', (e) => ev.optout.push(e));
   const c = await connect(svc);
   try { return await fn(svc, c, ev); } finally { await c.close(); await svc.stop(); }
 }
@@ -82,5 +83,51 @@ test('Meet chat: a panel that never opens is chat-unavailable, the error says wh
     // 20 s at the join, 5 s more for the announcement itself (plus joining), not 2 x 20 s.
     assert.ok(took < 38_000, `announcement settled after ${took} ms`);
     assert.equal(s.state, 'recording', 'records anyway, as before');
+  });
+});
+
+test('Meet chat: Enter that posts but empties the box only 3.5 s later is not sent twice', async () => {
+  await withService(async (svc, c) => {
+    const { code, id, s } = await join(c, { chatUi: 'slowClear' });
+    assert.equal(s.announce.sent_to, 'everyone');
+    const r = await c.call('meeting_chat_send', { meeting_id: id, text: 'Only once, please.' });
+    assert.equal(r.isError, false, r.text);
+    await sleep(4000);
+    assert.deepEqual(fake.room(code).chat.map((m) => m.text), [EN, DE, 'Only once, please.']);
+  });
+});
+
+test('Meet chat: a message with a link (rendered inline as <a>) is confirmed; a blank one is refused before anything is typed', async () => {
+  await withService(async (svc, c) => {
+    const { code, id } = await join(c, {});
+    const r = await c.call('meeting_chat_send', { meeting_id: id, text: 'The doc: https://example.com/plan. Deadline 14 Nov.' });
+    assert.equal(r.isError, false, r.text);
+    const blank = await c.call('meeting_chat_send', { meeting_id: id, text: '   ' });
+    assert.equal(blank.isError, true);
+    assert.match(blank.text, /empty chat message/);
+    assert.deepEqual(fake.room(code).chat.map((m) => m.text).slice(2), ['The doc: https://example.com/plan. Deadline 14 Nov.']);
+    assert.equal((await status(c, id)).state, 'recording', 'the page still answers');
+  });
+});
+
+test('Meet chat: someone else posting the same words while ours got lost does not confirm ours', async () => {
+  await withService(async (svc, c) => {
+    const { code, id } = await join(c, { chatUi: 'lost' });
+    setTimeout(() => fake.say(code, 'Alex Example', 'Same words here.'), 600);
+    const r = await c.call('meeting_chat_send', { meeting_id: id, text: 'Same words here.' });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /did not show up in the chat/);
+  });
+});
+
+test('Meet chat in a frame: an objection posted there is heard (opt-out), not only our posts', async () => {
+  await withService(async (svc, c, ev) => {
+    const { code, id, s } = await join(c, { chatUi: 'frame' });
+    assert.equal(s.announce.sent_to, 'everyone');
+    await until(async () => (await status(c, id)).state === 'recording', 10_000);
+    fake.say(code, 'Alex Example', "please don't record");
+    await until(() => ev.optout.length === 1, 10_000);
+    assert.equal(ev.optout[0].text, "please don't record");
+    await until(async () => (await status(c, id)).state === 'ended', 10_000);
   });
 });

@@ -49,9 +49,11 @@ const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 // toggles it too. chatUi varies the panel: 'frame' (the box and the messages sit in an iframe, as an embedded chat
 // would), 'blocked' (the panel says only hosts can send messages, "Let participants send messages" off, no box),
 // 'lost' (Enter empties the box but nothing is posted), 'enterNewline' (Enter adds a line break; only the send button
-// sends), 'hiddenToolbar' (the toolbar is invisible until the mouse moves), 'noButton' (no chat button: only Ctrl+Alt+C).
+// sends), 'hiddenToolbar' (the toolbar is invisible until the mouse moves), 'noButton' (no chat button: only Ctrl+Alt+C),
+// 'slowClear' (Enter posts at once, but the box empties only 3.5 s later). Links in messages are rendered as <a>.
+// selfName: the name on our own tile (default "self"; a signed-in account shows its name there).
 // chatReadyMs: clicks on the chat button in the first that many ms of the call do nothing (Meet still settling).
-function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false, chatOff = false, chatUi = null, chatReadyMs = 0 }) {
+function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false, chatOff = false, chatUi = null, chatReadyMs = 0, selfName = 'self' }) {
   const L = UI[lang];
   const de = lang === 'de';
   const joinButtons = elsewhere
@@ -111,6 +113,7 @@ if ($('ask')) $('ask').onclick = ask('ask');
 if ($('switch')) { $('switch').onclick = ask('switch'); $('too').onclick = ask('too'); $('other').onclick = () => { $('menu').hidden = !$('menu').hidden; }; }
 if ($('dlgOk')) $('dlgOk').onclick = () => $('dlg').remove();
 if (${readyMs}) setTimeout(() => { $('ask').disabled = false; $('ready')?.remove(); }, ${readyMs});
+const SELF_NAME = ${JSON.stringify(selfName)};
 const CHAT_UI = ${JSON.stringify(chatUi)}, CHAT_READY_MS = ${Number(chatReadyMs) || 0};
 let inCallAt = 0;
 const toggleChat = () => { const open = $('panel').hidden; $('panel').hidden = !open; $('chatBtn')?.setAttribute('aria-pressed', String(open)); if (open && CHAT_UI === 'frame' && !$('chatFrame').src) $('chatFrame').src = '/chatframe?code=' + code; };
@@ -148,6 +151,7 @@ if (box) box.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter' || e.shiftKey || CHAT_UI === 'enterNewline') return;
   e.preventDefault();
   if (CHAT_UI === 'lost') { box.value = ''; return; }
+  if (CHAT_UI === 'slowClear') { const t = box.value.trim(); if (t) post('chat', { text: t }); setTimeout(() => { box.value = ''; }, 3500); return; }
   send();
 });
 if ($('sendBtn')) $('sendBtn').onclick = send;
@@ -163,7 +167,7 @@ async function poll() {
       $('tiles').dataset.p = want;
       $('tiles').replaceChildren(...s.participants.map((p) => {
         const t = document.createElement('div'); t.className = 'tile'; t.dataset.participantId = p;
-        const n = document.createElement('span'); n.className = 'notranslate'; n.textContent = p;
+        const n = document.createElement('span'); n.className = 'notranslate'; n.textContent = p === 'self' ? SELF_NAME : p;
         const ind = document.createElement('div'); ind.className = 'ind';
         if (p === 'self') { t.dataset.selfName = 'You'; ind.dataset.selfName = 'You'; }
         t.append(n, ind);
@@ -188,7 +192,13 @@ async function poll() {
         if (m.self && TWICE) { const d2 = d.cloneNode(true); d2.dataset.messageId = m.id + '-confirmed'; g.append(d2); }
       } else {
         g.dataset.senderName = m.self ? 'You' : m.sender;
-        d.textContent = m.text; // may be empty at first and filled in by a later poll (lateMs)
+        // may be empty at first and filled in by a later poll (lateMs); links inline, as Meet renders them
+        m.text.split(' ').forEach((w, i) => {
+          if (i) d.append(' ');
+          const url = w.startsWith('http') ? (w.endsWith('.') || w.endsWith(',') ? w.slice(0, -1) : w) : null;
+          if (!url) return d.append(w);
+          const a = document.createElement('a'); a.href = url; a.textContent = url; d.append(a, w.slice(url.length));
+        });
       }
       g.append(d);
       $('msgs').append(g);

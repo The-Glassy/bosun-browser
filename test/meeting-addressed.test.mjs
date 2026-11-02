@@ -119,3 +119,23 @@ test('name_aliases: checked (up to 20 names of 1-60 characters), null removes it
     await c.close();
   });
 });
+
+test('addressed: with a signed-in profile the account name the call shows counts too (Meet: our own tile)', async () => {
+  await withService(async (svc, ev, audio) => {
+    const c = await host(svc);
+    const s0 = await c.open({ profile: 'google', engine: 'chromium' });
+    await c.call('session_close', { session: s0 });
+    await c.call('speech_settings_set', { turn_hold_ms: 0 });
+    const { code, url } = fake.newRoom();
+    fake.set(code, { signedIn: true, open: true, selfName: 'Alex Account' });
+    const id = (await c.call('meeting_join', { url, profile: 'google', name: 'Glassy', live_transcript: true })).json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    await until(() => c.registered.length === 1, 10_000);
+    phrases('Alex, what do you think?', 'Glassy, and you?', 'Nobody named here.');
+    audio.say(Buffer.concat([tonePcm(1.2), silence(2.5), tonePcm(1.2), silence(2.5), tonePcm(1.2)]));
+    await until(() => c.finals().length === 3, 30_000);
+    assert.deepEqual(c.finals().map((f) => f.metadata.addressed), [true, true, false]);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});

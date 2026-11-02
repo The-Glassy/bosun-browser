@@ -427,6 +427,8 @@ export class Meetings {
       // A chat that won't open (turned off by the host) is no reason to leave; the announcement then says why it failed.
       await platform.openChat(p).catch((e) => { m.chatError = oneLine(e); });
       await platform.watchChat(p, m.chatKey);
+      // Signed in, the call shows the account's name, which people then use (addressed): Meet's own tile says it.
+      if (!m.info.selfName && m.info.joinedAs === 'account' && platform.selfName) m.info.selfName = await platform.selfName(p);
       if (platform.watchSpeakers) await platform.watchSpeakers(p, m.speakerKey, { self: [m.name, m.info.selfName].filter(Boolean) }).catch(() => {});
     });
     await this.announce(m);
@@ -1249,7 +1251,7 @@ export class Meetings {
     m.pendingOwn.push(text.trim());
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
     // The chat already failed to open once (at the join): a short second try, so the recording is not held up long.
-    await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name, to, ...(m.chatError ? { openTimeoutMs: 5000 } : {}) });
+    await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name, names: [m.name], to, ...(m.chatError ? { openTimeoutMs: 5000 } : {}) });
     m.chatError = null; // the chat works after all
   }
 
