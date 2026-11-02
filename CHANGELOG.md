@@ -37,7 +37,7 @@ preset or tool. Finals now say whether they name the agent, and the README says 
 - **`addressed: true | false` on every final** (channel metadata and `bosun:meeting-transcript` events; partials
   carry none). It is true when the text names the agent by the join `name` (a bracketed note left out, and the first
   word of a longer name on its own), the account name the call shows (Meet: Bosun's own tile, read for signed-in
-  joins), or the new speech setting **`name_aliases`**
+  joins; the tile marked `data-self-name`, or the one with "Backgrounds and effects"), or the new speech setting **`name_aliases`**
   (up to 20 names). The matcher ignores case and accents, transliterates Cyrillic and compares a loose key
   (`src/meetings/addressed.mjs`), so "Glassi", "Гласі", "Глассі" and "Гласси" all match "Glassy" without being listed.
   Bosun's own voice coming back is never addressed. Bosun only marks finals and does nothing else with the mark.
@@ -54,8 +54,10 @@ preset or tool. Finals now say whether they name the agent, and the README says 
   (median 0.82 s, VAD 0.5 s included). After 8 of 12 complete sentences the speaker went on after 0.68 to 1.06 s. At
   800 ms all 8 would merge, at 300 ms 1 to 4 (assuming Scribe's first partial 0.3 to 0.5 s into new speech).
 - Live (prod container, a throwaway Bosun with a copy of the google-glassy profile, a real calendar Meet with Glassy's
-  own session as host and no other people): announcement posted and confirmed, the host's message read with
-  `meeting_chat_read`, `meeting_chat_send` seen by the host.
+  own session as host and no other people), with the final code: announcement posted and confirmed, the host's message
+  (Cyrillic and a link) read with `meeting_chat_read`, a `meeting_chat_send` with a link confirmed and seen once by
+  the host, a blank one refused. Live Meet marks no tile `data-self-name` any more; Bosun's own tile is the one with
+  "Backgrounds and effects", which gave the account name.
 
 ### Tests
 

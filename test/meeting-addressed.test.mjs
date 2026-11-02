@@ -120,14 +120,14 @@ test('name_aliases: checked (up to 20 names of 1-60 characters), null removes it
   });
 });
 
-test('addressed: with a signed-in profile the account name the call shows counts too (Meet: our own tile)', async () => {
+for (const selfMark of [null, 'controls']) test(`addressed: with a signed-in profile the account name the call shows counts too (Meet: our own tile, marked ${selfMark ? 'by its controls' : 'data-self-name'})`, async () => {
   await withService(async (svc, ev, audio) => {
     const c = await host(svc);
     const s0 = await c.open({ profile: 'google', engine: 'chromium' });
     await c.call('session_close', { session: s0 });
     await c.call('speech_settings_set', { turn_hold_ms: 0 });
     const { code, url } = fake.newRoom();
-    fake.set(code, { signedIn: true, open: true, selfName: 'Alex Account' });
+    fake.set(code, { signedIn: true, open: true, selfName: 'Alex Account', selfMark });
     const id = (await c.call('meeting_join', { url, profile: 'google', name: 'Glassy', live_transcript: true })).json().meeting_id;
     await until(async () => (await status(c, id)).state === 'recording', 15_000);
     await until(() => c.registered.length === 1, 10_000);

@@ -51,9 +51,10 @@ const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 // 'lost' (Enter empties the box but nothing is posted), 'enterNewline' (Enter adds a line break; only the send button
 // sends), 'hiddenToolbar' (the toolbar is invisible until the mouse moves), 'noButton' (no chat button: only Ctrl+Alt+C),
 // 'slowClear' (Enter posts at once, but the box empties only 3.5 s later). Links in messages are rendered as <a>.
-// selfName: the name on our own tile (default "self"; a signed-in account shows its name there).
+// selfName: the name on our own tile (default "self"; a signed-in account shows its name there). selfMark 'controls':
+// our tile is told by its "Backgrounds and effects" button, not data-self-name (live Meet, 2026-11-02).
 // chatReadyMs: clicks on the chat button in the first that many ms of the call do nothing (Meet still settling).
-function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false, chatOff = false, chatUi = null, chatReadyMs = 0, selfName = 'self' }) {
+function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false, chatOff = false, chatUi = null, chatReadyMs = 0, selfName = 'self', selfMark = null }) {
   const L = UI[lang];
   const de = lang === 'de';
   const joinButtons = elsewhere
@@ -113,7 +114,7 @@ if ($('ask')) $('ask').onclick = ask('ask');
 if ($('switch')) { $('switch').onclick = ask('switch'); $('too').onclick = ask('too'); $('other').onclick = () => { $('menu').hidden = !$('menu').hidden; }; }
 if ($('dlgOk')) $('dlgOk').onclick = () => $('dlg').remove();
 if (${readyMs}) setTimeout(() => { $('ask').disabled = false; $('ready')?.remove(); }, ${readyMs});
-const SELF_NAME = ${JSON.stringify(selfName)};
+const SELF_NAME = ${JSON.stringify(selfName)}, SELF_MARK = ${JSON.stringify(selfMark)};
 const CHAT_UI = ${JSON.stringify(chatUi)}, CHAT_READY_MS = ${Number(chatReadyMs) || 0};
 let inCallAt = 0;
 const toggleChat = () => { const open = $('panel').hidden; $('panel').hidden = !open; $('chatBtn')?.setAttribute('aria-pressed', String(open)); if (open && CHAT_UI === 'frame' && !$('chatFrame').src) $('chatFrame').src = '/chatframe?code=' + code; };
@@ -169,7 +170,8 @@ async function poll() {
         const t = document.createElement('div'); t.className = 'tile'; t.dataset.participantId = p;
         const n = document.createElement('span'); n.className = 'notranslate'; n.textContent = p === 'self' ? SELF_NAME : p;
         const ind = document.createElement('div'); ind.className = 'ind';
-        if (p === 'self') { t.dataset.selfName = 'You'; ind.dataset.selfName = 'You'; }
+        // SELF_MARK 'controls': no data-self-name (live Meet, 2026-11-02); our tile has "Backgrounds and effects".
+        if (p === 'self') { if (SELF_MARK === 'controls') { const b = document.createElement('button'); b.setAttribute('aria-label', 'Backgrounds and effects'); b.textContent = 'visual_effects'; t.append(b); } else { t.dataset.selfName = 'You'; ind.dataset.selfName = 'You'; } }
         t.append(n, ind);
         return t;
       }));

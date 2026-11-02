@@ -64,6 +64,8 @@ const TEXT = {
   // "Mic not found": the device picker ("Microphone: Mic not found").
   noMic: any('microphone not found', 'no microphone found', '\\bmic not found', 'mikrofon nicht gefunden', 'kein mikrofon gefunden', 'mikrofón sa nenašiel', 'мікрофон не знайдено', 'микрофон не найден'),
 };
+// A control only one's own tile has ("Backgrounds and effects"), by its label in the languages Bosun matches.
+const OWN_TILE = ['Backgrounds and effects', 'Hintergründe und Effekte', 'Pozadia a efekty', 'Фони та ефекти', 'Фоны и эффекты'].map((l) => `[aria-label*="${l}" i]`).join(', ');
 const MEET_SPEAKERS = {
   tiles: '[data-participant-id]', tileName: 'span.notranslate', selfMark: '[data-self-name]',
   speaking: ['[data-audio-level]:not([data-audio-level="0"])', '.Oaajhc', '.HX2H7', '.wEsLMd', '.OgVli'],
@@ -549,17 +551,18 @@ export const meet = {
     return out;
   },
 
-  // The name the call shows for Bosun (a signed-in profile: the account's name, whatever `name` was asked for): our own
-  // tile's name, or its data-self-name when that is a name and not "You". null when the page doesn't show it.
+  // The name the call shows for Bosun (a signed-in profile: the account's name, whatever `name` was asked for): the name
+  // on our own tile, which is the one marked data-self-name, or (live Meet, 2026-11-02: no such mark) the one with the
+  // "Backgrounds and effects" control only one's own tile has. A mark reading "You" is no name. null when not shown.
   async selfName(page) {
-    return page.evaluate(() => {
-      const tile = [...document.querySelectorAll('[data-participant-id]')].find((t) => t.matches('[data-self-name]') || t.querySelector('[data-self-name]'));
+    return page.evaluate((own) => {
+      const tile = [...document.querySelectorAll('[data-participant-id]')].find((t) => t.matches('[data-self-name]') || t.querySelector(`[data-self-name], ${own}`));
       if (!tile) return null;
       const mark = tile.matches('[data-self-name]') ? tile : tile.querySelector('[data-self-name]');
       const n = (x) => String(x || '').replace(/\s+/g, ' ').trim();
-      return [n(tile.querySelector('span.notranslate')?.textContent), n(mark.getAttribute('data-self-name'))]
+      return [n(tile.querySelector('span.notranslate')?.textContent), n(mark?.getAttribute('data-self-name'))]
         .find((x) => x && x.length <= 80 && !/^(?:you|du|sie|ich|me|vy|ty|ви|вы|ти|ты|я)$/i.test(x)) || null;
-    }).catch(() => null);
+    }, OWN_TILE).catch(() => null);
   },
 
   async participants(page) {
