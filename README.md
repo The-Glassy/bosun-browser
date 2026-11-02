@@ -946,7 +946,8 @@ once the announcement is out.
 - **Incoming:** transcript finals arrive as `channels/incoming`:
   - `messageId` `<meeting>:<seq>`, `threadId` the meeting.
   - `author` is the speaker when known, else "Meeting".
-  - `metadata` `{meeting_id, platform, seq, start_s, end_s, final, lang, speaker, speakers}`, tags
+  - `metadata` `{meeting_id, platform, seq, start_s, end_s, final, lang, speaker, speakers}`, and on finals
+    `turn_seq` and `addressed` (whether the text names the agent, see [Group calls](#group-calls)), tags
     `bosun:meeting-transcript` and `bosun:meeting=<id>`.
   - With `agent_partials: true`, partial text comes too, tagged `bosun:partial`, at most every
     `agent_partials_interval_s` (1.5 s), so the agent can prepare.
@@ -1077,11 +1078,75 @@ Meetings need a **headful** browser (headless Chromium plays no audio), so run t
 - **An objection in the last second before Zoom leaves the page can be missed.** Bosun reads the chat once more
   when a meeting ends, but if Zoom has already navigated to its end page, messages it hadn't read yet are gone.
   The recording is then kept; the agent can still delete it with `meeting_recording_delete`.
+- **Meet's chat in a calendar meeting of another organisation was not tested live.** The group call of 2026-11-02
+  failed to post with "the Meet chat panel did not open" and could not be reproduced with Glassy's account, whose
+  plan has no continuous chat. 0.20.0 looks for the chat box in frames too, clicks the chat button only while the
+  panel is closed (it toggles), retries with the toolbar shown and Meet's Ctrl+Alt+C, reports a chat the host or
+  their organisation keeps closed as `chat-restricted`, and confirms that each message shows up. When it still
+  fails, the error says what the page showed (chat button, side panel heading, text boxes, frames), so the next
+  failure can be fixed from `meeting_status` alone.
 - **One mixed audio track.** There is no speaker separation, also not in the live transcript.
 - **Bosun doesn't hear itself.** The meeting doesn't play Bosun's own voice back, so the live transcript has only
   the others; what Bosun said is what the agent passed to `meeting_speak`.
 - **Consent is the operator's responsibility.** The announcement and the opt-out are a courtesy, not a legal basis.
   Check what applies where the participants are; some places require everyone's explicit consent before recording.
+
+### Group calls
+
+This is guidance, not a mode. Bosun has no group setting or group tool. An agent in a call with several people uses
+the settings below and decides for itself. The advice comes from the first group call (Google Meet, four people and
+Glassy, 2026-11-02): acknowledgements on every turn annoyed the group, answers took 1 to 2 s, and the agent talked
+too much.
+
+**Turn acknowledgements off.** `speech_settings_set({ "ack_on_final": false })` (the default). In a group every
+finished sentence is a turn, so "Mhm" after each one is noise.
+
+**Shorter hold after a complete sentence.** `speech_settings_set({ "turn_hold_complete_ms": 300 })` (the default; the
+group call ran with 800). The hold adds exactly its value to every answer: measured with the stand-ins
+(`node scripts/measure-turn-hold.mjs`, results in `docs/measurements/turn-hold.json`), the first final reached the
+agent 0, 150, 300, 500 and 800 ms after Scribe ended it for those settings, within 11 ms. The rest of the wait is
+Scribe itself. In the Zoom call of 2026-11-02 a final reached Bosun 0.64 to 1.54 s after the speaker stopped (median
+0.82 s, `vad_silence_s` 0.5 included).
+- What a shorter hold costs: a speaker who pauses after a full sentence and goes on is more often split into two
+  turns. In that call, after 8 of 12 complete sentences the same speaker went on after a pause of 0.68 to 1.06 s.
+  Taking Scribe's first partial as 0.3 to 0.5 s into new speech, 800 ms merged all 8, 500 ms merged 4 to 7, 300 ms 1
+  to 4, and 0 ms none or one.
+- Why 300 anyway: in a group the agent answers few turns (see below), so a split mostly costs nothing. When it does
+  hit a turn the agent is answering, `turn_extend_s` (default 20) reopens the turn and drops the stale answer. Each
+  answer comes 0.5 s sooner than at 800. Go lower than 300 only if the agent waits for `addressed` before it
+  answers anything.
+- `turn_hold_ms` (900) stays as it is. It applies after a fragment ("so I was thinking about the"), where the speaker
+  almost always goes on. It also caps `turn_hold_complete_ms`.
+
+**Clarifications go to the chat.** A short factual note ("The deadline in the doc is 14 Nov.", a link, a number)
+goes to `meeting_chat_send`, not to the voice. It doesn't interrupt anyone, and people read it when they want to.
+Keep it to one or two lines. The chat works on Meet and Zoom with a signed-in profile (0.20.0 checks that each
+message shows up in the chat; see `meeting_status.announce` and `chat_error` when it doesn't).
+
+**Speak only when addressed.** Every final carries `metadata.addressed: true | false` (also in
+`bosun:meeting-transcript` events). It is true when the text names the agent: the join `name` (a bracketed note such
+as "(notetaker)" is left out, and the first word of a longer name counts on its own), the account name the call
+shows, or one of the speech setting `name_aliases` (up to 20). Case, accents, spelling ("Glassi") and Ukrainian or
+Russian forms ("Гласі", "Глассі", "Гласси" for "Glassy") don't matter. Add the nicknames people actually use:
+`speech_settings_set({ "name_aliases": ["Гласька", "Glassy AI"] })`. Bosun only marks finals and never answers by
+itself.
+- Speak when `addressed` is true and the turn asks something of the agent.
+- Stay silent otherwise, or put a clarification in the chat.
+- A question to "everyone" or "the notetaker" without the name is not marked, so add such words to `name_aliases`
+  only if the group uses them for the agent. A word that sounds like the name ("glassy eyes") is marked too, so the
+  agent still reads the turn.
+
+**Announce and privacy.** The announcement goes to the chat before recording starts, as in every call. In a group,
+check `meeting_status.announce.sent_to`: anything but `everyone` means some people may not have seen it. Then say it
+once by voice (`meeting_speak`) or leave. Everyone can still object in the chat ("please don't record"), and the
+agent should take a spoken objection the same way and call `meeting_stop_recording`.
+
+**Example settings for a group call:**
+
+```jsonc
+speech_settings_set({ "ack_on_final": false, "turn_hold_complete_ms": 300, "name_aliases": ["Гласька"] })
+meeting_join({ "url": "https://meet.google.com/abc-defg-hij", "profile": "google", "name": "Glassy", "live_transcript": true })
+```
 
 ## Read-only tokens for subagents
 

@@ -11,7 +11,7 @@
 //   state(page)           'lobby' | 'waiting' | 'admitted' | 'denied' | 'refused' | 'removed' | 'ended' | 'unknown'
 //   afterAdmit(page)      optional: what has to happen once in the call before the chat (Zoom joins computer audio)
 //   messages              optional: {refused, invalid, signIn, captcha} texts for those outcomes
-//   openChat(page), sendChat(page, text, {selfName, to})  to: 'everyone' | 'host'; a message not posted throws a
+//   openChat(page), sendChat(page, text, {selfName, to, openTimeoutMs})  to: 'everyone' | 'host'; a message not posted throws a
 //                         chatError (common.mjs) whose code says why
 //   watchChat(page, key)  install a MutationObserver that queues new chat messages; drainChat(page, key) -> [{id, sender, text}]
 //   participants(page)    number of people in the call (incl. the bot), or null if the page doesn't show it
@@ -88,8 +88,12 @@ const LABEL = {
     '^verstanden$', '^schließen$', '^nein danke$', '^nicht jetzt$', '^ohne (?:mikrofon|kamera|mikrofon und kamera) (?:fortfahren|weiter)$',
     '^rozumiem$', '^zavrieť$', '^nie, ďakujem$', '^зрозуміло$', '^закрити$', '^ні, дякую$', '^не зараз$', '^продовжити без (?:мікрофона|камери|мікрофона й камери|мікрофона та камери)$',
     '^понятно$', '^закрыть$', '^нет, спасибо$', '^не сейчас$', '^продолжить без (?:микрофона|камеры|микрофона и камеры)$'),
-  chat: any('^chat with everyone$', '^chat mit allen$', '^open chat$', '^chat öffnen$', '^chat$', '^chatovať so všetkými$', '^чат з усіма$', '^чат со всеми$', '^чат$'),
+  // The toolbar's chat toggle. Meet has added text to its name before ("Chat with everyone, 2 new messages"): a name
+  // that starts with one of these counts.
+  chat: any('^chat with everyone\\b', '^chat mit allen\\b', '^open chat$', '^chat öffnen$', '^show chat\\b', '^chat$', '^chatovať so všetkými\\b', '^чат з усіма', '^чат со всеми', '^чат$'),
   chatInput: any('send a message', 'nachricht senden', 'nachricht an alle', 'odoslať správu', 'надіслати повідомлення', 'отправить сообщение'),
+  // The send button next to the box ("Send a message" / "Send message").
+  chatSend: any('^send (?:a )?message$', '^nachricht senden$', '^odoslať správu$', '^надіслати повідомлення$', '^отправить сообщение$'),
   leave: any('^leave call$', '^anruf verlassen$', '^leave meeting$', '^besprechung verlassen$', '^opustiť hovor$', '^вийти з дзвінка$', '^покинуть звонок$'),
   // The call's hand control, named with its shortcut ("Raise hand (ctrl + alt + h)" / "Lower hand (ctrl + alt + h)").
   handDown: any('^raise hand', '^hand heben', '^zdvihnúť ruku', '^підняти руку', '^поднять руку'), // the hand is down
@@ -154,6 +158,94 @@ export async function meetRefusalPage(page, { meetHost = 'meet.google.com' } = {
   if (!headings.some(meetCantJoin)) return false;
   return !(await challengeShown(page));
 }
+
+// --- The chat panel ---------------------------------------------------------------------------------------------
+// Meet's chat sits in the side panel ("In-call messages"; a calendar meeting's panel is titled with the meeting). Where
+// Google embeds it (continuous chat, a Google Chat conversation) the box can sit in a frame, so every frame of the page
+// is searched. The toolbar's chat button is a toggle (aria-pressed): it is clicked only while the panel is closed, as a
+// second click would close it again.
+const CHAT_PANEL = '[role="complementary"], aside';
+// Said in the panel when this participant may not post: the host turned chat off for participants, or the host's
+// organisation keeps people from outside it out of the meeting's (continuous) chat.
+const CHAT_BLOCKED = any('only (?:the )?(?:hosts?|co-hosts?|organi[sz]ers?)(?: and co-hosts)? can send (?:chat )?messages', 'host (?:has )?turned off (?:the )?chat', "you can(?:'|no)t send messages",
+  'messages are turned off', 'sending messages (?:is|has been) turned off', 'chat (?:is|has been) turned off for (?:participants|everyone)', "can(?:'|no)t (?:chat|send messages) (?:with|to) (?:people|users) outside",
+  'nur (?:der|die) (?:host|organisator)\\S* (?:kann|können) nachrichten senden', 'sie können keine nachrichten senden', 'nemôžete posielať správy', 'ви не можете надсилати повідомлення', 'вы не можете отправлять сообщения');
+const frames = (page) => [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
+
+// The chat box, in the page or a frame of it, or null. A frame from Google Chat (chat.google.com, mail.google.com/chat)
+// may name its box otherwise ("Message"): there any visible text box counts.
+async function chatBox(page) {
+  for (const f of frames(page)) {
+    const b = await firstVisible(f.getByRole('textbox', { name: LABEL.chatInput }));
+    if (b) return b;
+    let host = '';
+    try { host = new URL(f.url()).hostname; } catch {}
+    if (/^(?:chat|mail|dynamite-preprod)\.google\.com$/.test(host)) {
+      const any = await firstVisible(f.getByRole('textbox'));
+      if (any) return any;
+    }
+  }
+  return null;
+}
+// The toolbar's chat toggle (visible), or null.
+const chatToggle = (page) => firstVisible(button(page, LABEL.chat));
+const pressed = async (b) => (b ? (await b.getAttribute('aria-pressed').catch(() => null)) === 'true' : false);
+
+// Why the open panel lets this participant post nothing, or null: the "Let participants send messages" switch off, or
+// the panel (in any frame) saying so.
+async function chatBlocked(page) {
+  for (const f of frames(page)) {
+    const sw = await firstVisible(f.getByRole('switch', { name: /let participants send messages|teilnehmern erlauben, nachrichten zu senden/i }));
+    if (sw && (await sw.getAttribute('aria-checked').catch(() => null)) === 'false') return 'the host turned the Meet chat off for participants ("Let participants send messages" is off)';
+    const t = norm(await f.locator(CHAT_PANEL).allInnerTexts().catch(() => [])).toLowerCase();
+    const m = t.match(CHAT_BLOCKED);
+    if (m) return `the Meet chat does not let Bosun post ("${m[0]}")`;
+  }
+  return null;
+}
+
+// What the page showed when the chat would not open, for the error: the chat button (name, pressed), the side panel's
+// heading, the text boxes there, and the frames from elsewhere.
+async function chatDiag(page) {
+  const out = [];
+  const b = await chatToggle(page);
+  const all = await button(page, LABEL.chat).count().catch(() => 0);
+  out.push(b ? `chat button "${((await b.getAttribute('aria-label').catch(() => '')) || '').slice(0, 60)}" pressed=${await pressed(b)}` : `no visible chat button (${all} hidden)`);
+  const heads = (await page.locator(CHAT_PANEL).locator('h1, h2, [role="heading"]').allInnerTexts().catch(() => [])).map((h) => norm(h).trim()).filter(Boolean);
+  out.push(heads.length ? `side panel "${heads.slice(0, 2).join('" / "').slice(0, 80)}"` : 'no side panel heading');
+  const boxes = await page.locator(`${CHAT_PANEL} textarea, ${CHAT_PANEL} [contenteditable="true"], ${CHAT_PANEL} [role="textbox"]`).evaluateAll((els) => els.map((e) => `${e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.tagName.toLowerCase()}${e.checkVisibility?.() === false ? ' (hidden)' : ''}`)).catch(() => []);
+  out.push(boxes.length ? `boxes: ${boxes.slice(0, 3).join(', ').slice(0, 80)}` : 'no text box in the panel');
+  const hosts = [...new Set(page.frames().slice(1).map((f) => { try { return new URL(f.url()).hostname; } catch { return ''; } }).filter((h) => h && !/recaptcha|gstatic/.test(h)))];
+  if (hosts.length) out.push(`frames: ${hosts.slice(0, 4).join(', ')}`);
+  return out.join('; ');
+}
+
+// How often the posted text shows up in the chat (outside any text box), in the page and its frames; texts are compared
+// with whitespace collapsed, so the line breaks of a bubble don't matter.
+async function chatCount(page, text) {
+  const needle = norm(text).trim().slice(0, 200);
+  let n = 0;
+  for (const f of frames(page)) {
+    n += await f.evaluate(({ needle, panel }) => {
+      const roots = [...document.querySelectorAll(panel)];
+      const parts = [];
+      for (const root of roots.length ? roots : [document.body]) {
+        const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        for (let t = w.nextNode(); t; t = w.nextNode()) {
+          const el = t.parentElement;
+          if (!el || el.closest('textarea, input, [contenteditable="true"], [role="textbox"], [aria-hidden="true"], [role="tooltip"]')) continue;
+          parts.push(t.nodeValue);
+        }
+      }
+      const hay = parts.join(' ').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ');
+      let c = 0;
+      for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + needle.length)) c++;
+      return c;
+    }, { needle, panel: CHAT_PANEL }).catch(() => 0);
+  }
+  return n;
+}
+const boxText = (box) => box.evaluate((e) => ('value' in e ? e.value : e.innerText)).then((t) => norm(t).trim());
 
 export const meet = {
   name: 'meet',
@@ -280,22 +372,77 @@ export const meet = {
     return 'unknown';
   },
 
-  async openChat(page) {
-    if (await visible(page.getByRole('textbox', { name: LABEL.chatInput }))) return;
-    await button(page, LABEL.chat).first().click({ timeout: 10_000 }).catch(() => { throw chatError('chat-unavailable', 'no chat button in the Meet toolbar'); });
-    await page.getByRole('textbox', { name: LABEL.chatInput }).first().waitFor({ state: 'visible', timeout: 10_000 })
-      .catch(() => { throw chatError('chat-unavailable', 'the Meet chat panel did not open'); });
+  // Opens the chat panel and returns its box. The click is repeated (the toolbar shown first, overlays closed) while
+  // the panel does not come up, at most every 3 s and only while the toggle says it is closed; after two clicks (or with
+  // no button in sight after the toolbar was shown once) Meet's own shortcut (Ctrl+Alt+C) is tried once. Throws chat-restricted when the panel says this participant may not post,
+  // chat-unavailable (with what the page showed) when no box turns up within timeoutMs.
+  async openChat(page, { timeoutMs = 20_000 } = {}) {
+    const until = Date.now() + timeoutMs;
+    let clicks = 0, last = 0, keyed = false, openSince = 0, hidden = 0;
+    for (;;) {
+      const box = await chatBox(page);
+      if (box) return box;
+      const b = await chatToggle(page);
+      const open = await pressed(b);
+      const blocked = (open || clicks) ? await chatBlocked(page) : null;
+      if (blocked) throw chatError('chat-restricted', blocked);
+      if (open) openSince ||= Date.now(); else openSince = 0;
+      if (Date.now() - last > 3000) {
+        if (!b) {
+          // No button to be seen: show the toolbar (it fades out), and on the next round try the shortcut once.
+          if (hidden++ && !keyed) { keyed = true; await page.keyboard.press('Control+Alt+KeyC').catch(() => {}); }
+          await overlays(page);
+          await revealToolbar(page);
+          last = Date.now();
+        } else if (!open) {
+          await overlays(page);
+          await revealToolbar(page);
+          if (clicks >= 2 && !keyed) { keyed = true; await page.keyboard.press('Control+Alt+KeyC').catch(() => {}); }
+          else { await b.click({ timeout: 3000 }).catch(() => {}); clicks++; }
+          last = Date.now();
+        } else if (Date.now() - openSince > 6000 && clicks < 4) {
+          // Open for 6 s without a box: close it and open it again (a panel that came up on another tab or half-rendered).
+          await b.click({ timeout: 3000 }).catch(() => {});
+          await page.waitForTimeout(500);
+          await b.click({ timeout: 3000 }).catch(() => {});
+          clicks += 2; last = Date.now(); openSince = 0;
+        }
+      }
+      if (Date.now() > until) {
+        const why = await chatDiag(page).catch(() => '');
+        throw chatError('chat-unavailable', b || clicks ? `the Meet chat panel did not open (${why})` : `no chat button in the Meet toolbar (${why})`);
+      }
+      await page.waitForTimeout(300);
+    }
   },
 
-  // Meet's chat goes to everyone; there is no message to the host alone.
-  async sendChat(page, text, { to = 'everyone' } = {}) {
+  // Meet's chat goes to everyone; there is no message to the host alone. Posted means: the box emptied and the text
+  // showed up in the chat once more than before (Enter, else the send button); otherwise this throws not-sent or
+  // not-confirmed.
+  async sendChat(page, text, { to = 'everyone', openTimeoutMs } = {}) {
     if (to === 'host') throw chatError('host-unreachable', "Google Meet's chat has no way to write to the host alone");
-    await this.openChat(page);
-    const box = page.getByRole('textbox', { name: LABEL.chatInput }).first();
+    const box = await this.openChat(page, openTimeoutMs ? { timeoutMs: openTimeoutMs } : {});
     // The host turned chat off for participants: the box is there, disabled.
     if (await disabled(box)) throw chatError('chat-restricted', 'the Meet chat is turned off for participants (the host allows no chat messages)');
+    const before = await chatCount(page, text);
     await box.fill(text, { timeout: 5000 });
     await box.press('Enter', { timeout: 5000 });
+    const left = () => boxText(box).catch(() => '');
+    for (let i = 0; i < 10 && await left(); i++) await page.waitForTimeout(150);
+    if (await left()) {
+      await box.fill(text, { timeout: 5000 }); // Enter may have added a line break
+      for (const f of frames(page)) {
+        const send = await firstVisible(f.getByRole('button', { name: LABEL.chatSend }));
+        if (send && !(await disabled(send))) { await send.click({ timeout: 3000 }).catch(() => {}); break; }
+      }
+      for (let i = 0; i < 10 && await left(); i++) await page.waitForTimeout(150);
+      if (await left()) throw chatError('not-sent', 'the Meet chat message was not sent (still in the chat box)');
+    }
+    for (let i = 0; i < 32; i++) {
+      if (await chatCount(page, text) > before) return;
+      await page.waitForTimeout(250);
+    }
+    throw chatError('not-confirmed', 'the Meet chat message left the box but did not show up in the chat');
   },
 
   // New chat messages are queued in the page under a random, non-enumerable key; drainChat empties the queue.

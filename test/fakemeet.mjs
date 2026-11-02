@@ -45,7 +45,13 @@ const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 // liveChat 'twice': each of Bosun's own messages is rendered twice, as sent and again under a new id once confirmed
 // (live Meet, 2026-10-23 11:14: the second copy came through as a chat event from "someone"). chatOff: the host
 // turned chat off for participants (the message box is shown, disabled).
-function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false, chatOff = false }) {
+// The chat button is a toggle (aria-pressed), as on live Meet (2026-11-02): a second click closes the panel; Ctrl+Alt+C
+// toggles it too. chatUi varies the panel: 'frame' (the box and the messages sit in an iframe, as an embedded chat
+// would), 'blocked' (the panel says only hosts can send messages, "Let participants send messages" off, no box),
+// 'lost' (Enter empties the box but nothing is posted), 'enterNewline' (Enter adds a line break; only the send button
+// sends), 'hiddenToolbar' (the toolbar is invisible until the mouse moves), 'noButton' (no chat button: only Ctrl+Alt+C).
+// chatReadyMs: clicks on the chat button in the first that many ms of the call do nothing (Meet still settling).
+function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false, chatOff = false, chatUi = null, chatReadyMs = 0 }) {
   const L = UI[lang];
   const de = lang === 'de';
   const joinButtons = elsewhere
@@ -80,8 +86,11 @@ ${live ? `<div role="alert"><h2><span aria-hidden="true">error</span>${esc(L.noC
 <div id="refused" hidden><h1>${esc(L.cantJoin)}</h1><button>${esc(L.home)}</button><p>${esc(L.safe)}</p>${frame}</div>
 <div id="pending" hidden></div>
 <div id="call" hidden><div id="topic">${esc(title || '')}</div><div id="tiles"></div><div id="captions" class="caption-text"></div>
-  <div role="toolbar"><button id="callMic">mic</button><button id="hand" aria-label="Raise hand (ctrl + alt + h)">hand</button><button aria-label="${esc(L.chat)}">chat</button><button aria-label="${esc(L.leave)}">leave</button></div>
-  <aside id="panel" hidden><div role="list" id="msgs"></div><textarea aria-label="${esc(L.send)}"${chatOff ? ' disabled' : ''}></textarea></aside></div>
+  <div role="toolbar" id="toolbar"${chatUi === 'hiddenToolbar' ? ' style="visibility:hidden"' : ''}><button id="callMic">mic</button><button id="hand" aria-label="Raise hand (ctrl + alt + h)">hand</button>${chatUi === 'noButton' ? '' : `<button id="chatBtn" aria-label="${esc(L.chat)}" aria-pressed="false">chat</button>`}<button aria-label="${esc(L.leave)}">leave</button></div>
+  <aside id="panel" hidden><h2>In-call messages</h2>${chatUi === 'blocked'
+    ? '<div role="switch" aria-label="Let participants send messages" aria-checked="false" aria-disabled="true"></div><p>Only hosts can send messages</p>'
+    : chatUi === 'frame' ? '<iframe id="chatFrame" title="Chat" style="width:320px;height:240px"></iframe>'
+    : `<div role="list" id="msgs"></div><textarea aria-label="${esc(L.send)}"${chatOff ? ' disabled' : ''}></textarea><button id="sendBtn" aria-label="${esc(L.send)}">send</button>`}</aside></div>
 <div id="over" hidden><h1 id="overText"></h1></div>
 <script>
 const L = ${JSON.stringify(L)}, TOGGLES = ${JSON.stringify(toggles)};
@@ -102,7 +111,13 @@ if ($('ask')) $('ask').onclick = ask('ask');
 if ($('switch')) { $('switch').onclick = ask('switch'); $('too').onclick = ask('too'); $('other').onclick = () => { $('menu').hidden = !$('menu').hidden; }; }
 if ($('dlgOk')) $('dlgOk').onclick = () => $('dlg').remove();
 if (${readyMs}) setTimeout(() => { $('ask').disabled = false; $('ready')?.remove(); }, ${readyMs});
-document.querySelector('[aria-label="' + L.chat + '"]').onclick = () => { $('panel').hidden = false; };
+const CHAT_UI = ${JSON.stringify(chatUi)}, CHAT_READY_MS = ${Number(chatReadyMs) || 0};
+let inCallAt = 0;
+const toggleChat = () => { const open = $('panel').hidden; $('panel').hidden = !open; $('chatBtn')?.setAttribute('aria-pressed', String(open)); if (open && CHAT_UI === 'frame' && !$('chatFrame').src) $('chatFrame').src = '/chatframe?code=' + code; };
+if ($('chatBtn')) $('chatBtn').onclick = () => { if (!inCallAt || Date.now() < inCallAt + CHAT_READY_MS) return; toggleChat(); };
+document.addEventListener('keydown', (e) => { if (e.ctrlKey && e.altKey && e.code === 'KeyC' && inCallAt && Date.now() >= inCallAt + CHAT_READY_MS) toggleChat(); });
+let toolbarTimer = null;
+if (CHAT_UI === 'hiddenToolbar') document.addEventListener('mousemove', () => { $('toolbar').style.visibility = 'visible'; clearTimeout(toolbarTimer); toolbarTimer = setTimeout(() => { $('toolbar').style.visibility = 'hidden'; }, 3000); });
 document.querySelector('[aria-label="' + L.leave + '"]').onclick = () => post('leave', {});
 // In the call: the microphone as the lobby left it, a hand to raise (also Ctrl+Alt+H), and an ear on the microphone.
 let callMic = null, hand = false, played = 0, ear = null;
@@ -127,13 +142,21 @@ async function listen() {
     if (callMic && rms > 0.01 && Date.now() - last > 100) { last = Date.now(); post('heard', { rms, at: Date.now() }); }
   }, 10);
 }
-const box = document.querySelector('textarea');
-box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); const t = box.value.trim(); box.value = ''; if (t) post('chat', { text: t }); } });
+const box = document.querySelector('#panel textarea');
+const send = () => { const t = box.value.trim(); box.value = ''; if (t) post('chat', { text: t }); };
+if (box) box.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || e.shiftKey || CHAT_UI === 'enterNewline') return;
+  e.preventDefault();
+  if (CHAT_UI === 'lost') { box.value = ''; return; }
+  send();
+});
+if ($('sendBtn')) $('sendBtn').onclick = send;
 async function poll() {
   const s = await (await fetch('/api/state?code=' + code)).json();
   for (const id of ['lobby', 'waiting', 'denied', 'refused', 'pending', 'call', 'over']) $(id).hidden = s.view !== id;
   if (s.view === 'over') $('overText').textContent = L[s.over];
   if (s.view === 'call') {
+    inCallAt ||= Date.now();
     $('captions').textContent = s.caption || '';
     const want = s.participants.join();
     if ($('tiles').dataset.p !== want) {
@@ -149,7 +172,7 @@ async function poll() {
     }
     // speaking: the tile of whoever speaks gets Meet's speaking-animation class (selfSpeaking: ours lights up too).
     for (const t of document.querySelectorAll('#tiles [data-participant-id]')) t.querySelector('.ind').className = 'ind' + (s.speaking === t.dataset.participantId || (s.selfSpeaking && t.dataset.participantId === 'self') ? ' Oaajhc' : '');
-    for (const m of s.chat) {
+    for (const m of CHAT_UI === 'frame' || CHAT_UI === 'blocked' ? [] : s.chat) {
       if (shown.has(m.id)) { const d = document.querySelector('[data-message-id="' + m.id + '"]'); if (!LIVE_CHAT && d.textContent !== m.text) d.textContent = m.text; continue; }
       shown.add(m.id);
       const g = document.createElement('div');
@@ -201,6 +224,22 @@ export async function startFakeMeet({ tone = false } = {}) {
       r.loads.push({ hl: u.searchParams.get('hl'), acceptLanguage: req.headers['accept-language'] || null });
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       return res.end(app(r));
+    }
+    // chatUi 'frame': the chat (box and messages) as a page of its own inside the panel.
+    if (u.pathname === '/chatframe') {
+      const code = JSON.stringify(u.searchParams.get('code'));
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      return res.end(`<!doctype html><meta charset="utf-8"><div role="list" id="msgs"></div><div contenteditable="true" role="textbox" aria-label="Send a message" id="box"></div>
+<script>
+const code = ${code}, box = document.getElementById('box'), shown = new Set();
+box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); const t = box.innerText.trim(); box.textContent = ''; if (t) fetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, text: t }) }); } });
+async function poll() {
+  const s = await (await fetch('/api/state?code=' + code)).json();
+  for (const m of s.chat) { if (shown.has(m.id)) continue; shown.add(m.id); const d = document.createElement('div'); d.dataset.messageId = m.id; d.textContent = m.text; document.getElementById('msgs').append(d); }
+  setTimeout(poll, 150);
+}
+poll();
+</script>`);
     }
     if (u.pathname === '/api/state') {
       const r = room(u.searchParams.get('code'));

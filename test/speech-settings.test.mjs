@@ -23,7 +23,7 @@ test('defaults without env or settings; env fallbacks; the tenant\'s settings ov
     meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
     ack_on_final: false, ack_phrases: ['Mhm.', 'One sec.', 'Okay.', 'Right.'], ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
     turn_hold_ms: 900, turn_hold_complete_ms: 300, barge_in: true, barge_in_min_words: 2, barge_in_min_s: 0.6,
-    turn_extend_s: 20, superseded_publish: 'drop', speculative_speech: false,
+    turn_extend_s: 20, superseded_publish: 'drop', speculative_speech: false, name_aliases: [],
   });
   const s = settings({ ...KEY, TTS_DEFAULT_BACKEND: 'elevenlabs', ELEVENLABS_TTS_MODEL: 'eleven_flash_v2_5', ELEVENLABS_VOICE: 'SAz9YHcvj6GT2YYXdXww', TTS_VOICE: 'supertonic-F2', LIVE_TRANSCRIPT_VAD_SILENCE_S: '0.8' });
   assert.deepEqual(s.get('a').effective, { backend: 'elevenlabs', elevenlabs_model: 'eleven_flash_v2_5', elevenlabs_voice: 'SAz9YHcvj6GT2YYXdXww', supertonic_voice: 'supertonic-F2', vad_silence_s: 0.8, ...DEFAULTS });

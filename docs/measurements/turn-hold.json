@@ -1,0 +1,135 @@
+{
+ "at": "2026-11-02T10:25:32.631Z",
+ "stand_in": {
+  "commit_after_silence_s": 1,
+  "first_partial_s": 0.5
+ },
+ "rows": [
+  {
+   "turn_hold_complete_ms": 0,
+   "gap_s": 1.2,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 1
+  },
+  {
+   "turn_hold_complete_ms": 0,
+   "gap_s": 1.5,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 0
+  },
+  {
+   "turn_hold_complete_ms": 0,
+   "gap_s": 1.8,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 0
+  },
+  {
+   "turn_hold_complete_ms": 150,
+   "gap_s": 1.2,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 151
+  },
+  {
+   "turn_hold_complete_ms": 150,
+   "gap_s": 1.5,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 150
+  },
+  {
+   "turn_hold_complete_ms": 150,
+   "gap_s": 1.8,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 151
+  },
+  {
+   "turn_hold_complete_ms": 300,
+   "gap_s": 1.2,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 301
+  },
+  {
+   "turn_hold_complete_ms": 300,
+   "gap_s": 1.5,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 300
+  },
+  {
+   "turn_hold_complete_ms": 300,
+   "gap_s": 1.8,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 300
+  },
+  {
+   "turn_hold_complete_ms": 500,
+   "gap_s": 1.2,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 500
+  },
+  {
+   "turn_hold_complete_ms": 500,
+   "gap_s": 1.5,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 501
+  },
+  {
+   "turn_hold_complete_ms": 500,
+   "gap_s": 1.8,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 500
+  },
+  {
+   "turn_hold_complete_ms": 800,
+   "gap_s": 1.2,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 801
+  },
+  {
+   "turn_hold_complete_ms": 800,
+   "gap_s": 1.5,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 800
+  },
+  {
+   "turn_hold_complete_ms": 800,
+   "gap_s": 1.8,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 809
+  },
+  {
+   "turn_hold_complete_ms": 900,
+   "gap_s": 1.2,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 1027
+  },
+  {
+   "turn_hold_complete_ms": 900,
+   "gap_s": 1.5,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 900
+  },
+  {
+   "turn_hold_complete_ms": 900,
+   "gap_s": 1.8,
+   "turns": 2,
+   "merged": false,
+   "first_held_ms": 901
+  }
+ ]
+}

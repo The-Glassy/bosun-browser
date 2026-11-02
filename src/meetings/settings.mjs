@@ -3,7 +3,8 @@
 // the agent over its MCPL channel (meeting_channel, transcript_events, agent_partials, channel_prepare_chunks); the
 // acknowledgement played when someone finishes (ack_*); how long a final is held for more of the same turn (turn_hold_*)
 // and whether someone speaking over Bosun stops it (barge_in*); a turn reopened while the agent is still thinking
-// (turn_extend_s, superseded_publish); text spoken as the host streams it (speculative_speech). What a call passes
+// (turn_extend_s, superseded_publish); text spoken as the host streams it (speculative_speech); more names the agent
+// answers to (name_aliases, for the finals' addressed mark). What a call passes
 // wins, then the tenant's setting, then the
 // environment (TTS_DEFAULT_BACKEND, ELEVENLABS_TTS_MODEL, ELEVENLABS_VOICE, TTS_VOICE, LIVE_TRANSCRIPT_VAD_SILENCE_S),
 // then Bosun's own default.
@@ -64,6 +65,11 @@ export const SETTINGS = {
   // The meeting channel declares streaming {speculative: true}: text the host streams while the agent writes its
   // publish (channels/outgoing/chunk with speculative: true) is spoken sentence by sentence before the publish lands.
   speculative_speech: (v) => (typeof v === 'boolean' ? null : 'speculative_speech must be true or false'),
+  // More names the agent answers to, besides the join name: each final says whether it addresses the agent (metadata
+  // addressed, src/meetings/addressed.mjs). Spelling variants and Ukrainian/Russian forms of a name match without being
+  // listed ("Glassy": "Гласі", "Глассі", "Гласси").
+  name_aliases: (v) => (Array.isArray(v) && v.length <= 20 && v.every((a) => typeof a === 'string' && a.trim().length >= 1 && a.length <= 60)
+    ? null : 'name_aliases must be up to 20 names of 1 to 60 characters'),
 };
 // Settings a meeting_join may set for that meeting only (over the tenant's).
 export const PER_CALL = ['speculative_speech'];
@@ -79,7 +85,7 @@ export const DEFAULTS = {
   meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
   ack_on_final: false, ack_phrases: ACK_PHRASES_DEFAULT, ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
   turn_hold_ms: 900, turn_hold_complete_ms: 300, barge_in: true, barge_in_min_words: 2, barge_in_min_s: 0.6,
-  turn_extend_s: 20, superseded_publish: 'drop', speculative_speech: false,
+  turn_extend_s: 20, superseded_publish: 'drop', speculative_speech: false, name_aliases: [],
 };
 
 export class SpeechSettings {

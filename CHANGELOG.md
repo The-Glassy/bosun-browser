@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.20.0: Meet chat fix, `addressed` on finals, group-call guidance
+
+The first group call (Google Meet, 2 Nov 2026, four people and Glassy, signed-in profile) went badly in three ways.
+The announcement never reached the chat ("chat-unavailable: the Meet chat panel did not open"). Acknowledgements on
+every final annoyed the group. Answers came 1 to 2 s late. Misha: guidance, not a mode. So there is no group mode,
+preset or tool. Finals now say whether they name the agent, and the README says how to set up a group call.
+
+### Fixed
+
+- **Meet chat: opening, posting, confirming.** `openChat` looks for the chat box in every frame of the page (an
+  embedded chat), not only the page itself. It clicks the chat button only while the button says the panel is closed
+  (`aria-pressed`): the button toggles, and 0.19.0 could close a panel it had just opened. A click that doesn't
+  open the panel is repeated every 3 s with the toolbar shown and overlays closed, then Meet's Ctrl+Alt+C is tried.
+  The button may carry text after its name ("Chat with everyone, 2 new messages"). It gives up after 20 s, or 5 s
+  when the chat already failed to open at the join, so the recording waits 25 s at most instead of 40 s.
+- **A chat this participant may not post in** ("Let participants send messages" off, "Only hosts can send messages",
+  an organisation that keeps outsiders out of its chat) is `chat-restricted`, not `chat-unavailable`.
+- **Meet posts are confirmed.** A message counts as posted only once the box is empty and the text shows up in the
+  chat once more than before. Enter that leaves the text in the box falls back to the send button (`not-sent` if that
+  fails too). A message that leaves the box but never shows up is `not-confirmed`. 0.19.0 pressed Enter and assumed
+  success.
+- **The error says what the page showed** when the chat won't open: the chat button's name and `pressed` state, the
+  side panel's heading, the text boxes in it, and frames from other hosts. That goes to `meeting_status` (`announce`
+  failures, `chat_error`), so the next live failure can be fixed from the status alone.
+
+### Added
+
+- **`addressed: true | false` on every final** (channel metadata and `bosun:meeting-transcript` events; partials
+  carry none). It is true when the text names the agent by the join `name` (a bracketed note left out, and the first
+  word of a longer name on its own), the account name the call shows, or the new speech setting **`name_aliases`**
+  (up to 20 names). The matcher ignores case and accents, transliterates Cyrillic and compares a loose key
+  (`src/meetings/addressed.mjs`), so "Glassi", "Гласі", "Глассі" and "Гласси" all match "Glassy" without being listed.
+  Bosun's own voice coming back is never addressed. Bosun only marks finals and does nothing else with the mark.
+- **README "Group calls"**: ack_on_final off, `turn_hold_complete_ms` 300 (measured), clarifications in the chat,
+  speak only when `addressed`, announcement and privacy.
+- **`scripts/measure-turn-hold.mjs`**: what `turn_hold_complete_ms` adds and when a continuation is merged, against
+  the stand-ins (`docs/measurements/turn-hold.json`).
+
+### Measured
+
+- Hold: the first final reached the channel 0 / 150 / 300 / 500 / 800 ms after Scribe ended it at
+  `turn_hold_complete_ms` 0 / 150 / 300 / 500 / 800 (stand-ins, within 11 ms).
+- Real timings (the Zoom call of 2 Nov, 26 finals): a final reached Bosun 0.64 to 1.54 s after the speaker stopped
+  (median 0.82 s, VAD 0.5 s included). After 8 of 12 complete sentences the speaker went on after 0.68 to 1.06 s. At
+  800 ms all 8 would merge, at 300 ms 1 to 4 (assuming Scribe's first partial 0.3 to 0.5 s into new speech).
+- Live (prod container, a throwaway Bosun with a copy of the google-glassy profile, a real calendar Meet with Glassy's
+  own session as host and no other people): announcement posted and confirmed, the host's message read with
+  `meeting_chat_read`, `meeting_chat_send` seen by the host.
+
+### Tests
+
+- `test/meeting-chat-open.test.mjs`: the announcement and a later `meeting_chat_send` go out with a click Meet ignores
+  for 2.5 s, a toolbar hidden until the mouse moves, no chat button (Ctrl+Alt+C), the chat in a frame, Enter that
+  adds a line break. Plus a blocked chat (`chat-restricted` with the panel's words), a lost message
+  (`not-confirmed`) and a panel that never opens (`chat-unavailable` with the diagnosis, settled in under 38 s).
+  `test/fakemeet.mjs`: the chat button toggles (`aria-pressed`) as on live Meet, Ctrl+Alt+C, and those variants.
+- `test/meeting-addressed.test.mjs`: the matcher (Latin, accents, Cyrillic forms, possessive, multi-word aliases, no
+  hits on "glasses", "a glass", "AI"), `addressed` on channel finals and events through MCP, `name_aliases`
+  validation and `null`.
+
 ## 0.19.0: meeting_draft removed
 
 The live test on 30 Oct (15 min) showed the draft fired once, too early, and gave nothing speculative speech doesn't
