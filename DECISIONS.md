@@ -2,6 +2,55 @@
 
 Decisions made without asking (Misha: "use your judgment and decide yourself"), with the reason. Newest first.
 
+## 0.20.0 (2026-11-02): Meet chat fix, `addressed`, group-call guidance
+
+- **No group mode, preset or tool** (Misha: guidance, not a mode). The only new things are `metadata.addressed` and
+  the setting it needs (`name_aliases`). Everything else in the group guidance uses existing settings.
+- **The 2 Nov chat failure was not reproduced, so the fix covers every cause I could find.** Live, with this code and
+  with 0.19.0, Glassy's account posted fine in a calendar Meet and a plain one, with the host present. The account's
+  plan has no continuous chat (the panel says "Continuous chat is turned off"). The group call ran in someone else's
+  meeting, where a Google Chat conversation may replace the panel, or the host's organisation may keep outsiders
+  out of it. The two `openChat` calls of 0.19.0 took 20 s together (admitted 09:00:09.8, transcript started
+  09:00:30.2), so the click worked and no box was found both times. So: frames are searched, the toggle is
+  respected, clicks are retried with a shortcut fallback, restriction is recognised, and a failure reports what was
+  on the page. The README lists it as not verified live.
+- **Posts are confirmed by a new message element with the whole text that is not someone else's** (Zoom has
+  checked its posts since 0.9.0). Live Meet shows no sender on Bosun's own messages, so "not someone else's" is the
+  check that works there. Someone else posting the very same words, unmarked, in the same seconds would still count:
+  rare, and a false `not-confirmed` would be worse (the announcement would then go to the host and fail). Codex
+  round 1 found the first version (text counted anywhere in the panel, cut at 200 characters) too loose; round 2
+  added the sender header live Meet shows (not only `data-sender-name`), drafts left out of the count, and frames
+  compared by identity.
+- **No close-and-reopen of an open chat panel.** Meet's side panel has no tabs any more, and Codex showed a reopen
+  can kill a slow embedded chat that was still loading. Waiting the whole 20 s is safer.
+- **Enter gets 5 s before the send button is tried.** An Enter that is still pending after that could be sent twice;
+  waiting longer only delays the not-sent case, and Meet posts within a second live.
+- **The second open attempt is 5 s, not 20 s.** The join already waited 20 s. Recording and the transcript wait for
+  the announcement, and 40 s of an unrecorded call is too much for a second try that rarely helps.
+- **The `addressed` matcher compares a loose key, not spellings.** Scribe writes the name as it heard it, in the
+  speaker's language. Listing every form ("Гласі", "Глассі", "Гласси", "Glassi", ...) in settings would never be
+  complete. The key (Cyrillic transliterated, accents off, y=i, h=g, doubled letters single) makes those one word and
+  still keeps "glass" and "glasses" apart. Keys under 3 letters never match, because "AI" or "Bo" would fire on
+  every other sentence. A false hit ("glassy eyes") costs little: the agent reads the turn anyway.
+- **The account name the call shows counts as a name too.** With a signed-in profile Meet shows the account's name
+  ("Glassy Notetaker"), and people address what they see. The first word of a longer name counts on its own,
+  because people say "Glassy", not "Glassy Notetaker". A bracketed note ("Glassy (notetaker)") is no part of a name.
+- **The Meet account name comes from Bosun's own tile, only for signed-in joins.** A guest's tile shows the join
+  name anyway. A tile labelled "You" is no name.
+- **`addressed` only on finals.** Partials change while they come in, and the agent decides on turns.
+- **No `addressed_as` or position field.** The brief asked for true or false, and the agent has the text.
+- **`turn_hold_complete_ms` 300 is the recommendation, and the default stays 300.** The hold adds exactly its value
+  (measured). Shorter holds split more continuations into two turns, but in a group the agent answers few turns, and
+  `turn_extend_s` repairs a split turn it was answering. 0 is not recommended: by the real timings almost every
+  continuation would reopen a turn. Glassy's stored settings (800) are left alone. The brief says not to change any
+  tenant's settings; the README tells her what to set.
+- **Zoom chat unchanged.** Both prod Zoom calls on 2 Nov posted the announcement to everyone (`sent_to: everyone`,
+  confirmed by Zoom's own check of the posted message since 0.9.0), and the Zoom tests pass.
+- **Live check without deploying first.** A second Bosun from the branch ran inside the browser container on
+  127.0.0.1 only, with its own data dir, a copy of the google-glassy profile and a random token. Prod data, prod
+  settings and the prod service were not touched. Guest joins could not be checked: Google turns away a datacenter
+  guest ("You can't join this video call"), as the README already says.
+
 ## 0.19.0 (2026-11-01): meeting_draft removed
 
 - **The removed keys stay in the two tool schemas, as arguments that only fail.** The MCP SDK strips arguments a

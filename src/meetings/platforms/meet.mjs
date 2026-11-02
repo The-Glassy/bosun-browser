@@ -11,7 +11,7 @@
 //   state(page)           'lobby' | 'waiting' | 'admitted' | 'denied' | 'refused' | 'removed' | 'ended' | 'unknown'
 //   afterAdmit(page)      optional: what has to happen once in the call before the chat (Zoom joins computer audio)
 //   messages              optional: {refused, invalid, signIn, captcha} texts for those outcomes
-//   openChat(page), sendChat(page, text, {selfName, to})  to: 'everyone' | 'host'; a message not posted throws a
+//   openChat(page), sendChat(page, text, {selfName, names, to, openTimeoutMs})  to: 'everyone' | 'host'; a message not posted throws a
 //                         chatError (common.mjs) whose code says why
 //   watchChat(page, key)  install a MutationObserver that queues new chat messages; drainChat(page, key) -> [{id, sender, text}]
 //   participants(page)    number of people in the call (incl. the bot), or null if the page doesn't show it
@@ -64,6 +64,8 @@ const TEXT = {
   // "Mic not found": the device picker ("Microphone: Mic not found").
   noMic: any('microphone not found', 'no microphone found', '\\bmic not found', 'mikrofon nicht gefunden', 'kein mikrofon gefunden', 'mikrofón sa nenašiel', 'мікрофон не знайдено', 'микрофон не найден'),
 };
+// A control only one's own tile has ("Backgrounds and effects"), by its label in the languages Bosun matches.
+const OWN_TILE = ['Backgrounds and effects', 'Hintergründe und Effekte', 'Pozadia a efekty', 'Фони та ефекти', 'Фоны и эффекты'].map((l) => `[aria-label*="${l}" i]`).join(', ');
 const MEET_SPEAKERS = {
   tiles: '[data-participant-id]', tileName: 'span.notranslate', selfMark: '[data-self-name]',
   speaking: ['[data-audio-level]:not([data-audio-level="0"])', '.Oaajhc', '.HX2H7', '.wEsLMd', '.OgVli'],
@@ -88,8 +90,12 @@ const LABEL = {
     '^verstanden$', '^schließen$', '^nein danke$', '^nicht jetzt$', '^ohne (?:mikrofon|kamera|mikrofon und kamera) (?:fortfahren|weiter)$',
     '^rozumiem$', '^zavrieť$', '^nie, ďakujem$', '^зрозуміло$', '^закрити$', '^ні, дякую$', '^не зараз$', '^продовжити без (?:мікрофона|камери|мікрофона й камери|мікрофона та камери)$',
     '^понятно$', '^закрыть$', '^нет, спасибо$', '^не сейчас$', '^продолжить без (?:микрофона|камеры|микрофона и камеры)$'),
-  chat: any('^chat with everyone$', '^chat mit allen$', '^open chat$', '^chat öffnen$', '^chat$', '^chatovať so všetkými$', '^чат з усіма$', '^чат со всеми$', '^чат$'),
+  // The toolbar's chat toggle. Meet has added text to its name before ("Chat with everyone, 2 new messages"): a name
+  // that starts with one of these counts.
+  chat: any('^chat with everyone\\b', '^chat mit allen\\b', '^open chat$', '^chat öffnen$', '^show chat\\b', '^chat$', '^chatovať so všetkými\\b', '^чат з усіма', '^чат со всеми', '^чат$'),
   chatInput: any('send a message', 'nachricht senden', 'nachricht an alle', 'odoslať správu', 'надіслати повідомлення', 'отправить сообщение'),
+  // The send button next to the box ("Send a message" / "Send message").
+  chatSend: any('^send (?:a )?message$', '^nachricht senden$', '^odoslať správu$', '^надіслати повідомлення$', '^отправить сообщение$'),
   leave: any('^leave call$', '^anruf verlassen$', '^leave meeting$', '^besprechung verlassen$', '^opustiť hovor$', '^вийти з дзвінка$', '^покинуть звонок$'),
   // The call's hand control, named with its shortcut ("Raise hand (ctrl + alt + h)" / "Lower hand (ctrl + alt + h)").
   handDown: any('^raise hand', '^hand heben', '^zdvihnúť ruku', '^підняти руку', '^поднять руку'), // the hand is down
@@ -154,6 +160,128 @@ export async function meetRefusalPage(page, { meetHost = 'meet.google.com' } = {
   if (!headings.some(meetCantJoin)) return false;
   return !(await challengeShown(page));
 }
+
+// --- The chat panel ---------------------------------------------------------------------------------------------
+// Meet's chat sits in the side panel ("In-call messages"; a calendar meeting's panel is titled with the meeting). Where
+// Google embeds it (continuous chat, a Google Chat conversation) the box can sit in a frame, so every frame of the page
+// is searched. The toolbar's chat button is a toggle (aria-pressed): it is clicked only while the panel is closed, as a
+// second click would close it again.
+const CHAT_PANEL = '[role="complementary"], aside';
+// Said in the panel when this participant may not post: the host turned chat off for participants, or the host's
+// organisation keeps people from outside it out of the meeting's (continuous) chat.
+const CHAT_BLOCKED = any('only (?:the )?(?:hosts?|co-hosts?|organi[sz]ers?)(?: and co-hosts)? can send (?:chat )?messages', 'host (?:has )?turned off (?:the )?chat', "you can(?:'|no)t send messages",
+  'messages are turned off', 'sending messages (?:is|has been) turned off', 'chat (?:is|has been) turned off for (?:participants|everyone)', "can(?:'|no)t (?:chat|send messages) (?:with|to) (?:people|users) outside",
+  'nur (?:der|die) (?:host|organisator)\\S* (?:kann|können) nachrichten senden', 'sie können keine nachrichten senden', 'nemôžete posielať správy', 'ви не можете надсилати повідомлення', 'вы не можете отправлять сообщения');
+const frames = (page) => [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
+
+// The chat box, in the page or a frame of it, or null. A frame from Google Chat (chat.google.com, mail.google.com/chat)
+// may name its box otherwise ("Message"): there any visible text box counts.
+async function chatBox(page) {
+  for (const f of frames(page)) {
+    const b = await firstVisible(f.getByRole('textbox', { name: LABEL.chatInput }));
+    if (b) return b;
+    let host = '';
+    try { host = new URL(f.url()).hostname; } catch {}
+    if (/^(?:chat|mail|dynamite-preprod)\.google\.com$/.test(host)) {
+      const any = await firstVisible(f.getByRole('textbox'));
+      if (any) return any;
+    }
+  }
+  return null;
+}
+// The toolbar's chat toggle (visible), or null.
+const chatToggle = (page) => firstVisible(button(page, LABEL.chat));
+const pressed = async (b) => (b ? (await b.getAttribute('aria-pressed').catch(() => null)) === 'true' : false);
+
+// Why the open panel lets this participant post nothing, or null: the "Let participants send messages" switch off, or
+// the panel (in any frame) saying so.
+async function chatBlocked(page) {
+  for (const f of frames(page)) {
+    const sw = await firstVisible(f.getByRole('switch', { name: /let participants send messages|teilnehmern erlauben, nachrichten zu senden/i }));
+    if (sw && (await sw.getAttribute('aria-checked').catch(() => null)) === 'false') return 'the host turned the Meet chat off for participants ("Let participants send messages" is off)';
+    const t = norm(await f.locator(CHAT_PANEL).allInnerTexts().catch(() => [])).toLowerCase();
+    const m = t.match(CHAT_BLOCKED);
+    if (m) return `the Meet chat does not let Bosun post ("${m[0]}")`;
+  }
+  return null;
+}
+
+// What the page showed when the chat would not open, for the error: the chat button (name, pressed), the side panel's
+// heading, the text boxes there, and the frames from elsewhere.
+async function chatDiag(page) {
+  const out = [];
+  const b = await chatToggle(page);
+  const all = await button(page, LABEL.chat).count().catch(() => 0);
+  out.push(b ? `chat button "${((await b.getAttribute('aria-label').catch(() => '')) || '').slice(0, 60)}" pressed=${await pressed(b)}` : `no visible chat button (${all} hidden)`);
+  const heads = (await page.locator(CHAT_PANEL).locator('h1, h2, [role="heading"]').allInnerTexts().catch(() => [])).map((h) => norm(h).trim()).filter(Boolean);
+  out.push(heads.length ? `side panel "${heads.slice(0, 2).join('" / "').slice(0, 80)}"` : 'no side panel heading');
+  const boxes = await page.locator(`${CHAT_PANEL} textarea, ${CHAT_PANEL} [contenteditable="true"], ${CHAT_PANEL} [role="textbox"]`).evaluateAll((els) => els.map((e) => `${e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.tagName.toLowerCase()}${e.checkVisibility?.() === false ? ' (hidden)' : ''}`)).catch(() => []);
+  out.push(boxes.length ? `boxes: ${boxes.slice(0, 3).join(', ').slice(0, 80)}` : 'no text box in the panel');
+  const hosts = [...new Set(page.frames().slice(1).map((f) => { try { return new URL(f.url()).hostname; } catch { return ''; } }).filter((h) => h && !/recaptcha|gstatic/.test(h)))];
+  if (hosts.length) out.push(`frames: ${hosts.slice(0, 4).join(', ')}`);
+  return out.join('; ');
+}
+
+// What the chat shows now, to tell a new message from what was there: per frame, the ids of the message elements
+// ([data-message-id]) with their text, and (for a chat without such elements) how often the text appears in the panel.
+// Texts are compared as rendered (innerText: a link inside a sentence stays where it was), with whitespace collapsed.
+const flat = (t) => String(t || '').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ').trim();
+async function chatSnapshot(page, text) {
+  const needle = flat(text);
+  const out = new Map(); // frame -> {msgs, count}: frames compared by identity, not by place
+  for (const f of frames(page)) {
+    out.set(f, await f.evaluate(({ needle, panel }) => {
+      const n = (t) => String(t || '').replace(/[‘’ʼ]/g, "'").replace(/\s+/g, ' ').trim();
+      // The sender a message is shown under: data-sender-name, else (live Meet) the header line of its group, as
+      // watchChat reads it; a time or the pin control's text is no name. null: no sender shown (Bosun's own).
+      const ui = /^(?:\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?|hover over a message to pin it|pin message|unpin message|keep|keep_off|push_pin|more_vert)$/i;
+      const sender = (el) => {
+        const named = el.closest('[data-sender-name]');
+        if (named) return named.getAttribute('data-sender-name');
+        const own = new Set((el.innerText || '').split('\n').map((x) => x.trim()));
+        for (let g = el.parentElement, i = 0; g && i < 3; g = g.parentElement, i++) {
+          if (g.querySelector('h1, h2, h3, [role="heading"], [role="switch"]')) break; // the panel, no message group
+          const first = (g.innerText || '').split('\n').map((x) => x.trim()).find((l) => l && !ui.test(l));
+          const name = first?.replace(/\s+\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?$/i, '').trim();
+          if (name && !own.has(first) && name.length <= 80) return name;
+        }
+        return null;
+      };
+      const msgs = [...document.querySelectorAll('[data-message-id]')].map((e) => [e.getAttribute('data-message-id'), n(e.innerText || e.textContent), sender(e)]);
+      let count = 0;
+      if (!msgs.length && needle) {
+        // The panel's text without what is still in a text box (an unsent draft is no message).
+        const occ = (hay) => { let c = 0; for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + needle.length)) c++; return c; };
+        const roots = [...document.querySelectorAll(panel)];
+        for (const r of roots.length ? roots : [document.body]) {
+          count += occ(n(r.innerText));
+          for (const b of r.querySelectorAll('textarea, input, [contenteditable="true"], [role="textbox"]')) count -= occ(n('value' in b ? '' : b.innerText));
+        }
+      }
+      return { msgs, count };
+    }, { needle, panel: CHAT_PANEL }).catch(() => ({ msgs: [], count: 0 })));
+  }
+  return out;
+}
+// Whether the chat shows the message as newly posted since `before` (a chatSnapshot): a message element that was not
+// there before, holds the whole text and is not shown under someone else's name (live Meet shows no sender on Bosun's
+// own messages; "You" or one of `self` is ours too), or, in a chat without message elements, the text once more than
+// before outside the text boxes. Someone else posting the very same words in those seconds with no name shown would
+// still count.
+const SELF = /^(?:you|me|du|ich|ви|вы|я)$/i;
+async function posted(page, text, before, self = []) {
+  const needle = flat(text);
+  const now = await chatSnapshot(page, text);
+  const ours = (sender) => sender === null || SELF.test(flat(sender)) || self.includes(flat(sender));
+  for (const [f, fr] of now) {
+    const old = before.get(f) || { msgs: [], count: 0 };
+    const seen = new Set(old.msgs.map(([id]) => id));
+    if (fr.msgs.some(([id, t, sender]) => !seen.has(id) && t.includes(needle) && ours(sender))) return true;
+    if (!fr.msgs.length && fr.count > old.count) return true;
+  }
+  return false;
+}
+const boxText = (box) => box.evaluate((e) => ('value' in e ? e.value : e.innerText)).then((t) => norm(t).trim());
 
 export const meet = {
   name: 'meet',
@@ -280,28 +408,89 @@ export const meet = {
     return 'unknown';
   },
 
-  async openChat(page) {
-    if (await visible(page.getByRole('textbox', { name: LABEL.chatInput }))) return;
-    await button(page, LABEL.chat).first().click({ timeout: 10_000 }).catch(() => { throw chatError('chat-unavailable', 'no chat button in the Meet toolbar'); });
-    await page.getByRole('textbox', { name: LABEL.chatInput }).first().waitFor({ state: 'visible', timeout: 10_000 })
-      .catch(() => { throw chatError('chat-unavailable', 'the Meet chat panel did not open'); });
+  // Opens the chat panel and returns its box. The click is repeated (the toolbar shown first, overlays closed) while
+  // the panel does not come up, at most every 3 s and only while the toggle says it is closed; after two clicks (or with
+  // no button in sight after the toolbar was shown once) Meet's own shortcut (Ctrl+Alt+C) is tried once. Throws chat-restricted when the panel says this participant may not post,
+  // chat-unavailable (with what the page showed) when no box turns up within timeoutMs.
+  async openChat(page, { timeoutMs = 20_000 } = {}) {
+    const until = Date.now() + timeoutMs;
+    let clicks = 0, last = 0, keyed = false, hidden = 0;
+    for (;;) {
+      const box = await chatBox(page);
+      if (box) return box;
+      const b = await chatToggle(page);
+      const open = await pressed(b);
+      const blocked = (open || clicks) ? await chatBlocked(page) : null;
+      if (blocked) throw chatError('chat-restricted', blocked);
+      if (Date.now() - last > 3000) {
+        if (!b) {
+          // No button to be seen: show the toolbar (it fades out), and on the next round try the shortcut once.
+          if (hidden++ && !keyed) { keyed = true; await page.keyboard.press('Control+Alt+KeyC').catch(() => {}); }
+          await overlays(page);
+          await revealToolbar(page);
+          last = Date.now();
+        } else if (!open) {
+          await overlays(page);
+          await revealToolbar(page);
+          if (clicks >= 2 && !keyed) { keyed = true; await page.keyboard.press('Control+Alt+KeyC').catch(() => {}); }
+          else { await b.click({ timeout: 3000 }).catch(() => {}); clicks++; }
+          last = Date.now();
+        }
+      }
+      if (Date.now() > until) {
+        const why = await chatDiag(page).catch(() => '');
+        throw chatError('chat-unavailable', b || clicks ? `the Meet chat panel did not open (${why})` : `no chat button in the Meet toolbar (${why})`);
+      }
+      await page.waitForTimeout(300);
+    }
   },
 
-  // Meet's chat goes to everyone; there is no message to the host alone.
-  async sendChat(page, text, { to = 'everyone' } = {}) {
+  // Meet's chat goes to everyone; there is no message to the host alone. Posted means: a new message with the whole
+  // text showed up in the chat (posted()); Enter first, the send button only while the text is still in the box and
+  // nothing new showed up (so a slow Enter is never sent twice). Otherwise this throws not-sent or not-confirmed.
+  async sendChat(page, text, { to = 'everyone', openTimeoutMs, selfName = null, names = [] } = {}) {
     if (to === 'host') throw chatError('host-unreachable', "Google Meet's chat has no way to write to the host alone");
-    await this.openChat(page);
-    const box = page.getByRole('textbox', { name: LABEL.chatInput }).first();
+    if (!flat(text)) throw chatError('not-sent', 'an empty chat message is not sent');
+    const box = await this.openChat(page, openTimeoutMs ? { timeoutMs: openTimeoutMs } : {});
     // The host turned chat off for participants: the box is there, disabled.
     if (await disabled(box)) throw chatError('chat-restricted', 'the Meet chat is turned off for participants (the host allows no chat messages)');
+    const before = await chatSnapshot(page, text);
+    const self = [selfName, ...names].filter(Boolean).map(flat);
     await box.fill(text, { timeout: 5000 });
     await box.press('Enter', { timeout: 5000 });
+    const left = () => boxText(box).catch(() => '');
+    // Up to 5 s for Enter to take: posted (done), or the box emptied (then wait for the message below).
+    for (let i = 0; i < 20; i++) {
+      if (await posted(page, text, before, self)) return;
+      if (!(await left())) break;
+      await page.waitForTimeout(250);
+    }
+    if (await left()) {
+      if (await posted(page, text, before, self)) return; // it went out after all: never send twice
+      await box.fill(text, { timeout: 5000 }); // Enter may have added a line break
+      for (const f of frames(page)) {
+        const send = await firstVisible(f.getByRole('button', { name: LABEL.chatSend }));
+        if (send && !(await disabled(send))) { await send.click({ timeout: 3000 }).catch(() => {}); break; }
+      }
+      for (let i = 0; i < 10 && await left(); i++) await page.waitForTimeout(150);
+      if (await left()) throw chatError('not-sent', 'the Meet chat message was not sent (still in the chat box)');
+    }
+    for (let i = 0; i < 32; i++) {
+      if (await posted(page, text, before, self)) return;
+      await page.waitForTimeout(250);
+    }
+    throw chatError('not-confirmed', 'the Meet chat message left the box but did not show up in the chat');
   },
 
   // New chat messages are queued in the page under a random, non-enumerable key; drainChat empties the queue.
-  // Messages already in the panel when the watch starts are queued too (they arrived before we could listen).
+  // Messages already in the panel when the watch starts are queued too (they arrived before we could listen). The
+  // watch runs in every frame of the page, so a chat embedded in a frame is heard too (and an objection in it counts).
   async watchChat(page, key) {
-    await page.evaluate((key) => {
+    for (const f of frames(page)) await this.watchFrame(f, key).catch((e) => { if (f === page.mainFrame()) throw e; });
+  },
+
+  async watchFrame(frame, key) {
+    await frame.evaluate((key) => {
       if (window[key]) return;
       const q = [];
       const seen = new Map(); // id -> text queued last; a message rendered empty first, or changed, is queued again
@@ -313,6 +502,8 @@ export const meet = {
         const ui = /^(?:\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?|hover over a message to pin it|pin message|unpin message|keep|keep_off|push_pin|more_vert)$/i;
         const own = new Set((el.innerText || '').split('\n').map((s) => s.trim()));
         for (let g = el.parentElement, i = 0; g && i < 3; g = g.parentElement, i++) {
+          // A box with a heading or a switch is the panel (its title, "Let participants send messages"), no group.
+          if (g.querySelector('h1, h2, h3, [role="heading"], [role="switch"]')) break;
           const first = (g.innerText || '').split('\n').map((s) => s.trim()).find((l) => l && !ui.test(l));
           const name = first?.replace(/\s+\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?$/i, '').trim();
           if (name && !own.has(first) && name.length <= 80) return name;
@@ -336,13 +527,42 @@ export const meet = {
     }, key);
   },
 
+  // null: the page itself was replaced (watch again). A frame that came (or was reloaded) since is watched from now on;
+  // its messages get ids of their own (prefixed with the frame's host and path), so two frames never share one.
   async drainChat(page, key) {
-    return page.evaluate((key) => {
-      const w = window[key];
-      if (!w) return null; // the page was replaced: watch again
-      w.scan();
-      return w.q.splice(0);
-    }, key);
+    const out = [];
+    for (const f of frames(page)) {
+      let tag = 'frame';
+      try { const u = new URL(f.url()); tag = `${u.host}${u.pathname}`.slice(0, 80); } catch {}
+      const main = f === page.mainFrame();
+      const got = await f.evaluate((key) => {
+        const w = window[key];
+        if (!w) return null;
+        w.scan();
+        return w.q.splice(0);
+      }, key).catch(() => (main ? Promise.reject(new Error('the Meet page is gone')) : []));
+      if (got === null) {
+        if (main) return null;
+        await this.watchFrame(f, key).catch(() => {});
+        const first = await f.evaluate((key) => (window[key] ? (window[key].scan(), window[key].q.splice(0)) : []), key).catch(() => []);
+        out.push(...first.map((m) => ({ ...m, id: `${tag}#${m.id}` })));
+      } else out.push(...(main ? got : got.map((m) => ({ ...m, id: `${tag}#${m.id}` }))));
+    }
+    return out;
+  },
+
+  // The name the call shows for Bosun (a signed-in profile: the account's name, whatever `name` was asked for): the name
+  // on our own tile, which is the one marked data-self-name, or (live Meet, 2026-11-02: no such mark) the one with the
+  // "Backgrounds and effects" control only one's own tile has. A mark reading "You" is no name. null when not shown.
+  async selfName(page) {
+    return page.evaluate((own) => {
+      const tile = [...document.querySelectorAll('[data-participant-id]')].find((t) => t.matches('[data-self-name]') || t.querySelector(`[data-self-name], ${own}`));
+      if (!tile) return null;
+      const mark = tile.matches('[data-self-name]') ? tile : tile.querySelector('[data-self-name]');
+      const n = (x) => String(x || '').replace(/\s+/g, ' ').trim();
+      return [n(tile.querySelector('span.notranslate')?.textContent), n(mark?.getAttribute('data-self-name'))]
+        .find((x) => x && x.length <= 80 && !/^(?:you|du|sie|ich|me|vy|ty|ви|вы|ти|ты|я)$/i.test(x)) || null;
+    }, OWN_TILE).catch(() => null);
   },
 
   async participants(page) {

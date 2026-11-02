@@ -489,6 +489,27 @@ still has one loads without it.
 
 **Settings per meeting.** `meeting_join` may set `speculative_speech` (`PER_CALL`). They are kept on the meeting as `m.overrides`, and `opts(m)` merges them over the tenant's settings.
 
+## 9f. Group calls: the Meet chat, `addressed` (0.20.0)
+
+- **Meet chat** (`platforms/meet.mjs`): `openChat` returns the chat box, searched in every frame. The toolbar's chat
+  button is a toggle (`aria-pressed`) and is clicked only while it says closed, at most every 3 s, with the toolbar
+  revealed and overlays closed; after two clicks (or with no button found after the toolbar was shown) Ctrl+Alt+C
+  once. "Let participants send messages" off, or the panel saying only hosts may post, is `chat-restricted`. After
+  `timeoutMs` (20 s; 5 s when the join's attempt already failed) `chat-unavailable` with a diagnosis of the page.
+  `sendChat` snapshots the message elements (`[data-message-id]`, id, rendered text, `data-sender-name`) in every
+  frame, fills, presses Enter, and counts the message as posted when a new element holds the whole text and is not
+  marked as someone else's (without message elements: the text once more in the panel). The send button is used only
+  while the box still has the text and nothing new showed up (`not-sent`); then up to 8 s for the message
+  (`not-confirmed`). `watchChat`/`drainChat` run in every frame; a frame's message ids get its host and path in
+  front. `selfName` reads the name on Bosun's own tile, for signed-in joins.
+- **`addressed`** (`meetings/addressed.mjs`): names are the join `name` (bracketed notes dropped; a longer name also
+  by its first word), the account name the call shows, and the setting `name_aliases`. Words are compared by a loose
+  key (lower case, Cyrillic transliterated, accents dropped, y=i, h=g, w=v, x=ks, ph=f, ck=k, doubled letters single,
+  possessive 's dropped); a name of several words matches those words in a row; keys under 3 letters never match.
+  `deliver()` sets `seg.addressed` on each final (false for Bosun's echo), so it reaches the channel metadata and the
+  transcript event. Bosun does nothing else with it.
+- Group-call guidance is in the README; there is no group mode.
+
 ## 10. Deployment
 
 - Package: npm + Docker image (Chromium, Xvfb, fonts, the server).

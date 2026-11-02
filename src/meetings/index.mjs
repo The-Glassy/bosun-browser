@@ -25,6 +25,7 @@ import { LiveTranscript, TranscriptUsage, nodeDebugOn, NODE_DEBUG_REFUSED } from
 import { synthesizeWav, splitSpeech, takeSentences, probeSeconds, audioFormat } from './speech.mjs';
 import { SpeechSettings, SETTINGS, PER_CALL, REMOVED, removedSetting } from './settings.mjs';
 import { CHANNEL_PREFIX } from '../events.mjs';
+import { aliasKeys, isAddressed } from './addressed.mjs';
 import { RecordingLinks } from './recording-links.mjs';
 
 export const ID_RE = /^m[0-9a-f]{12}$/;
@@ -426,6 +427,8 @@ export class Meetings {
       // A chat that won't open (turned off by the host) is no reason to leave; the announcement then says why it failed.
       await platform.openChat(p).catch((e) => { m.chatError = oneLine(e); });
       await platform.watchChat(p, m.chatKey);
+      // Signed in, the call shows the account's name, which people then use (addressed): Meet's own tile says it.
+      if (!m.info.selfName && m.info.joinedAs === 'account' && platform.selfName) m.info.selfName = await platform.selfName(p);
       if (platform.watchSpeakers) await platform.watchSpeakers(p, m.speakerKey, { self: [m.name, m.info.selfName].filter(Boolean) }).catch(() => {});
     });
     await this.announce(m);
@@ -1052,6 +1055,9 @@ export class Meetings {
   // A turn to the agent: acknowledged (ack_on_final), sent on the meeting's channel, and as a bosun:meeting-transcript
   // event unless the channel took it (transcript_events).
   deliver(m, seg, d) {
+    // Whether the turn names the agent (the join name, the account name the call shows, name_aliases). Bosun's own
+    // voice coming back never does.
+    if (seg.final) seg.addressed = !seg.echo && isAddressed(seg.text, this.aliases(m, d));
     if (!seg.echo && seg.seq >= m.lastTurnSeq) { // Bosun's own voice is not someone's turn
       m.lastTurnSeq = seg.seq;
       m.lastTurn = { seq: seg.seq, segs: seg.merged_seqs ? (seg.parts || [seg]) : [seg], speaker: seg.speaker || null, at: this.now(), gen: m.consentGen };
@@ -1065,6 +1071,13 @@ export class Meetings {
     this.incoming(m, seg).then((ok) => { if (!ok && d.transcript_events === 'auto' && gen === m.consentGen) this.emitLive(m, 'transcript', seg); }, () => {});
   }
 
+  // The names this meeting answers to, as addressed.mjs keys (kept until the names or the aliases change).
+  aliases(m, d) {
+    const src = JSON.stringify([m.name, m.info.selfName || null, d.name_aliases || []]);
+    if (m.aliasSrc !== src) { m.aliasSrc = src; m.aliasKeys = aliasKeys({ names: [m.name, m.info.selfName].filter(Boolean), aliases: d.name_aliases || [] }); }
+    return m.aliasKeys;
+  }
+
   // A transcript segment as channels/incoming on the meeting's channel. Partials carry the seq of their final and
   // final: false (tag bosun:partial), so a wake policy can tell them apart.
   async incoming(m, seg) {
@@ -1075,7 +1088,7 @@ export class Meetings {
       content: [{ type: 'text', text: seg.text }],
       metadata: {
         meeting_id: m.id, platform: m.platform.name, seq: seg.seq, start_s: seg.start_s, end_s: seg.end_s, final: !!seg.final, ...(seg.lang ? { lang: seg.lang } : {}), ...(who ? { speaker: who } : {}), ...(seg.speakers ? { speakers: seg.speakers } : {}),
-        ...(seg.final && !seg.echo ? { turn_seq: seg.seq } : {}), ...(seg.extends_turn ? { extends_turn: seg.extends_turn } : {}),
+        ...(seg.final && !seg.echo ? { turn_seq: seg.seq } : {}), ...(seg.final ? { addressed: !!seg.addressed } : {}), ...(seg.extends_turn ? { extends_turn: seg.extends_turn } : {}),
         ...(seg.merged_seqs ? { merged_seqs: seg.merged_seqs } : {}), ...(seg.held_ms !== undefined ? { held_ms: seg.held_ms } : {}), ...(seg.echo ? { echo_suspected: true } : {}),
       },
       tags: ['bosun:meeting-transcript', `bosun:meeting=${m.id}`, ...(seg.final ? [] : ['bosun:partial']), ...(seg.echo ? ['bosun:echo-suspected'] : [])],
@@ -1237,7 +1250,8 @@ export class Meetings {
     m.echoes.set(text.trim(), { ...e, count: e.count + 1, until: this.now() + ECHO_MS }); // see withoutOwn
     m.pendingOwn.push(text.trim());
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
-    await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name, to });
+    // The chat already failed to open once (at the join): a short second try, so the recording is not held up long.
+    await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name, names: [m.name], to, ...(m.chatError ? { openTimeoutMs: 5000 } : {}) });
     m.chatError = null; // the chat works after all
   }
 
