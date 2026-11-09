@@ -11,7 +11,7 @@ export const CHROMIUM_ARGS = ['--disable-blink-features=AutomationControlled'];
 // Extra flags for a browser that serves a proxied tenant (host allowlist): QUIC would not go through an HTTP proxy, and
 // WebRTC must not open UDP of its own. Chromium does not fall back to a direct connection when a configured proxy
 // refuses or fails. They are Chromium flags, and they are added only where a proxy is in play: a browser serving
-// tenants without an allowlist is launched exactly the way upstream launches it.
+// tenants without a configured proxy is launched exactly the way upstream launches it.
 export const PROXY_ARGS = ['--disable-quic', '--dns-prefetch-disable', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'];
 const chromiumArgs = (proxy, extra = []) => [...CHROMIUM_ARGS, ...(proxy ? PROXY_ARGS : []), ...extra];
 // A persistent Chromium profile ignores --force-webrtc-ip-handling-policy (full Chromium reads the profile preference
@@ -91,7 +91,7 @@ async function sandboxPreflight(bt, cfg) {
   if (!cfg.chromiumSandbox || process.platform !== 'linux') return;
   let b = null;
   try {
-    b = await bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: true, timeout: 60_000 });
+    b = await bt.launch({ headless: cfg.headless, args: chromiumArgs(cfg.egressProxy), ...(cfg.egressProxy ? { proxy: cfg.egressProxy } : {}), chromiumSandbox: true, timeout: 60_000 });
   } finally {
     await b?.close().catch(() => {});
   }

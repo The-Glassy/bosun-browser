@@ -28,6 +28,10 @@ async function fixture(t) {
     res.end('<title>Exit</title><p>proxied</p>');
   });
   origin.on('connection', () => directConnections++);
+  origin.on('upgrade', (req, sock) => {
+    originHeaders.push(req.headers);
+    sock.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
+  });
   const originPort = await listen(origin);
   const exit = http.createServer((req, res) => {
     if (req.headers['proxy-authorization'] !== 'Basic dXNlcjpwYXNz') { res.writeHead(407); return res.end(); }
@@ -237,3 +241,121 @@ test('egress per-profile MCP parameter and two concurrent allowlist exits stay i
   assert.ok(first.requests.some((r) => r.url.endsWith('/first'))); assert.ok(!first.requests.some((r) => r.url.endsWith('/second')));
   assert.ok(second.requests.some((r) => r.url.endsWith('/second'))); assert.ok(!second.requests.some((r) => r.url.endsWith('/first')));
 });
+
+test('egress SOCKS5 protocol: fragmented reply, remote DNS hostname, and first application bytes preserved', async (t) => {
+  const { Duplex } = await import('node:stream');
+  let stage = 0;
+  const sock = new Duplex({ read() {}, write(chunk, _encoding, cb) {
+    if (stage++ === 0) {
+      assert.deepEqual([...chunk], [5, 1, 0]);
+      this.push(Buffer.from([5])); setImmediate(() => this.push(Buffer.from([0])));
+    } else {
+      assert.deepEqual([...chunk.subarray(0, 5)], [5, 1, 0, 3, 12]);
+      assert.equal(chunk.subarray(5, 17).toString(), 'allowed.test');
+      assert.equal(chunk.readUInt16BE(17), 443);
+      this.push(Buffer.concat([Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 1, 187]), Buffer.from('first TLS bytes')]));
+    }
+    cb();
+  } });
+  t.mock.method(net, 'connect', (options) => { assert.deepEqual(options, { host: 'exit.test', port: 1080 }); queueMicrotask(() => sock.emit('connect')); return sock; });
+  const result = await connectEgress(parseEgress('socks5://exit.test:1080'), { host: 'allowed.test', port: 443 });
+  assert.equal(result, sock);
+  assert.equal(sock.read().toString(), 'first TLS bytes');
+  sock.destroy();
+});
+
+for (const failure of ['authentication refused', 'peer closed', 'timeout']) {
+  test(`egress SOCKS5 protocol: ${failure} fails closed and destroys the socket`, async (t) => {
+    const { Duplex } = await import('node:stream');
+    const sock = new Duplex({ read() {}, write(_chunk, _encoding, cb) {
+      if (failure === 'authentication refused') this.push(Buffer.from([5, 255]));
+      if (failure === 'peer closed') setImmediate(() => this.destroy());
+      cb();
+    } });
+    t.mock.method(net, 'connect', () => { queueMicrotask(() => sock.emit('connect')); return sock; });
+    await assert.rejects(connectEgress(parseEgress('socks5://exit.test:1080'), { host: 'allowed.test', port: 443 }, (s) => s, 20), /egress proxy socks5:\/\/exit.test:1080 failed.*no direct fallback/);
+    assert.equal(sock.destroyed, true);
+  });
+}
+
+for (const mode of ['connected', 'refused', 'closed', 'timeout']) {
+  test(`egress HTTP CONNECT protocol: ${mode}, credentials stay at the exit and no fallback occurs`, async (t) => {
+    const { EventEmitter } = await import('node:events');
+    const { PassThrough } = await import('node:stream');
+    let requests = 0;
+    const sock = new PassThrough();
+    t.mock.method(http, 'request', (options) => {
+      requests++;
+      assert.equal(options.host, 'exit.test'); assert.equal(options.port, 3128);
+      assert.equal(options.path, 'allowed.test:443');
+      assert.equal(options.headers['proxy-authorization'], 'Basic dXNlcjpwYXNz');
+      const req = new EventEmitter();
+      req.end = () => queueMicrotask(() => {
+        req.emit('socket', sock);
+        if (mode === 'closed') req.emit('close');
+        else if (mode !== 'timeout') req.emit('connect', { statusCode: mode === 'connected' ? 200 : 407 }, sock, Buffer.from('first bytes'));
+      });
+      req.destroy = (e) => { sock.destroy(); if (e) req.emit('error', e); req.emit('close'); };
+      return req;
+    });
+    const pending = connectEgress(parseEgress('http://user:pass@exit.test:3128'), { host: 'allowed.test', port: 443 }, (s) => s, 20);
+    if (mode === 'connected') { assert.equal(await pending, sock); assert.equal(sock.read().toString(), 'first bytes'); sock.destroy(); }
+    else await assert.rejects(pending, (e) => /egress proxy http:\/\/exit.test:3128 failed/.test(e.message) && !e.message.includes('user:pass'));
+    assert.equal(requests, 1);
+  });
+}
+
+test('egress session_open MCP exposes and persists exit selection, and sanitizes upstream errors', async (t) => {
+  const { buildServer } = await import('../src/tools.mjs');
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
+  const { manager, cfg } = await managerFixture(t);
+  const server = buildServer({ manager, cfg, tenant: 'default', owner: 'test' });
+  const client = new Client({ name: 'test', version: '0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(b); await client.connect(a);
+  t.after(async () => { await client.close(); await server.close(); });
+  const response = await client.callTool({ name: 'session_open', arguments: { profile: 'home', egress: 'home' } });
+  assert.ok(!response.isError, JSON.stringify(response));
+  assert.equal(JSON.parse(response.content[0].text).egress, 'home');
+  manager.engines.open = async () => { throw new Error('upstream http://user:password@exit:8080 failed'); };
+  const error = await client.callTool({ name: 'session_open', arguments: { egress: 'default' } });
+  assert.equal(error.isError, true);
+  assert.ok(!JSON.stringify(error).includes('password')); assert.match(error.content[0].text, /\[masked\]@exit/);
+});
+
+
+test('egress Firefox-style WebSocket upgrade uses CONNECT at the exit and strips local proxy credentials', async (t) => {
+  const f = await fixture(t);
+  const logs = [];
+  const p = await startTenantProxy({ tenant: 'test', allow: patterns('allowed.test'), lookup: async () => '8.8.8.8', egress: parseEgress(f.url), log: (line) => logs.push(line) });
+  t.after(() => p.close());
+  await new Promise((ok, no) => {
+    const req = http.request({ host: '127.0.0.1', port: p.port, path: 'http://allowed.test/socket',
+      headers: { host: 'allowed.test', connection: 'Upgrade', upgrade: 'websocket', 'proxy-authorization': auth(p) } });
+    req.once('upgrade', (res, sock) => { assert.equal(res.statusCode, 101); sock.destroy(); ok(); });
+    req.once('response', (res) => { res.resume(); no(new Error(`upgrade refused: ${res.statusCode}`)); });
+    req.once('error', no); req.end();
+  });
+  assert.deepEqual(f.tunnels, ['allowed.test:80']);
+  assert.equal(f.originHeaders[0]['proxy-authorization'], undefined);
+  await requestProxy(p, 'http://denied.test/');
+  assert.equal(logs.length, 1); assert.ok(!logs.join().includes('user:pass')); assert.ok(!logs.join().includes(p.password));
+});
+
+for (const status of [200, 400, 407, 503]) {
+  test(`egress health protocol: HTTP ${status}, bounded probe reports public URL only`, async (t) => {
+    const { EventEmitter } = await import('node:events');
+    t.mock.method(http, 'request', (options) => {
+      assert.equal(options.method, 'OPTIONS'); assert.equal(options.path, '*');
+      assert.equal(options.headers['proxy-authorization'], 'Basic dXNlcjpwYXNz');
+      const req = new EventEmitter();
+      req.end = () => queueMicrotask(() => req.emit('response', { statusCode: status, resume() {} }));
+      req.destroy = () => req.emit('close');
+      return req;
+    });
+    const health = await probeEgress(parseEgress('http://user:pass@exit:3128'));
+    assert.equal(health.ok, status < 500 && status !== 407);
+    assert.equal(health.server, 'http://exit:3128'); assert.ok(!JSON.stringify(health).includes('user:pass'));
+  });
+}

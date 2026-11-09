@@ -8,9 +8,10 @@
 // intercepted, so the browser keeps its own semantics: origins, CORS, cookies and the URL bar are exactly what the
 // network said they are.
 //
-// Hostnames are resolved here, once, and the connection goes to that address. The browser never resolves a proxied
+// Without an egress exit, hostnames are resolved here, once, and the connection goes to that address. The browser never resolves a proxied
 // name itself, so the address the decision was made about is the address that gets used (no DNS rebinding). A name
 // that resolves into loopback or a private range is only followed if the allowlist names that address as well.
+// With an exit, the hostname goes upstream after the same private-address preflight (see resolveTarget).
 //
 // The listener is on loopback with a random Basic-auth password, so no other local process can use it as an open
 // proxy into the tenant's hosts. Denials are logged as host:port, never a path or a query.
@@ -124,8 +125,8 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     log(`bosun: tenant ${tenant}: blocked ${at} — ${reason}`);
     if (logged.size === MAX_LOGGED) log(`bosun: tenant ${tenant}: further blocked targets are not logged`);
   };
-  // Connects to the address the decision was made about; the name only travels in the request (and in SNI, which
-  // the browser sets inside the tunnel).
+  // Connects to the pinned address in direct mode, or passes the hostname to the selected exit.
+  // The browser supplies TLS/SNI inside the tunnel; neither proxy terminates it.
   const dial = (t) => egress ? connectEgress(egress, t, track) : new Promise((resolve_, reject) => {
     const sock = track(net.connect({ host: t.ip, port: t.port }));
     sock.setTimeout(CONNECT_TIMEOUT_MS, () => sock.destroy(new Error('timeout')));
@@ -176,7 +177,8 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
       port: exit ? Number(exit.port || 80) : target.port, path: viaHttp ? u.href : `${u.pathname}${u.search}`,
       method: req.method, headers, setHost: false, agent: socksAgent || agent }, (up) => {
       clearTimeout(timer);
-      if (egress && (up.statusCode === 407 || up.statusCode === 502 || up.statusCode === 503 || up.statusCode === 504)) {
+      // A 407 belongs to the exit; origin 5xx responses must retain their browser semantics.
+      if (egress && up.statusCode === 407) {
         up.resume(); return end(502, failed());
       }
       res.writeHead(up.statusCode, up.statusMessage, up.headers);

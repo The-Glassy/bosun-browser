@@ -28,7 +28,9 @@ async function readBytes(sock, n) {
   const chunks = [];
   let left = n;
   while (left) {
-    const part = sock.read(left);
+    // Consume partial fragments too: read(n) with fewer than n buffered bytes can repeatedly emit
+    // readable without making progress, starving the handshake deadline and the next network packet.
+    const part = sock.read(Math.min(left, sock.readableLength) || left);
     if (part) { chunks.push(part); left -= part.length; continue; }
     await new Promise((ok, no) => {
       const cleanup = () => { sock.off('readable', ready); sock.off('error', fail); sock.off('close', closed); };

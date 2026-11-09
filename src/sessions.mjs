@@ -115,7 +115,7 @@ export class SessionManager {
   }
 
   // The shared browser of the shared engine (chromium): launched once, relaunched after it goes away. Only tenants
-  // without a host allowlist use it, so it is launched exactly as 0.7.0 launched it; a proxied tenant's sessions
+  // without a configured proxy use it, so it is launched exactly as 0.7.0 launched it; a proxied tenant's sessions
   // each get a browser of their own (engines.mjs open).
   getBrowser(def, bt) {
     if (!this.browserP) {
