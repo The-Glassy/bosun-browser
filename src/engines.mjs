@@ -11,8 +11,8 @@ export const CHROMIUM_ARGS = ['--disable-blink-features=AutomationControlled'];
 // Extra flags for a browser that serves a proxied tenant (host allowlist): QUIC would not go through an HTTP proxy, and
 // WebRTC must not open UDP of its own. Chromium does not fall back to a direct connection when a configured proxy
 // refuses or fails. They are Chromium flags, and they are added only where a proxy is in play: a browser serving
-// tenants without an allowlist is launched exactly the way upstream launches it.
-export const PROXY_ARGS = ['--disable-quic', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'];
+// tenants without a configured proxy is launched exactly the way upstream launches it.
+export const PROXY_ARGS = ['--disable-quic', '--dns-prefetch-disable', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'];
 const chromiumArgs = (proxy, extra = []) => [...CHROMIUM_ARGS, ...(proxy ? PROXY_ARGS : []), ...extra];
 // A persistent Chromium profile ignores --force-webrtc-ip-handling-policy (full Chromium reads the profile preference
 // instead; only the headless shell honours the flag), so a proxied tenant's profile directory also gets the
@@ -58,6 +58,9 @@ export const PROXY_FIREFOX_PREFS = {
   'network.http.http3.enable': false,
   'network.dns.disablePrefetch': true,
   'network.predictor.enabled': false,
+  'network.prefetch-next': false,
+  'network.proxy.socks_remote_dns': true,
+  'network.proxy.failover_direct': false,
 };
 
 const INSTALL = {
@@ -88,7 +91,7 @@ async function sandboxPreflight(bt, cfg) {
   if (!cfg.chromiumSandbox || process.platform !== 'linux') return;
   let b = null;
   try {
-    b = await bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: true, timeout: 60_000 });
+    b = await bt.launch({ headless: cfg.headless, args: chromiumArgs(cfg.egressProxy), ...(cfg.egressProxy ? { proxy: cfg.egressProxy } : {}), chromiumSandbox: true, timeout: 60_000 });
   } finally {
     await b?.close().catch(() => {});
   }
@@ -129,6 +132,8 @@ function definitions(importer) {
       async load() { return (await importer('playwright')).chromium; },
       // Headless runs use Playwright's separate headless shell, whose path the API doesn't expose: checked at launch.
       async check(bt, cfg) { if (!cfg.headless) exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
+      // Always direct, even when cfg.egressProxy is set. Selected exits use private processes in open() below,
+      // so an ephemeral session choosing "direct" cannot inherit the default exit from a shared launch.
       launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: cfg.chromiumSandbox }),
       async open(bt, { cfg, dir, locale, timezone, shared, media, proxy, downloads }) {
         const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: false, ...(proxy ? { proxy } : {}) };
@@ -230,8 +235,8 @@ export function readProfileMeta(dir) {
 
 // After a successful open: remember the engine and mode (headless or not) the profile was last used with, so
 // background work (keepalive) opens it the same way and its fingerprint stays consistent.
-export function recordProfileUse(dir, { engine, headless }) {
-  const meta = { ...(readProfileMeta(dir) || {}), engine, headless };
+export function recordProfileUse(dir, { engine, headless, egress }) {
+  const meta = { ...(readProfileMeta(dir) || {}), engine, headless, ...(egress !== undefined ? { egress } : {}) };
   const tmp = path.join(dir, `${META}.${crypto.randomBytes(4).toString('hex')}`);
   fs.writeFileSync(tmp, JSON.stringify(meta), { mode: 0o600 });
   fs.renameSync(tmp, path.join(dir, META));

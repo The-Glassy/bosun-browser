@@ -70,6 +70,12 @@ export async function startWsServer({ cfg, manager }) {
   };
   const srv = http.createServer(async (req, res) => {
     try {
+      if (req.method === 'GET' && req.url === '/health') {
+        if (!authTenant(req)) { res.writeHead(401); return res.end(); }
+        const health = await manager.health();
+        res.writeHead(health.ok ? 200 : 503, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        return res.end(JSON.stringify(health));
+      }
       // Checked without a tick in between: an upload's body must reach its handler before Node buffers more of it.
       if (secrets && Secrets.owns(req) && await secrets.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
       if (uploads && await uploads.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;

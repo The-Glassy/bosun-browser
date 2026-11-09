@@ -35,7 +35,9 @@ test('every page tool is refused during a handoff, and nothing leaks URL/title',
     assert.ok(!r.text.includes('424242') && !r.text.includes(pages.base), `${tool} leaked: ${r.text}`);
   }
   const list = await c.call('sessions');
-  assert.deepEqual(list.json(), [{ id: s, profile: 'ephemeral', engine: ENGINE, handoff: 'active' }]);
+  // The selected route is session metadata; the page URL and title must stay hidden.
+  assert.deepEqual(list.json(), [{ id: s, profile: 'ephemeral', engine: ENGINE, egress: 'default', handoff: 'active' }]);
+  assert.ok(!list.text.includes('424242') && !list.text.includes(pages.base), list.text);
   const w = await c.call('handoff_wait', { session: s, timeoutSec: 1 });
   assert.equal(w.json().status, 'still_waiting');
   assert.ok(!w.text.includes('424242') && !w.text.includes(pages.base), w.text);

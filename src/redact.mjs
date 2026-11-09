@@ -339,3 +339,6 @@ export function maskText(text, values = []) {
   }
   return out.replace(new RegExp(FORMAT_SOURCE, 'g'), (v) => maskedValue(v));
 }
+
+// Credentials in HTTP/SOCKS URLs must never survive errors or launch diagnostics. No secret suffix is retained.
+export const redactUrlCredentials = (text) => String(text).replace(/\b((?:https?|socks5):\/\/)[^\s/]*@/gi, '$1[masked]@');

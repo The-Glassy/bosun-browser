@@ -8,9 +8,10 @@
 // intercepted, so the browser keeps its own semantics: origins, CORS, cookies and the URL bar are exactly what the
 // network said they are.
 //
-// Hostnames are resolved here, once, and the connection goes to that address. The browser never resolves a proxied
+// Without an egress exit, hostnames are resolved here, once, and the connection goes to that address. The browser never resolves a proxied
 // name itself, so the address the decision was made about is the address that gets used (no DNS rebinding). A name
 // that resolves into loopback or a private range is only followed if the allowlist names that address as well.
+// With an exit, the hostname goes upstream after the same private-address preflight (see resolveTarget).
 //
 // The listener is on loopback with a random Basic-auth password, so no other local process can use it as an open
 // proxy into the tenant's hosts. Denials are logged as host:port, never a path or a query.
@@ -18,6 +19,7 @@ import crypto from 'crypto';
 import dns from 'dns';
 import http from 'http';
 import net from 'net';
+import { connectEgress, egressError, proxyAuth } from './egress.mjs';
 import { allowsUrl } from './allow.mjs';
 
 const MAX_LOGGED = 50; // distinct denied targets logged per tenant
@@ -73,7 +75,7 @@ export function isPrivateAddress(ip) {
 const resolve = (host) => dns.promises.lookup(host, { verbatim: true }).then((r) => r.address);
 
 // What this connection may do: {ip, host, port} to go ahead, or {denied: <reason>}.
-export async function resolveTarget(allow, host, port, lookup = resolve) {
+export async function resolveTarget(allow, host, port, lookup = resolve, remote = false) {
   if (!allowsUrl(allow, `http://${bracketed(host)}:${port}`)) return { denied: 'not in the host allowlist' };
   if (net.isIP(host)) return { ip: host, host, port };
   let ip;
@@ -81,17 +83,23 @@ export async function resolveTarget(allow, host, port, lookup = resolve) {
   if (!net.isIP(ip)) return { denied: 'could not be resolved' };
   // Resolved into a private range: only follow it if the allowlist names that address itself.
   if (isPrivateAddress(ip) && !allowsUrl(allow, `http://${bracketed(ip)}:${port}`)) return { denied: 'resolves into a private address the allowlist does not name' };
-  return { ip, host, port };
+  // With an exit we still do this local private-address preflight, but send the hostname upstream. The exit's
+  // DNS may differ or change: we cannot pin its answer without resolving locally and losing exit-side DNS. An
+  // allowlist of names therefore trusts the exit's DNS/private-network policy; locally private-only names remain
+  // refused unless their address is explicitly allowed. Use literal public IPs for strict address pinning.
+  return { ip: remote ? host : ip, host, port };
 }
 
 // Starts the proxy for one tenant. Returns Playwright proxy options plus close() and the counters tests look at.
 // log is called, not captured: tests replace console.error after the proxy is already running.
-export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log = (...a) => console.error(...a), lookup = resolve }) {
+export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log = (...a) => console.error(...a), lookup = resolve, egress = null }) {
   const username = 'bosun';
   const password = crypto.randomBytes(24).toString('base64url');
   const expected = digest(`Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`);
   const logged = new Set();
   const stats = { allowed: 0, denied: 0 };
+  const failures = [];
+  const failed = () => { failures.push(Date.now()); if (failures.length > RECENT_DENIALS) failures.shift(); return egress ? egressError(egress).message : 'upstream failed'; };
   const recent = []; // [{at, target}] of the latest denials, newest last
   const sockets = new Set(); // every client and upstream socket, so close() can end tunnels too
   const agent = new http.Agent({ keepAlive: true }); // this proxy's own upstream pool for plain http://, closed with it
@@ -117,9 +125,9 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     log(`bosun: tenant ${tenant}: blocked ${at} — ${reason}`);
     if (logged.size === MAX_LOGGED) log(`bosun: tenant ${tenant}: further blocked targets are not logged`);
   };
-  // Connects to the address the decision was made about; the name only travels in the request (and in SNI, which
-  // the browser sets inside the tunnel).
-  const dial = (t) => new Promise((resolve_, reject) => {
+  // Connects to the pinned address in direct mode, or passes the hostname to the selected exit.
+  // The browser supplies TLS/SNI inside the tunnel; neither proxy terminates it.
+  const dial = (t) => egress ? connectEgress(egress, t, track) : new Promise((resolve_, reject) => {
     const sock = track(net.connect({ host: t.ip, port: t.port }));
     sock.setTimeout(CONNECT_TIMEOUT_MS, () => sock.destroy(new Error('timeout')));
     sock.once('connect', () => { sock.setTimeout(0); resolve_(sock); });
@@ -150,7 +158,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     try { u = new URL(req.url); } catch { return end(400, 'malformed request target'); }
     const authority = parseAuthority(u.host, 80);
     if (!authority) return end(400, 'malformed request target');
-    const target = await resolveTarget(allow, authority.host, authority.port, lookup);
+    const target = await resolveTarget(allow, authority.host, authority.port, lookup, !!egress);
     if (closing || res.destroyed || req.socket.destroyed) return res.destroy(); // closed or gone while resolving
     if (target.denied) {
       deny(authority.host, authority.port, target.denied);
@@ -159,13 +167,28 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     stats.allowed++;
     const headers = { ...req.headers };
     for (const h of HOP_BY_HOP) delete headers[h];
-    const out = http.request({ host: target.ip, port: target.port, path: `${u.pathname}${u.search}`, method: req.method, headers, setHost: false, agent }, (up) => {
+    const viaHttp = egress?.server.startsWith('http:');
+    const exit = viaHttp ? new URL(egress.server) : null;
+    if (viaHttp) Object.assign(headers, proxyAuth(egress));
+    // HTTP uses absolute-form forwarding at the exit. SOCKS5 supplies a tunnel to the origin to http.Agent.
+    const socksAgent = egress && !viaHttp ? new http.Agent({ keepAlive: false }) : null;
+    if (socksAgent) socksAgent.createConnection = (_opts, cb) => { connectEgress(egress, target, track).then((sock) => cb(null, sock), cb); };
+    const out = http.request({ host: exit ? exit.hostname.replace(/^\[|\]$/g, '') : target.ip,
+      port: exit ? Number(exit.port || 80) : target.port, path: viaHttp ? u.href : `${u.pathname}${u.search}`,
+      method: req.method, headers, setHost: false, agent: socksAgent || agent }, (up) => {
+      clearTimeout(timer);
+      // A 407 belongs to the exit; origin 5xx responses must retain their browser semantics.
+      if (egress && up.statusCode === 407) {
+        up.resume(); return end(502, failed());
+      }
       res.writeHead(up.statusCode, up.statusMessage, up.headers);
       up.pipe(res);
     });
     out.on('socket', track);
     out.setTimeout(CONNECT_TIMEOUT_MS, () => out.destroy(new Error('timeout')));
-    out.on('error', () => { if (!res.headersSent) end(502, 'upstream failed'); else res.destroy(); });
+    const timer = egress ? setTimeout(() => out.destroy(new Error('timeout')), CONNECT_TIMEOUT_MS) : null;
+    out.on('close', () => { clearTimeout(timer); socksAgent?.destroy(); });
+    out.on('error', () => { const message = failed(); if (!res.headersSent) end(502, message); else res.destroy(); });
     res.on('close', () => out.destroy());
     req.pipe(out);
   });
@@ -178,14 +201,14 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     if (!authenticated(req)) return refuse(`407 Proxy Authentication Required\r\n${AUTH_REALM}`, 'proxy authentication required');
     const authority = parseAuthority(req.url, 443);
     if (!authority) return refuse('400 Bad Request', 'malformed CONNECT target');
-    const target = await resolveTarget(allow, authority.host, authority.port, lookup);
+    const target = await resolveTarget(allow, authority.host, authority.port, lookup, !!egress);
     if (closing || sock.destroyed) return sock.destroy(); // closed or gone while resolving
     if (target.denied) {
       deny(authority.host, authority.port, target.denied);
       return refuse('403 Forbidden', `${bracketed(authority.host)}:${authority.port} ${target.denied}`);
     }
     let up;
-    try { up = await dial(target); } catch { return refuse('502 Bad Gateway', 'upstream failed'); }
+    try { up = await dial(target); } catch { return refuse('502 Bad Gateway', failed()); }
     stats.allowed++;
     if (closing || sock.destroyed) { sock.destroy(); return up.destroy(); }
     sock.write('HTTP/1.1 200 Connection Established\r\nProxy-Agent: bosun\r\n\r\n');
@@ -204,14 +227,14 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     try { u = new URL(req.url); } catch { return refuse('400 Bad Request', 'malformed request target'); }
     const authority = parseAuthority(u.host, 80);
     if (!authority) return refuse('400 Bad Request', 'malformed request target');
-    const target = await resolveTarget(allow, authority.host, authority.port, lookup);
+    const target = await resolveTarget(allow, authority.host, authority.port, lookup, !!egress);
     if (closing || sock.destroyed) return sock.destroy(); // closed or gone while resolving
     if (target.denied) {
       deny(authority.host, authority.port, target.denied);
       return refuse('403 Forbidden', `${bracketed(authority.host)}:${authority.port} ${target.denied}`);
     }
     let up;
-    try { up = await dial(target); } catch { return refuse('502 Bad Gateway', 'upstream failed'); }
+    try { up = await dial(target); } catch { return refuse('502 Bad Gateway', failed()); }
     stats.allowed++;
     if (closing || sock.destroyed) { sock.destroy(); return up.destroy(); }
     const lines = [`${req.method} ${u.pathname}${u.search} HTTP/1.1`];
@@ -234,6 +257,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     bypass: '<-loopback>',
     port,
     stats,
+    failuresSince(t) { return failures.some((at) => at >= t); },
     // host:port targets refused since time t (ms), oldest first.
     deniedSince(t) { return recent.filter((d) => d.at >= t).map((d) => d.target); },
     // Stops listening and ends every connection, tunnels included; never waits longer than CLOSE_DEADLINE_MS.

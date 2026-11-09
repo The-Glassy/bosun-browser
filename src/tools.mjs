@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { countNodes, markSensitive, markValue, maskText, maskedScreenshot, readText, scrubValue, sensitiveValues } from './redact.mjs';
+import { redactUrlCredentials, countNodes, markSensitive, markValue, maskText, maskedScreenshot, readText, scrubValue, sensitiveValues } from './redact.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, TENANT_RE } from './auth.mjs';
 import { urlKey, httpUrl, HANDOFF_ACTIVE } from './sessions.mjs';
 
@@ -16,6 +16,7 @@ import { challengeShown } from './meetings/platforms/common.mjs';
 import { BASE64_MAX_BYTES } from './uploads.mjs';
 import { DRIVER_LOGS_REFUSED, SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS, driverLogsValues } from './secrets.mjs';
 import { INLINE_MAX_BYTES } from './downloads.mjs';
+import { egressError } from './egress.mjs';
 import { showPattern } from './allow.mjs';
 import { currentCall, stepCall, withDeadline } from './deadline.mjs';
 import { MAX_SITES, MAX_STEPS, RUN_DEFAULT_SEC, RUN_MAX_SEC, runMacro } from './macros.mjs';
@@ -75,7 +76,7 @@ async function pageInfo(p) { return { url: p.url(), title: await p.title().catch
 
 
 // Playwright errors carry a call log that can quote page markup; keep only the headline.
-const cleanError = (e) => String(e?.message || e).split('\nCall log:')[0].replace(/\x1b\[[0-9;]*m/g, '').slice(0, 500);
+const cleanError = (e) => redactUrlCredentials(e?.message || e).split('\nCall log:')[0].replace(/\x1b\[[0-9;]*m/g, '').slice(0, 500);
 
 // Every element a target matches, in document order: role+name, css (or any Playwright selector), or text. getByRole
 // leaves hidden elements out by itself; all: with them (to say what matched).
@@ -439,7 +440,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.22.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.23.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -480,16 +481,16 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   };
 
   tool('session_open', ephemeral ? `Open an ephemeral browser session (wiped on close). Profiles, and engines other than ${cfg.engine}, are not allowed for this token.` : 'Open a browser session. Without profile: ephemeral (wiped on close). With profile: persistent per-tenant profile (stays logged in).',
-    { profile: z.string().regex(TENANT_RE).optional(), locale: str(35).optional(), timezone: str(64).optional(),
+    { profile: z.string().regex(TENANT_RE).optional(), egress: z.string().regex(TENANT_RE).optional().describe('Exit: default, direct, or a name in BROWSER_EGRESS_PROXIES; saved with a persistent profile'), locale: str(35).optional(), timezone: str(64).optional(),
       engine: z.enum(cfg.engines).optional().describe(`browser engine (default ${cfg.engine}); enabled here: ${cfg.engines.join(', ')}`) },
     async (a) => {
       if (ephemeral && a.profile !== undefined) throw new Error(PROFILES_REFUSED);
       if (ephemeral && a.engine && a.engine !== cfg.engine) throw new Error(`engine ${a.engine} is ${NOT_ALLOWED}; use the default (${cfg.engine})`);
       const call = currentCall();
-      const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine, downloads: true });
+      const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine, egress: a.egress, downloads: true });
       // The agent was told this open timed out: a session it never learned about is not left open.
       if (call?.expired) { await manager.dispose(s, 'open-timed-out'); throw new Error('session_open timed out'); }
-      return ok({ session: s.id, profile: a.profile || 'ephemeral', engine: s.engine });
+      return ok({ session: s.id, profile: a.profile || 'ephemeral', engine: s.engine, egress: s.egress });
     });
 
   tool('session_close', 'Close a session (persistent profile stays on disk).', { session: str(40) }, async ({ session }) => {
@@ -511,16 +512,18 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         if (dl.length) return ok({ ...(await pageInfo(s.page)), downloads: dl.map((f) => capture.info(f)) });
         // A redirect hop the tenant's proxy refused over CONNECT (https, wss) fails the navigation in the browser:
         // say that it was the allowlist, naming host and port only.
-        const denied = /TUNNEL|PROXY/i.test(String(e?.message)) ? await manager.deniedSince(tenant, t0) : [];
+        const denied = /TUNNEL|PROXY/i.test(String(e?.message)) ? await manager.deniedSince(tenant, t0, s.proxyRoute) : [];
         if (denied.length) throw new Error(`navigation refused by the host allowlist of this token: ${denied[denied.length - 1]}`);
+        if (s.egressProxy && (/PROXY|TUNNEL|SOCKS|CONNECTION|AUTH_CREDENTIALS|NAME_NOT_RESOLVED|NS_ERROR_UNKNOWN_PROXY_HOST/i.test(String(e?.message)) || s.proxyRoute?.failuresSince(t0))) throw egressError(s.egressProxy);
         throw e;
       }
+      if (s.egressProxy && r?.status() === 502 && s.proxyRoute?.failuresSince(t0)) throw egressError(s.egressProxy);
       await s.page.waitForTimeout(1200);
       const w = noteWall(s, await wall(s.page));
       const info = await pageInfo(s.page);
       // The browser follows plain-http redirects itself; one that left the allowlist, or an allowed name that
       // resolves into a private address, got the tenant proxy's 403 instead.
-      const refused = r?.status() === 403 && (!manager.isAllowed(tenant, info.url) || (await manager.deniedSince(tenant, t0)).length > 0);
+      const refused = r?.status() === 403 && (!manager.isAllowed(tenant, info.url) || (await manager.deniedSince(tenant, t0, s.proxyRoute)).length > 0);
       return ok({ status: r?.status(), ...info, ...(refused ? { refused: 'host allowlist' } : {}), ...(w ? { blocked: w, hint: 'call request_human to let a person solve it' } : {}) });
     });
   });
@@ -1062,7 +1065,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   }
 
   tool('sessions', 'List your open sessions.', {}, async () => ok(manager.list(owner).map((s) => (
-    s.handoff ? { id: s.id, profile: s.profile || 'ephemeral', engine: s.engine, handoff: 'active' } : { id: s.id, profile: s.profile || 'ephemeral', engine: s.engine, url: s.page.url() }
+    s.handoff ? { id: s.id, profile: s.profile || 'ephemeral', engine: s.engine, egress: s.egress, handoff: 'active' } : { id: s.id, profile: s.profile || 'ephemeral', engine: s.engine, egress: s.egress, url: s.page.url() }
   ))));
 
   if (ephemeral) {
