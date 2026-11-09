@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { countNodes, markSensitive, markValue, maskText, maskedScreenshot, scrubValue, sensitiveValues } from './redact.mjs';
+import { countNodes, markSensitive, markValue, maskText, maskedScreenshot, readText, scrubValue, sensitiveValues } from './redact.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, TENANT_RE } from './auth.mjs';
 import { urlKey, httpUrl, HANDOFF_ACTIVE } from './sessions.mjs';
 
@@ -439,7 +439,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.20.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.21.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -525,14 +525,14 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     });
   });
 
-  tool('read', 'Read the page. mode a11y (default): accessibility snapshot with element refs [ref=eN] usable by click/type. mode text: visible text. Values of password/PIN/OTP fields are masked.',
+  tool('read', 'Read the page. mode a11y (default): accessibility snapshot with element refs [ref=eN] usable by click/type. mode text: visible text. Credential/token fields and secret-format values are masked.',
     { session: str(40), mode: z.enum(['a11y', 'text']).optional(), selector: str(2000).optional(), maxChars: z.number().int().min(1).max(200000).optional() },
     async (a) => run(a.session, async (s) => {
       const max = a.maxChars ?? 20000;
       // The first visible match (as click finds it), or the first one when none is visible.
       const sel = a.selector ? s.page.locator(a.selector) : null;
       const root = !sel ? s.page.locator('body') : (await sel.filter({ visible: true }).count()) ? sel.filter({ visible: true }).first() : sel.first();
-      let out, total;
+      let values, out, total;
       if ((a.mode || 'a11y') === 'a11y') {
         if (!a.selector) {
           const nodes = await countNodes(s.page, cfg.maxDomNodes);
@@ -540,13 +540,14 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         }
         out = await (a.selector ? root.ariaSnapshot({ mode: 'ai', timeout: 15000 }) : s.page.ariaSnapshot({ mode: 'ai', timeout: 15000 }));
         total = out.length;
+        values = await sensitiveValues(s.page);
       } else {
-        // Truncate in the page so a huge document never crosses the wire whole.
-        [total, out] = await root.evaluate((el, n) => { const t = el.innerText.replace(/\n{3,}/g, '\n\n'); return [t.length, t.slice(0, n)]; }, max, { timeout: 15000 });
+        values = await sensitiveValues(s.page);
+        [total, out] = await readText(root, max, values);
       }
-      out = maskText(out, await sensitiveValues(s.page));
+      out = maskText(out, values);
       const info = await pageInfo(s.page);
-      return ok(`url: ${info.url}\ntitle: ${info.title}\nchars: ${total}${total > max ? ` (truncated to ${max})` : ''}\n\n${out.slice(0, max)}`);
+      return ok(maskText(`url: ${info.url}\ntitle: ${info.title}\nchars: ${total}${total > max ? ` (truncated to ${max})` : ''}\n\n${out.slice(0, max)}`, values));
     }));
 
   tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target }, async (a) => run(a.session, async (s) => {
@@ -684,7 +685,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     return ok(await pageInfo(s.page));
   }));
 
-  tool('screenshot', `Screenshot of the viewport (or an element; fullPage is cut at ${MAX_SHOT_PX}px). Returns an image with password/OTP fields masked. Saved to disk only with SAVE_SHOTS=1.`,
+  tool('screenshot', `Screenshot of the viewport (or an element; fullPage is cut at ${MAX_SHOT_PX}px). Returns an image with credential/token fields and secret-format values masked. Saved to disk only with SAVE_SHOTS=1.`,
     { session: str(40), ...target, fullPage: z.boolean().optional() }, async (a) => run(a.session, async (s) => {
       const opt = { type: 'jpeg', quality: 70, timeout: 30000 };
       const buf = await maskedScreenshot(s.page, async (mask) => {

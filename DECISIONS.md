@@ -2,6 +2,23 @@
 
 Decisions made without asking (Misha: "use your judgment and decide yourself"), with the reason. Newest first.
 
+## 0.21.0 (2026-11-09): secret masking in read/screenshot (#31)
+
+- Keep detection in `src/redact.mjs`; macro reads/screenshots already invoke the same tools. Match metadata on
+  fields and value-bearing widgets, with word boundaries and separator normalization. Headings, labels and
+  buttons do not become secret values merely because they say “token”, “PIN” or “secret”.
+- Recognize public secret prefixes, JWTs, AWS key IDs and PEM private keys anywhere, including accessible names
+  and hidden reveal copies. Retain only fixed non-secret prefixes. Entropy detection is limited to inputs,
+  code/pre and readonly elements (32 characters minimum; Shannon entropy at least 3 bits for hex, 4.3 otherwise).
+  URLs are exempt unless a component has a known secret format or a secret-named query contains an entropy match.
+- Scan frames and open shadow roots for the same screenshot masks. Mark the smallest element containing the
+  complete secret, including values split across inline spans; remove markers even when capture fails.
+- Text reads explicitly exclude hidden/aria-hidden content, including a hidden selected root, and redact in the
+  browser before truncating. No general unmask switch; the existing `secret_id` / `allow_non_password` flow stays.
+- Accepted false-positive risks: credential-shaped examples, hashes/random identifiers in code or readonly
+  elements, and opaque values under token-named widget wrappers can be masked. This is heuristic protection;
+  arbitrary echoed passwords without a recognized format and closed shadow roots remain outside its coverage.
+
 ## 0.20.0 (2026-11-02): Meet chat fix, `addressed`, group-call guidance
 
 - **No group mode, preset or tool** (Misha: guidance, not a mode). The only new things are `metadata.addressed` and
