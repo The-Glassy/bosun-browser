@@ -114,9 +114,9 @@ export class SessionManager {
     }
   }
 
-  // The shared browser of the shared engine (chromium): launched once, relaunched after it goes away. Only tenants
-  // without a configured proxy use it, so it is launched exactly as 0.7.0 launched it; a proxied tenant's sessions
-  // each get a browser of their own (engines.mjs open).
+  // The shared browser of the shared engine (chromium): launched once, relaunched after it goes away. Only sessions
+  // whose resolved route has no proxy use it, so it is always launched direct, including when the default exit is
+  // configured. Sessions with a selected exit or an allowlist each get their own browser (engines.mjs open).
   getBrowser(def, bt) {
     if (!this.browserP) {
       this.launches++;

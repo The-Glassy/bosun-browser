@@ -132,6 +132,8 @@ function definitions(importer) {
       async load() { return (await importer('playwright')).chromium; },
       // Headless runs use Playwright's separate headless shell, whose path the API doesn't expose: checked at launch.
       async check(bt, cfg) { if (!cfg.headless) exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
+      // Always direct, even when cfg.egressProxy is set. Selected exits use private processes in open() below,
+      // so an ephemeral session choosing "direct" cannot inherit the default exit from a shared launch.
       launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: cfg.chromiumSandbox }),
       async open(bt, { cfg, dir, locale, timezone, shared, media, proxy, downloads }) {
         const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: false, ...(proxy ? { proxy } : {}) };

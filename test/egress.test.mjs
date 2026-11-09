@@ -10,53 +10,12 @@ import { redactUrlCredentials } from '../src/redact.mjs';
 import { parseHostPattern } from '../src/allow.mjs';
 import { startTenantProxy, resolveTarget } from '../src/proxy.mjs';
 import { createEngines, PROXY_ARGS, PROXY_FIREFOX_PREFS } from '../src/engines.mjs';
+import { SessionManager } from '../src/sessions.mjs';
 import { startBosun, connect, tmpDir, TOKEN } from './helpers.mjs';
+import { fixture, listen, closeServer } from './egress-fixture.mjs';
 
-const listen = (server) => new Promise((ok, no) => { server.once('error', no); server.listen(0, '127.0.0.1', () => ok(server.address().port)); });
-const closeServer = (server) => new Promise((ok) => { server.closeAllConnections?.(); server.close(ok); });
 const auth = (p) => `Basic ${Buffer.from(`${p.username}:${p.password}`).toString('base64')}`;
 const patterns = (...values) => values.map(parseHostPattern);
-
-// The fake exit resolves virtual public hostnames to our local target. Tests assert the exit received the original
-// name and that its credentials do not leak through to the origin. No public network or DNS is required.
-async function fixture(t) {
-  const sockets = new Set(), requests = [], tunnels = [], originHeaders = [];
-  let directConnections = 0;
-  const origin = http.createServer((req, res) => {
-    originHeaders.push(req.headers);
-    res.writeHead(200, { 'content-type': 'text/html' });
-    res.end('<title>Exit</title><p>proxied</p>');
-  });
-  origin.on('connection', () => directConnections++);
-  origin.on('upgrade', (req, sock) => {
-    originHeaders.push(req.headers);
-    sock.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
-  });
-  const originPort = await listen(origin);
-  const exit = http.createServer((req, res) => {
-    if (req.headers['proxy-authorization'] !== 'Basic dXNlcjpwYXNz') { res.writeHead(407); return res.end(); }
-    if (req.method === 'OPTIONS') { res.writeHead(200); return res.end(); }
-    requests.push({ url: req.url, auth: req.headers['proxy-authorization'] });
-    const u = new URL(req.url);
-    const headers = { ...req.headers }; delete headers['proxy-authorization'];
-    const out = http.request({ host: '127.0.0.1', port: originPort, path: u.pathname, headers }, (up) => { res.writeHead(up.statusCode, up.headers); up.pipe(res); });
-    out.on('error', () => res.destroy()); req.pipe(out);
-  });
-  exit.on('connect', (req, client, head) => {
-    tunnels.push(req.url);
-    if (req.headers['proxy-authorization'] !== 'Basic dXNlcjpwYXNz') return client.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n');
-    const up = net.connect(originPort, '127.0.0.1', () => {
-      client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      if (head.length) up.write(head); client.pipe(up); up.pipe(client);
-    });
-    sockets.add(up); up.on('close', () => sockets.delete(up));
-    up.on('error', () => client.destroy()); client.on('error', () => up.destroy()); client.on('close', () => up.destroy());
-  });
-  exit.on('connection', (sock) => { sockets.add(sock); sock.on('close', () => sockets.delete(sock)); });
-  const port = await listen(exit);
-  t.after(async () => { for (const sock of sockets) sock.destroy(); await closeServer(exit); await closeServer(origin); });
-  return { originPort, exit, stopExit: async () => { for (const sock of sockets) sock.destroy(); await closeServer(exit); }, port, url: `http://user:pass@127.0.0.1:${port}`, requests, tunnels, originHeaders, connections: () => directConnections };
-}
 
 function requestProxy(p, url) {
   return new Promise((ok, no) => {
@@ -149,7 +108,9 @@ test('egress no-allowlist real browser visits only through the configured authen
   const id = await c.open();
   const nav = await c.call('navigate', { session: id, url: 'http://exit-only.invalid/page' });
   assert.equal(nav.isError, false, nav.text); assert.equal(nav.json().title, 'Exit');
+  assert.equal(nav.json().status, 200);
   assert.ok(f.requests.some((r) => r.url === 'http://exit-only.invalid/page'));
+  assert.equal(f.directConnections(), 0);
   const base = svc.wsUrl.replace('ws:', 'http:');
   assert.equal((await fetch(`${base}/health`)).status, 401);
   const health = await fetch(`${base}/health`, { headers: { authorization: `Bearer ${TOKEN}` } });
@@ -158,6 +119,31 @@ test('egress no-allowlist real browser visits only through the configured authen
   const before = f.connections();
   const failed = await c.call('navigate', { session: id, url: `http://127.0.0.1:${f.originPort}/never-direct` });
   assert.equal(failed.isError, true); assert.match(failed.text, /egress proxy/); assert.equal(f.connections(), before);
+  assert.equal(f.directConnections(), 0);
+});
+
+test('egress manager: non-allowlist ephemeral direct bypasses the exit while default uses it', async (t) => {
+  const f = await fixture(t), dataDir = tmpDir();
+  const cfg = loadConfig({ BROWSER_DATA: dataDir, HEADLESS: '1', CHROMIUM_SANDBOX: '0', IDLE_TIMEOUT_SEC: '0', BROWSER_EGRESS_PROXY: f.url });
+  const manager = new SessionManager(cfg);
+  t.after(async () => { await manager.closeAll(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  assert.equal(manager.allowList('default'), null);
+  const direct = await manager.open({ owner: 'agent', tenant: 'default', egress: 'direct' });
+  const viaExit = await manager.open({ owner: 'agent', tenant: 'default', egress: 'default' });
+  assert.equal(direct.profile, null); assert.equal(viaExit.profile, null);
+  // The shared browser is always direct; any selected proxy gets a private process and its launch restrictions.
+  assert.ok(direct.browser); assert.equal(direct.dir, null); assert.equal(direct.egressProxy, null);
+  assert.equal(viaExit.browser, null); assert.ok(viaExit.tmpDir); assert.deepEqual(viaExit.egressProxy, parseEgress(f.url));
+  assert.equal(manager.launches, 1);
+  const url = `http://127.0.0.1:${f.originPort}`;
+  assert.equal((await viaExit.page.goto(`${url}/default`)).status(), 200);
+  assert.equal(await viaExit.page.title(), 'Exit');
+  assert.ok(f.requests.some((r) => r.url === `${url}/default`));
+  assert.equal(f.directConnections(), 0);
+  assert.equal((await direct.page.goto(`${url}/direct`)).status(), 200);
+  assert.equal(await direct.page.title(), 'Exit');
+  assert.ok(!f.requests.some((r) => r.url === `${url}/direct`));
+  assert.ok(f.directConnections() > 0, 'the direct session must open a TCP connection to the origin');
 });
 
 test('egress named proxy configuration rejects malformed maps and reserved names without echoing credentials', () => {
@@ -172,7 +158,6 @@ test('egress named proxy configuration rejects malformed maps and reserved names
 // installing three browsers or opening sockets. The wire-level tests above separately exercise local fake exits.
 async function managerFixture(t, config = {}) {
   const { EventEmitter } = await import('node:events');
-  const { SessionManager } = await import('../src/sessions.mjs');
   const dataDir = tmpDir(), opens = [];
   const engines = {
     get: (name) => ({ name, family: 'chromium', cdp: true, tracker: 'init' }),

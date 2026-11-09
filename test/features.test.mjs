@@ -94,9 +94,10 @@ test('the engine launches Chromium with its sandbox, and refuses downloads by de
   const launchedWith = async (cfg) => { let o; await real.launchShared({ launch: async (x) => { o = x; return { on() {} }; } }, cfg); return o; };
   assert.equal((await launchedWith(loadConfig({}))).chromiumSandbox, true);
   assert.equal((await launchedWith(loadConfig({ CHROMIUM_SANDBOX: '0' }))).chromiumSandbox, false);
-  // The shared browser is only for tenants without a proxy: launched exactly as 0.7.0 launched it, whatever another
-  // tenant's allowlist says.
-  for (const cfg of [loadConfig({}), loadConfig({ BROWSER_TOKEN: 'x'.repeat(24), BROWSER_TENANT_ALLOW: 'default=example.org' })]) {
+  // Only sessions whose resolved proxy is null share this browser. A configured default exit must never affect a
+  // session choosing direct, even when another tenant has an allowlist or the default exit has credentials.
+  for (const cfg of [loadConfig({}), loadConfig({ BROWSER_TOKEN: 'x'.repeat(24), BROWSER_TENANT_ALLOW: 'default=example.org' }),
+    loadConfig({ BROWSER_EGRESS_PROXY: 'http://user:pass@exit:3128' })]) {
     const plain = await launchedWith(cfg);
     assert.equal(plain.proxy, undefined);
     assert.deepEqual(plain.args, CHROMIUM_ARGS);
