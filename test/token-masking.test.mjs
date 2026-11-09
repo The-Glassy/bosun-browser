@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { pages, PAT, FEED, GITHUB, JWT, AWS, ENTROPY, HEX, LONG_WORD, URL } from './fixtures/secret-pages.mjs';
+import { pages, PAT, FEED, GITHUB, JWT, AWS, ENTROPY, HEX, LONG_WORD, URL as URL_PAGE } from './fixtures/secret-pages.mjs';
 import { maskedScreenshot, sensitiveValues } from '../src/redact.mjs';
 import { startBosun, connect } from './helpers.mjs';
 
@@ -64,7 +64,7 @@ test('ordinary long words, URLs and pinned/spinner/Tokenized fields remain reada
   for (const mode of ['a11y', 'text']) {
     const r = await c.call('read', { session, mode });
     assert.equal(r.isError, false, r.text);
-    for (const word of ['token', 'Tokenized headings', 'pinned spinner', LONG_WORD, URL]) assert.ok(r.text.includes(word), r.text);
+    for (const word of ['token', 'Tokenized headings', 'pinned spinner', LONG_WORD, URL_PAGE]) assert.ok(r.text.includes(word), r.text);
     assert.ok(!r.text.includes('[masked]'), r.text);
     if (mode === 'a11y') for (const v of ['keep-pinned', 'keep-spinner', 'keep-tokenized']) assert.ok(r.text.includes(v), r.text);
   }
