@@ -10,6 +10,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { glidePath } from './liveview.mjs';
 import { readProfileMeta } from './engines.mjs';
+import { egressError } from './egress.mjs';
 import { httpUrl } from './sessions.mjs';
 
 export const HISTORY = 10; // results kept per profile
@@ -409,18 +410,20 @@ export class Keepalive {
       try {
         s = run.session = await m.open({ owner, tenant: e.tenant, profile: e.profile, engine: this.engineFor(meta), preempt: false });
       } catch (err) {
-        reason = /^(engine \S+ (is not installed|: browser binary missing)|session limit|profile \S+ is already open|profile was created with|service is shutting down)/.test(err?.message || '')
+        reason = /^(engine \S+ (is not installed|: browser binary missing)|session limit|profile \S+ is already open|profile was created with|service is shutting down|unknown egress proxy name)/.test(err?.message || '')
           ? String(err.message).split('\n')[0].slice(0, 200) : 'could not open the profile';
         throw err;
       }
       if (signal.aborted) throw new Error('aborted');
       const r = await m.run(owner, s.id, async (ss) => {
         phase = 'navigate';
+        const started = Date.now();
         try {
-          await ss.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+          const response = await ss.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+          if (ss.egressProxy && response?.status() === 502 && ss.proxyRoute?.failuresSince(started)) throw egressError(ss.egressProxy);
         } catch (err) {
           const code = /\b(net::ERR_[A-Z_]+|NS_ERROR_[A-Z_]+)\b/.exec(err?.message || '')?.[1];
-          reason = /Timeout/.test(err?.name || '') || /timeout/i.test(err?.message || '') ? 'navigation timeout' : `navigation failed${code ? ` (${code})` : ''}`;
+          reason = ss.egressProxy && (/PROXY|TUNNEL|SOCKS|AUTH_CREDENTIALS|egress proxy/i.test(String(err?.message)) || ss.proxyRoute?.failuresSince(started)) ? egressError(ss.egressProxy).message : /Timeout/.test(err?.name || '') || /timeout/i.test(err?.message || '') ? 'navigation timeout' : `navigation failed${code ? ` (${code})` : ''}`;
           throw err;
         }
         await ss.page.waitForLoadState('load', { timeout: 15_000 }).catch(() => {});

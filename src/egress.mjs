@@ -8,9 +8,10 @@ export function parseEgress(raw, label = 'BROWSER_EGRESS_PROXY') {
     if (typeof raw !== 'string') throw new Error();
     const u = new URL(raw);
     if (!['http:', 'socks5:'].includes(u.protocol) || !u.hostname || u.search || u.hash || !['', '/'].includes(u.pathname)) throw new Error();
+    if (u.port && Number(u.port) < 1) throw new Error();
     if (u.protocol === 'socks5:' && (u.username || u.password || !u.port)) throw new Error();
     const username = decodeURIComponent(u.username), password = decodeURIComponent(u.password);
-    if (/[\x00-\x1f\x7f]/.test(username + password)) throw new Error();
+    if (username.includes(':') || /[\x00-\x1f\x7f]/.test(username + password)) throw new Error();
     return { server: `${u.protocol}//${u.host}`, ...(username || password ? { username, password } : {}), bypass: '<-loopback>' };
   } catch {
     // Do not echo even malformed input: it can contain an unparseable credential.
@@ -78,7 +79,7 @@ export async function connectEgress(p, target, track = (s) => s, timeoutMs = 15_
       headers: { host: authority, ...proxyAuth(p) }, agent: false });
     const timer = setTimeout(() => req.destroy(egressError(p)), timeoutMs);
     const fail = () => { clearTimeout(timer); no(egressError(p)); };
-    req.on('socket', track);
+    req.on('socket', (sock) => { track(sock); sock.on('error', () => {}); });
     req.on('error', fail);
     req.on('connect', (res, sock, head) => {
       clearTimeout(timer);
@@ -108,4 +109,27 @@ export async function probeEgress(p, timeoutMs = 2000) {
     });
     return { mode: 'proxy', server: p.server, ok: true };
   } catch { return { mode: 'proxy', server: p.server, ok: false, error: egressError(p).message }; }
+}
+
+export function parseEgressProxies(raw) {
+  if (raw === undefined || raw === '') return new Map();
+  let values;
+  try { values = JSON.parse(raw); } catch { throw new Error('BROWSER_EGRESS_PROXIES must be a JSON object of name -> proxy URL'); }
+  if (!values || Array.isArray(values) || typeof values !== 'object' || Object.keys(values).length > 32) throw new Error('BROWSER_EGRESS_PROXIES must be an object with at most 32 named proxies');
+  const proxies = new Map();
+  for (const [name, value] of Object.entries(values)) {
+    if (!/^[a-z0-9_-]{1,40}$/.test(name) || ['default', 'direct'].includes(name)) throw new Error('BROWSER_EGRESS_PROXIES names must match [a-z0-9_-]{1,40}, excluding default and direct');
+    const proxy = parseEgress(value, 'BROWSER_EGRESS_PROXIES entry');
+    if (!proxy) throw new Error('BROWSER_EGRESS_PROXIES entries must have a proxy URL');
+    proxies.set(name, proxy);
+  }
+  return proxies;
+}
+
+export function selectEgress(cfg, name = 'default') {
+  if (name === 'default') return cfg.egressProxy || null;
+  if (name === 'direct') return null;
+  if (cfg.egressProxies?.has(name)) return cfg.egressProxies.get(name);
+  // Saved profiles must fail closed if their named exit is removed. Never use the default or go direct instead.
+  throw new Error('unknown egress proxy name; use default, direct, or a name in BROWSER_EGRESS_PROXIES');
 }

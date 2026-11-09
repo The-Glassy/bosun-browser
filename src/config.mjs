@@ -1,7 +1,7 @@
 // Environment -> validated configuration. Anything malformed or unsafe throws, so the service refuses to start.
 import { isLoopbackHost, parsePolicies, parseTokens } from './auth.mjs';
 import { parseTenantAllow } from './allow.mjs';
-import { parseEgress } from './egress.mjs';
+import { parseEgress, parseEgressProxies } from './egress.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
 import { parseToolTimeouts } from './deadline.mjs';
 import { parseMacroSource } from './macros.mjs';
@@ -28,6 +28,7 @@ function flag(env, name, def) {
 export function loadConfig(env = process.env) {
   const cfg = {
     egressProxy: parseEgress(env.BROWSER_EGRESS_PROXY),
+    egressProxies: parseEgressProxies(env.BROWSER_EGRESS_PROXIES),
     dataDir: env.BROWSER_DATA || './data',
     headless: env.HEADLESS === '1',
     maxSessions: int(env, 'MAX_SESSIONS', 3, 1, 1000),

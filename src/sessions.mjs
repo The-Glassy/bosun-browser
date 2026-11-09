@@ -5,10 +5,10 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { clearSensitive, installTracker, notePasswords, passwordTracker } from './redact.mjs';
-import { createEngines, claimProfile, unclaimProfile, recordProfileUse } from './engines.mjs';
+import { createEngines, claimProfile, unclaimProfile, recordProfileUse, readProfileMeta } from './engines.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, policyOf } from './auth.mjs';
 import { allowFor, allowsUrl } from './allow.mjs';
-import { egressError, probeEgress } from './egress.mjs';
+import { egressError, probeEgress, selectEgress } from './egress.mjs';
 import { startTenantProxy } from './proxy.mjs';
 import { currentCall, timeoutMessage } from './deadline.mjs';
 
@@ -104,7 +104,7 @@ export class SessionManager {
     this.browserP = null;
     this.launches = 0;
     this.closing = false;
-    this.proxies = new Map(); // tenant -> Promise<Playwright proxy options> (per-tenant forward proxy)
+    this.proxies = new Map(); // tenant[/exit] -> Promise<Playwright proxy options> (per-tenant forward proxy)
     fs.mkdirSync(path.join(cfg.dataDir, 'profiles'), { recursive: true });
     // Temp profiles of ephemeral per-browser sessions: anything left here is from a process that was killed.
     fs.rmSync(path.join(cfg.dataDir, 'tmp'), { recursive: true, force: true });
@@ -136,7 +136,7 @@ export class SessionManager {
   // media: {args, env} for a meeting's own browser process (see engines.mjs). downloads: the session may keep what
   // its pages download, if the tenant's download allowlist lets it (sessions the agent opens; keepalive visits and
   // meetings never download).
-  async open({ owner, tenant, profile, locale, timezone, engine, preempt = true, media = null, downloads = false }) {
+  async open({ owner, tenant, profile, locale, timezone, engine, egress, preempt = true, media = null, downloads = false }) {
     if (this.closing) throw new Error('service is shutting down');
     const def = this.engines.get(engine || this.cfg.engine);
     // Only engines this deployment enabled (FEATURES_ENGINES, plus the default ENGINE).
@@ -159,13 +159,13 @@ export class SessionManager {
     };
     try {
       // agent: a session the agent opened (it hears why a download was refused even when its tenant may not download).
-      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral, downloads: downloads && !media && !!this.downloads?.allowFor(tenant), agent: downloads && !media && !ephemeral });
+      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, egress, preempt, media, ephemeral, downloads: downloads && !media && !!this.downloads?.allowFor(tenant), agent: downloads && !media && !ephemeral });
     } finally {
       untrack();
     }
   }
 
-  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, preempt, media, ephemeral, downloads, agent = false }) {
+  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, egress, preempt, media, ephemeral, downloads, agent = false }) {
     // The profile was just closed (by session_close, a dropped connection, idle or crash) and its browser is still
     // shutting down; or a background keepalive holds it. Wait for it rather than refusing.
     if (profileKey && this.profilesInUse.has(profileKey)) {
@@ -197,8 +197,11 @@ export class SessionManager {
         // A tenant with a host allowlist only reaches the network through its own forward proxy, which is what its
         // browser contexts are launched with. A failure here fails the open rather than opening a session that is
         // not restricted.
-        const egressProxy = this.cfg.egressProxy;
-        const proxy = await this.tenantProxy(tenant);
+        // Resolve after the profile lock is acquired: keepalive, macros and meetings all reuse this path.
+        const saved = profile ? readProfileMeta(path.join(this.cfg.dataDir, 'profiles', tenant, profile)) : null;
+        const egressName = egress ?? saved?.egress ?? 'default';
+        const egressProxy = selectEgress(this.cfg, egressName);
+        const proxy = await this.tenantProxy(tenant, egressName);
         // Where this session's browser writes downloads: a directory of its own on the data volume.
         if (downloads) dlDir = this.downloads.incoming(tenant);
         if (profile) {
@@ -221,12 +224,12 @@ export class SessionManager {
         await trackPasswords(page, def.tracker);
         if (this.closing) throw new Error('service is shutting down');
         if (this.goneOwners.has(owner)) throw new Error('connection closed'); // owner left while we were launching
-        if (profileDir) recordProfileUse(profileDir, { engine: def.name, headless: this.cfg.headless });
+        if (profileDir) recordProfileUse(profileDir, { engine: def.name, headless: this.cfg.headless, egress: egressName });
         const s = {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, tracker: def.tracker, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
           navs: [], ctxErrors: [], wallSeen: null, // recent main-frame navigations {t, at: origin+path}, "context destroyed" failures, last bot check seen (bot-check loops)
-          egressProxy, proxyRoute: this.allowList(tenant) ? proxy : null,
+          egress: egressName, egressProxy, proxyRoute: this.allowList(tenant) ? proxy : null,
           dlDir, // null: the context refuses downloads
         };
         this.sessions.set(s.id, s);
@@ -337,20 +340,25 @@ export class SessionManager {
   // The tenant's host allowlist, or null when it has none (then nothing is restricted).
   allowList(tenant) { return allowFor(this.cfg, tenant); }
 
-  // The tenant's forward proxy (Playwright proxy options), started on first use. null for a tenant without an
-  // allowlist: it gets no proxy at all, which is upstream behaviour.
-  tenantProxy(tenant) {
+  // One allowlist proxy per tenant AND exit, so concurrent profiles cannot change one another's route.
+  // An unrestricted tenant gets the exit directly as Playwright proxy options (null preserves direct behaviour).
+  tenantProxy(tenant, egressName = 'default') {
     const allow = this.allowList(tenant);
-    if (!allow) return this.cfg.egressProxy || null;
-    if (!this.proxies.has(tenant)) {
-      this.proxies.set(tenant, startTenantProxy({ tenant, allow, egress: this.cfg.egressProxy }).catch((e) => { this.proxies.delete(tenant); throw e; }));
+    const egress = selectEgress(this.cfg, egressName);
+    if (!allow) return egress;
+    const key = egressName === 'default' ? tenant : `${tenant}/${egressName}`;
+    if (!this.proxies.has(key)) {
+      this.proxies.set(key, startTenantProxy({ tenant, allow, egress }).catch((e) => { this.proxies.delete(key); throw e; }));
     }
-    return this.proxies.get(tenant);
+    return this.proxies.get(key);
   }
 
   async health() {
-    const egress = await probeEgress(this.cfg.egressProxy);
-    return { ok: !this.closing && egress.ok, egress };
+    const [egress, proxies] = await Promise.all([
+      probeEgress(this.cfg.egressProxy),
+      Promise.all([...(this.cfg.egressProxies || [])].map(async ([name, p]) => ({ name, ...await probeEgress(p) }))),
+    ]);
+    return { ok: !this.closing && egress.ok && proxies.every((p) => p.ok), egress, proxies };
   }
 
   // Whether the tenant's allowlist covers this URL (true when it has no allowlist).
@@ -360,7 +368,8 @@ export class SessionManager {
   }
 
   // host:port targets the tenant's proxy refused since time t (ms); [] for a tenant without one.
-  async deniedSince(tenant, t) {
+  async deniedSince(tenant, t, route) {
+    if (route !== undefined) return route?.deniedSince(t) || [];
     const p = this.proxies.get(tenant);
     return p ? (await p).deniedSince(t) : [];
   }
@@ -393,15 +402,17 @@ export class SessionManager {
       call?.guard?.();
       if (call) call.inPage = true;
       const gen = s.gen;
+      const started = Date.now();
       s.busy++;
       s.lastUsed = Date.now();
       try {
         const r = call ? await this.within(s, fn(s), call) : await fn(s);
         if (s.gen !== gen || s.handoff) throw new Error(HANDOFF_ACTIVE);
+        if (s.egressProxy && typeof r?.status === 'function' && r.status() === 502 && s.proxyRoute?.failuresSince(started)) throw egressError(s.egressProxy);
         return r;
       } catch (e) {
         if (s.gen !== gen || s.handoff) throw new Error(HANDOFF_ACTIVE);
-        if (s.egressProxy && /PROXY|TUNNEL|SOCKS|NS_ERROR_UNKNOWN_PROXY_HOST/i.test(String(e?.message))) throw egressError(s.egressProxy);
+        if (s.egressProxy && /ERR_PROXY|ERR_TUNNEL|SOCKS|ERR_INVALID_AUTH_CREDENTIALS|NS_ERROR_PROXY|NS_ERROR_UNKNOWN_PROXY_HOST/i.test(String(e?.message))) throw egressError(s.egressProxy);
         throw e;
       } finally {
         s.busy--;

@@ -155,3 +155,85 @@ test('egress no-allowlist real browser visits only through the configured authen
   const failed = await c.call('navigate', { session: id, url: `http://127.0.0.1:${f.originPort}/never-direct` });
   assert.equal(failed.isError, true); assert.match(failed.text, /egress proxy/); assert.equal(f.connections(), before);
 });
+
+test('egress named proxy configuration rejects malformed maps and reserved names without echoing credentials', () => {
+  for (const value of ['[]', 'null', '{', '{"direct":"http://password@host:80"}', '{"home":null}', '{"home":""}']) {
+    assert.throws(() => loadConfig({ BROWSER_EGRESS_PROXIES: value }), (e) => !e.message.includes('password'));
+  }
+  const cfg = loadConfig({ BROWSER_EGRESS_PROXIES: '{"home":"http://user:pass@host:8080"}' });
+  assert.equal(cfg.egressProxies.get('home').server, 'http://host:8080');
+});
+
+// These lifecycle tests use a minimal browser adapter, exercising the real manager and profile persistence without
+// installing three browsers or opening sockets. The wire-level tests above separately exercise local fake exits.
+async function managerFixture(t, config = {}) {
+  const { EventEmitter } = await import('node:events');
+  const { SessionManager } = await import('../src/sessions.mjs');
+  const dataDir = tmpDir(), opens = [];
+  const engines = {
+    get: (name) => ({ name, family: 'chromium', cdp: true, tracker: 'init' }),
+    load: async () => ({}),
+    open: async (_name, opts) => {
+      opens.push(opts);
+      const page = new EventEmitter();
+      page.url = () => 'about:blank'; page.frames = () => []; page.mainFrame = () => null;
+      const ctx = new EventEmitter(); ctx.pages = () => [page]; ctx.addInitScript = async () => {};
+      ctx.close = async () => { await Promise.resolve(); ctx.emit('close'); };
+      return { ctx, dir: null, tmpDir: null };
+    },
+  };
+  const cfg = loadConfig({ IDLE_TIMEOUT_SEC: '0', KEEPALIVE: '0', BROWSER_DATA: dataDir, BROWSER_EGRESS_PROXY: 'http://default:3128',
+    BROWSER_EGRESS_PROXIES: '{"home":"http://home:8080"}', ...config });
+  const manager = new SessionManager(cfg, { engines });
+  t.after(async () => { await manager.closeAll(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  return { cfg, manager, opens, dataDir };
+}
+
+test('egress profile override: named, direct and default persist and are reused by background/media opens', async (t) => {
+  const { manager, opens, dataDir } = await managerFixture(t);
+  for (const egress of ['home', 'direct', 'default']) {
+    const session = await manager.open({ owner: 'agent', tenant: 'default', profile: 'work', egress });
+    assert.equal(session.egress, egress);
+    assert.equal(opens.at(-1).proxy?.server || null, egress === 'home' ? 'http://home:8080' : egress === 'direct' ? null : 'http://default:3128');
+    await manager.close('agent', session.id);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'profiles/default/work/bosun-profile.json'))).egress, egress);
+    // Same calls used by keepalive and meeting_join: no egress parameter, reuse the profile's saved choice.
+    for (const media of [null, { args: [], env: {} }]) {
+      const reopened = await manager.open({ owner: 'background', tenant: 'default', profile: 'work', media });
+      assert.equal(reopened.egress, egress);
+      assert.equal(opens.at(-1).proxy?.server || null, egress === 'home' ? 'http://home:8080' : egress === 'direct' ? null : 'http://default:3128');
+      await manager.close('background', reopened.id);
+    }
+  }
+});
+
+test('egress missing saved exit fails closed and releases capacity; failed open does not change saved exit', async (t) => {
+  const { manager, cfg, dataDir } = await managerFixture(t);
+  const first = await manager.open({ owner: 'agent', tenant: 'default', profile: 'work', egress: 'home' });
+  await manager.close('agent', first.id);
+  cfg.egressProxies.delete('home');
+  await assert.rejects(manager.open({ owner: 'agent', tenant: 'default', profile: 'work' }), /unknown egress/);
+  await assert.rejects(manager.open({ owner: 'agent', tenant: 'default', profile: 'work', egress: 'missing' }), /unknown egress/);
+  assert.equal(manager.used, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'profiles/default/work/bosun-profile.json'))).egress, 'home');
+});
+
+test('egress no configuration preserves unproxied manager options', async (t) => {
+  const { manager, opens } = await managerFixture(t, { BROWSER_EGRESS_PROXY: '', BROWSER_EGRESS_PROXIES: '' });
+  const session = await manager.open({ owner: 'agent', tenant: 'default' });
+  assert.equal(session.egressProxy, null); assert.equal(opens[0].proxy, null);
+});
+
+test('egress per-profile MCP parameter and two concurrent allowlist exits stay independent', async (t) => {
+  const first = await fixture(t), second = await fixture(t);
+  const svc = await startBosun({ BROWSER_EGRESS_PROXY: first.url, BROWSER_EGRESS_PROXIES: JSON.stringify({ home: second.url }), BROWSER_TENANT_ALLOW: 'alice=127.0.0.1' });
+  t.after(() => svc.stop());
+  const c = await connect(svc); t.after(() => c.close());
+  const a = await c.open({ profile: 'default-exit' }), b = await c.open({ profile: 'home-exit', egress: 'home' });
+  assert.notEqual(svc.manager.sessions.get(a).proxyRoute, svc.manager.sessions.get(b).proxyRoute);
+  for (const [session, url] of [[a, `http://127.0.0.1:${first.originPort}/first`], [b, `http://127.0.0.1:${second.originPort}/second`]]) {
+    const r = await c.call('navigate', { session, url }); assert.equal(r.isError, false, r.text);
+  }
+  assert.ok(first.requests.some((r) => r.url.endsWith('/first'))); assert.ok(!first.requests.some((r) => r.url.endsWith('/second')));
+  assert.ok(second.requests.some((r) => r.url.endsWith('/second'))); assert.ok(!second.requests.some((r) => r.url.endsWith('/first')));
+});
