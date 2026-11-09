@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.23.0 (unreleased): browser egress exits
+## 0.23.0 (2026-11-09): browser egress exits
 
 - `BROWSER_EGRESS_PROXY` routes all Chromium, patchright and camoufox contexts through an HTTP proxy (optional
   authentication) or unauthenticated SOCKS5 proxy, with no direct fallback, QUIC/DNS-prefetch suppression and
