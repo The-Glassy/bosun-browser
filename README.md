@@ -519,16 +519,18 @@ note? }`.
 - **Paste bar:** paste (long-press → Paste on iOS) or type into the masked field, then **Insert** or Enter: the text
   goes into the page's focused field (tap that field first) and the bar is cleared. The eye button shows what's in
   it. The text is not logged, not kept by the service after it is typed, and never sent to the agent — but once it
-  is in the page, the page field rules below apply (a password field is masked; an ordinary field is not).
+  is in the page, the credential/token and secret-format masking rules below apply.
 - A reconnecting viewer gets the last frame at once, and a page that doesn't repaint is re-captured every 2 s.
 - While a handoff is active **every** page tool (`read`, `screenshot`, `navigate`, `click`, `type`, `select`,
   `press`, `back`, `wait_for`) is refused, and `sessions`/`handoff_wait` report no URL or title. Tool calls that were
   already running when `request_human` came in finish first; the human gets the tab after them.
 - `handoff_wait` waits 50 s by default (below the MCP SDK's 60 s request timeout); call it again on `still_waiting`.
   Longer `timeoutSec` needs a longer client-side request timeout.
-- After the handoff the agent can read the page again. What the human typed into **password, PIN, OTP and card
-  security-code fields** (detected by input type, `autocomplete`, name/id and label, across frames and open shadow
-  roots, including show-password toggles) is masked as `[masked]` in `read` output and blacked out in screenshots.
+- After the handoff the agent can read the page again. Values in **password, PIN, OTP, card security-code and
+  token/secret fields** (input type, `autocomplete`, name/id, aria/associated label, placeholder and `data-*`, across
+  frames and open shadow roots, including show-password toggles) are masked in `read` and covered by opaque
+  boxes in screenshots. This includes text/readonly token inputs and value-bearing reveal widgets. Labels and
+  headings stay readable. Known secret formats retain only a fixed public prefix, e.g. `glpat-…[masked]`.
   After **Give up / timeout / cancel** those fields are emptied before the agent resumes; if that fails, the
   session is closed instead. If a frame can't be inspected, `read`/`screenshot` fail rather than return unmasked
   output. The handoff ends only after the human's last input has reached the page.
@@ -538,9 +540,10 @@ note? }`.
   — and replace them, which switches masking off for fields that aren't sensitive by markup (probed, see
   [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md) finding H2); on `patchright` and `camoufox` they run
   in an isolated world, which stops that and nothing else (details in [docs/ENGINES.md](docs/ENGINES.md)).
-- Not protected: text the human types into ordinary fields, secrets the page itself echoes as normal text, custom
-  widgets that aren't `<input>`/`<textarea>` (e.g. per-digit OTP boxes built from `div`s), closed shadow roots.
-  Those are visible to the agent after Done. Ask the human to finish the login (submit it) before pressing Done.
+- Known secret formats are masked even in ordinary text (see [Security notes](#security-notes)). Arbitrary text
+  typed into an ordinary field or echoed after its credential field is cleared, unlabelled custom OTP widgets,
+  and closed shadow roots can still be visible after Done. Ask the human to finish the login (submit it) before
+  pressing Done.
 
 ## Keeping logins alive
 
@@ -1330,12 +1333,19 @@ A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a
 - Secrets sent for `type { secret_id }` stay in the service's memory (at most 4 KB each, 20 per tenant, 10 min),
   never on disk or in its log, and are zeroed once typed. They keep the password out of the agent's transcript, not
   out of the page: the page that receives one can do with it what it likes.
-- Credential masking around a handoff covers credential **fields** — their value, and values Bosun saw in them. A
-  page that copies what the human typed into ordinary text, or into something it reads later, is not masked on
-  **any** engine, and on `chromium` a page can also neutralize the masking helpers outright (they run in its own
-  JavaScript world; `patchright` uses an isolated one, which stops that technique and nothing more). Treat the page
-  where a credential is typed as trusted, or don't type it there. Details, probes and the standing test:
-  [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md) (finding H2).
+- `read` (a11y/text) and `screenshot`, including macro steps, always mask credential/token field values and known
+  secret formats: GitLab (`glpat-`, `glft-`, `glrt-`, `glptt-`), GitHub (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
+  `github_pat_`), OpenAI/Anthropic (`sk-`, `sk-ant-`), Slack (`xox[abprs]-`), AWS (`AKIA`/`ASIA` plus 16 characters),
+  JWTs and PEM private keys. Inputs, code/pre and readonly elements also mask high-entropy base64url/hex strings
+  of at least 32 characters. Ordinary long words and URLs without a secret component stay readable. Hidden
+  reveal copies are excluded from text reads; redaction happens before truncation. Text keeps only fixed public
+  prefixes, screenshots draw opaque boxes, and there is no general unmask flag. Credential-shaped documentation
+  examples, hashes or random identifiers in code/readonly elements can be false positives.
+- Masking is heuristic. Arbitrary passwords echoed into ordinary text after the credential field is cleared,
+  unlabelled custom widgets and closed shadow roots can still escape it. On `chromium` a page can also neutralize
+  the masking helpers (they run in its own JavaScript world; `patchright` uses an isolated one). Treat a page where
+  a credential is typed as trusted. The original limit and probe remain in
+  [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md) (finding H2) and `test/masking-limits.test.mjs`.
 
 ## Roadmap
 

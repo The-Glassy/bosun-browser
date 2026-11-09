@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.21.0 (unreleased): mask token widgets and secret-format values (#31)
+
+- `read` (a11y and text) and `screenshot`, including macro steps, share credential detection in `src/redact.mjs`.
+  Token, secret, API/private key and client-secret metadata now protects text/readonly inputs and value-bearing
+  widgets as well as password/PIN/OTP fields. Labels and headings remain readable.
+- Recognize GitLab/GitHub tokens, OpenAI/Anthropic keys, Slack tokens, AWS access-key IDs, JWTs and PEM private
+  keys anywhere in page text or accessible names. Inputs, code/pre and readonly elements also detect long
+  high-entropy values; ordinary long words and URLs without a secret component remain readable.
+- Hidden reveal copies cannot leak through text reads, including selected hidden roots. Mask before truncation
+  and redact read titles/URLs too. Only fixed public prefixes survive (for example `glpat-…[masked]`); screenshots
+  use opaque boxes over the matching elements. There is no general unmask option.
+- Add synthetic GitLab feed-token/PAT, GitHub, JWT, AWS, entropy, hidden-widget and false-positive fixtures,
+  format/label unit regressions, and screenshot pixel and macro regressions.
+
 ## 0.20.0: Meet chat fix, `addressed` on finals, group-call guidance
 
 The first group call (Google Meet, 2 Nov 2026, four people and Glassy, signed-in profile) went badly in three ways.
