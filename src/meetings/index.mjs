@@ -27,6 +27,7 @@ import { SpeechSettings, SETTINGS, PER_CALL, REMOVED, removedSetting } from './s
 import { CHANNEL_PREFIX } from '../events.mjs';
 import { aliasKeys, isAddressed } from './addressed.mjs';
 import { RecordingLinks } from './recording-links.mjs';
+import { SpeakerTimeline, speakerFile } from './speaker-timeline.mjs';
 
 export const ID_RE = /^m[0-9a-f]{12}$/;
 const ORPHAN_QUIET_MS = 60_000; // a file of an earlier run changed this recently may still be growing
@@ -167,13 +168,19 @@ export function sweepRecordings(dir, days, { now = Date.now(), keep = new Set() 
       if (/^m[0-9a-f]{12}\.deleted$/.test(f)) {
         const ogg = p.replace(/\.deleted$/, '.ogg');
         try {
+          if (!keep.has(ogg)) fs.rmSync(speakerFile(ogg), { force: true });
           if (!keep.has(ogg) && fs.existsSync(ogg)) { fs.rmSync(ogg, { force: true }); removed.push(ogg); }
           if (!keep.has(ogg) && now - fs.statSync(p).mtimeMs > days * 86_400_000) fs.rmSync(p, { force: true });
         } catch {}
         continue;
       }
+      if (/^m[0-9a-f]{12}\.speakers\.json$/.test(f)) {
+        const ogg = p.replace(/\.speakers\.json$/, '.ogg');
+        try { if (!keep.has(ogg) && !fs.existsSync(ogg)) fs.rmSync(p, { force: true }); } catch {}
+        continue;
+      }
       if (!/^m[0-9a-f]{12}\.ogg$/.test(f) || keep.has(p)) continue;
-      try { if (now - fs.statSync(p).mtimeMs > days * 86_400_000) { fs.rmSync(p, { force: true }); removed.push(p); } } catch {}
+      try { if (now - fs.statSync(p).mtimeMs > days * 86_400_000) { fs.rmSync(p, { force: true }); fs.rmSync(speakerFile(p), { force: true }); removed.push(p); } } catch {}
     }
   }
   return removed;
@@ -183,8 +190,8 @@ export class Meetings {
   // audio: {unsupported() -> reason|null, open() -> {browserEnv, args?, record(file), close()}, needsHeadful};
   // platformFor(url) -> platform|null; bus: EventBus (meeting events).
   constructor({ cfg, manager, bus, audio = pulseAudio, platformFor = (url) => PLATFORMS.find((p) => p.matches(url)) || null,
-    now = Date.now, pollMs = POLL_MS, aloneMs = ALONE_MS, aloneLeaveMs = ALONE_LEAVE_MS, speechGraceMs = SPEECH_GRACE_MS }) {
-    Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs, aloneLeaveMs, speechGraceMs });
+    now = Date.now, pollMs = POLL_MS, aloneMs = ALONE_MS, aloneLeaveMs = ALONE_LEAVE_MS, speechGraceMs = SPEECH_GRACE_MS, speakerDrainMs = 2000 }) {
+    Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs, aloneLeaveMs, speechGraceMs, speakerDrainMs });
     this.dir = path.join(cfg.dataDir, 'recordings');
     this.active = new Map(); // id -> meeting
     this.dryRuns = new Set(); // dry runs in progress: {tenant, session} (capacity)
@@ -196,7 +203,10 @@ export class Meetings {
     this.settings = new SpeechSettings(cfg);
     this.ackCache = new Map(); // acknowledgement clips: JSON [tts, phrase] -> {text, clip, error, failedAt}
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    this.links = new RecordingLinks({ cfg, resolve: (tenant, id) => this.recordingFile(tenant, id).file });
+    this.links = new RecordingLinks({ cfg, resolve: (tenant, id, kind) => {
+      const file = this.recordingFile(tenant, id).file;
+      return kind === 'speakers' ? speakerFile(file) : file;
+    } });
     this.sweep();
     this.sweeper = setInterval(() => this.sweep(), 3_600_000);
     this.sweeper.unref();
@@ -204,7 +214,7 @@ export class Meetings {
 
   sweep() {
     this.links.sweep();
-    const keep = new Set([...this.active.values()].filter((m) => m.rec).map((m) => m.file));
+    const keep = new Set([...this.active.values()].filter((m) => m.rec || m.stopping).map((m) => m.file));
     const removed = sweepRecordings(this.dir, this.cfg.recordingRetentionDays, { now: this.now(), keep });
     // A URL out for a recording the retention just deleted is dead too, and so is a transfer of it under way.
     for (const p of removed) this.links.revoke(path.basename(path.dirname(p)), path.basename(p, '.ogg'));
@@ -221,6 +231,9 @@ export class Meetings {
     fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
     fs.writeFileSync(f.replace(/\.ogg$/, '.deleted'), '', { mode: 0o600 });
     fs.rmSync(f, { force: true });
+    fs.rmSync(speakerFile(f), { force: true });
+    const m = this.active.get(id) || this.ended.get(id);
+    if (m?.tenant === tenant) { m.speakerTimeline = null; m.speakerTimelineCount = 0; }
   }
 
   emit(m, kind, data) {
@@ -353,6 +366,7 @@ export class Meetings {
       channelId: null, channelOpen: false, channelQueue: Promise.resolve(), channelGen: 0, channelBacklog: 0, channelSaid: [], chunkStreams: new Map(), prepared: new Map(),
       channelMsgs: 0, speechFollows: 0, consentGen: 0,
       ackTimer: null, ackPlaying: null, lastAck: 0, lastAckText: null, acks: 0, lastSpokeAt: 0, partialSentAt: 0,
+      speakerTimeline: null, speakerTimelineCount: 0, speakerDrain: null, timelineSaving: null,
       speakerKey: `__s${crypto.randomBytes(8).toString('hex')}`, speakerLog: [], speakerTimer: null, speakersSeen: false, lastNamedAt: 0,
       // Turns: finals held for more of the same turn (turn_hold_ms), speech heard since the last turn went to the agent,
       // the open segment's text (what a barge-in counts from), what Bosun said lately (its own voice coming back).
@@ -448,16 +462,25 @@ export class Meetings {
 
   startRecording(m) {
     m.file = this.file(m.tenant, m.id);
+    // record() overwrites the Ogg; a new recording therefore owns a fresh timeline and zero.
+    fs.rmSync(speakerFile(m.file), { force: true });
+    this.links.revoke(m.tenant, m.id);
     m.rec = m.rig.record(m.file);
+    m.recMs = 0;
+    m.timelineSaving = null;
+    m.speakerTimelineCount = 0;
+    m.speakerTimelineError = null;
+    m.speakerTimeline = new SpeakerTimeline({ startedAt: m.rec.startedAt, self: [m.name, m.info.selfName] });
+    const initial = m.speakerLog.at(-1);
+    if (initial) m.speakerTimeline.sample(initial);
+    const rec = m.rec;
     transition(m, 'recording');
-    m.rec.exited.then(() => {
-      if (m.rec?.file !== m.file || m.state !== 'recording') return;
+    rec.exited.then(() => {
+      if (m.rec !== rec || m.state !== 'recording') return;
       // The recorder died on its own (ffmpeg error): the meeting goes on without recording, and without the live
       // transcript, which only runs with the recording (the text so far is kept, like the file).
-      m.recMs += this.now() - m.rec.startedAt;
-      m.recError = m.rec.error() || 'recorder exited';
-      m.rec = null;
-      transition(m, 'admitted');
+      m.recError = rec.error() || 'recorder exited';
+      this.stopRecording(m, { del: false }).catch((e) => { m.speakerTimelineError = oneLine(e); });
       this.stopTranscript(m, 'recording-failed').catch(() => {});
     });
   }
@@ -1145,26 +1168,77 @@ export class Meetings {
     m.ackTimer.unref?.();
   }
 
-  // Who the page shows as speaking (platform.watchSpeakers), read every SPEAKER_POLL_MS outside the page queue (a
-  // read only; the queue may be busy for seconds), kept as changes {t, name} for SPEAKER_LOG_MS.
+  // Serialized drains also let stop/finish collect the final page changes before sealing the sidecar.
+  drainSpeakers(m) {
+    if (!m.platform.drainSpeakers || !m.session || m.session.disposed) return Promise.resolve();
+    if (m.speakerDrain) return m.speakerDrain;
+    m.speakerDrain = (async () => {
+      let got = await m.platform.drainSpeakers(m.session.page, m.speakerKey).catch(() => {
+        if (m.speakerTimeline) m.speakerTimeline.incomplete = true;
+        return [];
+      });
+      if (got === null) {
+        if (m.speakerTimeline) m.speakerTimeline.incomplete = true;
+        m.speakerTimeline?.sample({ t: this.now(), names: [] });
+        await this.page(m, (p) => m.platform.watchSpeakers(p, m.speakerKey, { self: [m.name, m.info.selfName].filter(Boolean) })).catch(() => {});
+        got = [];
+      }
+      for (const c of got) {
+        m.speakerLog.push(c);
+        m.speakerTimeline?.sample(c);
+        if (c.name) { m.speakersSeen = true; m.lastNamedAt = this.now(); }
+      }
+      const cut = this.now() - SPEAKER_LOG_MS;
+      while (m.speakerLog.length > 1 && m.speakerLog[1].t < cut) m.speakerLog.shift();
+    })().finally(() => { m.speakerDrain = null; });
+    return m.speakerDrain;
+  }
+
   pollSpeakers(m) {
     if (!m.platform.drainSpeakers || m.speakerTimer) return;
-    let busy = false;
-    m.speakerTimer = setInterval(async () => {
-      if (busy || m.state === 'ended' || !m.session || m.session.disposed) return;
-      busy = true;
-      try {
-        let got = await m.platform.drainSpeakers(m.session.page, m.speakerKey).catch(() => []);
-        if (got === null) { // the page was replaced: watch again
-          await this.page(m, (p) => m.platform.watchSpeakers(p, m.speakerKey, { self: [m.name, m.info.selfName].filter(Boolean) })).catch(() => {});
-          got = [];
-        }
-        for (const c of got) { m.speakerLog.push(c); if (c.name) { m.speakersSeen = true; m.lastNamedAt = this.now(); } }
-        const cut = this.now() - SPEAKER_LOG_MS;
-        while (m.speakerLog.length > 1 && m.speakerLog[1].t < cut) m.speakerLog.shift();
-      } finally { busy = false; }
+    m.speakerTimer = setInterval(() => {
+      if (m.state !== 'ended') this.drainSpeakers(m).catch(() => {});
     }, SPEAKER_POLL_MS);
     m.speakerTimer.unref?.();
+  }
+
+  saveSpeakerTimeline(m, rec, stoppedAt) {
+    if (m.timelineSaving) return m.timelineSaving;
+    const timeline = m.speakerTimeline;
+    if (!timeline) return Promise.resolve();
+    m.timelineSaving = (async () => {
+      // The input timestamp excludes ffmpeg startup; probe the finished file for the actual audio length.
+      const inputAt = rec.audioStartedAt;
+      const aligned = Number.isFinite(inputAt) && Math.abs(inputAt - rec.startedAt) < 60_000;
+      const audioStartedAt = aligned ? inputAt : rec.startedAt;
+      const seconds = m.file && !m.deleted ? await probeSeconds(m.file, 'ogg') : null;
+      timeline.until = seconds === null ? stoppedAt : audioStartedAt + seconds * 1000;
+      let timer;
+      try {
+        await Promise.race([
+          (async () => { await m.speakerDrain; await this.drainSpeakers(m); })(),
+          new Promise((resolve) => { timer = setTimeout(() => { timeline.incomplete = true; resolve(); }, this.speakerDrainMs); }),
+        ]);
+      } finally { clearTimeout(timer); }
+      timeline.finish(timeline.until);
+      if (m.deleted || !m.file || m.speakerTimeline !== timeline) return;
+      m.recMs = (seconds ?? Math.max(0, (stoppedAt - audioStartedAt) / 1000)) * 1000;
+      const data = timeline.snapshot({ meeting_id: m.id, platform: m.platform.name, audioStartedAt,
+        recording_seconds: m.recMs / 1000, alignment: aligned ? 'pulse-input-timestamp' : 'estimated-recorder-start',
+        duration_source: seconds === null ? 'wall-clock-estimate' : 'audio-probe' });
+      const file = speakerFile(m.file);
+      if (fs.existsSync(m.file.replace(/\.ogg$/, '.deleted'))) return;
+      fs.writeFileSync(file, JSON.stringify(data) + '\n', { mode: 0o600 });
+      fs.chmodSync(file, 0o600);
+      m.speakerTimelineCount = data.intervals.length;
+      m.speakerTimeline = null; // ended meetings retain only the count; the full timeline lives on disk
+    })();
+    return m.timelineSaving;
+  }
+
+  timelineCount(m) {
+    if (!m.speakerTimeline) return m.speakerTimelineCount || 0;
+    return m.speakerTimeline.count(this.now());
   }
 
   // The speaker of a segment: who the page showed speaking longest while it was said (its audio times as wall clock,
@@ -1366,6 +1440,7 @@ export class Meetings {
   // A graceful stop still in progress (m.stopping) is escalated to a kill when a deletion comes in meanwhile.
   async stopRecording(m, { del = true } = {}) {
     const rec = m.rec || m.stopping;
+    const stoppedAt = this.now();
     if (m.rec) {
       m.rec = null;
       m.recMs += this.now() - rec.startedAt;
@@ -1381,7 +1456,10 @@ export class Meetings {
     }
     if (rec) {
       m.stopping = rec;
-      try { await (del ? rec.kill() : rec.stop()); } finally { if (m.stopping === rec) m.stopping = null; }
+      try {
+        await (del ? rec.kill() : rec.stop());
+        if (!del) await this.saveSpeakerTimeline(m, rec, stoppedAt).catch((e) => { m.speakerTimelineError = oneLine(e); });
+      } finally { if (m.stopping === rec) m.stopping = null; }
     }
     let bytes = null;
     if (m.file) bytes = fs.statSync(m.file, { throwIfNoEntry: false })?.size ?? null;
@@ -1406,12 +1484,8 @@ export class Meetings {
       const stoppingTranscript = this.stopTranscript(m, 'ended').catch(() => {});
       try { this.flushHold(m); } catch {}
       this.closeChannel(m);
-      const rec = m.rec;
       await Promise.all([
-        (async () => {
-          if (rec) { m.rec = null; m.recMs += this.now() - rec.startedAt; m.stopping = rec; await rec.stop().catch(() => {}); }
-          else if (m.stopping) await m.stopping.stop().catch(() => {});
-        })(),
+        this.stopRecording(m, { del: false }).catch(() => {}),
         stoppingTranscript,
         this.endSpeech(m).catch(() => {}),
       ]);
@@ -1430,7 +1504,7 @@ export class Meetings {
         reason, ...(m.error ? { error: m.error } : {}),
         duration_s: Math.round(((m.endedAt - (m.admittedAt ?? m.endedAt))) / 1000),
         recording: m.file && bytes ? { path: m.file, bytes, mime_type: 'audio/ogg', seconds: Math.round(m.recMs / 1000), next: `call recording_get { meeting_id: "${m.id}" }` } : null,
-        bytes,
+        bytes, speaker_timeline: { intervals: this.timelineCount(m), ...(m.speakerTimelineError ? { error: m.speakerTimelineError } : {}) },
       });
     })();
     return m.finishing;
@@ -1445,6 +1519,7 @@ export class Meetings {
       ...(m.info.warning ? { warning: m.info.warning } : {}),
       ...(m.reason ? { reason: m.reason } : {}), ...(m.error ? { error: m.error } : {}),
       participants: m.participants, recording_seconds: Math.round(recMs / 1000),
+      speaker_timeline: { intervals: this.timelineCount(m), ...(m.speakerTimelineError ? { error: m.speakerTimelineError } : {}) },
       recording: m.file ? { path: m.file, bytes, ...(m.state === 'ended' && bytes ? { next: `call recording_get { meeting_id: "${m.id}" }` } : {}) } : m.deleted ? 'deleted' : null,
       ...(m.recError ? { recording_error: m.recError } : {}),
       ...(m.optedOut ? { opted_out: { sender: m.optedOut.sender, at: m.optedOut.at } } : {}),
@@ -1914,7 +1989,16 @@ export class Meetings {
   // recording_get: a one-time GET URL for the recording.
   recordingGet(tenant, id) {
     const r = this.recordingFile(tenant, id);
-    return { ...r, secret: this.links.issue(tenant, id) };
+    const file = speakerFile(r.file);
+    let speakers = null, speakers_error = null;
+    try {
+      if (fs.existsSync(file)) {
+        const size = fs.statSync(file).size;
+        speakers = size <= 32_768 ? { data: JSON.parse(fs.readFileSync(file, 'utf8')) }
+          : { file, size, secret: this.links.issue(tenant, id, 'speakers') };
+      }
+    } catch { speakers_error = 'speaker timeline could not be read'; }
+    return { ...r, speakers, ...(speakers_error ? { speakers_error } : {}), secret: this.links.issue(tenant, id) };
   }
 
   // Deletes a recording: a meeting still recording stops first. Works for recordings of earlier runs too.
@@ -1928,8 +2012,7 @@ export class Meetings {
     const f = this.file(tenant, id);
     const existed = fs.existsSync(f);
     if (existed || m) this.links.revoke(tenant, id); // only the tenant's own
-    if (existed) this.forget(tenant, id);
-    else fs.rmSync(f, { force: true });
+    if (existed || m || fs.existsSync(speakerFile(f))) this.forget(tenant, id);
     if (m && m.file === f) { m.file = null; m.deleted = true; }
     if (!existed && !m) throw new Error(`no recording for meeting ${id}`);
     return { meeting_id: id, deleted: existed };

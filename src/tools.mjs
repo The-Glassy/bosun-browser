@@ -439,7 +439,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.21.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.22.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -879,7 +879,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
           settings: { speculative_speech: a.speculative_speech },
         }));
       });
-    tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), platform (meet, zoom), joined_as (account, guest), participants if visible, recorded seconds, announce {mode, sent_to: everyone|host|none|failed, reason and failures when it fell short}, live_transcript {state, zero_retention, minutes, lag} if asked for, speaking, channel {id, registered, published}, acks, speaker_labels, mic_open + mute_error when Bosun could not mute its microphone again; without meeting_id all your meetings.',
+    tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), platform (meet, zoom), joined_as (account, guest), participants if visible, recorded seconds, announce {mode, sent_to: everyone|host|none|failed, reason and failures when it fell short}, live_transcript {state, zero_retention, minutes, lag} if asked for, speaking, channel {id, registered, published}, acks, speaker_labels, speaker_timeline {intervals}, mic_open + mute_error when Bosun could not mute its microphone again; without meeting_id all your meetings.',
       { meeting_id: z.string().max(20).optional() }, async (a) => ok(meetings.status(tenant, a.meeting_id)));
     tool('meeting_chat_read', 'Chat messages of a meeting seen so far (others\' messages; since = last seq you have).', { ...mid, since: z.number().int().min(0).optional() },
       async (a) => ok(meetings.chatRead(tenant, a.meeting_id, a.since ?? 0)));
@@ -917,14 +917,24 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       async (a) => ok(await meetings.mute(tenant, a.meeting_id, a.on)));
     tool('meeting_raise_hand', 'Raise (on=true) or lower (on=false) Bosun\'s hand in the meeting (Meet, Zoom).', { ...mid, on: z.boolean() },
       async (a) => ok(await meetings.raiseHand(tenant, a.meeting_id, a.on)));
-    tool('meeting_stop_recording', 'Stop recording (delete=true, default: also delete the file); a live transcript stops too (delete: its text is forgotten). The meeting goes on unrecorded.', { ...mid, delete: z.boolean().optional() },
+    tool('meeting_stop_recording', 'Stop recording (delete=true, default: also delete the audio and speaker timeline); a live transcript stops too (delete: its text is forgotten). The meeting goes on unrecorded.', { ...mid, delete: z.boolean().optional() },
       async (a) => ok(await meetings.stopRecordingTool(tenant, a.meeting_id, a.delete ?? true)));
     tool('meeting_leave', 'Leave the meeting; the recording is finished and kept (bosun:meeting-ended).', mid, async (a) => ok(await meetings.leave(tenant, a.meeting_id)));
-    tool('recording_get', `Fetch the audio recording of one of your meetings (Ogg/Opus, mono): returns a one-time GET URL (valid ${Math.round(cfg.downloadUrlTtlMs / 60000)} min, this token only) and a ready curl -o line; transcribe the file with any tool. Only once the recording is finished (the meeting ended, or meeting_stop_recording with delete=false) and not deleted. The file is kept (deleted after ${cfg.recordingRetentionDays ?? 30} days or with meeting_recording_delete); call recording_get again for a new URL.`,
+    tool('recording_get', `Fetch the audio recording of one of your meetings (Ogg/Opus, mono): returns a one-time GET URL (valid ${Math.round(cfg.downloadUrlTtlMs / 60000)} min, this token only) and a ready curl -o line, plus speakers (inline timeline JSON up to 32 KiB, otherwise a separate one-time JSON URL; null for older recordings). Use its audio-relative intervals to label an offline transcript. Only once the recording is finished (the meeting ended, or meeting_stop_recording with delete=false) and not deleted. The file is kept (deleted after ${cfg.recordingRetentionDays ?? 30} days or with meeting_recording_delete); call recording_get again for a new URL.`,
       mid, async (a) => {
         const r = meetings.recordingGet(tenant, a.meeting_id);
         const meta = { meeting_id: a.meeting_id, filename: `${a.meeting_id}.ogg`, size: r.bytes, mime: 'audio/ogg', ...(r.seconds ? { seconds: r.seconds } : {}) };
-        if (!cfg.ws) return ok({ ...meta, path: r.file, note: 'no MCP port (stdio): read the file at path' });
+        const speakerMeta = r.speakers;
+        let speakers = speakerMeta?.data ?? null;
+        if (speakerMeta?.secret) {
+          const where = `/recording/${a.meeting_id}/speakers?t=${speakerMeta.secret}`;
+          speakers = { filename: `${a.meeting_id}.speakers.json`, size: speakerMeta.size, mime: 'application/json',
+            ...(cfg.ws ? { get_url: uploadBase ? `${uploadBase}${where}` : where, valid_min: Math.round(cfg.downloadUrlTtlMs / 60000) }
+              : { path: speakerMeta.file }) };
+        }
+        meta.speakers = speakers;
+        if (r.speakers_error) meta.speakers_error = r.speakers_error;
+        if (!cfg.ws) return ok({ ...meta, path: r.file, note: 'no MCP port (stdio): read the files at path' });
         const where = `/recording/${a.meeting_id}?t=${r.secret}`;
         const url = uploadBase ? `${uploadBase}${where}` : null;
         return ok({
@@ -933,7 +943,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
           valid_min: Math.round(cfg.downloadUrlTtlMs / 60000), next: 'GET it once (curl), then transcribe it; call recording_get again for another URL',
         });
       });
-    tool('meeting_recording_delete', `Delete a meeting's recording and its live transcript (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
+    tool('meeting_recording_delete', `Delete a meeting's recording, speaker timeline and live transcript (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
       async (a) => ok(await meetings.deleteRecording(tenant, a.meeting_id)));
   }
 
