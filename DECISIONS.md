@@ -2,6 +2,31 @@
 
 Decisions made without asking (Misha: "use your judgment and decide yourself"), with the reason. Newest first.
 
+## 0.22.0 (2026-11-09): recording speaker timeline
+
+- Keep a recording-only timeline separate from the ten-minute live-transcript speaker log. Page snapshots now
+  carry all active names and preserve `name` for live transcript compatibility. Track each name independently,
+  merge unchanged samples and discard runs shorter than 300 ms; display-name collisions remain ambiguous.
+- Align zero with the first PulseAudio input PTS printed by FFmpeg's input header, not process launch. The
+  [FFmpeg PulseAudio input](https://github.com/FFmpeg/FFmpeg/blob/master/libavdevice/pulse_audio_dec.c) timestamps
+  packets with host epoch time adjusted for input latency. Probe the final Ogg duration and clip labels to it.
+  Backends without this timestamp use launch time and explicitly report `estimated-recorder-start`; failed
+  duration probes report `wall-clock-estimate`. Page sampling/indicator lag still makes labels approximate.
+- No public restart or pause API exists. A hypothetical internal restart overwrites the same recording file,
+  so reset both duration and timeline instead of concatenating clocks across unrecorded gaps. Recorder failure
+  finalizes the existing timeline. A crash before finalization can leave audio without labels.
+- Bound each recording to 50,000 intervals and 128 simultaneous names. Preserve the first completed intervals, flag
+  omitted later runs with `truncated` and an explanatory note, and release full in-memory data after saving.
+- Serialize page drains and collect a final snapshot on stop. Audio and labels share the deletion marker;
+  deletion wins over a pending graceful stop, so an opt-out cannot be resurrected by sidecar finalization.
+  Final drains have a two-second deadline and failed/missing page reads flag `incomplete`.
+  Retention follows the audio file's age and also removes orphan sidecars.
+- Inline sidecars up to 32 KiB; reuse the recording URL handler for larger JSON with separate secrets and
+  one-time consumption. Tenant checks, expiry, replacement, revocation and transfer cancellation apply to both.
+  Keep all audio response fields; older recordings have `speakers: null`, while empty new sidecars say `none-seen`.
+- The optional pure `labelTranscript` helper scores total overlap per name, unions duplicate ranges, resolves
+  ties by timeline order and returns `speaker: null` for gaps. It neither uploads audio nor requires an API key.
+
 ## 0.21.0 (2026-11-09): secret masking in read/screenshot (#31)
 
 - Keep detection in `src/redact.mjs`; macro reads/screenshots already invoke the same tools. Match metadata on

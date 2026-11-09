@@ -208,7 +208,7 @@ export async function setControl(page, { onLabel, offLabel, on, what, site, open
 }
 
 // Who the call shows as speaking, watched in the page: every 200 ms the platform's marks are read (spec below) and a
-// change is queued as {t: Date.now(), name} (name null: nobody shown) under a random, non-enumerable key, like the
+// change is queued as {t: Date.now(), name, names} (name null/names []: nobody shown) under a random, non-enumerable key, like the
 // chat. Our own tile (self: Bosun's names, or a tile the platform marks as ours) is never the speaker. drainSpeakers
 // returns what changed since the last call, or null when the page was replaced (watch again).
 // spec: {active: selectors of the box around the one speaker shown (Zoom's speaker view), activeName: the name inside
@@ -227,29 +227,37 @@ export async function watchSpeakers(page, key, spec, { self = [] } = {}) {
       return t && t.length <= 80 ? t : null;
     };
     const read = () => {
+      const names = new Set();
+      let truncated = false;
+      const add = (name) => {
+        if (!name || mine.has(name.toLowerCase())) return;
+        if (names.size < 128 || names.has(name)) names.add(name);
+        else truncated = true;
+      };
       for (const sel of spec.active || []) {
         for (const box of document.querySelectorAll(sel)) {
           const name = nameIn(box, spec.activeName);
-          if (name && !mine.has(name.toLowerCase())) return name;
+          add(name);
         }
       }
-      if (!spec.tiles) return null;
-      for (const tile of document.querySelectorAll(spec.tiles)) {
+      for (const tile of spec.tiles ? document.querySelectorAll(spec.tiles) : []) {
         if (spec.selfMark && (tile.matches(spec.selfMark) || tile.querySelector(spec.selfMark))) continue;
         if (!(spec.speaking || []).some((s) => tile.matches(s) || tile.querySelector(s))) continue;
         const name = nameIn(tile, spec.tileName);
-        if (name && !mine.has(name.toLowerCase())) return name;
+        add(name);
       }
-      return null;
+      return { names: [...names], truncated };
     };
     let last;
     const tick = () => {
-      let name = null;
-      try { name = read(); } catch {}
-      if (name === last) return;
-      last = name;
-      q.push({ t: Date.now(), name });
-      if (q.length > 500) q.shift();
+      let names = [], truncated = false;
+      try { ({ names, truncated } = read()); } catch {}
+      const state = JSON.stringify([names[0] || null, [...names].sort(), truncated]);
+      if (state === last) return;
+      last = state;
+      // name remains for live transcript clients; names preserves simultaneous speakers.
+      q.push({ t: Date.now(), name: names[0] || null, names, ...(truncated ? { truncated } : {}) });
+      if (q.length > 500) { q.shift(); q[0].truncated = true; }
     };
     Object.defineProperty(window, key, { value: { q }, enumerable: false });
     setInterval(tick, 200);

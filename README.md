@@ -842,6 +842,45 @@ The agent gets one with `recording_get` (see *Mode 1*), after the meeting ended 
 A deletion leaves an empty marker `<meeting_id>.deleted` beside it, for the same retention period.
 Chat text is kept only in memory, for the last 50 meetings.
 
+### Speaker labels for a recording
+
+Every recording mode, including notetaker mode (`live_transcript: false`), keeps page active-speaker labels in
+`<meeting_id>.speakers.json`, next to the Ogg and with the same 0600 permissions, consent and retention. It is
+written when recording stops or the meeting ends. Opt-out and `meeting_recording_delete` delete both files.
+`meeting_status` and `bosun:meeting-ended` include `speaker_timeline: {intervals: N}`.
+
+After recording ends (or `meeting_stop_recording` with `delete: false`), call `recording_get` as usual. Existing audio
+fields stay the same. Its `speakers` object is the sidecar JSON up to 32 KiB; larger timelines return
+`{filename, size, mime, get_url, valid_min}` with a separate one-time URL under the same tenant and expiry rules.
+Download audio and JSON independently; requesting new URLs replaces the previous unused URLs. In stdio mode a large
+sidecar has `path` instead. `speakers: null` means an older recording has no sidecar; a new recording with no detected
+speakers has `speaker_labels: "none-seen"` and empty `intervals` and `speakers` arrays.
+
+Transcribe the downloaded Ogg with Whisper, Plaud, ElevenLabs batch or another offline tool, preserving timestamps
+relative to that file's start. Combine its `[{start_s, end_s, text}]` segments with the sidecar's
+`[{start_s, end_s, name}]` intervals. The exported pure helper assigns the name with the longest total overlap;
+ties use the first name in the timeline, and a segment without overlap gets `speaker: null`:
+
+```js
+import { labelTranscript } from './src/meetings/speaker-timeline.mjs';
+const labelled = labelTranscript(speakers, transcriptSegments);
+// [{start_s: 1.2, end_s: 3.4, text: 'Hello', speaker: 'Alex'}, ...]
+```
+
+The timeline uses the Ogg's zero, from FFmpeg's PulseAudio input timestamp, and clips to the probed audio duration.
+`alignment: "estimated-recorder-start"` explicitly flags backends without that timestamp; startup latency may offset
+those labels. `duration_source: "wall-clock-estimate"` flags an unavailable audio duration. There is currently no
+pause/resume or restart tool: stopped recordings stay stopped. An internal recorder restart overwrites the Ogg and
+resets the timeline; unrecorded gaps are never appended to a new file's clock.
+
+These are approximate page labels, sampled every 200 ms, not audio diarization: activity indicators may lag, miss
+speakers or share duplicate display names. Simultaneous speakers are retained, consecutive samples of the same
+speaker are merged, runs under 300 ms are dropped, and Bosun's own names are excluded. Up to 50,000 intervals and
+128 simultaneous names are kept per recording; `truncated: true` and `note` report omitted labels at the limit.
+`incomplete: true` flags page read failures or a final drain that exceeded two seconds.
+A process crash before finalization can leave audio without a sidecar.
+
+
 ### Live transcript and speaking
 
 **Live transcript** (`meeting_join { live_transcript: true }`, off by default; needs `ELEVENLABS_API_KEY`):

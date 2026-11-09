@@ -20,16 +20,16 @@ export class RecordingLinks {
   }
 
   // A new URL secret for the tenant's meeting; it replaces the previous one.
-  issue(tenant, id) {
+  issue(tenant, id, kind = 'audio') {
     const secret = crypto.randomBytes(24).toString('base64url');
-    this.links.set(id, { tenant, secret, expiresAt: Date.now() + this.cfg.downloadUrlTtlMs });
+    this.links.set(kind === 'audio' ? id : `${id}:speakers`, { tenant, kind, secret, expiresAt: Date.now() + this.cfg.downloadUrlTtlMs });
     return secret;
   }
 
   // The tenant's recording is gone (deleted): no URL works any more and a transfer under way is cut off. Another
   // tenant's links and transfers are not touched, whatever id it names.
   revoke(tenant, id) {
-    if (this.links.get(id)?.tenant === tenant) this.links.delete(id);
+    for (const k of [id, `${id}:speakers`]) if (this.links.get(k)?.tenant === tenant) this.links.delete(k);
     for (const t of this.transfers) if (t.id === id && t.tenant === tenant) t.abort();
   }
 
@@ -41,7 +41,7 @@ export class RecordingLinks {
   // Answers the request itself; returns true when the path was ours.
   async handle(req, res, { authTenant }) {
     const u = new URL(req.url, 'http://x');
-    const m = /^\/recording\/([^/]+)$/.exec(u.pathname);
+    const m = /^\/recording\/([^/]+)(\/speakers)?$/.exec(u.pathname);
     if (!m) return false;
     const reply = (code, body) => {
       if (res.headersSent) return res.destroy();
@@ -50,10 +50,11 @@ export class RecordingLinks {
       req.resume();
     };
     if (req.method !== 'GET') { reply(405, { error: 'GET only' }); return true; }
-    const id = m[1];
+    const id = m[1], kind = m[2] ? 'speakers' : 'audio';
+    const linkKey = kind === 'audio' ? id : `${id}:speakers`;
     const secret = u.searchParams.get('t');
     if (secret === null) { reply(401, { error: 'give the URL from recording_get (with ?t=)' }); return true; }
-    const l = ID_RE.test(id) ? this.links.get(id) : null;
+    const l = ID_RE.test(id) ? this.links.get(linkKey) : null;
     const ok = !!l && Buffer.byteLength(secret) === l.secret.length && crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(l.secret));
     if (!ok || Date.now() > l.expiresAt) { reply(404, { error: 'no such recording URL (used, expired, or never issued); call recording_get again' }); return true; }
     const hdr = authTenant(req);
@@ -63,9 +64,9 @@ export class RecordingLinks {
       return true;
     }
     let file;
-    try { file = this.resolve(l.tenant, id); } catch (e) { this.links.delete(id); reply(409, { error: e.message }); return true; }
+    try { file = this.resolve(l.tenant, id, kind); } catch (e) { this.links.delete(linkKey); reply(409, { error: e.message }); return true; }
     // The URL is spent from here on (a transfer that breaks needs a new recording_get).
-    this.links.delete(id);
+    this.links.delete(linkKey);
     const ac = new AbortController();
     const transfer = { id, tenant: l.tenant, abort: () => ac.abort() };
     this.transfers.add(transfer);
@@ -77,7 +78,8 @@ export class RecordingLinks {
       await new Promise((resolve, reject) => { stream.once('open', resolve); stream.once('error', reject); });
       const { size } = fs.fstatSync(stream.fd);
       res.writeHead(200, {
-        'content-type': 'audio/ogg', 'content-length': String(size), 'content-disposition': `attachment; filename="${id}.ogg"`,
+        'content-type': kind === 'speakers' ? 'application/json' : 'audio/ogg', 'content-length': String(size),
+        'content-disposition': `attachment; filename="${id}.${kind === 'speakers' ? 'speakers.json' : 'ogg'}"`,
         'x-content-type-options': 'nosniff', 'cache-control': 'no-store', connection: 'close',
       });
       await pipeline(stream, res, { signal: ac.signal });

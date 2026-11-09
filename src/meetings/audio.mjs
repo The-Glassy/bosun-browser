@@ -84,6 +84,12 @@ export async function startPulse({ tmpRoot = os.tmpdir() } = {}) {
   };
 }
 
+// FFmpeg's PulseAudio input header reports the first packet's epoch PTS (seconds).
+export function pulseInputStartedAt(header) {
+  const match = /Duration: N\/A, start: ([0-9]+\.[0-9]+),/.exec(header);
+  return match ? Number(match[1]) * 1000 : null;
+}
+
 // ffmpeg: bosun_out's monitor -> Ogg/Opus 16 kHz mono 24 kbps in `file` (created 0600 first). stop() ends it cleanly
 // (the file stays valid), kill() just ends it.
 export function startRecorder(pulse, file) {
@@ -91,12 +97,20 @@ export function startRecorder(pulse, file) {
   fs.closeSync(fs.openSync(file, 'w', 0o600));
   fs.chmodSync(file, 0o600);
   const proc = spawn('ffmpeg', [
-    '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+    '-nostdin', '-hide_banner', '-nostats', '-loglevel', 'info', '-y',
     '-f', 'pulse', '-server', pulse.server, '-name', 'bosun', '-i', 'bosun_out.monitor',
     '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip', '-f', 'ogg', file,
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
-  let err = '';
-  proc.stderr.on('data', (d) => { if (err.length < 4000) err += d; });
+  let err = '', header = '', audioStartedAt = null;
+  proc.stderr.on('data', (d) => {
+    // PulseAudio's first packet PTS is host epoch time with input latency subtracted. FFmpeg rebases
+    // it to audio zero. Parse the input header once, even when stderr chunks split the line.
+    if (audioStartedAt === null) {
+      header = (header + d).slice(-8000);
+      audioStartedAt = pulseInputStartedAt(header);
+    }
+    err = (err + d).slice(-4000);
+  });
   // Settles on exit, or on a spawn failure (which emits 'error' and no 'exit').
   const exited = new Promise((r) => {
     proc.on('exit', (code, sig) => r({ code, sig }));
@@ -116,6 +130,7 @@ export function startRecorder(pulse, file) {
   return {
     file,
     startedAt: Date.now(),
+    get audioStartedAt() { return audioStartedAt; },
     exited,
     error: () => err.trim().split('\n').pop() || null,
     stop: () => end('SIGINT', 5000),

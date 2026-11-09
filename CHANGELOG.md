@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.22.0 (unreleased): speaker timelines for recordings
+
+- All meeting recording modes retain active-speaker intervals relative to the audio file, including overlapping
+  speakers, with self names excluded and sub-300 ms flickers dropped. Bounded storage reports truncation.
+- Save a private `<id>.speakers.json` sidecar on meeting end or recording stop without deletion. Opt-out,
+  recording deletion and retention remove it with the audio, and revoke its URLs and transfers.
+- `recording_get` adds `speakers`: inline JSON up to 32 KiB, otherwise an independent one-time download URL.
+  Existing audio fields stay compatible; old recordings return `speakers: null`. Status and ended events show
+  the interval count. PulseAudio input timestamps align audio zero; unavailable clocks/durations are flagged.
+- Export `labelTranscript` for assigning offline transcript segments by longest overlap, document the workflow,
+  and add browser-free interval, alignment, lifecycle, deletion and MCP/download regressions.
+
 ## 0.21.0 (unreleased): mask token widgets and secret-format values (#31)
 
 - `read` (a11y and text) and `screenshot`, including macro steps, share credential detection in `src/redact.mjs`.
