@@ -81,7 +81,11 @@ export function guardDriverRejections(log = (...a) => console.error(...a)) {
 export async function main(env = process.env) {
   const cfg = loadConfig(env);
   // The ElevenLabs key lives in cfg only: no browser or helper process started from here inherits it.
-  if (env === process.env) delete process.env.ELEVENLABS_API_KEY;
+  if (env === process.env) {
+    delete process.env.ELEVENLABS_API_KEY;
+    delete process.env.BROWSER_EGRESS_PROXY;
+    delete process.env.BROWSER_EGRESS_PROXIES;
+  }
   guardDriverRejections();
   // Never silent: an unsandboxed browser is said out loud at every start.
   if (!cfg.chromiumSandbox && cfg.engine !== 'camoufox') {

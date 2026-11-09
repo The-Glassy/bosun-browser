@@ -8,6 +8,7 @@ import { clearSensitive, installTracker, notePasswords, passwordTracker } from '
 import { createEngines, claimProfile, unclaimProfile, recordProfileUse } from './engines.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, policyOf } from './auth.mjs';
 import { allowFor, allowsUrl } from './allow.mjs';
+import { egressError, probeEgress } from './egress.mjs';
 import { startTenantProxy } from './proxy.mjs';
 import { currentCall, timeoutMessage } from './deadline.mjs';
 
@@ -196,6 +197,7 @@ export class SessionManager {
         // A tenant with a host allowlist only reaches the network through its own forward proxy, which is what its
         // browser contexts are launched with. A failure here fails the open rather than opening a session that is
         // not restricted.
+        const egressProxy = this.cfg.egressProxy;
         const proxy = await this.tenantProxy(tenant);
         // Where this session's browser writes downloads: a directory of its own on the data volume.
         if (downloads) dlDir = this.downloads.incoming(tenant);
@@ -224,6 +226,7 @@ export class SessionManager {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, tracker: def.tracker, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
           navs: [], ctxErrors: [], wallSeen: null, // recent main-frame navigations {t, at: origin+path}, "context destroyed" failures, last bot check seen (bot-check loops)
+          egressProxy, proxyRoute: this.allowList(tenant) ? proxy : null,
           dlDir, // null: the context refuses downloads
         };
         this.sessions.set(s.id, s);
@@ -338,11 +341,16 @@ export class SessionManager {
   // allowlist: it gets no proxy at all, which is upstream behaviour.
   tenantProxy(tenant) {
     const allow = this.allowList(tenant);
-    if (!allow) return null;
+    if (!allow) return this.cfg.egressProxy || null;
     if (!this.proxies.has(tenant)) {
-      this.proxies.set(tenant, startTenantProxy({ tenant, allow }).catch((e) => { this.proxies.delete(tenant); throw e; }));
+      this.proxies.set(tenant, startTenantProxy({ tenant, allow, egress: this.cfg.egressProxy }).catch((e) => { this.proxies.delete(tenant); throw e; }));
     }
     return this.proxies.get(tenant);
+  }
+
+  async health() {
+    const egress = await probeEgress(this.cfg.egressProxy);
+    return { ok: !this.closing && egress.ok, egress };
   }
 
   // Whether the tenant's allowlist covers this URL (true when it has no allowlist).
@@ -393,6 +401,7 @@ export class SessionManager {
         return r;
       } catch (e) {
         if (s.gen !== gen || s.handoff) throw new Error(HANDOFF_ACTIVE);
+        if (s.egressProxy && /PROXY|TUNNEL|SOCKS|NS_ERROR_UNKNOWN_PROXY_HOST/i.test(String(e?.message))) throw egressError(s.egressProxy);
         throw e;
       } finally {
         s.busy--;

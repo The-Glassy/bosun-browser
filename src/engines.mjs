@@ -12,7 +12,7 @@ export const CHROMIUM_ARGS = ['--disable-blink-features=AutomationControlled'];
 // WebRTC must not open UDP of its own. Chromium does not fall back to a direct connection when a configured proxy
 // refuses or fails. They are Chromium flags, and they are added only where a proxy is in play: a browser serving
 // tenants without an allowlist is launched exactly the way upstream launches it.
-export const PROXY_ARGS = ['--disable-quic', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'];
+export const PROXY_ARGS = ['--disable-quic', '--dns-prefetch-disable', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'];
 const chromiumArgs = (proxy, extra = []) => [...CHROMIUM_ARGS, ...(proxy ? PROXY_ARGS : []), ...extra];
 // A persistent Chromium profile ignores --force-webrtc-ip-handling-policy (full Chromium reads the profile preference
 // instead; only the headless shell honours the flag), so a proxied tenant's profile directory also gets the
@@ -58,6 +58,9 @@ export const PROXY_FIREFOX_PREFS = {
   'network.http.http3.enable': false,
   'network.dns.disablePrefetch': true,
   'network.predictor.enabled': false,
+  'network.prefetch-next': false,
+  'network.proxy.socks_remote_dns': true,
+  'network.proxy.failover_direct': false,
 };
 
 const INSTALL = {

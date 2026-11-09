@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { countNodes, markSensitive, markValue, maskText, maskedScreenshot, readText, scrubValue, sensitiveValues } from './redact.mjs';
+import { redactUrlCredentials, countNodes, markSensitive, markValue, maskText, maskedScreenshot, readText, scrubValue, sensitiveValues } from './redact.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, TENANT_RE } from './auth.mjs';
 import { urlKey, httpUrl, HANDOFF_ACTIVE } from './sessions.mjs';
 
@@ -16,6 +16,7 @@ import { challengeShown } from './meetings/platforms/common.mjs';
 import { BASE64_MAX_BYTES } from './uploads.mjs';
 import { DRIVER_LOGS_REFUSED, SECRET_MAX_BYTES, SECRET_TTL_MS, SECRET_URL_TTL_MS, driverLogsValues } from './secrets.mjs';
 import { INLINE_MAX_BYTES } from './downloads.mjs';
+import { egressError } from './egress.mjs';
 import { showPattern } from './allow.mjs';
 import { currentCall, stepCall, withDeadline } from './deadline.mjs';
 import { MAX_SITES, MAX_STEPS, RUN_DEFAULT_SEC, RUN_MAX_SEC, runMacro } from './macros.mjs';
@@ -75,7 +76,7 @@ async function pageInfo(p) { return { url: p.url(), title: await p.title().catch
 
 
 // Playwright errors carry a call log that can quote page markup; keep only the headline.
-const cleanError = (e) => String(e?.message || e).split('\nCall log:')[0].replace(/\x1b\[[0-9;]*m/g, '').slice(0, 500);
+const cleanError = (e) => redactUrlCredentials(e?.message || e).split('\nCall log:')[0].replace(/\x1b\[[0-9;]*m/g, '').slice(0, 500);
 
 // Every element a target matches, in document order: role+name, css (or any Playwright selector), or text. getByRole
 // leaves hidden elements out by itself; all: with them (to say what matched).
@@ -513,8 +514,10 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         // say that it was the allowlist, naming host and port only.
         const denied = /TUNNEL|PROXY/i.test(String(e?.message)) ? await manager.deniedSince(tenant, t0) : [];
         if (denied.length) throw new Error(`navigation refused by the host allowlist of this token: ${denied[denied.length - 1]}`);
+        if (s.egressProxy && (/PROXY|TUNNEL|SOCKS|CONNECTION|NAME_NOT_RESOLVED|NS_ERROR_UNKNOWN_PROXY_HOST/i.test(String(e?.message)) || s.proxyRoute?.failuresSince(t0))) throw egressError(s.egressProxy);
         throw e;
       }
+      if (s.egressProxy && r?.status() === 502 && s.proxyRoute?.failuresSince(t0)) throw egressError(s.egressProxy);
       await s.page.waitForTimeout(1200);
       const w = noteWall(s, await wall(s.page));
       const info = await pageInfo(s.page);
