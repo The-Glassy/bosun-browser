@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.23.0 (unreleased): browser egress exits
+
+- `BROWSER_EGRESS_PROXY` routes all Chromium, patchright and camoufox contexts through an HTTP proxy (optional
+  authentication) or unauthenticated SOCKS5 proxy, with no direct fallback, QUIC/DNS-prefetch suppression and
+  WebRTC proxy-only settings. Empty configuration retains direct behaviour.
+- Tenant allowlist proxies retain destination checks and chain HTTP/CONNECT/WebSocket traffic through the chosen
+  exit. Hostnames resolve at the exit after a local private-address preflight; README documents the DNS trade-off.
+- `session_open.egress` selects `default`, `direct`, or a named exit in `BROWSER_EGRESS_PROXIES`. Persistent profiles
+  remember the choice for future opens, keepalive and meetings; missing named exits fail closed. Concurrent
+  tenant/exit routes are isolated, and session responses report the choice without credentials.
+- Authenticated `GET /health` on the MCP port probes default/named exits and returns 503 on failure. Diagnostics
+  redact proxy URL credentials, including malformed configuration errors; children do not inherit egress secrets.
+  Authenticated exits refuse diagnostic modes that can log credentials outside Bosun’s logger.
+- Document routing for browser downloads/uploads and local download/recording transfers; ElevenLabs/TTS and
+  externally run whisper/transcription keep their existing networking. Add fake-exit, protocol and profile tests.
+
 ## 0.22.0 (unreleased): speaker timelines for recordings
 
 - All meeting recording modes retain active-speaker intervals relative to the audio file, including overlapping

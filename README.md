@@ -96,6 +96,8 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `BROWSER_TOKEN_POLICIES` | – (all `full`) | per-tenant policy: `swarm=ephemeral` (see [Read-only tokens for subagents](#read-only-tokens-for-subagents)) |
 | `BROWSER_MACRO_SOURCE` | – | `swarm=me`: the read-only tenant `swarm` lists, gets and runs the macros of tenant `me` (see [Macros](#macros)) |
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
+| `BROWSER_EGRESS_PROXY` | – (direct) | default browser exit: `http://[user:pass@]host:port` or unauthenticated `socks5://host:port`; see [Egress](#egress) |
+| `BROWSER_EGRESS_PROXIES` | – | JSON map of named exits for `session_open.egress`, e.g. `{"home":"http://exit:3128"}` |
 | `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist, enforced by a per-tenant forward proxy: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
 | `FEATURES_MEETINGS` | `1` | `0` = the meeting tools are not listed and their handlers not wired |
 | `FEATURES_UPLOADS` | `1` | `0` = no upload tools and no PUT endpoint |
@@ -148,6 +150,65 @@ The speech values above (`TTS_DEFAULT_BACKEND`, `ELEVENLABS_TTS_MODEL`, `ELEVENL
 own argument wins over both (see Live transcript and speaking).
 
 All numbers are validated at startup; a bad value stops the service instead of silently disabling a limit.
+
+### Egress
+
+Set `BROWSER_EGRESS_PROXY=http://[user:pass@]old-host:3128` to send browser traffic through an upstream exit.
+An empty value preserves direct behaviour. HTTP proxies (optional Basic authentication) and unauthenticated
+`socks5://host:port` proxies work with Chromium, patchright and camoufox. SOCKS5 credentials are refused at startup;
+[Playwright's proxy interface](https://playwright.dev/docs/api/class-browsertype#browser-type-launch-option-proxy)
+supports HTTP and SOCKS proxies, with credentials for HTTP. URL credentials are percent-decoded, kept separate from
+the server URL and masked in diagnostics. Authenticated exits are refused while `NODE_DEBUG` or sensitive
+Playwright `DEBUG` logs could expose credentials, using the same diagnostic guard as typed secrets. Egress configuration is removed from child-process environments at startup.
+
+Every browser context uses the selected exit, including ephemeral sessions, persistent profiles, keepalive visits,
+macro runs, meeting joins and dry runs. Proxied Chromium contexts use their own browser process and WebRTC profile
+preference; all proxied engines disable QUIC/HTTP3, direct WebRTC UDP and DNS prefetching. Loopback targets also go
+through the exit. A refused, unreachable or unauthenticated exit never causes a direct retry; navigation reports
+`egress proxy <scheme>://<host>:<port> failed ... no direct fallback`. Changing an exit requires a service restart
+and reopening sessions.
+
+A tenant with `BROWSER_TENANT_ALLOW` keeps its local allowlist proxy. That proxy still checks every destination,
+then forwards plain HTTP through the HTTP exit and uses CONNECT for HTTPS and WebSockets (SOCKS5 uses tunnels for
+all protocols). Destination hostnames reach the exit unchanged, so the exit resolves them. The allowlist proxy
+still performs a **local DNS preflight** and refuses a locally private address unless that address is explicitly
+allowed; an unresolvable name is refused too. Consequently the exit's DNS can differ from the preflight: hostname
+allowlists trust the exit's DNS and private-network policy. Use literal public IP entries when address pinning is
+required. DNS for the exit itself, and this allowlist preflight, remain local.
+
+For profile-specific exits, configure a JSON map (at most 32 names):
+
+```sh
+BROWSER_EGRESS_PROXY=http://old-host:3128
+BROWSER_EGRESS_PROXIES='{"home":"http://home-exit:3128","residential":"http://user:pass@provider:8000"}'
+```
+
+`session_open({profile: "shopping", egress: "home"})` selects that named exit. `egress: "default"` uses
+`BROWSER_EGRESS_PROXY` (direct if unset); `egress: "direct"` explicitly selects a direct exit. An existing host
+allowlist is still enforced for `direct`. Names match `[a-z0-9_-]{1,40}`; `default` and `direct` are reserved.
+The choice is saved in `bosun-profile.json` only after a successful open, and reused when `egress` is omitted,
+including keepalive and meetings. Named exits removed from the configuration fail closed on reopen. Ephemeral
+sessions may select an exit for that session too. `session_open` and `sessions` report the choice without its URL
+or credentials. Each tenant/exit pair has an independent allowlist proxy, so profiles can run concurrently.
+
+Routing scope:
+
+- Navigations, redirects, subresources, page/worker/service-worker fetches, WebSockets and browser downloads use
+  the selected exit. File uploads into pages use that browser's network too.
+- `download_get` serves a file the browser already downloaded, from local disk or inline; its one-time GET URL
+  transfers that local file to the caller and does not fetch the origin again. `upload_create` accepts bytes from
+  the caller, and `recording_get` similarly serves local recordings and speaker sidecars. Bosun does not upload
+  recordings to an external service or fetch arbitrary page files with a separate Node HTTP client.
+- Bosun's ElevenLabs transcription/TTS, configured TTS service, and external whisper/transcription workflows
+  deliberately keep their own networking. MCP, live view, upload/download/recording transfers to the caller and
+  browser installation/update operations also keep their existing networking.
+
+WebSocket deployments expose `GET /health` on the MCP port, authenticated with the same Bearer token. It reports
+`egress` (the default exit) and `proxies` (named exits), with credential-free server URLs and `ok` flags. HTTP
+health checks use a bounded OPTIONS/authentication probe, SOCKS5 health checks negotiate a connection; neither
+contacts an arbitrary Internet target, so a successful probe does not guarantee a particular site is permitted.
+Any configured exit failing its probe makes health return 503; otherwise it returns 200. Without a Bearer token
+it returns 401. The status is also available to embedders as `manager.health()`; stdio has no HTTP listener.
 
 ### Per-call deadline
 
@@ -1306,7 +1367,7 @@ preference before every proxied launch (a persistent profile loses it again on a
 it).
 `camoufox` gets the same as Firefox preferences: loopback through the proxy too
 (`network.proxy.allow_hijacking_localhost`), WebRTC through the proxy only, no HTTP/3, no DNS prefetching. Those
-settings belong to that browser alone — tenants without an allowlist share a browser launched exactly the way upstream
+settings belong to that browser alone — tenants without an allowlist or egress proxy share a browser launched exactly the way upstream
 launches it, so one tenant's allowlist never changes another tenant's networking. Every
 connection the browser wants — a navigation, each hop of a redirect, a subresource, XHR, a WebSocket from the page
 **or from a worker**, a service-worker fetch, a prefetch — arrives at the proxy as a request or a `CONNECT` and is
@@ -1318,10 +1379,11 @@ checked against the allowlist before a byte leaves the host:
   "navigation refused by the host allowlist of this token: <host>:<port>".
 - Denials are logged as `bosun: tenant <t>: blocked <host>:<port> — <reason>`: host and port, never a path or a
   query. One line per target per tenant (a repeat is counted, not logged again).
-- **DNS is resolved by the proxy, once**, and the connection goes to that address, so the address a decision was
+- **Without an egress exit, DNS is resolved by the proxy, once**, and the connection goes to that address, so the address a decision was
   made about is the address that gets used — a name cannot change where it points between the check and the
   connection. A name that resolves into loopback or a private range is only followed if the allowlist names that
-  address as well, so `127.0.0.1:4848` has to be in the list for a name that resolves there.
+  address as well, so `127.0.0.1:4848` has to be in the list for a name that resolves there. With an egress exit,
+  the hostname is resolved at the exit after a local private-address preflight; see [Egress](#egress) for the DNS trade-off.
 - **Nothing is intercepted.** The proxy tunnels TLS (`CONNECT`) and streams plain HTTP; it never terminates TLS,
   rewrites a response or buffers a body. The browser's own rules therefore all still hold: a redirect to another
   allowed host loads **as that host**, with its own origin, storage and cookies, and the tab shows the URL it
@@ -1329,8 +1391,8 @@ checked against the allowlist before a byte leaves the host:
 - `navigate` and `keepalive_set` also check the allowlist up front, so the agent gets a clear refusal instead of a
   403 page, and `navigate`'s tool description names the hosts it may reach.
 
-A tenant that is not named is unrestricted: no proxy, nothing intercepted, and a browser with upstream's own flags
-— exactly upstream behaviour, whatever another tenant's allowlist says.
+A tenant that is not named is unrestricted by the host allowlist. Without an egress exit it gets no proxy and a
+browser with upstream's own flags. An egress exit, when selected, still applies (see [Egress](#egress)).
 
 ### What it does not do
 
