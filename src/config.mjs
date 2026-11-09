@@ -1,7 +1,7 @@
 // Environment -> validated configuration. Anything malformed or unsafe throws, so the service refuses to start.
 import { isLoopbackHost, parsePolicies, parseTokens } from './auth.mjs';
 import { parseTenantAllow } from './allow.mjs';
-import { parseEgress, parseEgressProxies } from './egress.mjs';
+import { parseEgress, parseEgressProxies, protectEgressCredentials } from './egress.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
 import { parseToolTimeouts } from './deadline.mjs';
 import { parseMacroSource } from './macros.mjs';
@@ -79,6 +79,7 @@ export function loadConfig(env = process.env) {
     ws: null,
     live: null,
   };
+  protectEgressCredentials([cfg.egressProxy, ...cfg.egressProxies.values()], env.DEBUG, env.NODE_DEBUG);
   if (!ENGINE_NAMES.includes(cfg.engine)) throw new Error(`ENGINE must be one of ${ENGINE_NAMES.join(', ')} (got "${cfg.engine}")`);
   try { new Intl.DateTimeFormat('en', { timeZone: cfg.tz }); } catch { throw new Error(`TZ must be an IANA time zone such as Europe/Vienna (got "${cfg.tz}")`); }
   if (cfg.camoufoxOs && !['macos', 'windows', 'linux'].includes(cfg.camoufoxOs)) throw new Error('CAMOUFOX_OS must be macos, windows or linux');

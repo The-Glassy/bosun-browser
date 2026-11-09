@@ -1,6 +1,7 @@
 // Upstream exits. Credentials are separate from the public server URL and never enter diagnostics.
 import http from 'http';
 import net from 'net';
+import { driverLogsValues } from './secrets.mjs';
 
 export function parseEgress(raw, label = 'BROWSER_EGRESS_PROXY') {
   if (raw === undefined || raw === '') return null;
@@ -19,7 +20,17 @@ export function parseEgress(raw, label = 'BROWSER_EGRESS_PROXY') {
   }
 }
 
-export const proxyAuth = (p) => p.username || p.password ? { 'proxy-authorization': `Basic ${Buffer.from(`${p.username || ''}:${p.password || ''}`).toString('base64')}` } : {};
+// Node/driver diagnostics can log Authorization headers outside our logger. Reuse the typed-secrets guard:
+// refuse credential-bearing exits under these diagnostics, rather than promising redaction we cannot enforce.
+export function protectEgressCredentials(proxies, debug = process.env.DEBUG, nodeDebug = process.env.NODE_DEBUG) {
+  if (proxies.some((p) => p && (p.username || p.password)) && driverLogsValues(debug, nodeDebug)) {
+    throw new Error('egress proxy credentials are refused while DEBUG enables sensitive Playwright logs or NODE_DEBUG is set; disable those diagnostics');
+  }
+}
+export const proxyAuth = (p) => {
+  protectEgressCredentials([p]);
+  return p.username || p.password ? { 'proxy-authorization': `Basic ${Buffer.from(`${p.username || ''}:${p.password || ''}`).toString('base64')}` } : {};
+};
 export const egressError = (p) => new Error(`egress proxy ${p.server} failed (unreachable, refused, or authentication failed); no direct fallback`);
 const hostOf = (p) => new URL(p.server).hostname.replace(/^\[|\]$/g, '');
 
@@ -129,6 +140,7 @@ export function parseEgressProxies(raw) {
 }
 
 export function selectEgress(cfg, name = 'default') {
+  protectEgressCredentials([cfg.egressProxy, ...(cfg.egressProxies?.values() || [])]);
   if (name === 'default') return cfg.egressProxy || null;
   if (name === 'direct') return null;
   if (cfg.egressProxies?.has(name)) return cfg.egressProxies.get(name);

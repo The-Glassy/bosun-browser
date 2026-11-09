@@ -359,3 +359,15 @@ for (const status of [200, 400, 407, 503]) {
     assert.equal(health.server, 'http://exit:3128'); assert.ok(!JSON.stringify(health).includes('user:pass'));
   });
 }
+
+
+test('egress diagnostics: authenticated exits refuse debug modes that bypass logger redaction', () => {
+  const url = 'http://user:password@exit:3128';
+  for (const debug of [{ NODE_DEBUG: 'http' }, { DEBUG: 'pw:protocol' }, { DEBUG: '*' }]) {
+    for (const exit of [{ BROWSER_EGRESS_PROXY: url }, { BROWSER_EGRESS_PROXIES: JSON.stringify({ home: url }) }]) {
+      assert.throws(() => loadConfig({ ...debug, ...exit }), (e) => /egress proxy credentials are refused/.test(e.message) && !e.message.includes('password'));
+    }
+  }
+  assert.ok(loadConfig({ BROWSER_EGRESS_PROXY: url, DEBUG: 'pw:*,-pw:protocol,-pw:api,-pw:channel' }).egressProxy);
+  assert.ok(loadConfig({ BROWSER_EGRESS_PROXY: 'http://exit:3128', NODE_DEBUG: 'http' }).egressProxy);
+});
