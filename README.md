@@ -129,6 +129,7 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `MAX_SESSIONS_PER_TENANT` | `MAX_SESSIONS` | |
 | `IDLE_TIMEOUT_SEC` | 900 | close sessions unused this long (`0` = never; a session in handoff is never idle) |
 | `MAX_PAGES_PER_SESSION` | 5 | popups beyond this are closed |
+| `SESSION_COOKIES_MAX_AGE_DAYS` | `30` | maximum age of a saved session-cookie snapshot (1–3650 days); older files are deleted on open |
 | `KEEPALIVE` | `1` | `0` = don't run scheduled keepalive visits (schedules are kept) |
 | `TZ` | `Europe/Vienna` | IANA time zone for keepalive `quiet_hours` |
 | `RECORDING_RETENTION_DAYS` | 30 | meeting recordings are deleted this many days after they were written |
@@ -209,6 +210,36 @@ health checks use a bounded OPTIONS/authentication probe, SOCKS5 health checks n
 contacts an arbitrary Internet target, so a successful probe does not guarantee a particular site is permitted.
 Any configured exit failing its probe makes health return 503; otherwise it returns 200. Without a Bearer token
 it returns 401. The status is also available to embedders as `manager.health()`; stdio has no HTTP listener.
+
+### Session cookies in persistent profiles
+
+Session cookies (cookies without an expiry) normally disappear when Chromium closes a profile. To keep logins
+such as Zoom's “Sign in with Google” across closes, opt in for that profile:
+
+```js
+session_open({profile: "zoom", keep_session_cookies: true})
+```
+
+`keep_session_cookies` defaults to **false**. Like `egress`, it is saved in the tenant profile's
+`bosun-profile.json` after a successful open and reused when omitted, including keepalive visits and meetings.
+It requires a persistent profile and works with Chromium, Patchright and Camoufox (Firefox).
+
+When enabled, Bosun saves only cookies with `expires === -1` before closing the context, within the existing
+10-second close grace, including at the end of a keepalive visit. The snapshot is
+`BROWSER_DATA/profiles/<tenant>/<profile>/session-cookies.json`, written atomically with mode 0600. It contains
+login secrets in plaintext, so protect the data directory and its backups. Cookie values are never logged or
+included in tool results or events by this feature. As with typed secrets, persistence is refused while
+`DEBUG` enables sensitive Playwright logs (`pw:api`, `pw:protocol`, `pw:channel`) or `NODE_DEBUG` is set.
+Persistent cookies remain in the browser's own store.
+
+On open, Bosun restores snapshot cookies only when their domain/name/path is absent from the current jar;
+existing cookies take precedence. A snapshot older than `SESSION_COOKIES_MAX_AGE_DAYS` (default 30) is deleted
+and ignored. `session_open({profile: "zoom", keep_session_cookies: false})` saves the disabled setting and
+deletes the snapshot; it does not clear cookies in the running browser. Deleting the profile directory also
+deletes the snapshot. Each tenant reads and writes only its own profile directory.
+
+After a crash or failed save, the last successful snapshot remains; changes since that save can be lost, and
+an older login may need signing in again. This option does not extend the site's server-side login lifetime.
 
 ### Per-call deadline
 
@@ -867,7 +898,7 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
 **Signed-in profile.** Google turns away anonymous automated guests far more often than signed-in users, and Zoom
 may turn anonymous browser guests away (it admitted them in our tests, but a profile is the dependable way in).
 - **Setup:** `session_open({ "profile": "google" })`, `navigate` to `https://accounts.google.com` (Zoom:
-  `https://zoom.us/signin`), `request_human` so a person signs in, `session_close`.
+  `https://zoom.us/signin`; open Zoom with `keep_session_cookies: true` to retain its session login), `request_human` so a person signs in, `session_close`.
 - **Joining:** `meeting_join({ "url": "…", "profile": "google" })` or `{ …, "profile": "zoom" }`.
 - **Engine:** the profile is opened with the engine it was last used with. It can't be in use by an agent session at
   the same time.
