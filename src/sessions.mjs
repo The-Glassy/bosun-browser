@@ -10,6 +10,7 @@ import { NOT_ALLOWED, PROFILES_REFUSED, policyOf } from './auth.mjs';
 import { allowFor, allowsUrl } from './allow.mjs';
 import { egressError, probeEgress, selectEgress } from './egress.mjs';
 import { startTenantProxy } from './proxy.mjs';
+import { checkSessionCookieLogs, deleteSessionCookies, restoreSessionCookies, saveSessionCookies } from './session-cookies.mjs';
 import { currentCall, timeoutMessage } from './deadline.mjs';
 
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
@@ -136,8 +137,10 @@ export class SessionManager {
   // media: {args, env} for a meeting's own browser process (see engines.mjs). downloads: the session may keep what
   // its pages download, if the tenant's download allowlist lets it (sessions the agent opens; keepalive visits and
   // meetings never download).
-  async open({ owner, tenant, profile, locale, timezone, engine, egress, preempt = true, media = null, downloads = false }) {
+  async open({ owner, tenant, profile, locale, timezone, engine, egress, keep_session_cookies, preempt = true, media = null, downloads = false }) {
     if (this.closing) throw new Error('service is shutting down');
+    if (keep_session_cookies !== undefined && typeof keep_session_cookies !== 'boolean') throw new Error('keep_session_cookies must be a boolean');
+    if (keep_session_cookies !== undefined && !profile) throw new Error('keep_session_cookies requires a persistent profile');
     const def = this.engines.get(engine || this.cfg.engine);
     // Only engines this deployment enabled (FEATURES_ENGINES, plus the default ENGINE).
     if (!this.cfg.engines.includes(def.name)) throw new Error(`engine ${def.name} is not enabled on this service (FEATURES_ENGINES)`);
@@ -159,13 +162,13 @@ export class SessionManager {
     };
     try {
       // agent: a session the agent opened (it hears why a download was refused even when its tenant may not download).
-      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, egress, preempt, media, ephemeral, downloads: downloads && !media && !!this.downloads?.allowFor(tenant), agent: downloads && !media && !ephemeral });
+      return await this.openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, egress, keep_session_cookies, preempt, media, ephemeral, downloads: downloads && !media && !!this.downloads?.allowFor(tenant), agent: downloads && !media && !ephemeral });
     } finally {
       untrack();
     }
   }
 
-  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, egress, preempt, media, ephemeral, downloads, agent = false }) {
+  async openTracked({ owner, tenant, profile, profileKey, locale, timezone, def, egress, keep_session_cookies, preempt, media, ephemeral, downloads, agent = false }) {
     // The profile was just closed (by session_close, a dropped connection, idle or crash) and its browser is still
     // shutting down; or a background keepalive holds it. Wait for it rather than refusing.
     if (profileKey && this.profilesInUse.has(profileKey)) {
@@ -199,6 +202,8 @@ export class SessionManager {
         // not restricted.
         // Resolve after the profile lock is acquired: keepalive, macros and meetings all reuse this path.
         const saved = profile ? readProfileMeta(path.join(this.cfg.dataDir, 'profiles', tenant, profile)) : null;
+        const keepSessionCookies = keep_session_cookies ?? (saved?.keep_session_cookies === true);
+        if (keepSessionCookies) checkSessionCookieLogs();
         const egressName = egress ?? saved?.egress ?? 'default';
         const egressProxy = selectEgress(this.cfg, egressName);
         const proxy = await this.tenantProxy(tenant, egressName);
@@ -219,16 +224,25 @@ export class SessionManager {
           ({ dir = null, tmpDir = null } = e);
           throw e;
         }
+        if (profileDir && keepSessionCookies) {
+          // A damaged snapshot must not lock the profile out: drop it and open without the restored cookies.
+          try { await restoreSessionCookies(ctx, profileDir, this.cfg.sessionCookiesMaxAgeMs); }
+          catch { console.error('bosun: could not restore saved session cookies; snapshot discarded'); try { deleteSessionCookies(profileDir); } catch {} }
+        }
         if (def.tracker === 'init') await ctx.addInitScript(passwordTracker);
         const page = ctx.pages()[0] || await ctx.newPage();
         await trackPasswords(page, def.tracker);
         if (this.closing) throw new Error('service is shutting down');
         if (this.goneOwners.has(owner)) throw new Error('connection closed'); // owner left while we were launching
-        if (profileDir) recordProfileUse(profileDir, { engine: def.name, headless: this.cfg.headless, egress: egressName });
+        if (profileDir) {
+          recordProfileUse(profileDir, { engine: def.name, headless: this.cfg.headless, egress: egressName, keep_session_cookies: keepSessionCookies });
+          if (!keepSessionCookies) deleteSessionCookies(profileDir);
+        }
         const s = {
           id: `s${crypto.randomBytes(6).toString('hex')}`, owner, tenant, profile: profile || null, engine: def.name, cdp: def.cdp, tracker: def.tracker, ctx, page, browser, dir, tmpDir,
           queue: new SerialQueue(8), handoff: null, gen: 0, busy: 0, lastUsed: Date.now(), shots: [], writes: new Set(), disposed: false, release,
           navs: [], ctxErrors: [], wallSeen: null, // recent main-frame navigations {t, at: origin+path}, "context destroyed" failures, last bot check seen (bot-check loops)
+          profileDir, keep_session_cookies: keepSessionCookies,
           egress: egressName, egressProxy, proxyRoute: this.allowList(tenant) ? proxy : null,
           dlDir, // null: the context refuses downloads
         };
@@ -533,7 +547,25 @@ export class SessionManager {
     s.disposing = (async () => {
       let reclaimed = false;
       try {
-        await Promise.race([s.ctx.close().catch(() => {}), sleep(this.closeDeadlineMs)]);
+        // Saving and graceful close share the existing 10 s budget. Crashes keep the last good snapshot.
+        let canSave = true, closeStarted = false, timer;
+        const close = () => { closeStarted = true; return s.ctx.close().catch(() => {}); };
+        try {
+          await Promise.race([
+            (async () => {
+              if (s.profileDir && s.keep_session_cookies && !['browser-crashed', 'page-crashed', 'context-closed', 'page-closed'].includes(reason)) {
+                try { await saveSessionCookies(s.ctx, s.profileDir, () => canSave); }
+                catch { console.error('bosun: could not save session cookies; keeping last snapshot'); }
+              }
+              if (canSave) await close();
+            })(),
+            new Promise((resolve) => { timer = setTimeout(resolve, this.closeDeadlineMs); }),
+          ]);
+        } finally {
+          canSave = false;
+          clearTimeout(timer);
+          if (!closeStarted) void close();
+        }
         await Promise.allSettled([...s.writes]); // a screenshot being written must not outlive the directory removal
         await fs.promises.rm(path.join(this.cfg.dataDir, 'shots', s.tenant, s.id), { recursive: true, force: true }).catch(() => {});
         reclaimed = await this.reclaim({ dir: s.dir, tmpDir: s.tmpDir, release: s.release, what: `session ${s.id} (${s.engine})` });

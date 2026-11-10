@@ -235,8 +235,8 @@ export function readProfileMeta(dir) {
 
 // After a successful open: remember the engine and mode (headless or not) the profile was last used with, so
 // background work (keepalive) opens it the same way and its fingerprint stays consistent.
-export function recordProfileUse(dir, { engine, headless, egress }) {
-  const meta = { ...(readProfileMeta(dir) || {}), engine, headless, ...(egress !== undefined ? { egress } : {}) };
+export function recordProfileUse(dir, { engine, headless, egress, keep_session_cookies }) {
+  const meta = { ...(readProfileMeta(dir) || {}), engine, headless, ...(egress !== undefined ? { egress } : {}), ...(keep_session_cookies !== undefined ? { keep_session_cookies } : {}) };
   const tmp = path.join(dir, `${META}.${crypto.randomBytes(4).toString('hex')}`);
   fs.writeFileSync(tmp, JSON.stringify(meta), { mode: 0o600 });
   fs.renameSync(tmp, path.join(dir, META));

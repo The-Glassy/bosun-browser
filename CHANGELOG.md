@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.24.0 (2026-11-10): opt-in session-cookie persistence
+
+- Per-profile `keep_session_cookies` (default false), set and saved by `session_open` alongside `egress` in
+  `bosun-profile.json`. Chromium, Patchright and Camoufox use the same cookie API; keepalive and meetings
+  reuse the saved setting. Fixes session-cookie logins such as Zoom's “Sign in with Google” disappearing on close (#35).
+- Enabled profiles save only session cookies before clean close, within the existing 10 s grace, including
+  keepalive visits. Tenant-local `session-cookies.json` snapshots use atomic replacement and mode 0600;
+  restore never overwrites an existing domain/name/path. Cookie values and raw cookie API errors are not logged.
+- `SESSION_COOKIES_MAX_AGE_DAYS` defaults to 30; stale snapshots are deleted and ignored. Disabling deletes the
+  snapshot, profile-directory deletion removes it too, and crashes or failed saves preserve the last good file.
+- Add browser and lifecycle regressions for opt-in/default-off behavior, persistent cookies, duplicates, age,
+  permissions, tenant isolation, keepalive, crash preservation and close-grace cancellation.
+
 ## 0.23.0 (2026-11-09): browser egress exits
 
 - `BROWSER_EGRESS_PROXY` routes all Chromium, patchright and camoufox contexts through an HTTP proxy (optional

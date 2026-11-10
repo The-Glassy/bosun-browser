@@ -440,7 +440,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.23.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.24.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -480,20 +480,20 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     });
   };
 
-  tool('session_open', ephemeral ? `Open an ephemeral browser session (wiped on close). Profiles, and engines other than ${cfg.engine}, are not allowed for this token.` : 'Open a browser session. Without profile: ephemeral (wiped on close). With profile: persistent per-tenant profile (stays logged in).',
-    { profile: z.string().regex(TENANT_RE).optional(), egress: z.string().regex(TENANT_RE).optional().describe('Exit: default, direct, or a name in BROWSER_EGRESS_PROXIES; saved with a persistent profile'), locale: str(35).optional(), timezone: str(64).optional(),
+  tool('session_open', ephemeral ? `Open an ephemeral browser session (wiped on close). Profiles, and engines other than ${cfg.engine}, are not allowed for this token.` : 'Open a browser session. Without profile: ephemeral (wiped on close). With profile: persistent per-tenant profile. keep_session_cookies opts into saving session cookies across closes (default false; also used by keepalive and meetings).',
+    { profile: z.string().regex(TENANT_RE).optional(), keep_session_cookies: z.boolean().optional().describe('Persistent profiles only: save session cookies on close and restore on open; saved in bosun-profile.json, default false. false deletes the snapshot. Supports all engines.'), egress: z.string().regex(TENANT_RE).optional().describe('Exit: default, direct, or a name in BROWSER_EGRESS_PROXIES; saved with a persistent profile'), locale: str(35).optional(), timezone: str(64).optional(),
       engine: z.enum(cfg.engines).optional().describe(`browser engine (default ${cfg.engine}); enabled here: ${cfg.engines.join(', ')}`) },
     async (a) => {
       if (ephemeral && a.profile !== undefined) throw new Error(PROFILES_REFUSED);
       if (ephemeral && a.engine && a.engine !== cfg.engine) throw new Error(`engine ${a.engine} is ${NOT_ALLOWED}; use the default (${cfg.engine})`);
       const call = currentCall();
-      const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine, egress: a.egress, downloads: true });
+      const s = await manager.open({ owner, tenant, profile: a.profile, locale: a.locale, timezone: a.timezone, engine: a.engine, egress: a.egress, keep_session_cookies: a.keep_session_cookies, downloads: true });
       // The agent was told this open timed out: a session it never learned about is not left open.
       if (call?.expired) { await manager.dispose(s, 'open-timed-out'); throw new Error('session_open timed out'); }
-      return ok({ session: s.id, profile: a.profile || 'ephemeral', engine: s.engine, egress: s.egress });
+      return ok({ session: s.id, profile: a.profile || 'ephemeral', engine: s.engine, egress: s.egress, keep_session_cookies: s.keep_session_cookies });
     });
 
-  tool('session_close', 'Close a session (persistent profile stays on disk).', { session: str(40) }, async ({ session }) => {
+  tool('session_close', 'Close a session (persistent profile stays on disk; opted-in session cookies are saved within the close grace).', { session: str(40) }, async ({ session }) => {
     await manager.close(owner, session);
     return ok({ closed: session });
   });
@@ -832,7 +832,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   // Keepalive: per tenant (like profiles, shared by the tenant's connections).
   const keepalive = manager.keepalive;
   if (keepalive) {
-    tool('keepalive_set', 'Keep a persistent profile logged in without a model: every every_hours or every_minutes (± jitter_min; ×4 during quiet_hours) the service opens the profile, loads url, moves the mouse and scrolls for 20–60 s (no clicks, typing or navigation), then checks logged_in_check. Logged out or a bot check -> a bosun:needs-human event; no retries before the next visit. Optional watch: read one value on the page (e.g. a "43 neue Nachrichten" counter) and send a bosun:watch-changed event when it changes (count up, or text differs); the first visit only records it. Only helps sites with sliding sessions.',
+    tool('keepalive_set', 'Keep a persistent profile logged in without a model: every every_hours or every_minutes (± jitter_min; ×4 during quiet_hours) the service opens the profile, loads url, moves the mouse and scrolls for 20–60 s (no clicks, typing or navigation), then checks logged_in_check. Logged out or a bot check -> a bosun:needs-human event; no retries before the next visit. Optional watch: read one value on the page (e.g. a "43 neue Nachrichten" counter) and send a bosun:watch-changed event when it changes (count up, or text differs); the first visit only records it. Only helps sites with sliding sessions. Reuses the profile\'s keep_session_cookies setting: restores before visiting and saves on close.',
       { profile: z.string().regex(TENANT_RE), url: z.string().max(4096).url().describe('http(s) only'),
         every_hours: z.number().int().min(1).max(720).optional().describe('interval (default 12)'),
         every_minutes: z.number().int().min(MIN_PERIOD_MIN).max(43200).optional().describe(`interval in minutes, at least ${MIN_PERIOD_MIN} (instead of every_hours)`),
