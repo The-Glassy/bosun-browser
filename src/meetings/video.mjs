@@ -27,7 +27,7 @@ export function videoUnsupported() {
 // Returns a recorder immediately so deletion/shutdown can cancel even a CDP setup still in flight. makeRecorder
 // opens BOTH audio and video in a single ffmpeg. Its first PulseAudio PTS is also the speaker timeline's zero.
 export function startPageVideo({ page, fps, file, makeRecorder }) {
-  let cdp, rec, latest, timer, err = null, closed = false, startedAt = Date.now(), sent = 0;
+  let cdp, rec, latest, timer, setupTimer, err = null, closed = false, startedAt = Date.now(), sent = 0;
   let firstResolve, finishResolve, cancelResolve;
   const first = new Promise((r) => { firstResolve = r; });
   const exited = new Promise((r) => { finishResolve = r; });
@@ -41,6 +41,7 @@ export function startPageVideo({ page, fps, file, makeRecorder }) {
   };
   const detach = async () => {
     clearInterval(timer);
+    clearTimeout(setupTimer);
     latest = null;
     if (cdp) {
       const session = cdp;
@@ -65,17 +66,22 @@ export function startPageVideo({ page, fps, file, makeRecorder }) {
       if (Date.now() - startedAt > 5000) fail(new Error('video recorder received no audio input timestamp'));
       return;
     }
-    for (const sessionId of pending) cdp?.send('Page.screencastFrameAck', { sessionId }).catch(fail);
-    pending.clear();
     // image2pipe has constant-rate PTS starting at zero. Repeat static slides, and use the same audio input zero
     // as the timeline. Catch up small event-loop delays; sustained backpressure fails rather than losing sync.
     const due = Math.floor(Math.max(0, Date.now() - rec.audioStartedAt) * fps / 1000) + 1;
     if (due - sent > fps * 5) return fail(new Error('video encoder fell more than 5 seconds behind'));
+    if (due > sent) {
+      // ACK pacing bounds Chromium's JPEG work too, rather than merely discarding a full-rate screencast.
+      const ack = [...pending]; pending.clear();
+      for (const sessionId of ack) cdp?.send('Page.screencastFrameAck', { sessionId }).catch(fail);
+    }
     while (sent < due && !rec.frames.writableNeedDrain && !rec.frames.destroyed) {
       rec.frames.write(latest);
       sent++;
     }
   };
+  setupTimer = setTimeout(() => fail(new Error('video capture setup timed out')), 10_000);
+  setupTimer.unref?.();
   const setup = (async () => {
     cdp = await page.context().newCDPSession(page);
     if (closed) return;
@@ -93,7 +99,7 @@ export function startPageVideo({ page, fps, file, makeRecorder }) {
     timer = setInterval(pump, Math.min(50, 1000 / fps));
     timer.unref?.();
     pump();
-  })().catch(fail).finally(async () => { if (closed) await detach(); });
+  })().catch(fail).finally(async () => { clearTimeout(setupTimer); if (closed) await detach(); });
   const end = async (kill) => {
     closed = true; cancelResolve(); clearInterval(timer);
     // rec is installed synchronously, and setup checks closed after every asynchronous acquisition.

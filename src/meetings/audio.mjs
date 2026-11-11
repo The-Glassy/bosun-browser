@@ -12,6 +12,11 @@ import { spawn, execFile } from 'child_process';
 import { startPageVideo, videoUnsupported } from './video.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(promise, ms) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((r) => { timer = setTimeout(() => r(null), ms); })]); }
+  finally { clearTimeout(timer); }
+}
 const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   execFile(cmd, args, { timeout: 10_000, ...opts }, (e, stdout, stderr) => (e ? reject(Object.assign(e, { stderr: String(stderr) })) : resolve(String(stdout))));
 });
@@ -130,10 +135,10 @@ export function startRecorder(pulse, file, { fps = null, audioInput = null } = {
   const end = async (sig, waitMs) => {
     const alive = () => proc.exitCode === null && proc.signalCode === null && proc.pid !== undefined;
     if (alive()) { try { proc.kill(sig); } catch {} }
-    let r = await Promise.race([exited, sleep(waitMs).then(() => null)]);
+    let r = await waitFor(exited, waitMs);
     if (!r) {
       try { proc.kill('SIGKILL'); } catch {}
-      r = await Promise.race([exited, sleep(2000).then(() => null)]);
+      r = await waitFor(exited, 2000);
     }
     return r;
   };
