@@ -1,10 +1,12 @@
 # Bosun
 
+[![MCP Badge](https://lobehub.com/badge/mcp/the-glassy-bosun-browser)](https://lobehub.com/mcp/the-glassy-bosun-browser)
+
 **The boatswain browser for agents.** A self-hosted browser service that gives AI agents a real browser — and
 calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 
-> Status: **prototype (M0)**. Works end to end in one deployment; APIs will change. See [docs/DESIGN.md](docs/DESIGN.md)
-> and [CHANGELOG.md](CHANGELOG.md).
+> Status: **in daily use** (v0.26) by a few agent teams on a shared deployment; tool APIs may still change between
+> minor versions. See [docs/DESIGN.md](docs/DESIGN.md) and [CHANGELOG.md](CHANGELOG.md).
 
 > Security: Chromium runs **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), downloads are refused
 > unless a tenant is given [download hosts](#downloading-files), and a tenant can be kept to a [host allowlist](#per-tenant-host-allowlist)
