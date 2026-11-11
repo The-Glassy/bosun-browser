@@ -237,3 +237,31 @@ test('delete during CDP acquisition starts no screencast/encoder; page failures 
   const slow = startPageVideo({ page: g.page, fps: 2, makeRecorder: () => ({ frames: new PassThrough(), startedAt: now, audioStartedAt: now - 6000, exited: done.p, kill: async () => done.resolve() }) });
   await slow.exited; assert.match(slow.error(), /5 seconds behind/);
 });
+
+test('video failure falls back to audio-only and keeps recording', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bosun-vfb-'));
+  const records = [];
+  let resolveExit;
+  const rig = { record: (file, video) => {
+    const exited = video ? new Promise((r) => { resolveExit = r; }) : new Promise(() => {});
+    const rec = { file, startedAt: Date.now(), audioStartedAt: Date.now(), exited, error: () => (video ? 'meeting page supplied no video frame' : null), stop: async () => null, kill: async () => null };
+    records.push({ file, video: !!video });
+    fs.writeFileSync(file, 'x');
+    return rec;
+  } };
+  const mt = Object.create(Meetings.prototype);
+  Object.assign(mt, { dir, cfg: { meetingVideoLimit: 1, meetingVideoMinFreeGb: 0 }, diskStat: () => ({ bavail: 1e9, bsize: 4096 }),
+    active: new Map(), ended: new Map(), links: { revoke() {} } });
+  const m = { id: 'm0123456789ab', tenant: 't', state: 'admitted', recordVideo: true, videoFps: 2, videoReserved: true, rig, session: { page: {} },
+    speakerLog: [], name: 'x', info: {}, noRecord: false, optedOut: false, deleted: false };
+  fs.mkdirSync(path.join(dir, 't'), { recursive: true });
+  mt.active.set(m.id, m);
+  mt.startRecording(m);
+  assert.equal(records.length, 1); assert.ok(records[0].file.endsWith('.webm'));
+  resolveExit({ error: 'x' });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(records.length, 2); assert.ok(records[1].file.endsWith('.ogg')); assert.equal(records[1].video, false);
+  assert.equal(m.state, 'recording'); assert.equal(m.recordVideo, false); assert.equal(m.videoReserved, false);
+  assert.match(m.videoError, /no video frame/); assert.equal(m.recError, null);
+  assert.equal(fs.existsSync(records[0].file), false);
+});

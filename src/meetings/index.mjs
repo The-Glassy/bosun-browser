@@ -506,12 +506,23 @@ export class Meetings {
     const initial = m.speakerLog.at(-1);
     if (initial) m.speakerTimeline.sample(initial);
     const rec = m.rec;
-    transition(m, 'recording');
+    if (m.state !== 'recording') transition(m, 'recording'); // the audio-only fallback after a video failure stays in it
     rec.exited.then(() => {
       if (m.rec !== rec || m.state !== 'recording') return;
       // The recorder died on its own (ffmpeg error): the meeting goes on without recording, and without the live
       // transcript, which only runs with the recording (the text so far is kept, like the file).
       m.recError = rec.error() || 'recorder exited';
+      if (m.recordVideo && !m.deleted && !m.optedOut && !m.noRecord) {
+        // Video capture failed: keep the meeting's audio. Drop the partial WebM and record audio-only from here on.
+        m.videoError = m.recError; m.recError = null;
+        m.recordVideo = false; m.videoReserved = false;
+        const partial = m.file;
+        m.rec = null;
+        try { fs.rmSync(partial, { force: true }); fs.rmSync(speakerFile(partial), { force: true }); } catch {}
+        console.error(`bosun meeting ${m.id}: video failed (${m.videoError}); recording audio only`);
+        try { this.startRecording(m); } catch (e) { m.recError = oneLine(e); }
+        return;
+      }
       this.stopRecording(m, { del: false }).catch((e) => { m.speakerTimelineError = oneLine(e); });
       this.stopTranscript(m, 'recording-failed').catch(() => {});
     });
@@ -1552,7 +1563,7 @@ export class Meetings {
       ...(m.info.warning ? { warning: m.info.warning } : {}),
       ...(m.reason ? { reason: m.reason } : {}), ...(m.error ? { error: m.error } : {}),
       participants: m.participants, recording_seconds: Math.round(recMs / 1000),
-      video: { on: !!(m.recordVideo && m.rec), fps: m.videoFps ?? 2, bytes: m.recordVideo ? bytes ?? 0 : 0 },
+      video: { on: !!(m.recordVideo && m.rec), fps: m.videoFps ?? 2, bytes: m.recordVideo ? bytes ?? 0 : 0, ...(m.videoError ? { error: m.videoError, fallback: 'audio-only' } : {}) },
       speaker_timeline: { intervals: this.timelineCount(m), ...(m.speakerTimelineError ? { error: m.speakerTimelineError } : {}) },
       recording: m.file ? { path: m.file, bytes, ...(m.state === 'ended' && bytes ? { next: `call recording_get { meeting_id: "${m.id}" }` } : {}) } : m.deleted ? 'deleted' : null,
       ...(m.recError ? { recording_error: m.recError } : {}),
