@@ -221,9 +221,9 @@ export class Meetings {
     this.ackCache = new Map(); // acknowledgement clips: JSON [tts, phrase] -> {text, clip, error, failedAt}
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     this.links = new RecordingLinks({ cfg, resolve: (tenant, id, kind) => {
-      const file = this.recordingFile(tenant, id).file;
+      const recording = this.recordingFile(tenant, id), file = recording.file;
       if (kind === 'video') {
-        const video = this.recordingFile(tenant, id).video;
+        const video = recording.video;
         if (!video) throw new Error(`no video for meeting ${id}`);
         return video.file;
       }
@@ -549,6 +549,7 @@ export class Meetings {
         if (rec) await (del ? rec.kill() : rec.stop());
         const file = m.videoFile;
         if (file && (del || m.deleted || !(await (rec?.valid ? rec.valid() : validVideo(file))))) {
+          if (!del && !m.deleted) m.videoError ||= 'video recording contains no readable frames';
           fs.rmSync(file, { force: true });
           if (m.videoFile === file) m.videoFile = null;
         }
@@ -561,7 +562,6 @@ export class Meetings {
     m.videoCleanup = cleanup;
     return cleanup;
   }
-
 
   // The live transcript, once the recording may start (same consent), for a meeting that asked for it.
   startTranscript(m) {

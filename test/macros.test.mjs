@@ -627,6 +627,7 @@ test('action timeoutMs bounds missing click/type/select/hover targets through MC
       assert.equal(result.json().ok, false);
       const step = result.json().steps.find((st) => st.step === 2);
       assert.ok(step.ms < 2000, `${tool} waited ${step.ms}ms`);
+      assert.match(step.error, /100 ms/);
     }
   } finally { await c.call('session_close', { session: s }); }
 });

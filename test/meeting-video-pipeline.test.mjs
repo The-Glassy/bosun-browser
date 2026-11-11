@@ -7,7 +7,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chromium } from 'playwright';
-import { startPageVideo, videoUnsupported } from '../src/meetings/video.mjs';
+import { startPageVideo, videoUnsupported, validVideo } from '../src/meetings/video.mjs';
 import { startRecorder } from '../src/meetings/audio.mjs';
 
 const why = await videoUnsupported() || (spawnSync('ffprobe', ['-version']).status !== 0 ? 'ffprobe unavailable' : null);
@@ -47,6 +47,7 @@ test('real VP9/Opus mux: static page frames repeat, audio spans the recording, f
   t.after(() => rec.kill());
   await pause(5500); await rec.stop();
   inspect(file, 2, 4);
+  assert.equal(await validVideo(file), true);
 });
 
 test('local browser page: capture updates the meeting page while another window is foreground', { skip: why || false }, async (t) => {
@@ -107,4 +108,14 @@ test('Ogg recorder keeps identical audio format and full duration alongside vide
     assert.ok(pcm.length / 32000 >= 4, 'audio continued after video died');
   }
   assert.ok(audio.audioStartedAt >= audio.startedAt - 100);
+});
+
+test('video validity rejects headers, corrupt data and audio-only WebM', { skip: why || false }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bosun-video-valid-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const corrupt = path.join(dir, 'corrupt.webm'), audio = path.join(dir, 'audio.webm');
+  fs.writeFileSync(corrupt, 'partial header');
+  assert.equal(await validVideo(corrupt), false);
+  execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '0.2', '-c:a', 'libopus', audio]);
+  assert.equal(await validVideo(audio), false);
 });

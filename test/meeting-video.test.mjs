@@ -21,7 +21,7 @@ async function until(fn) { for (let n = 0; n < 200; n++) { if (fn()) return; awa
 function fixture(t, { announceGate, cfg: overrides = {} } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bosun-video-'));
   const cfg = { ...loadConfig({ ALLOW_NO_TOKEN: '1' }), dataDir, maxSessions: 10, maxSessionsPerTenant: 10, ...overrides };
-  const log = [], recorders = [], chat = [];
+  const log = [], recorders = [], chat = [], events = [];
   const page = { goto: async () => {}, keyboard: { press: async () => {} } };
   const platform = {
     name: 'meet', lobby: async () => 'admitted', state: async () => 'admitted', participants: async () => 3,
@@ -43,11 +43,11 @@ function fixture(t, { announceGate, cfg: overrides = {} } = {}) {
     recorders.push(rec); return rec;
   }
   let free = 100;
-  const meetings = new Meetings({ cfg, manager, audio, platformFor: () => platform, pollMs: 10,
+  const meetings = new Meetings({ cfg, manager, audio, bus: { meeting: (kind, data) => events.push({ kind, ...data }) }, platformFor: () => platform, pollMs: 10,
     diskStat: () => ({ bavail: free * 1024 ** 3, bsize: 1 }) });
   manager.meetings = meetings;
   t.after(async () => { announceGate?.resolve(); await meetings.stop(); fs.rmSync(dataDir, { recursive: true, force: true }); });
-  return { meetings, manager, cfg, log, chat, recorders, page, setFree: (n) => { free = n; } };
+  return { meetings, manager, cfg, log, chat, recorders, page, events, setFree: (n) => { free = n; } };
 }
 async function join(f, opts = {}) {
   const r = await f.meetings.join('alice', { url: 'https://meet.google.com/abc-defg-hij', leaveOnOptOut: false, ...opts });
@@ -145,7 +145,7 @@ test('disk and concurrency guards reserve lobby joins across tenants and release
   assert.throws(() => videoCapacity('/tmp', { meetingVideoMinFreeGb: 3 }, 0, () => ({ bavail: 2 * 1024 ** 3, bsize: 1 })), /3 GB/);
 });
 
-test('WebM download uses video metadata and one-time tenant-scoped URL; sidecar and restart discovery', async (t) => {
+test('audio and WebM downloads use separate metadata and one-time tenant-scoped URL; sidecar and restart discovery', async (t) => {
   const f = fixture(t, { cfg: { ws: true } }), m = await recording(f);
   assert.throws(() => f.meetings.recordingGet('alice', m.id), /still recording/);
   await f.meetings.stopRecordingTool('alice', m.id, false);
@@ -171,7 +171,11 @@ test('WebM download uses video metadata and one-time tenant-scoped URL; sidecar 
   assert.equal(videoFetched.status, 200); assert.equal(videoFetched.headers['content-type'], 'video/webm');
   assert.equal((await get(f.meetings.links, m.id, videoSecret, null, 'video')).status, 404);
   const videoFile = m.videoFile;
-  await f.meetings.finish(m, 'meeting-ended'); f.meetings.ended.clear();
+  await f.meetings.finish(m, 'meeting-ended');
+  const ended = f.events.find((event) => event.kind === 'ended');
+  assert.equal(ended.recording.path, m.file); assert.equal(ended.recording.mime_type, 'audio/ogg');
+  assert.deepEqual(ended.recording.video, { path: videoFile, bytes: 10 });
+  f.meetings.ended.clear();
   fs.utimesSync(m.file, new Date(0), new Date(0));
   assert.equal(f.meetings.recordingGet('alice', m.id).file, m.file);
   assert.equal(f.meetings.recordingGet('alice', m.id).video.file, videoFile);
@@ -184,6 +188,7 @@ test('opt-out, stop(delete), recording_delete, shutdown and deletion during a gr
     const f = fixture(t), m = await recording(f), file = m.file, videoFile = m.videoFile;
     fs.writeFileSync(speakerFile(file), '{}');
     const url = f.meetings.links.issue('alice', m.id);
+    const videoUrl = f.meetings.links.issue('alice', m.id, 'video');
     if (action === 'optout') await f.meetings.optOut(m, { sender: 'Alice', text: 'stop recording' });
     if (action === 'stop') await f.meetings.stopRecordingTool('alice', m.id, true);
     if (action === 'delete') await f.meetings.deleteRecording('alice', m.id);
@@ -197,6 +202,7 @@ test('opt-out, stop(delete), recording_delete, shutdown and deletion during a gr
     assert.equal(m.rec, null); assert.equal(m.deleted, true); assert.equal(m.videoReserved, false);
     assert.equal(fs.existsSync(file), false); assert.equal(fs.existsSync(videoFile), false); assert.equal(fs.existsSync(speakerFile(file)), false);
     assert.equal((await get(f.meetings.links, m.id, url)).status, 404);
+    assert.equal((await get(f.meetings.links, m.id, videoUrl, null, 'video')).status, 404);
     assert.throws(() => f.meetings.recordingGet('alice', m.id), /deleted/);
     // A late encoder reopening either extension cannot resurrect deleted content after restart.
     fs.writeFileSync(file, 'late'); fs.writeFileSync(videoFile, 'late'); fs.writeFileSync(speakerFile(file), '{}');
@@ -205,15 +211,16 @@ test('opt-out, stop(delete), recording_delete, shutdown and deletion during a gr
   }
 });
 
-test('30-day cleanup removes WebM and sidecar, keeps active files and sidecars, revokes links', async (t) => {
+test('30-day cleanup removes Ogg, WebM and sidecar, keeps active files and sidecars, revokes links', async (t) => {
   const f = fixture(t), m = await recording(f), file = m.file, videoFile = m.videoFile;
   fs.writeFileSync(speakerFile(file), '{}'); fs.utimesSync(file, new Date(0), new Date(0));
   assert.deepEqual(f.meetings.sweep(), []); assert.ok(fs.existsSync(speakerFile(file)));
   await f.meetings.stopRecordingTool('alice', m.id, false);
-  const link = f.meetings.recordingGet('alice', m.id).secret;
+  const links = f.meetings.recordingGet('alice', m.id), link = links.secret;
   assert.deepEqual(f.meetings.sweep().sort(), [file, videoFile].sort());
   assert.equal(fs.existsSync(videoFile), false);
   assert.equal(fs.existsSync(speakerFile(file)), false); assert.equal((await get(f.meetings.links, m.id, link)).status, 404);
+  assert.equal((await get(f.meetings.links, m.id, links.video.secret, null, 'video')).status, 404);
   fs.writeFileSync(speakerFile(file), '{}'); sweepRecordings(f.meetings.dir, 30);
   assert.equal(fs.existsSync(speakerFile(file)), false);
 });

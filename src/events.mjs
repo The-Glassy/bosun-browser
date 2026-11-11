@@ -52,7 +52,7 @@ export const MANIFEST = {
       },
     },
     [MEETING_SET]: {
-      description: 'Push events from a meeting Bosun attends as a notetaker (meeting_join): every chat message, a participant opting out of the recording (recording stopped and deleted), an announcement that reached fewer people than asked (the host only, or nobody), the end of the meeting with the audio recording size and speaker timeline interval count (fetch it with recording_get); with live_transcript the transcript as it is spoken (partials and finals, only to connections there at the time) and its end; the end of what Bosun said with meeting_speak.',
+      description: 'Push events from a meeting Bosun attends as a notetaker (meeting_join): every chat message, a participant opting out of the recording (recording stopped and deleted), an announcement that reached fewer people than asked (the host only, or nobody), the end of the meeting with the Ogg audio recording size, optional separate WebM video and speaker timeline interval count (three artifacts with record_video) (fetch it with recording_get); with live_transcript the transcript as it is spoken (partials and finals, only to connections there at the time) and its end; the end of what Bosun said with meeting_speak.',
       uses: ['pushEvents'],
       tagOntology: {
         tags: {

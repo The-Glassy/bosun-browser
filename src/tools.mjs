@@ -241,7 +241,8 @@ async function withTarget(p, t, opts, fn, { retry = false } = {}) {
 }
 
 async function whyNone(p, t, missing, count, call) {
-  const secs = `${Math.round(FIND_MS / 1000)} s`;
+  const ms = t.timeoutMs ?? FIND_MS;
+  const secs = ms < 1000 ? `${ms} ms` : `${ms / 1000} s`;
   if (missing) return `${missing} within ${secs}`;
   const all = matches(p, t, { all: true });
   const n = await all.count();
@@ -274,7 +275,7 @@ function blocker(el) {
 
 // click(opts) on el (a locator or a handle) by until, with Playwright's waits for it to be clickable. One that times
 // out says why, where it can tell.
-async function clicking(page, el, click, until) {
+async function clicking(page, el, click, until, waitMs = FIND_MS) {
   const call = stepCall() ?? currentCall();
   try {
     return await click({ timeout: left(until) });
@@ -284,7 +285,7 @@ async function clicking(page, el, click, until) {
     const b = await el.evaluate(blocker, null, { timeout: 2000 }).catch(() => null);
     stillOn(call);
     const why = b?.why === 'gone' ? 'it left the page' : b?.why === 'disabled' ? 'it is disabled' : b?.covered ? `it is covered by ${await safeTag(page, b.covered, call)}, which would get the click` : null;
-    throw new Error(`the element did not become clickable within ${Math.round(FIND_MS / 1000)} s${why ? `: ${why}` : ' (it stayed hidden, moving or disabled)'}`);
+    throw new Error(`the element did not become clickable within ${waitMs < 1000 ? `${waitMs} ms` : `${waitMs / 1000} s`}${why ? `: ${why}` : ' (it stayed hidden, moving or disabled)'}`);
   }
 }
 
@@ -443,7 +444,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.25.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.26.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -559,8 +560,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target, ...actionTimeout }, async (a) => run(a.session, async (s) => {
     const mark = capture?.mark();
     const until = Date.now() + (a.timeoutMs ?? FIND_MS);
-    await withTarget(s.page, a, { until }, (l) => onTarget(l, (t) => clicking(s.page, t, (o) => t.click(o), until),
-      { until, ready: (h) => clicking(s.page, h, (o) => h.click({ ...o, trial: true }), until) }), { retry: true });
+    await withTarget(s.page, a, { until }, (l) => onTarget(l, (t) => clicking(s.page, t, (o) => t.click(o), until, a.timeoutMs ?? FIND_MS),
+      { until, ready: (h) => clicking(s.page, h, (o) => h.click({ ...o, trial: true }), until, a.timeoutMs ?? FIND_MS) }), { retry: true });
     await s.page.waitForTimeout(1000);
     const dl = capture ? await capture.since(s.id, mark) : [];
     const w = noteWall(s, await wall(s.page));
@@ -640,7 +641,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         throw new Error('the secret did not end up in the field that was checked (the page moved the focus or the field); Bosun left the page (about:blank) so nothing on it can show the secret, check the site before trying again');
       }
       await markValue(page, value);
-      if (a.submit) { await recheck(call); await l.press('Enter', { timeout: 15000 }); await page.waitForTimeout(1500); }
+      if (a.submit) { await recheck(call); await l.press('Enter', { timeout: a.timeoutMs === undefined ? 15000 : left(until) }); await page.waitForTimeout(1500); }
       const info = await pageInfo(page);
       console.error(`bosun: secret ${a.secret_id} of tenant ${tenant}: typed in session ${s.id}, ${Buffer.byteLength(value)} bytes`);
       return { ...info, url: hide(info.url), title: hide(info.title), secret: 'typed and deleted' };
@@ -934,7 +935,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       async (a) => ok(await meetings.mute(tenant, a.meeting_id, a.on)));
     tool('meeting_raise_hand', 'Raise (on=true) or lower (on=false) Bosun\'s hand in the meeting (Meet, Zoom).', { ...mid, on: z.boolean() },
       async (a) => ok(await meetings.raiseHand(tenant, a.meeting_id, a.on)));
-    tool('meeting_stop_recording', 'Stop recording (delete=true, default: also delete the audio and speaker timeline); a live transcript stops too (delete: its text is forgotten). The meeting goes on unrecorded.', { ...mid, delete: z.boolean().optional() },
+    tool('meeting_stop_recording', 'Stop recording (delete=true, default: also delete all three artifacts (Ogg audio, optional WebM video and speaker timeline)); a live transcript stops too (delete: its text is forgotten). The meeting goes on unrecorded.', { ...mid, delete: z.boolean().optional() },
       async (a) => ok(await meetings.stopRecordingTool(tenant, a.meeting_id, a.delete ?? true)));
     tool('meeting_leave', 'Leave the meeting; the recording is finished and kept (bosun:meeting-ended).', mid, async (a) => ok(await meetings.leave(tenant, a.meeting_id)));
     tool('recording_get', `Fetch the recording of one of your meetings (Ogg/Opus audio, plus a separate WebM video and speaker timeline with record_video: three artifacts): returns a one-time GET URL (valid ${Math.round(cfg.downloadUrlTtlMs / 60000)} min, this token only) and a ready curl -o line, plus speakers (inline timeline JSON up to 32 KiB, otherwise a separate one-time JSON URL; null for older recordings). Use its audio-relative intervals to label an offline transcript. Only once the recording is finished (the meeting ended, or meeting_stop_recording with delete=false) and not deleted. The file is kept (deleted after ${cfg.recordingRetentionDays ?? 30} days or with meeting_recording_delete); call recording_get again for a new URL.`,
@@ -968,7 +969,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
           valid_min: Math.round(cfg.downloadUrlTtlMs / 60000), next: 'GET it once (curl), then transcribe it; call recording_get again for another URL',
         });
       });
-    tool('meeting_recording_delete', `Delete a meeting's recording, speaker timeline and live transcript (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
+    tool('meeting_recording_delete', `Delete a meeting's Ogg recording, optional WebM video, speaker timeline and live transcript (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
       async (a) => ok(await meetings.deleteRecording(tenant, a.meeting_id)));
   }
 

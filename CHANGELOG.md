@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.26.0 (2026-11-11): separate meeting video and macro control flow
+
+- `record_video` now delivers three artifacts: unchanged `<id>.ogg` Ogg/Opus audio (16 kHz mono input),
+  separate `<id>.webm` video, and `<id>.speakers.json`. Independent recorders keep audio and its timeline
+  uninterrupted when video fails. Video errors stop only video and retain valid partial video; audio errors stop both.
+- `recording_get` preserves audio metadata and speakers and adds independent tenant-scoped, one-time video
+  URLs/curl commands with the same TTL. Ended events include `recording.video: {path, bytes}`;
+  status separates audio recording from `video: {on, fps, bytes, error?}`. Deletion, retention and restart discovery
+  cover all three files; consent ordering, page-only CDP capture and capacity/disk guards are preserved.
+- Macros: per-step `timeoutMs` (100–60000) for click/type/select and new hover, instant `if_exists` branches,
+  and bounded `repeat` loops (required max 1–100). Nested steps share schema, site and risky-step checks;
+  at most three nested controls and 100 saved steps total. Read results carry step indices; asserts return matched text.
+  Closes #36 (Lynx/Zoom co-host flows). No evaluate or arbitrary JavaScript.
+- Added lifecycle, dual-download, real-encoder/audio-continuity and macro validation/control-flow tests,
+  plus browser-backed macro and Linux meeting integration coverage.
+
 ## 0.25.0 (2026-11-11): optional meeting page video
 
 - `meeting_join` accepts `record_video` (default false) and `video_fps` (2–5, default 2), for this join only.
