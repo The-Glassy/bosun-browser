@@ -47,6 +47,8 @@ export function loadConfig(env = process.env) {
     keepalive: env.KEEPALIVE !== '0', // run scheduled keepalive visits (configured with keepalive_set)
     tz: env.TZ || 'Europe/Vienna', // local time for keepalive quiet_hours
     recordingRetentionDays: int(env, 'RECORDING_RETENTION_DAYS', 30, 1, 3650), // meeting recordings are deleted after this
+    meetingVideoLimit: int(env, 'MEETING_VIDEO_LIMIT', 1, 0, 1000),
+    meetingVideoMinFreeGb: int(env, 'MEETING_VIDEO_MIN_FREE_GB', 2, 0, 100000),
     meetingOwner: (env.MEETING_OWNER || '').trim().slice(0, 60) || null, // named in the meeting announcement ("X's AI notetaker")
     // Live transcript of meetings (meeting_join live_transcript): ElevenLabs Scribe realtime, at most this many minutes a
     // day per tenant (local day, TZ). elevenlabs: null without ELEVENLABS_API_KEY (the key is also what elevenlabs TTS

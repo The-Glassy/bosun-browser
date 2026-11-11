@@ -78,8 +78,8 @@ export class RecordingLinks {
       await new Promise((resolve, reject) => { stream.once('open', resolve); stream.once('error', reject); });
       const { size } = fs.fstatSync(stream.fd);
       res.writeHead(200, {
-        'content-type': kind === 'speakers' ? 'application/json' : 'audio/ogg', 'content-length': String(size),
-        'content-disposition': `attachment; filename="${id}.${kind === 'speakers' ? 'speakers.json' : 'ogg'}"`,
+        'content-type': kind === 'speakers' ? 'application/json' : file.endsWith('.webm') ? 'video/webm' : 'audio/ogg', 'content-length': String(size),
+        'content-disposition': `attachment; filename="${id}.${kind === 'speakers' ? 'speakers.json' : file.endsWith('.webm') ? 'webm' : 'ogg'}"`,
         'x-content-type-options': 'nosniff', 'cache-control': 'no-store', connection: 'close',
       });
       await pipeline(stream, res, { signal: ac.signal });

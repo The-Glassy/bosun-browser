@@ -97,13 +97,15 @@ export function startRecorder(pulse, file, { fps = null, audioInput = null } = {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   fs.closeSync(fs.openSync(file, 'w', 0o600));
   fs.chmodSync(file, 0o600);
+  const startedAt = Date.now();
   const proc = spawn('ffmpeg', [
     '-nostdin', '-hide_banner', '-nostats', '-loglevel', 'info', '-y',
     // audioInput is injectable for the cross-platform local-page integration/measurement harness.
+    ...(fps ? ['-thread_queue_size', '512'] : []),
     ...(audioInput || ['-f', 'pulse', '-server', pulse.server, '-name', 'bosun', '-i', 'bosun_out.monitor']),
-    ...(fps ? ['-thread_queue_size', '16', '-probesize', '32', '-analyzeduration', '0', '-f', 'image2pipe', '-framerate', String(fps), '-c:v', 'mjpeg', '-i', 'pipe:0',
+    ...(fps ? ['-thread_queue_size', '16', '-probesize', '32', '-analyzeduration', '0', '-f', 'image2pipe', '-framerate', String(fps), '-c:v', 'mjpeg', '-threads', '1', '-i', 'pipe:0',
       '-map', '1:v:0', '-map', '0:a:0', '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
-      '-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8', '-threads', '2', '-crf', '36', '-b:v', '0', '-pix_fmt', 'yuv420p'] : []),
+      '-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8', '-lag-in-frames', '0', '-threads', '2', '-crf', '36', '-b:v', '0', '-pix_fmt', 'yuv420p'] : []),
     '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip', '-f', fps ? 'webm' : 'ogg', file,
   ], { stdio: [fps ? 'pipe' : 'ignore', 'ignore', 'pipe'] });
   proc.stdin?.on('error', () => {}); // deletion / encoder exit may close a pending frame write
@@ -114,6 +116,8 @@ export function startRecorder(pulse, file, { fps = null, audioInput = null } = {
     if (audioStartedAt === null) {
       header = (header + d).slice(-8000);
       audioStartedAt = pulseInputStartedAt(header);
+      // Synthetic/file inputs in the local integration harness use relative timestamps, unlike PulseAudio.
+      if (audioInput && audioStartedAt !== null && audioStartedAt < 60_000) audioStartedAt += startedAt;
     }
     err = (err + d).slice(-4000);
   });
@@ -136,7 +140,7 @@ export function startRecorder(pulse, file, { fps = null, audioInput = null } = {
   return {
     file,
     frames: proc.stdin,
-    startedAt: Date.now(),
+    startedAt,
     get audioStartedAt() { return audioStartedAt; },
     exited,
     error: () => err.trim().split('\n').pop() || null,
