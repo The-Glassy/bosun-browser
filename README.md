@@ -133,6 +133,8 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `KEEPALIVE` | `1` | `0` = don't run scheduled keepalive visits (schedules are kept) |
 | `TZ` | `Europe/Vienna` | IANA time zone for keepalive `quiet_hours` |
 | `RECORDING_RETENTION_DAYS` | 30 | meeting recordings are deleted this many days after they were written |
+| `MEETING_VIDEO_LIMIT` | 1 | concurrent video slots per Bosun process, across tenants (including joins waiting for admission); `0` disables video |
+| `MEETING_VIDEO_MIN_FREE_GB` | 2 | minimum free disk in GiB for a video join and again before capture starts (whole number; `0` disables the floor) |
 | `MEETING_OWNER` | – | name in the meeting announcement ("Hi, I'm Glassy, `<owner>`'s AI notetaker"); unset: "an AI notetaker" |
 | `ELEVENLABS_API_KEY` | – | ElevenLabs key: the live meeting transcript (`meeting_join` `live_transcript`) and the `elevenlabs` voice of `meeting_speak`; unset: both refused. Kept in the service only (removed from its environment at start) |
 | `ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io` | another ElevenLabs API host (`https://*.elevenlabs.io`, e.g. `https://api.eu.residency.elevenlabs.io`); nothing else gets the key (http on loopback is accepted, for tests) |
@@ -745,7 +747,7 @@ arrived on average and up to about 40 minutes after (longer in quiet hours). Sev
 > `FEATURES_MEETINGS=0` switches meetings off: the tools are not listed and their handlers are not wired, and nothing
 > of the below runs — no recordings directory, no audio server. Read the consent notes before using them.
 
-Bosun can attend a **Google Meet** or a **Zoom** meeting, record its audio and leave. There are two ways to use it.
+Bosun can attend a **Google Meet** or a **Zoom** meeting, record its audio, optionally capture the meeting page as video, and leave. There are two ways to use it.
 
 **Mode 1, notetaker (record only).** `meeting_join { url }` and nothing else. No ElevenLabs key, no voice, and the
 microphone is never unmuted. Bosun announces itself in the chat, records, and leaves when the meeting ends. Afterwards
@@ -934,10 +936,76 @@ The agent gets one with `recording_get` (see *Mode 1*), after the meeting ended 
 A deletion leaves an empty marker `<meeting_id>.deleted` beside it, for the same retention period.
 Chat text is kept only in memory, for the last 50 meetings.
 
+### Meeting page video (0.25.0)
+
+```jsonc
+meeting_join({ "url": "https://meet.google.com/abc-defg-hij", "record_video": true, "video_fps": 2 })
+// After meeting_leave (or meeting_stop_recording with delete: false):
+recording_get({ "meeting_id": "m1a2b3c4d5e6" }) // filename: m1a2b3c4d5e6.webm, mime: video/webm
+```
+
+`record_video` is a boolean, **false by default**, and `video_fps` is an integer **2–5, default 2**.
+Both belong to this join only; neither is a tenant speech setting. It works with either notetaker or participant
+mode and with Chromium or Patchright. The recording is **one WebM file** containing VP9 video and the existing
+mono Opus audio track (16 kHz input, 24 kbps). ffmpeg uses VP9 realtime, CPU-used 8, no lookahead, two encoder
+threads and CRF 36. The page is scaled proportionally to fit **1280×720**, with black padding.
+
+Bosun captures **only the meeting page's viewport** through CDP `Page.startScreencast`. The headful browsers inherit
+the service's Xvfb `DISPLAY` (see `deploy/bosun.service`); several tenants can share it, so display grabbing would
+include another tenant's windows. CDP stays attached to this page even when another window is in front. Slides,
+screen shares and demo apps are included when they are visible **inside that meeting page**. Browser chrome,
+other tabs, local desktop apps and content scrolled out of view are not captured. At 2 fps rapid changes can be
+missed. Static frames repeat at the selected rate; frame acknowledgement pacing limits JPEG capture work.
+
+The default English/German announcement explicitly mentions audio and video. As with audio, no capture starts
+until the announcement step finishes and queued chat objections have been checked. The existing `announce: "host"`,
+`"none"` and failed-announcement behavior still applies. If you supply `announce_text`, mention video in it too.
+Opt-out, `meeting_stop_recording` with `delete: true`, `meeting_recording_delete` and the 30-day retention sweep
+remove the combined file and speaker timeline. `delete: false` keeps the combined file. `recording_get` returns
+its `.webm` name, `video/webm` MIME and the same one-time URL/curl scheme; older `.ogg` recordings still work.
+`meeting_status.video` is `{on, fps, bytes}`: `on` means currently recording video, `bytes` is the **combined
+file size**, including audio (zero after deletion). The sidecar remains `<meeting_id>.speakers.json`, with the
+same PulseAudio input timestamp as audio zero; video starts on that clock too, within a frame's sampling interval
+and Opus codec delay.
+
+Video joins are refused below `MEETING_VIDEO_MIN_FREE_GB` free disk (default 2 GiB), or when
+`MEETING_VIDEO_LIMIT` slots are reserved (default 1). Slots are reserved before browser setup, including lobby
+waits, across all tenants in this Bosun process. Stopping capture releases the slot. Free space is checked again
+after admission, since a lobby wait may be long. An unavailable encoder, page capture failure or encoder falling
+more than five seconds behind is reported as a recording error; there is no automatic audio-only fallback.
+
+**Measured cost:** see [video measurement results](docs/measurements/meeting-video.json) and
+`node scripts/measure-meeting-video.mjs [static|motion] [2–5 fps] [seconds]`. On Apple M4, native ffmpeg 9.0.2,
+1280×720, 30-second samples, the measured **encoder plus Node frame controller** costs were:
+
+| Synthetic content | FPS | CPU (% of one core) | CPU seconds per hour | Combined disk MB/hour |
+|---|---:|---:|---:|---:|
+| Static test slide | 2 | 3.7 | 133 | 24.84 |
+| Moving test pattern | 2 | 6.43 | 232 | 173.5 |
+| Moving test pattern | 5 | 14.17 | 510 | 395.53 |
+
+These are hourly extrapolations, not hour-long runs. JPEG fixtures were generated before timing; audio was a
+synthetic realtime tone. **Browser rendering/CDP JPEG work, PulseAudio and the live call are excluded**: this
+sandbox blocks Chromium's Mach bootstrap, Linux audio and Docker. Total deployment CPU needs measurement on the
+Linux host; actual disk usage depends on content and motion. The guard is an admission check, not a disk quota.
+
+**Verification:** `node --test test/meeting-video.test.mjs test/meeting-video-pipeline.test.mjs` runs lifecycle/MCP
+unit tests and a real ffmpeg test, plus a local browser page test when Chromium can launch. The browser test puts
+a second colored window in front and verifies decoded pixels still come from the meeting page. For the complete
+headful Linux audio/video path, use the existing image:
+
+```sh
+docker build -f docker/meeting-test.Dockerfile -t bosun-meeting-test .
+docker run --rm --init -v "$PWD":/app -w /app bosun-meeting-test \
+  xvfb-run -a node --test test/meeting-video-integration.test.mjs test/meeting-audio.test.mjs
+docker run --rm --init -e TEST_HEADFUL=1 -v "$PWD":/app -w /app bosun-meeting-test \
+  xvfb-run -a node --test test/meeting-video-pipeline.test.mjs
+```
+
 ### Speaker labels for a recording
 
 Every recording mode, including notetaker mode (`live_transcript: false`), keeps page active-speaker labels in
-`<meeting_id>.speakers.json`, next to the Ogg and with the same 0600 permissions, consent and retention. It is
+`<meeting_id>.speakers.json`, next to the Ogg or WebM and with the same 0600 permissions, consent and retention. It is
 written when recording stops or the meeting ends. Opt-out and `meeting_recording_delete` delete both files.
 `meeting_status` and `bosun:meeting-ended` include `speaker_timeline: {intervals: N}`.
 
@@ -1272,6 +1340,9 @@ itself.
 - A question to "everyone" or "the notetaker" without the name is not marked, so add such words to `name_aliases`
   only if the group uses them for the agent. A word that sounds like the name ("glassy eyes") is marked too, so the
   agent still reads the turn.
+
+**Optional page video.** For slides or screen shares in a group call, pass `record_video: true` on that
+`meeting_join` (see [Meeting page video](#meeting-page-video-0250)). The announcement then mentions video as well.
 
 **Announce and privacy.** The announcement goes to the chat before recording starts, as in every call. In a group,
 check `meeting_status.announce.sent_to`: anything but `everyone` means some people may not have seen it. Then say it

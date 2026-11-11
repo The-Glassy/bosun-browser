@@ -1,0 +1,75 @@
+{
+  "description": "30-second native VP9/Opus encoder benchmarks; hourly extrapolations. Browser/CDP JPEG work and PulseAudio excluded.",
+  "command": "node scripts/measure-meeting-video.mjs [static|motion] [2\u20135 fps] 30",
+  "samples": [
+    {
+      "date": "2026-11-11T08:46:47.370Z",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "cpu": "Apple M4"
+      },
+      "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+      "scope": "native ffmpeg + Node source controller; synthetic JPEGs/audio; excludes browser/CDP rendering and PulseAudio",
+      "scenario": "static",
+      "fps": 2,
+      "width": 1280,
+      "height": 720,
+      "seconds": 30,
+      "media_seconds": 29.64,
+      "audio_seconds": 29.632,
+      "bytes": 204516,
+      "cpu_seconds": 1.11,
+      "elapsed_seconds": 30.07,
+      "cpu_percent_one_core": 3.7,
+      "cpu_seconds_per_hour": 133,
+      "mb_per_hour": 24.84
+    },
+    {
+      "date": "2026-11-11T08:48:09.570Z",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "cpu": "Apple M4"
+      },
+      "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+      "scope": "native ffmpeg + Node source controller; synthetic JPEGs/audio; excludes browser/CDP rendering and PulseAudio",
+      "scenario": "motion",
+      "fps": 2,
+      "width": 1280,
+      "height": 720,
+      "seconds": 30,
+      "media_seconds": 29.64,
+      "audio_seconds": 29.632,
+      "bytes": 1428518,
+      "cpu_seconds": 1.93,
+      "elapsed_seconds": 30.08,
+      "cpu_percent_one_core": 6.43,
+      "cpu_seconds_per_hour": 232,
+      "mb_per_hour": 173.5
+    },
+    {
+      "date": "2026-11-11T08:45:23.584Z",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "cpu": "Apple M4"
+      },
+      "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+      "scope": "native ffmpeg + Node source controller; synthetic JPEGs/audio; excludes browser/CDP rendering and PulseAudio",
+      "scenario": "motion",
+      "fps": 5,
+      "width": 1280,
+      "height": 720,
+      "seconds": 30,
+      "media_seconds": 30.173,
+      "audio_seconds": 30.1653125,
+      "bytes": 3315081,
+      "cpu_seconds": 4.25,
+      "elapsed_seconds": 30.08,
+      "cpu_percent_one_core": 14.17,
+      "cpu_seconds_per_hour": 510,
+      "mb_per_hour": 395.53
+    }
+  ]
+}
