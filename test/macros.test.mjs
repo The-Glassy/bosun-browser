@@ -45,6 +45,12 @@ function serverA() {
           document.getElementById('st').textContent = 'Uploaded: ' + file.name;
         };</script>`);
     }
+    if (u.pathname === '/controls') return html(res, `<title>Controls</title><p>Start</p>
+      <button onmouseover="document.querySelector('#menu').hidden=false">Menu</button>
+      <div id="menu" hidden>Options available</div>
+      <button id="more" onclick="if (++window.count === 3) this.remove(); document.querySelector('#count').textContent=window.count">More</button>
+      <p id="count">0</p><input id="field"><select id="select"><option>First</option><option>Second</option></select>
+      <p id="result"></p><script>window.count=0;</script>`);
     if (u.pathname === '/huge') return html(res, `<title>Huge</title><button id="huge"><svg>${'<g></g>'.repeat(60000)}</svg>Delete account</button>`);
     if (u.pathname === '/slow') { // typing takes 1.5 s (a busy input handler); Enter is reported
       return html(res, `<title>Slow</title><input id="si" oninput="for (const e = Date.now() + 1500; Date.now() < e;);">
@@ -315,6 +321,7 @@ test('a multi-step macro: upload through a chooser, a param, re-navigate, genera
   assert.equal(out.ok, true);
   assert.deepEqual(out.steps.map((x) => x.status), Array(13).fill('ok'));
   assert.deepEqual(received, [{ name: 'memo.m4a', text: 'fake audio bytes' }]);
+  assert.equal(out.steps[8].text, 'Transcript ready');
   assert.deepEqual(out.reads, [{ step: 10, as: 'summary', text: 'Summary of standup' }]);
   assert.equal(out.downloads.length, 1);
   assert.equal(out.downloads[0].filename, 'standup.txt');
@@ -575,4 +582,51 @@ test('macro_delete removes it; macro_run of an unknown macro or session fails be
   assert.match((await c.call('macro_run', { name: 'sneaky', session: 'nope' })).text, /no macro sneaky/);
   assert.match((await c.call('macro_run', { name: 'fails', session: 'nope', args: { t: 'x' } })).text, /no session nope/);
   assert.match((await c.call('macro_run', { name: 'fails', args: { t: 'x' } })).text, /give session/);
+});
+
+
+test('controls through MCP: instant branches, hover targeting, repeat and matched assert/read results', async () => {
+  const s = await c.open();
+  try {
+    const saved = await c.call('macro_save', { name: 'controls', site: [A.host], steps: [
+      { tool: 'navigate', url: `${A.base}/controls` },
+      { tool: 'if_exists', target: { selector: '#absent' }, then: [{ tool: 'press', key: 'Escape' }], else: [
+        { tool: 'hover', role: 'button', after: 'Start', nth: 0, timeoutMs: 2000 },
+        { tool: 'assert', text: 'Options available' },
+      ] },
+      { tool: 'type', selector: '#field', value: 'Notes', timeoutMs: 2000 },
+      { tool: 'select', selector: '#select', value: 'Second', timeoutMs: 2000 },
+      { tool: 'repeat', while: { role: 'button', name: 'More' }, max: 5, steps: [
+        { tool: 'click', role: 'button', name: 'More', timeoutMs: 2000 },
+      ] },
+      { tool: 'assert', selector: '#count' },
+      { tool: 'read', mode: 'text', selector: '#count', as: 'count' },
+    ] });
+    assert.equal(saved.isError, false, saved.text); assert.equal(saved.json().steps, 11);
+    const result = await c.call('macro_run', { name: 'controls', session: s });
+    assert.equal(result.isError, false, result.text);
+    const out = result.json();
+    assert.equal(out.steps.find((st) => st.tool === 'if_exists').branch, 'else');
+    const loop = out.steps.find((st) => st.tool === 'repeat');
+    assert.equal(loop.count, 3); assert.equal(loop.max_hit, false);
+    assert.equal(out.steps.find((st) => st.step === 10).text, '3');
+    assert.deepEqual(out.reads, [{ step: 11, as: 'count', text: '3' }]);
+  } finally { await c.call('session_close', { session: s }); }
+});
+
+test('action timeoutMs bounds missing click/type/select/hover targets through MCP', async () => {
+  const s = await c.open();
+  try {
+    for (const tool of ['click', 'type', 'select', 'hover']) {
+      const saved = await c.call('macro_save', { name: `timeout-${tool}`, site: [A.host], steps: [
+        { tool: 'navigate', url: `${A.base}/controls` },
+        { tool, selector: '#missing', timeoutMs: 100, ...(tool === 'type' || tool === 'select' ? { value: 'x' } : {}) },
+      ] });
+      assert.equal(saved.isError, false, saved.text);
+      const result = await c.call('macro_run', { name: `timeout-${tool}`, session: s });
+      assert.equal(result.json().ok, false);
+      const step = result.json().steps.find((st) => st.step === 2);
+      assert.ok(step.ms < 2000, `${tool} waited ${step.ms}ms`);
+    }
+  } finally { await c.call('session_close', { session: s }); }
 });

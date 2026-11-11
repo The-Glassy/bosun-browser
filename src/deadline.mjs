@@ -7,7 +7,7 @@ export const DEFAULT_TIMEOUT_SEC = 60;
 export const MAX_TIMEOUT_SEC = 120;
 // Tools with a deadline. The meeting tools, download_wait, request_human and handoff_wait wait by design and keep
 // the limits they have (their own timeoutMs / timeoutSec, the meeting's own deadlines).
-export const TIMED_TOOLS = ['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for',
+export const TIMED_TOOLS = ['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'hover', 'press', 'back', 'wait_for',
   'screenshot', 'sessions', 'secret_create', 'upload_create', 'upload', 'downloads', 'download_get', 'recording_get', 'keepalive_set', 'keepalive_list',
   'keepalive_remove', 'macro_save', 'macro_list', 'macro_get', 'macro_delete'];
 // macro_run has a cap of its own for the whole run (timeout_sec); each of its steps gets the deadline of its tool.
