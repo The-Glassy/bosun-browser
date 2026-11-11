@@ -55,7 +55,7 @@
 - Document routing for browser downloads/uploads and local download/recording transfers; ElevenLabs/TTS and
   externally run whisper/transcription keep their existing networking. Add fake-exit, protocol and profile tests.
 
-## 0.22.0 (unreleased): speaker timelines for recordings
+## 0.22.0 (2026-11-09): speaker timelines for recordings
 
 - All meeting recording modes retain active-speaker intervals relative to the audio file, including overlapping
   speakers, with self names excluded and sub-300 ms flickers dropped. Bounded storage reports truncation.
@@ -67,7 +67,7 @@
 - Export `labelTranscript` for assigning offline transcript segments by longest overlap, document the workflow,
   and add browser-free interval, alignment, lifecycle, deletion and MCP/download regressions.
 
-## 0.21.0 (unreleased): mask token widgets and secret-format values (#31)
+## 0.21.0 (2026-11-09): mask token widgets and secret-format values (#31)
 
 - `read` (a11y and text) and `screenshot`, including macro steps, share credential detection in `src/redact.mjs`.
   Token, secret, API/private key and client-secret metadata now protects text/readonly inputs and value-bearing
