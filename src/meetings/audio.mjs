@@ -9,6 +9,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn, execFile } from 'child_process';
+import { startPageVideo, videoUnsupported } from './video.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
@@ -92,15 +93,20 @@ export function pulseInputStartedAt(header) {
 
 // ffmpeg: bosun_out's monitor -> Ogg/Opus 16 kHz mono 24 kbps in `file` (created 0600 first). stop() ends it cleanly
 // (the file stays valid), kill() just ends it.
-export function startRecorder(pulse, file) {
+export function startRecorder(pulse, file, { fps = null, audioInput = null } = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   fs.closeSync(fs.openSync(file, 'w', 0o600));
   fs.chmodSync(file, 0o600);
   const proc = spawn('ffmpeg', [
     '-nostdin', '-hide_banner', '-nostats', '-loglevel', 'info', '-y',
-    '-f', 'pulse', '-server', pulse.server, '-name', 'bosun', '-i', 'bosun_out.monitor',
-    '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip', '-f', 'ogg', file,
-  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+    // audioInput is injectable for the cross-platform local-page integration/measurement harness.
+    ...(audioInput || ['-f', 'pulse', '-server', pulse.server, '-name', 'bosun', '-i', 'bosun_out.monitor']),
+    ...(fps ? ['-thread_queue_size', '16', '-probesize', '32', '-analyzeduration', '0', '-f', 'image2pipe', '-framerate', String(fps), '-c:v', 'mjpeg', '-i', 'pipe:0',
+      '-map', '1:v:0', '-map', '0:a:0', '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
+      '-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8', '-threads', '2', '-crf', '36', '-b:v', '0', '-pix_fmt', 'yuv420p'] : []),
+    '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '24k', '-application', 'voip', '-f', fps ? 'webm' : 'ogg', file,
+  ], { stdio: [fps ? 'pipe' : 'ignore', 'ignore', 'pipe'] });
+  proc.stdin?.on('error', () => {}); // deletion / encoder exit may close a pending frame write
   let err = '', header = '', audioStartedAt = null;
   proc.stderr.on('data', (d) => {
     // PulseAudio's first packet PTS is host epoch time with input latency subtracted. FFmpeg rebases
@@ -129,11 +135,12 @@ export function startRecorder(pulse, file) {
   };
   return {
     file,
+    frames: proc.stdin,
     startedAt: Date.now(),
     get audioStartedAt() { return audioStartedAt; },
     exited,
     error: () => err.trim().split('\n').pop() || null,
-    stop: () => end('SIGINT', 5000),
+    stop: () => { proc.stdin?.end(); return end('SIGINT', 5000); },
     kill: () => end('SIGKILL', 2000),
   };
 }
@@ -189,11 +196,14 @@ export function startPlayer(pulse, input) {
 // The default audio backend for meetings.
 export const pulseAudio = {
   unsupported: audioUnsupported,
+  videoUnsupported,
   needsHeadful: true, // headless Chromium plays no audio
   async open() {
     const pulse = await startPulse();
     return {
-      browserEnv: pulse.browserEnv, record: (file) => startRecorder(pulse, file), capture: () => startCapture(pulse), play: (input) => startPlayer(pulse, input),
+      browserEnv: pulse.browserEnv,
+      record: (file, video) => video ? startPageVideo({ ...video, file, makeRecorder: () => startRecorder(pulse, file, { fps: video.fps }) }) : startRecorder(pulse, file),
+      capture: () => startCapture(pulse), play: (input) => startPlayer(pulse, input),
       close: pulse.close,
     };
   },
