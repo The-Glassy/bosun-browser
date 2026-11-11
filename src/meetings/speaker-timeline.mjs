@@ -111,4 +111,4 @@ export function labelTranscript(timeline, segments) {
   });
 }
 
-export const speakerFile = (file) => file.replace(/\.ogg$/, '.speakers.json');
+export const speakerFile = (file) => file.replace(/\.(?:ogg|webm)$/, '.speakers.json');

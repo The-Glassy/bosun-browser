@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.25.0 (2026-11-11): optional meeting page video
+
+- `meeting_join` accepts `record_video` (default false) and `video_fps` (2–5, default 2), for this join only.
+- Page-scoped CDP frames and the private meeting audio are muxed into one VP9/Opus WebM, up to 1280×720.
+  Consent, deletion, retention, one-time downloads and speaker timeline alignment follow the existing audio lifecycle.
+- `meeting_status.video` reports `{on, fps, bytes}`. `MEETING_VIDEO_LIMIT` (default 1) and
+  `MEETING_VIDEO_MIN_FREE_GB` (default 2 GiB) guard resources before capture.
+- Added lifecycle/MCP, real ffmpeg, local-page isolation and Linux meeting integration tests, plus a reproducible
+  encoder benchmark. See README for measured costs and the limits of this sandbox's validation.
+
 ## 0.24.0 (2026-11-10): opt-in session-cookie persistence
 
 - Per-profile `keep_session_cookies` (default false), set and saved by `session_open` alongside `egress` in
