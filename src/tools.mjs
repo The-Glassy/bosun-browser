@@ -20,7 +20,7 @@ import { INLINE_MAX_BYTES } from './downloads.mjs';
 import { egressError } from './egress.mjs';
 import { showPattern } from './allow.mjs';
 import { currentCall, stepCall, withDeadline } from './deadline.mjs';
-import { MAX_SITES, MAX_STEPS, RUN_DEFAULT_SEC, RUN_MAX_SEC, runMacro } from './macros.mjs';
+import { MAX_SITES, MAX_STEPS, RUN_DEFAULT_SEC, RUN_MAX_SEC, runMacro, flattenSteps } from './macros.mjs';
 
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
@@ -173,7 +173,7 @@ async function safeTag(page, { tag: raw, id, cls }, call) {
 // them (a hidden <input type=file> or <select> takes files or options all the same).
 // Returns a locator, or for nth/after/before the element handle that was picked (what was counted is what is acted
 // on, whatever the page adds meanwhile): use it through withTarget, which lets it go.
-async function locate(p, t, { hidden = false, until = Date.now() + FIND_MS } = {}) {
+async function locate(p, t, { hidden = false, until = Date.now() + FIND_MS, instant = false } = {}) {
   const ordinal = t.nth !== undefined || t.after || t.before;
   if (t.ref) {
     if (ordinal) throw new Error('nth, after and before go with role, selector or text, not with ref');
@@ -219,6 +219,7 @@ async function locate(p, t, { hidden = false, until = Date.now() + FIND_MS } = {
     }
     stillOn(call);
     if (hidden && !ordinal && await matches(p, t, { all: true }).count()) return matches(p, t, { all: true }).first();
+    if (instant) return null;
     if (Date.now() >= until) { stillOn(call); throw new Error(await whyNone(p, t, missing, count, call)); }
     await sleep(Math.min(200, Math.max(0, until - Date.now())));
   }
@@ -240,7 +241,8 @@ async function withTarget(p, t, opts, fn, { retry = false } = {}) {
 }
 
 async function whyNone(p, t, missing, count, call) {
-  const secs = `${Math.round(FIND_MS / 1000)} s`;
+  const ms = t.timeoutMs ?? FIND_MS;
+  const secs = ms < 1000 ? `${ms} ms` : `${ms / 1000} s`;
   if (missing) return `${missing} within ${secs}`;
   const all = matches(p, t, { all: true });
   const n = await all.count();
@@ -273,7 +275,7 @@ function blocker(el) {
 
 // click(opts) on el (a locator or a handle) by until, with Playwright's waits for it to be clickable. One that times
 // out says why, where it can tell.
-async function clicking(page, el, click, until) {
+async function clicking(page, el, click, until, waitMs = FIND_MS) {
   const call = stepCall() ?? currentCall();
   try {
     return await click({ timeout: left(until) });
@@ -283,7 +285,7 @@ async function clicking(page, el, click, until) {
     const b = await el.evaluate(blocker, null, { timeout: 2000 }).catch(() => null);
     stillOn(call);
     const why = b?.why === 'gone' ? 'it left the page' : b?.why === 'disabled' ? 'it is disabled' : b?.covered ? `it is covered by ${await safeTag(page, b.covered, call)}, which would get the click` : null;
-    throw new Error(`the element did not become clickable within ${Math.round(FIND_MS / 1000)} s${why ? `: ${why}` : ' (it stayed hidden, moving or disabled)'}`);
+    throw new Error(`the element did not become clickable within ${waitMs < 1000 ? `${waitMs} ms` : `${waitMs / 1000} s`}${why ? `: ${why}` : ' (it stayed hidden, moving or disabled)'}`);
   }
 }
 
@@ -292,6 +294,7 @@ const target = { ref: str(20).optional().describe('element ref from read (e.g. "
   nth: z.number().int().min(-100).max(100).optional().describe('with role, selector or text: which visible match, 0 = first (default), -1 = last'),
   after: str(1000).optional().describe('with role, selector or text: count matches from the first visible element showing this text on (document order); e.g. role button, after "Share" = the first button after Share'),
   before: str(1000).optional().describe('with role, selector or text: count matches from the first visible element showing this text back, the nearest first') };
+const actionTimeout = { timeoutMs: z.number().int().min(100).max(60000).optional() };
 const hasTarget = (a) => !!(a.ref || a.role || a.selector || a.text);
 // A macro step's checks (deadline.mjs stepCall: guard, vet), before it acts on the page; h: the element it acts
 // on. A step whose call is over (it ran out of time, and its handler is still going) does nothing more.
@@ -428,7 +431,7 @@ async function putFiles(page, l, paths, method, { mainWorld = false, until = Dat
 // The tools a token with policy "ephemeral" may call: ephemeral sessions and page tools. No profiles, keepalive,
 // meetings or handoff. recording_get only reads: a URL for the token's own recording.
 // Macros: list, get and run (the steps are held to the same set), but not save or delete.
-export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'press', 'back', 'wait_for', 'screenshot', 'sessions',
+export const EPHEMERAL_TOOLS = new Set(['session_open', 'session_close', 'navigate', 'read', 'click', 'type', 'select', 'hover', 'press', 'back', 'wait_for', 'screenshot', 'sessions',
   'macro_list', 'macro_get', 'macro_run', 'speech_settings_get', 'recording_get']);
 
 export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn = { inflight: 0 }, uploadBase = null }) {
@@ -441,7 +444,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.25.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.26.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -554,11 +557,11 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       return ok(maskText(`url: ${info.url}\ntitle: ${info.title}\nchars: ${total}${total > max ? ` (truncated to ${max})` : ''}\n\n${out.slice(0, max)}`, values));
     }));
 
-  tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target }, async (a) => run(a.session, async (s) => {
+  tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target, ...actionTimeout }, async (a) => run(a.session, async (s) => {
     const mark = capture?.mark();
-    const until = Date.now() + FIND_MS;
-    await withTarget(s.page, a, { until }, (l) => onTarget(l, (t) => clicking(s.page, t, (o) => t.click(o), until),
-      { until, ready: (h) => clicking(s.page, h, (o) => h.click({ ...o, trial: true }), until) }), { retry: true });
+    const until = Date.now() + (a.timeoutMs ?? FIND_MS);
+    await withTarget(s.page, a, { until }, (l) => onTarget(l, (t) => clicking(s.page, t, (o) => t.click(o), until, a.timeoutMs ?? FIND_MS),
+      { until, ready: (h) => clicking(s.page, h, (o) => h.click({ ...o, trial: true }), until, a.timeoutMs ?? FIND_MS) }), { retry: true });
     await s.page.waitForTimeout(1000);
     const dl = capture ? await capture.since(s.id, mark) : [];
     const w = noteWall(s, await wall(s.page));
@@ -567,19 +570,19 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
 
   const secrets = manager.secrets ?? null;
   tool('type', `Fill a field with value. submit=true presses Enter.${secrets && !ephemeral ? ' For a password or other secret, pass secret_id (from secret_create) instead of value: Bosun types it without it passing through you, then deletes it. A secret goes only into an <input type=password>, unless allow_non_password=true (an OTP or e-mail field); that field is masked in read and screenshot from then on.' : ''}`,
-    { session: str(40), ...target, value: str(10000).optional(), ...(secrets ? { secret_id: str(40).optional(), allow_non_password: z.boolean().optional() } : {}), submit: z.boolean().optional() },
+    { session: str(40), ...target, ...actionTimeout, value: str(10000).optional(), ...(secrets ? { secret_id: str(40).optional(), allow_non_password: z.boolean().optional() } : {}), submit: z.boolean().optional() },
     async (a) => {
       if ((a.value === undefined) === (a.secret_id === undefined)) throw new Error(secrets ? 'give value or secret_id (not both)' : 'give value');
       if (a.secret_id !== undefined && ephemeral) throw new Error(`type with secret_id: ${NOT_ALLOWED}`);
       return run(a.session, async (s) => {
         if (a.secret_id !== undefined) return ok(await typeSecret(s, a));
-        const until = Date.now() + FIND_MS;
+        const until = Date.now() + (a.timeoutMs ?? FIND_MS);
         await withTarget(s.page, a, { until }, (l) => onTarget(l, async (t, call) => {
           await t.fill(a.value, { timeout: left(until) });
           // A macro step looks again before it goes on (and submits): a field that became a password field while it
           // was filled is cleared; a step that ran out of time meanwhile, or a page that left the site, stops here.
           await recheck(call, t).catch(async (e) => { await t.fill('', { timeout: 5000 }).catch(() => {}); throw e; });
-          if (a.submit) { await t.press('Enter', { timeout: 15000 }); await s.page.waitForTimeout(1500); }
+          if (a.submit) { await t.press('Enter', { timeout: a.timeoutMs === undefined ? 15000 : left(until) }); await s.page.waitForTimeout(1500); }
         }, { until, ready: async (h) => { await h.waitForElementState('visible', { timeout: left(until) }); await h.waitForElementState('editable', { timeout: left(until) }); } }));
         return ok(await pageInfo(s.page));
       });
@@ -594,7 +597,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     const call = stepCall();
     secrets.find(tenant, a.secret_id); // fails before the page is touched
     if (driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
-    const until = Date.now() + FIND_MS;
+    const until = Date.now() + (a.timeoutMs ?? FIND_MS);
     return withTarget(s.page, a, { until }, async (found) => {
       const l = found.asElement ? found : await found.elementHandle({ timeout: left(until) });
       try {
@@ -638,7 +641,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         throw new Error('the secret did not end up in the field that was checked (the page moved the focus or the field); Bosun left the page (about:blank) so nothing on it can show the secret, check the site before trying again');
       }
       await markValue(page, value);
-      if (a.submit) { await recheck(call); await l.press('Enter', { timeout: 15000 }); await page.waitForTimeout(1500); }
+      if (a.submit) { await recheck(call); await l.press('Enter', { timeout: a.timeoutMs === undefined ? 15000 : left(until) }); await page.waitForTimeout(1500); }
       const info = await pageInfo(page);
       console.error(`bosun: secret ${a.secret_id} of tenant ${tenant}: typed in session ${s.id}, ${Buffer.byteLength(value)} bytes`);
       return { ...info, url: hide(info.url), title: hide(info.title), secret: 'typed and deleted' };
@@ -649,8 +652,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     }
   }
 
-  tool('select', 'Choose an option in a <select>.', { session: str(40), ...target, value: str(1000) }, async (a) => run(a.session, async (s) => {
-    const until = Date.now() + FIND_MS;
+  tool('select', 'Choose an option in a <select>.', { session: str(40), ...target, ...actionTimeout, value: str(1000) }, async (a) => run(a.session, async (s) => {
+    const until = Date.now() + (a.timeoutMs ?? FIND_MS);
     const cc = stepCall() ?? currentCall();
     // A hidden <select> (one a custom dropdown stands in for) takes the option all the same, once it is enabled. Looked
     // at before a macro step's last checks (ready), so nothing but the selection comes after them.
@@ -670,6 +673,14 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     }, { until, ready: async (h) => { await h.waitForElementState('enabled', { timeout: left(until) }); await probe(h); } }));
     return ok(await pageInfo(s.page));
   }));
+
+  tool('hover', 'Move the pointer over an element (role+name, selector or text, with nth/after/before). timeoutMs: 100–60000.',
+    { session: str(40), ...target, ...actionTimeout }, async (a) => run(a.session, async (s) => {
+      const until = Date.now() + (a.timeoutMs ?? FIND_MS);
+      await withTarget(s.page, a, { until }, (l) => onTarget(l, (h) => h.hover({ timeout: left(until) }),
+        { until, ready: (h) => h.hover({ trial: true, timeout: left(until) }) }), { retry: true });
+      return ok(await pageInfo(s.page));
+    }));
 
   tool('press', 'Press a key (Enter, Escape, PageDown, …).', { session: str(40), key: str(50) }, async (a) => run(a.session, async (s) => {
     await s.page.keyboard.press(a.key);
@@ -859,7 +870,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const meetings = manager.meetings;
   if (meetings) {
     const mid = { meeting_id: z.string().max(20) };
-    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom may turn a guest away). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. announce: "chat" (default) posts to everyone; where the host allows chat with the host only, to the host instead; if neither works it records anyway and says so (meeting_status announce.sent_to "failed", a bosun:meeting-announce event). "host" posts to the host only. "none" posts nothing and records without any announcement: use it only when the meeting owner told you so; you are then responsible for everyone knowing they are recorded. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or everyone else has left (after alone_leave_sec, default 30; 2 min while nobody else has joined yet); then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. live_transcript=true: the audio is also transcribed as it is spoken (ElevenLabs realtime; starts and stops with the recording, under the same announcement, which then says so; an opt-out stops both), as bosun:meeting-transcript events and meeting_transcript. record_video=true also captures this meeting page (slides, screen shares, demos) in the same WebM file with audio; video_fps=2–5 (default 2), per join only. Otherwise (the notetaker mode, no ElevenLabs key needed, the microphone is never unmuted) transcription is up to you: after the meeting call recording_get for the audio file. Once in, you can speak (meeting_speak), mute (meeting_mute) and raise a hand (meeting_raise_hand): when to do so is your call. Where your host grants MCPL channels, the meeting is also a channel bosun:meeting:<id> once the announcement is out: live transcript finals arrive on it (with speaker when the page shows who speaks, and addressed: whether they name you, see name_aliases), and text you publish to it (channel_publish) is spoken at once, sentence by sentence (speech settings: meeting_channel, transcript_events, agent_partials, ack_on_final). dry_run=true only checks the lobby (nothing is joined).',
+    tool('meeting_join', 'Join a Google Meet or Zoom meeting as a notetaker: a Meet as an unauthenticated guest or with profile (a Bosun profile signed in to Google: the account name is used, name is ignored); a Zoom meeting (zoom.us/j/<id>?pwd=…, in Zoom\'s web client) with profile signed in to Zoom (Zoom may turn a guest away). Mic and camera off; asks to be let in and waits (up to max_wait_admit_min) for admission. Once in, it posts announce_text in the chat (default: an English/German notice that audio is recorded and how to object), THEN records the meeting audio to a file. announce: "chat" (default) posts to everyone; where the host allows chat with the host only, to the host instead; if neither works it records anyway and says so (meeting_status announce.sent_to "failed", a bosun:meeting-announce event). "host" posts to the host only. "none" posts nothing and records without any announcement: use it only when the meeting owner told you so; you are then responsible for everyone knowing they are recorded. Every chat message becomes a bosun:meeting-chat event; a clear "please don\'t record" (EN/DE/UK/RU/SK) stops and deletes the recording at once (bosun:meeting-optout) and leaves (leave_on_optout=false: stay, unrecorded). Leaves by itself when the meeting ends, the bot is removed, or everyone else has left (after alone_leave_sec, default 30; 2 min while nobody else has joined yet); then bosun:meeting-ended carries the recording. Returns once the join request is out: poll meeting_status or wait for events. live_transcript=true: the audio is also transcribed as it is spoken (ElevenLabs realtime; starts and stops with the recording, under the same announcement, which then says so; an opt-out stops both), as bosun:meeting-transcript events and meeting_transcript. record_video=true also captures this meeting page (slides, screen shares, demos) as a separate WebM alongside the unchanged Ogg audio and speaker timeline (three artifacts); video_fps=2–5 (default 2), per join only. Otherwise (the notetaker mode, no ElevenLabs key needed, the microphone is never unmuted) transcription is up to you: after the meeting call recording_get for the audio file. Once in, you can speak (meeting_speak), mute (meeting_mute) and raise a hand (meeting_raise_hand): when to do so is your call. Where your host grants MCPL channels, the meeting is also a channel bosun:meeting:<id> once the announcement is out: live transcript finals arrive on it (with speaker when the page shows who speaks, and addressed: whether they name you, see name_aliases), and text you publish to it (channel_publish) is spoken at once, sentence by sentence (speech settings: meeting_channel, transcript_events, agent_partials, ack_on_final). dry_run=true only checks the lobby (nothing is joined).',
       { url: z.string().max(2048).url().describe('https://meet.google.com/abc-defg-hij or https://zoom.us/j/<id>?pwd=… (any *.zoom.us, /w/ and /wc/ links too)'), name: str(60).optional().describe('display name for a guest (default "Glassy (notetaker)"); a signed-in profile joins under the account name'),
         announce_text: str(1000).optional(),
         announce: z.enum(ANNOUNCE_MODES).optional().describe('who is told about the recording in the chat before it starts: "chat" (default: everyone, else the host), "host" (the host only), "none" (nobody; only when the meeting owner told you so). Opt-outs in the chat are heard in every mode'),
@@ -868,7 +879,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         engine: z.enum(cfg.engines).optional().describe('chromium (default) or patchright; camoufox is not supported for meetings'),
         leave_on_optout: z.boolean().optional(),
         alone_leave_sec: z.number().int().min(5).max(3600).optional().describe('leave this long after everyone else left (default 30); before anyone else has joined, Bosun waits 2 min'),
-        record_video: z.boolean().optional().describe('also record the meeting page as video with audio in one WebM file (default false; this join only)'),
+        record_video: z.boolean().optional().describe('also save a separate WebM video alongside the Ogg audio and speakers.json (three artifacts; default false; this join only)'),
         video_fps: z.number().int().min(2).max(5).optional().describe('video frames per second, 2–5 (default 2; with record_video)'),
         live_transcript: z.boolean().optional().describe(`transcribe the meeting live (default false): bosun:meeting-transcript events {seq, start_s, end_s, text, final, lang} as people speak (only to connections there at the time), all finals with meeting_transcript. At most ${cfg.liveTranscriptDailyMin ?? 180} min a day`),
         transcript_partials: z.boolean().optional().describe('with live_transcript: also send partial text while someone is still speaking (default true; at most 2 a second, final false); false sends finals only'),
@@ -924,13 +935,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       async (a) => ok(await meetings.mute(tenant, a.meeting_id, a.on)));
     tool('meeting_raise_hand', 'Raise (on=true) or lower (on=false) Bosun\'s hand in the meeting (Meet, Zoom).', { ...mid, on: z.boolean() },
       async (a) => ok(await meetings.raiseHand(tenant, a.meeting_id, a.on)));
-    tool('meeting_stop_recording', 'Stop recording (delete=true, default: also delete the audio and speaker timeline); a live transcript stops too (delete: its text is forgotten). The meeting goes on unrecorded.', { ...mid, delete: z.boolean().optional() },
+    tool('meeting_stop_recording', 'Stop recording (delete=true, default: also delete all three artifacts (Ogg audio, optional WebM video and speaker timeline)); a live transcript stops too (delete: its text is forgotten). The meeting goes on unrecorded.', { ...mid, delete: z.boolean().optional() },
       async (a) => ok(await meetings.stopRecordingTool(tenant, a.meeting_id, a.delete ?? true)));
     tool('meeting_leave', 'Leave the meeting; the recording is finished and kept (bosun:meeting-ended).', mid, async (a) => ok(await meetings.leave(tenant, a.meeting_id)));
-    tool('recording_get', `Fetch the recording of one of your meetings (Ogg/Opus audio, or WebM VP9/Opus with record_video): returns a one-time GET URL (valid ${Math.round(cfg.downloadUrlTtlMs / 60000)} min, this token only) and a ready curl -o line, plus speakers (inline timeline JSON up to 32 KiB, otherwise a separate one-time JSON URL; null for older recordings). Use its audio-relative intervals to label an offline transcript. Only once the recording is finished (the meeting ended, or meeting_stop_recording with delete=false) and not deleted. The file is kept (deleted after ${cfg.recordingRetentionDays ?? 30} days or with meeting_recording_delete); call recording_get again for a new URL.`,
+    tool('recording_get', `Fetch the recording of one of your meetings (Ogg/Opus audio, plus a separate WebM video and speaker timeline with record_video: three artifacts): returns a one-time GET URL (valid ${Math.round(cfg.downloadUrlTtlMs / 60000)} min, this token only) and a ready curl -o line, plus speakers (inline timeline JSON up to 32 KiB, otherwise a separate one-time JSON URL; null for older recordings). Use its audio-relative intervals to label an offline transcript. Only once the recording is finished (the meeting ended, or meeting_stop_recording with delete=false) and not deleted. The file is kept (deleted after ${cfg.recordingRetentionDays ?? 30} days or with meeting_recording_delete); call recording_get again for a new URL.`,
       mid, async (a) => {
         const r = meetings.recordingGet(tenant, a.meeting_id);
-        const meta = { meeting_id: a.meeting_id, filename: path.basename(r.file), size: r.bytes, mime: r.file.endsWith('.webm') ? 'video/webm' : 'audio/ogg', ...(r.seconds ? { seconds: r.seconds } : {}) };
+        const meta = { meeting_id: a.meeting_id, filename: path.basename(r.file), size: r.bytes, mime: 'audio/ogg', ...(r.seconds ? { seconds: r.seconds } : {}) };
         const speakerMeta = r.speakers;
         let speakers = speakerMeta?.data ?? null;
         if (speakerMeta?.secret) {
@@ -941,16 +952,24 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         }
         meta.speakers = speakers;
         if (r.speakers_error) meta.speakers_error = r.speakers_error;
+        if (r.video) {
+          const where = `/recording/${a.meeting_id}/video?t=${r.video.secret}`;
+          const url = uploadBase ? `${uploadBase}${where}` : where;
+          const filename = path.basename(r.video.file);
+          meta.video = { filename, size: r.video.bytes, mime: 'video/webm',
+            ...(cfg.ws ? { url, get_url: url, curl: `curl -sS --fail-with-body -o ${shq(filename)} ${shq(uploadBase ? url : `http://<mcp host:port>${where}`)}` }
+              : { path: r.video.file }) };
+        }
         if (!cfg.ws) return ok({ ...meta, path: r.file, note: 'no MCP port (stdio): read the files at path' });
         const where = `/recording/${a.meeting_id}?t=${r.secret}`;
         const url = uploadBase ? `${uploadBase}${where}` : null;
         return ok({
-          ...meta, get_url: url ?? where, ...(url ? {} : { get_url_note: 'GET from the host:port of your MCP URL, http, with this path' }),
+          ...meta, url: url ?? where, get_url: url ?? where, ...(url ? {} : { get_url_note: 'GET from the host:port of your MCP URL, http, with this path' }),
           curl: `curl -sS --fail-with-body -o ${shq(meta.filename)} ${shq(url ?? `http://<mcp host:port>${where}`)}`,
           valid_min: Math.round(cfg.downloadUrlTtlMs / 60000), next: 'GET it once (curl), then transcribe it; call recording_get again for another URL',
         });
       });
-    tool('meeting_recording_delete', `Delete a meeting's recording, speaker timeline and live transcript (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
+    tool('meeting_recording_delete', `Delete a meeting's Ogg recording, optional WebM video, speaker timeline and live transcript (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
       async (a) => ok(await meetings.deleteRecording(tenant, a.meeting_id)));
   }
 
@@ -981,6 +1000,11 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         allowed: (name) => (name === 'assert' || handlers.has(name) ? null : `${name} is not available for this token`),
         limitOf: (name) => cfg.toolTimeouts?.get(name === 'assert' ? 'wait_for' : name) ?? null,
         step,
+        exists: (target, limitMs, hooks) => withDeadline('read', limitMs, () => run(session, async (s) => {
+          const found = await locate(s.page, target, { instant: true });
+          try { return !!found; }
+          finally { if (found?.asElement) await found.dispose().catch(() => {}); }
+        }), hooks).catch(clean),
         url: () => page().url(),
         // The first main-frame navigation off the site while a step runs (a redirect that comes back is still seen).
         watch(isOff) {
@@ -999,9 +1023,16 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
               await sleep(200);
             }
           }
+          let matched = null;
           if (c.selector !== undefined) await s.page.locator(c.selector).filter({ visible: true }).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`no visible element matches selector ${c.selector}`));
           if (c.text !== undefined) await s.page.getByText(c.text).filter({ visible: true }).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`text "${c.text}" is not visible`));
-          return true;
+          if (c.text !== undefined || c.selector !== undefined) {
+            const l = c.text !== undefined ? s.page.getByText(c.text) : s.page.locator(c.selector);
+            // Use read's masking path for any matched text returned to the caller.
+            const values = await sensitiveValues(s.page);
+            matched = maskText(await l.filter({ visible: true }).first().innerText({ timeout: t }), values);
+          }
+          return matched;
         }), hooks).catch(clean),
         // Where the run stopped: URL, title and the start of the a11y snapshot (masked as read masks it), and a
         // screenshot (masked as screenshot masks it).
@@ -1029,21 +1060,21 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       };
     };
 
-    const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {target} where target is role+name | selector | text (no ref), optionally with nth (which visible match, -1 = last) and after / before (count from a text on the page: {"role": "button", "after": "Share"} is the first button after Share; for icon buttons without a name); type {target, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. Any string may use {{param}}; a step that uses a param not given is skipped.`;
+    const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {target, timeoutMs?} where target is role+name | selector | text (no ref), optionally with nth (which visible match, -1 = last) and after / before (count from a text on the page: {"role": "button", "after": "Share"} is the first button after Share; for icon buttons without a name); hover {target, timeoutMs?}; type {target, timeoutMs?, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value, timeoutMs?}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. if_exists {target: {role+name | selector | text, nth?, after?, before?}, then: [steps], else?: [steps]} checks presence instantly; repeat {while: {target fields}, max: 1–100 (required), steps: [steps]} checks instantly each iteration and reports count/max_hit. Nesting depth <=3; at most 100 steps including nested steps; action timeoutMs 100–60000, default unchanged. read returns reads [{step, as?, text}]; assert returns matched text in its step result. Any string may use {{param}}; a step that uses a param not given is skipped.`;
     tool('macro_save', `Save a multi-step flow on a site as a macro to rerun with macro_run (saving an existing name makes a new version; the last 20 are kept). site: the hosts it may run on (e.g. ["web.plaud.ai", "*.plaud.ai"]); a page outside them stops the run. params: {name: {type: string|number|file_id|secret_id, required?, default?, description?}}; a secret or file goes in only as a {{param}} of type secret_id / file_id, never stored. ${stepsHelp} A step whose text says pay, buy, purchase, submit/place order, checkout or delete account is refused unless confirm_risky: true.`,
       { name: str(64).describe('lowercase letters, digits, . _ -'), description: str(2000).optional(), site: z.array(str(300)).min(1).max(MAX_SITES),
         params: z.record(z.string().max(40), z.record(z.string(), z.unknown())).optional(), steps: z.array(z.record(z.string(), z.unknown())).min(1).max(MAX_STEPS),
         confirm_risky: z.boolean().optional().describe('allow steps that may pay, buy, order, check out or delete an account'), created_by: str(100).optional().describe('who saved it (default: the tenant)') },
       async (a) => {
         const v = macros.save(tenant, a, { createdBy: a.created_by || tenant });
-        return ok({ saved: v.name, version: v.version, steps: v.steps.length, site: v.site, params: v.params, confirm_risky: v.confirm_risky, ...(v.risky_steps.length ? { risky_steps: v.risky_steps } : {}), next: `macro_run { name: "${v.name}", session, args }` });
+        return ok({ saved: v.name, version: v.version, steps: flattenSteps(v.steps).length, site: v.site, params: v.params, confirm_risky: v.confirm_risky, ...(v.risky_steps.length ? { risky_steps: v.risky_steps } : {}), next: `macro_run { name: "${v.name}", session, args }` });
       });
     tool('macro_list', 'List your macros (latest version of each): name, version, description, site, params (type, ? = optional), number of steps, confirm_risky and the risky steps.', {},
       async () => ok(macros.list(tenant)));
     tool('macro_get', 'A macro in full (steps and all), the latest version or version.', { name: str(64), version: z.number().int().min(1).optional() },
       async (a) => ok(macros.get(tenant, a.name, a.version)));
     tool('macro_delete', 'Delete a macro with all its versions.', { name: str(64) }, async (a) => ok(macros.delete(tenant, a.name)));
-    tool('macro_run', `Run a macro in session, step by step; each step works like the tool of that name and has its deadline, the whole run at most timeout_sec (default ${RUN_DEFAULT_SEC}, up to ${RUN_MAX_SEC}; raise your MCP client's request timeout above that, or send a progressToken: Bosun reports progress after every step). Returns per-step status, reads (the read steps' text), downloads (download_id to fetch with download_get) and screenshots (images). On failure: the step, its error, the URL, the start of the page's a11y snapshot and a screenshot, so you can fix the macro and save a new version. A page outside the macro's site stops the run. dry_run: check args and show the steps as they would run, without touching the page.`,
+    tool('macro_run', `Run a macro in session, step by step; each step works like the tool of that name and has its deadline, the whole run at most timeout_sec (default ${RUN_DEFAULT_SEC}, up to ${RUN_MAX_SEC}; raise your MCP client's request timeout above that, or send a progressToken: Bosun reports progress after every step). Returns per-step status, reads (read text with its 1-based step index and optional as), assert matched text in steps[].text, branches and loop count/max_hit, downloads (download_id to fetch with download_get) and screenshots (images). On failure: the step, its error, the URL, the start of the page's a11y snapshot and a screenshot, so you can fix the macro and save a new version. A page outside the macro's site stops the run. dry_run: check args and show the steps as they would run, without touching the page.`,
       { name: str(64), session: str(40).optional().describe('required unless dry_run'), args: z.record(z.string().max(40), z.union([z.string().max(10000), z.number()])).optional(),
         version: z.number().int().min(1).optional(), dry_run: z.boolean().optional(), timeout_sec: z.number().int().min(10).max(RUN_MAX_SEC).optional() },
       async (a, extra) => {

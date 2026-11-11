@@ -211,7 +211,8 @@ export const pulseAudio = {
     const pulse = await startPulse();
     return {
       browserEnv: pulse.browserEnv,
-      record: (file, video) => video ? startPageVideo({ ...video, file, makeRecorder: () => startRecorder(pulse, file, { fps: video.fps }) }) : startRecorder(pulse, file),
+      record: (file) => startRecorder(pulse, file),
+      recordVideo: (file, video) => startPageVideo({ ...video, file, makeRecorder: () => startRecorder(pulse, file, { fps: video.fps }) }),
       capture: () => startCapture(pulse), play: (input) => startPlayer(pulse, input),
       close: pulse.close,
     };

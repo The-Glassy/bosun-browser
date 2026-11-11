@@ -533,17 +533,27 @@ note? }`.
 | tool | arguments |
 |---|---|
 | `navigate` | `url`, `wait?` |
-| `click` | `role` (+`name`), `selector` or `text`, optionally `nth`, `after`, `before` (see [Finding elements](#finding-elements)) — no `ref`: refs change with every `read` |
-| `type` | the element, `value` or `secret_id: "{{param}}"`, `submit?`, `allow_non_password?` |
-| `select` | the element, `value` |
+| `click` | `role` (+`name`), `selector` or `text`, optionally `nth`, `after`, `before` (see [Finding elements](#finding-elements)), `timeoutMs?` — no `ref`: refs change with every `read` |
+| `hover` | the same target fields as `click`, `timeoutMs?` |
+| `type` | the element, `timeoutMs?`, `value` or `secret_id: "{{param}}"`, `submit?`, `allow_non_password?` |
+| `select` | the element, `value`, `timeoutMs?` |
 | `press` | `key` |
 | `wait_for` | `text` or `selector`, `timeoutMs?` |
 | `upload` | the element, `file_id: "{{param}}"` or `files`, `method?` |
 | `download_wait` | `timeoutMs?` |
 | `read` | `mode?`, `selector?`, `maxChars?`, `as?` (a name for the text in `reads`) |
 | `screenshot` | the element?, `fullPage?` |
+| `if_exists` | `target: {role (+name), selector or text, nth?, after?, before?}`, `then: [steps]`, `else?: [steps]` |
+| `repeat` | `while: {target fields}`, required `max` (1–100), `steps: [steps]` |
 | `assert` | `text`, `selector` and/or `url_contains`, `timeoutMs?` (default 5000): fails the step unless all hold |
 
+- `click`, `type`, `select` and `hover` accept `timeoutMs` from **100–60000**; omitted, their existing 15 s
+  target/action wait stays unchanged. The step's tool deadline and remaining run time still cap the wait.
+- `if_exists` checks for a visible matching target **instantly**, without waiting; it runs `then` or `else`.
+  `repeat` checks instantly before each iteration, stops when the target is absent or after `max` iterations,
+  and reports `count` and `max_hit` (true when it ran `max` iterations). Nested steps use the same validation,
+  parameter rules, site guards and risky-step checks. At most **three nested control steps** and **100 total
+  saved steps**, including both branches and loop bodies. Loops remain subject to the run timeout and cancellation.
 - Any string may hold `{{param}}`. A step that names a param the run wasn't given (one that is not required) is
   skipped, so an optional param switches its steps on and off.
 - `optional: true`: the step's failure is noted (`failed_optional`) and the run goes on.
@@ -561,7 +571,10 @@ note? }`.
   which a client with `resetTimeoutOnProgress` counts as a sign of life. A cancelled request stops the run before
   its next step.
 - The answer: `ok`, every step's `status` (`ok`, `failed_optional`, `skipped`, `failed`, `not_run`) and time,
-  `reads` (the `read` steps' text), `downloads` (fetch them with `download_get`) and the `screenshot` steps' images.
+  `reads` (`{step, as?, text}` for each read), assert matched text in `steps[].text` when a selector or text matched,
+  `downloads` (fetch them with `download_get`) and the `screenshot` steps' images.
+  Step indices are 1-based in pre-order (control, then/else or loop body); repeated executions reuse that index
+  and include `iterations` (outer to inner iteration numbers). Unentered branches are skipped.
   A `download_wait` step also takes a download that the `click` before it already reported.
 - On failure (`isError`): `failure { step, tool, error, url, title, page (the start of the a11y snapshot, masked as
   in read), screenshot (attached as an image, masked) }`, to fix the macro and save a new version.
@@ -571,7 +584,7 @@ note? }`.
 
 - **Site.** A `navigate` to a host outside `site` is refused before the first step runs (also when an arg made the
   URL). The page is checked again in the session's queue right before each page operation of a step (another call
-  on the session may have moved it), and once more right before `click`, `type`, `select` or `upload` acts on its
+  on the session may have moved it), and once more right before `click`, `type`, `select`, `hover` or `upload` acts on its
   element (and before `upload` fills a file chooser or an input of its own),
   which must itself be in a document on the site (not in a frame from elsewhere). Any navigation of the tab outside
   the site while a step runs, a redirect that comes back included, stops the run after that step, even an
@@ -936,18 +949,20 @@ The agent gets one with `recording_get` (see *Mode 1*), after the meeting ended 
 A deletion leaves an empty marker `<meeting_id>.deleted` beside it, for the same retention period.
 Chat text is kept only in memory, for the last 50 meetings.
 
-### Meeting page video (0.25.0)
+### Meeting page video (0.26.0)
 
 ```jsonc
 meeting_join({ "url": "https://meet.google.com/abc-defg-hij", "record_video": true, "video_fps": 2 })
 // After meeting_leave (or meeting_stop_recording with delete: false):
-recording_get({ "meeting_id": "m1a2b3c4d5e6" }) // filename: m1a2b3c4d5e6.webm, mime: video/webm
+recording_get({ "meeting_id": "m1a2b3c4d5e6" }) // audio: .ogg; video: .webm; speakers: .speakers.json
 ```
 
 `record_video` is a boolean, **false by default**, and `video_fps` is an integer **2–5, default 2**.
 Both belong to this join only; neither is a tenant speech setting. It works with either notetaker or participant
-mode and with Chromium or Patchright. The recording is **one WebM file** containing VP9 video and the existing
-mono Opus audio track (16 kHz input, 24 kbps). ffmpeg uses VP9 realtime, CPU-used 8, no lookahead, two encoder
+mode and with Chromium or Patchright. It saves **three artifacts**: the unchanged `<id>.ogg` Ogg/Opus audio
+(16 kHz mono input, 24 kbps), a separate `<id>.webm` VP9 video (with its own audio track), and
+`<id>.speakers.json`. Audio and video use independent ffmpeg processes reading the same private PulseAudio
+monitor. The Ogg recorder always owns the speaker timeline zero, exactly as without video. Video uses VP9 realtime, CPU-used 8, no lookahead, two encoder
 threads and CRF 36. The page is scaled proportionally to fit **1280×720**, with black padding.
 
 Bosun captures **only the meeting page's viewport** through CDP `Page.startScreencast`. The headful browsers inherit
@@ -961,24 +976,27 @@ The default English/German announcement explicitly mentions audio and video. As 
 until the announcement step finishes and queued chat objections have been checked. The existing `announce: "host"`,
 `"none"` and failed-announcement behavior still applies. If you supply `announce_text`, mention video in it too.
 Opt-out, `meeting_stop_recording` with `delete: true`, `meeting_recording_delete` and the 30-day retention sweep
-remove the combined file and speaker timeline. `delete: false` keeps the combined file. `recording_get` returns
-its `.webm` name, `video/webm` MIME and the same one-time URL/curl scheme; older `.ogg` recordings still work.
-`meeting_status.video` is `{on, fps, bytes}`: `on` means currently recording video, `bytes` is the **combined
-file size**, including audio (zero after deletion). The sidecar remains `<meeting_id>.speakers.json`, with the
-same PulseAudio input timestamp as audio zero; video starts on that clock too, within a frame's sampling interval
-and Opus codec delay.
+remove all three files. `delete: false` keeps all three. `recording_get` keeps the audio fields (`url`/`get_url`,
+`filename: <id>.ogg`, `mime: audio/ogg`, `curl`) and `speakers`, and adds
+`video: {url, get_url, filename, size, mime: "video/webm", curl}` when a video exists. Video has an independent
+one-time, tenant-scoped download URL with the same TTL as audio. With stdio, both artifacts have local `path` fields.
+`bosun:meeting-ended.recording` includes `video: {path, bytes}`. Restart discovery finds both media files and
+the speaker sidecar. `meeting_status.recording` always refers to audio; `video` is `{on, fps, bytes, error?}`,
+where bytes is the WebM size (zero after deletion). A video error stops only video, releases its capacity slot,
+and keeps a partial WebM only when it contains readable video packets. The original audio recorder and its
+timeline continue uninterrupted. An audio failure also stops video.
 
 Video joins are refused below `MEETING_VIDEO_MIN_FREE_GB` free disk (default 2 GiB), or when
 `MEETING_VIDEO_LIMIT` slots are reserved (default 1). Slots are reserved before browser setup, including lobby
 waits, across all tenants in this Bosun process. Stopping capture releases the slot. Free space is checked again
 after admission, since a lobby wait may be long. An unavailable encoder, page capture failure or encoder falling
-more than five seconds behind is reported as a recording error; there is no automatic audio-only fallback.
+more than five seconds behind appears in `meeting_status.video.error`; audio continues recording.
 
-**Measured cost:** see [video measurement results](docs/measurements/meeting-video.json) and
+**Measured video encoder cost (the independent Ogg recorder adds its own CPU and disk use):** see [video measurement results](docs/measurements/meeting-video.json) and
 `node scripts/measure-meeting-video.mjs [static|motion] [2–5 fps] [seconds]`. On Apple M4, native ffmpeg 9.0.2,
 1280×720, 30-second samples, the measured **encoder plus Node frame controller** costs were:
 
-| Synthetic content | FPS | CPU (% of one core) | CPU seconds per hour | Combined disk MB/hour |
+| Synthetic content | FPS | CPU (% of one core) | CPU seconds per hour | WebM disk MB/hour |
 |---|---:|---:|---:|---:|
 | Static test slide | 2 | 3.7 | 133 | 24.84 |
 | Moving test pattern | 2 | 6.43 | 232 | 173.5 |
@@ -1005,7 +1023,7 @@ docker run --rm --init -e TEST_HEADFUL=1 -v "$PWD":/app -w /app bosun-meeting-te
 ### Speaker labels for a recording
 
 Every recording mode, including notetaker mode (`live_transcript: false`), keeps page active-speaker labels in
-`<meeting_id>.speakers.json`, next to the Ogg or WebM and with the same 0600 permissions, consent and retention. It is
+`<meeting_id>.speakers.json`, next to the Ogg and optional WebM and with the same 0600 permissions, consent and retention. It is
 written when recording stops or the meeting ends. Opt-out and `meeting_recording_delete` delete both files.
 `meeting_status` and `bosun:meeting-ended` include `speaker_timeline: {intervals: N}`.
 
@@ -1370,7 +1388,7 @@ BROWSER_EPHEMERAL_MAX_SESSIONS=2             # default
 With policy `ephemeral` the server enforces, not just hides:
 
 - `tools/list` shows only `session_open`, `session_close`, `navigate`, `read`, `click`, `type`, `select`, `press`,
-  `back`, `wait_for`, `screenshot`, `sessions`, `macro_list`, `macro_get` and `macro_run` (a macro's steps hold
+  `hover`, `back`, `wait_for`, `screenshot`, `sessions`, `macro_list`, `macro_get` and `macro_run` (a macro's steps hold
   to the same set; its macros are those of `BROWSER_MACRO_SOURCE`, see [Macros](#macros)). Any other tool answers `not allowed for this token`, whatever its
   arguments; its handler is never wired up for the connection.
 - `session_open` refuses `profile` ("profiles are not allowed for this token") and any engine but the default

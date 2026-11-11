@@ -25,7 +25,7 @@ export function videoUnsupported() {
 }
 
 // Returns a recorder immediately so deletion/shutdown can cancel even a CDP setup still in flight. makeRecorder
-// opens BOTH audio and video in a single ffmpeg. Its first PulseAudio PTS is also the speaker timeline's zero.
+// opens a separate video ffmpeg (optionally with its own audio track). The Ogg recorder owns timeline zero.
 export function startPageVideo({ page, fps, file, makeRecorder }) {
   let cdp, rec, latest, timer, setupTimer, err = null, closed = false, startedAt = Date.now(), sent = 0;
   let firstResolve, finishResolve, cancelResolve;
@@ -58,7 +58,7 @@ export function startPageVideo({ page, fps, file, makeRecorder }) {
     err = String(e?.message || e);
     closed = true;
     cancelResolve();
-    detach().finally(async () => { await rec?.kill(); finishResolve({ error: err }); });
+    detach().finally(async () => { await rec?.stop(); finishResolve({ error: err }); });
   };
   const pump = () => {
     if (closed || !latest || !rec) return;
@@ -111,4 +111,15 @@ export function startPageVideo({ page, fps, file, makeRecorder }) {
   };
   return { file, get startedAt() { return startedAt; }, get audioStartedAt() { return rec?.audioStartedAt ?? null; },
     exited, error: () => err || rec?.error() || null, stop: () => end(false), kill: () => end(true) };
+}
+
+// A partial video is retained only if ffprobe can read actual video packets. Never trust a nonempty header.
+export function validVideo(file) {
+  return new Promise((resolve) => {
+    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-count_packets',
+      '-show_entries', 'stream=nb_read_packets', '-of', 'json', file], { timeout: 5000 }, (e, out) => {
+      try { resolve(!e && JSON.parse(out).streams.some((s) => Number(s.nb_read_packets) > 0)); }
+      catch { resolve(false); }
+    });
+  });
 }
