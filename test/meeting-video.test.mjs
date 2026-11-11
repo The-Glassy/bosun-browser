@@ -33,14 +33,15 @@ function fixture(t, { announceGate, cfg: overrides = {} } = {}) {
     open: async () => ({ id: `s${++seq}`, page, ctx: { grantPermissions: async () => {} } }),
     run: async (_owner, _id, fn) => fn({ page }), dispose: async (s) => { s.disposed = true; },
   };
-  const audio = { unsupported: async () => null, open: async () => ({ close: async () => {}, record(file, video) {
+  const audio = { unsupported: async () => null, open: async () => ({ close: async () => {}, record: (file) => makeRecorder(file), recordVideo: (file, video) => makeRecorder(file, video) }) };
+  function makeRecorder(file, video) {
     log.push(['record', video]);
     fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, 'fake media', { mode: 0o600 });
     const done = deferred();
     const rec = { startedAt: Date.now(), audioStartedAt: Date.now(), exited: done.p, error: () => null,
-      stop: async () => done.resolve(), kill: async () => { rec.killed = true; done.resolve(); }, video };
+      valid: async () => true, fail: () => done.resolve(), stop: async () => done.resolve(), kill: async () => { rec.killed = true; done.resolve(); }, video };
     recorders.push(rec); return rec;
-  } }) };
+  }
   let free = 100;
   const meetings = new Meetings({ cfg, manager, audio, platformFor: () => platform, pollMs: 10,
     diskStat: () => ({ bavail: free * 1024 ** 3, bsize: 1 }) });
@@ -61,8 +62,8 @@ async function mcp(t, f) {
   t.after(async () => { await client.close(); await server.close(); });
   return client;
 }
-async function get(links, id, secret, tenant = null) {
-  const req = { method: 'GET', url: `/recording/${id}?t=${secret}`, resume() {} };
+async function get(links, id, secret, tenant = null, kind = '') {
+  const req = { method: 'GET', url: `/recording/${id}${kind ? `/${kind}` : ''}?t=${secret}`, resume() {} };
   const chunks = [];
   const res = new Writable({ write(chunk, _enc, done) { chunks.push(chunk); done(); } });
   res.setTimeout = () => {};
@@ -99,11 +100,11 @@ test('no recorder or frames before both announcements finish; page and fps passe
   await until(() => f.log.length > 0);
   assert.equal(m.state, 'admitted'); assert.equal(f.recorders.length, 0); assert.equal(m.file, null);
   gate.resolve(); await until(() => !!m.rec);
-  assert.deepEqual(f.log.map((x) => x[0]), ['announce-start', 'announce-end', 'announce-start', 'announce-end', 'record']);
-  assert.deepEqual(f.recorders[0].video, { page: f.page, fps: 4 });
+  assert.deepEqual(f.log.map((x) => x[0]), ['announce-start', 'announce-end', 'announce-start', 'announce-end', 'record', 'record']);
+  assert.deepEqual(f.recorders[1].video, { page: f.page, fps: 4 });
   assert.match(f.log[0][1], /audio and video of this meeting page/);
   assert.match(announcement('Notes', null, { video: true, live: true })[1], /Ton und Video/);
-  assert.ok(m.file.endsWith('.webm')); assert.equal(fs.statSync(m.file).mode & 0o777, 0o600);
+  assert.ok(m.file.endsWith('.ogg')); assert.ok(m.videoFile.endsWith('.webm')); assert.notEqual(m.rec, m.videoRec); assert.equal(fs.statSync(m.file).mode & 0o777, 0o600);
   assert.deepEqual(f.meetings.view(m).video, { on: true, fps: 4, bytes: 10 });
 });
 
@@ -154,24 +155,33 @@ test('WebM download uses video metadata and one-time tenant-scoped URL; sidecar 
   const result = await c.callTool({ name: 'recording_get', arguments: { meeting_id: m.id } });
   assert.ok(!result.isError, JSON.stringify(result));
   const meta = JSON.parse(result.content[0].text);
-  assert.equal(meta.mime, 'video/webm'); assert.equal(meta.filename, `${m.id}.webm`);
-  assert.match(meta.curl, /\.webm/); assert.equal(meta.speakers.meeting_id, m.id);
+  assert.equal(meta.mime, 'audio/ogg'); assert.equal(meta.filename, `${m.id}.ogg`);
+  assert.equal(meta.video.mime, 'video/webm'); assert.equal(meta.video.filename, `${m.id}.webm`);
+  assert.match(meta.video.curl, /\.webm/);
+  assert.match(meta.curl, /\.ogg/); assert.equal(meta.speakers.meeting_id, m.id);
   const secret = new URL(meta.get_url).searchParams.get('t');
   assert.equal((await get(f.meetings.links, m.id, secret, 'bob')).status, 403);
   const fetched = await get(f.meetings.links, m.id, secret);
-  assert.equal(fetched.status, 200); assert.equal(fetched.headers['content-type'], 'video/webm');
-  assert.match(fetched.headers['content-disposition'], /\.webm/);
+  assert.equal(fetched.status, 200); assert.equal(fetched.headers['content-type'], 'audio/ogg');
+  assert.match(fetched.headers['content-disposition'], /\.ogg/);
   assert.equal((await get(f.meetings.links, m.id, secret)).status, 404);
+  const videoSecret = new URL(meta.video.url).searchParams.get('t');
+  assert.equal((await get(f.meetings.links, m.id, videoSecret, 'bob', 'video')).status, 403);
+  const videoFetched = await get(f.meetings.links, m.id, videoSecret, null, 'video');
+  assert.equal(videoFetched.status, 200); assert.equal(videoFetched.headers['content-type'], 'video/webm');
+  assert.equal((await get(f.meetings.links, m.id, videoSecret, null, 'video')).status, 404);
+  const videoFile = m.videoFile;
   await f.meetings.finish(m, 'meeting-ended'); f.meetings.ended.clear();
   fs.utimesSync(m.file, new Date(0), new Date(0));
   assert.equal(f.meetings.recordingGet('alice', m.id).file, m.file);
-  await f.meetings.deleteRecording('alice', m.id);
-  assert.equal(fs.existsSync(m.file), false); assert.equal(fs.existsSync(speakerFile(m.file)), false);
+  assert.equal(f.meetings.recordingGet('alice', m.id).video.file, videoFile);
+  const audioFile = m.file; await f.meetings.deleteRecording('alice', m.id);
+  assert.equal(fs.existsSync(videoFile), false); assert.equal(fs.existsSync(audioFile), false); assert.equal(fs.existsSync(speakerFile(m.file)), false);
 });
 
 test('opt-out, stop(delete), recording_delete, shutdown and deletion during a graceful stop', async (t) => {
   for (const action of ['optout', 'stop', 'delete', 'shutdown', 'race']) {
-    const f = fixture(t), m = await recording(f), file = m.file;
+    const f = fixture(t), m = await recording(f), file = m.file, videoFile = m.videoFile;
     fs.writeFileSync(speakerFile(file), '{}');
     const url = f.meetings.links.issue('alice', m.id);
     if (action === 'optout') await f.meetings.optOut(m, { sender: 'Alice', text: 'stop recording' });
@@ -185,23 +195,24 @@ test('opt-out, stop(delete), recording_delete, shutdown and deletion during a gr
       await f.meetings.deleteRecording('alice', m.id); gate.resolve(); await stopping;
     }
     assert.equal(m.rec, null); assert.equal(m.deleted, true); assert.equal(m.videoReserved, false);
-    assert.equal(fs.existsSync(file), false); assert.equal(fs.existsSync(speakerFile(file)), false);
+    assert.equal(fs.existsSync(file), false); assert.equal(fs.existsSync(videoFile), false); assert.equal(fs.existsSync(speakerFile(file)), false);
     assert.equal((await get(f.meetings.links, m.id, url)).status, 404);
     assert.throws(() => f.meetings.recordingGet('alice', m.id), /deleted/);
     // A late encoder reopening either extension cannot resurrect deleted content after restart.
-    fs.writeFileSync(file, 'late'); fs.writeFileSync(file.replace('.webm', '.ogg'), 'late'); fs.writeFileSync(speakerFile(file), '{}');
+    fs.writeFileSync(file, 'late'); fs.writeFileSync(videoFile, 'late'); fs.writeFileSync(speakerFile(file), '{}');
     f.meetings.sweep(); assert.equal(fs.existsSync(file), false);
-    assert.equal(fs.existsSync(file.replace('.webm', '.ogg')), false); assert.equal(fs.existsSync(speakerFile(file)), false);
+    assert.equal(fs.existsSync(videoFile), false); assert.equal(fs.existsSync(speakerFile(file)), false);
   }
 });
 
 test('30-day cleanup removes WebM and sidecar, keeps active files and sidecars, revokes links', async (t) => {
-  const f = fixture(t), m = await recording(f), file = m.file;
+  const f = fixture(t), m = await recording(f), file = m.file, videoFile = m.videoFile;
   fs.writeFileSync(speakerFile(file), '{}'); fs.utimesSync(file, new Date(0), new Date(0));
   assert.deepEqual(f.meetings.sweep(), []); assert.ok(fs.existsSync(speakerFile(file)));
   await f.meetings.stopRecordingTool('alice', m.id, false);
   const link = f.meetings.recordingGet('alice', m.id).secret;
-  assert.deepEqual(f.meetings.sweep(), [file]);
+  assert.deepEqual(f.meetings.sweep().sort(), [file, videoFile].sort());
+  assert.equal(fs.existsSync(videoFile), false);
   assert.equal(fs.existsSync(speakerFile(file)), false); assert.equal((await get(f.meetings.links, m.id, link)).status, 404);
   fs.writeFileSync(speakerFile(file), '{}'); sweepRecordings(f.meetings.dir, 30);
   assert.equal(fs.existsSync(speakerFile(file)), false);
@@ -234,34 +245,30 @@ test('delete during CDP acquisition starts no screencast/encoder; page failures 
   const broken = startPageVideo({ page: { context: () => ({ newCDPSession: async () => { throw new Error('page closed'); } }) }, fps: 2 });
   await broken.exited; assert.match(broken.error(), /page closed/);
   const g = fakePage(), now = Date.now(), done = deferred();
-  const slow = startPageVideo({ page: g.page, fps: 2, makeRecorder: () => ({ frames: new PassThrough(), startedAt: now, audioStartedAt: now - 6000, exited: done.p, kill: async () => done.resolve() }) });
+  const slow = startPageVideo({ page: g.page, fps: 2, makeRecorder: () => ({ frames: new PassThrough(), startedAt: now, audioStartedAt: now - 6000, exited: done.p, stop: async () => done.resolve(), kill: async () => done.resolve() }) });
   await slow.exited; assert.match(slow.error(), /5 seconds behind/);
 });
 
-test('video failure falls back to audio-only and keeps recording', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bosun-vfb-'));
-  const records = [];
-  let resolveExit;
-  const rig = { record: (file, video) => {
-    const exited = video ? new Promise((r) => { resolveExit = r; }) : new Promise(() => {});
-    const rec = { file, startedAt: Date.now(), audioStartedAt: Date.now(), exited, error: () => (video ? 'meeting page supplied no video frame' : null), stop: async () => null, kill: async () => null };
-    records.push({ file, video: !!video });
-    fs.writeFileSync(file, 'x');
-    return rec;
-  } };
-  const mt = Object.create(Meetings.prototype);
-  Object.assign(mt, { dir, cfg: { meetingVideoLimit: 1, meetingVideoMinFreeGb: 0 }, diskStat: () => ({ bavail: 1e9, bsize: 4096 }),
-    active: new Map(), ended: new Map(), links: { revoke() {} } });
-  const m = { id: 'm0123456789ab', tenant: 't', state: 'admitted', recordVideo: true, videoFps: 2, videoReserved: true, rig, session: { page: {} },
-    speakerLog: [], name: 'x', info: {}, noRecord: false, optedOut: false, deleted: false };
-  fs.mkdirSync(path.join(dir, 't'), { recursive: true });
-  mt.active.set(m.id, m);
-  mt.startRecording(m);
-  assert.equal(records.length, 1); assert.ok(records[0].file.endsWith('.webm'));
-  resolveExit({ error: 'x' });
-  await new Promise((r) => setTimeout(r, 20));
-  assert.equal(records.length, 2); assert.ok(records[1].file.endsWith('.ogg')); assert.equal(records[1].video, false);
-  assert.equal(m.state, 'recording'); assert.equal(m.recordVideo, false); assert.equal(m.videoReserved, false);
-  assert.match(m.videoError, /no video frame/); assert.equal(m.recError, null);
-  assert.equal(fs.existsSync(records[0].file), false);
+test('video failures keep the original audio recorder, file and timeline running', async (t) => {
+  for (const valid of [false, true]) {
+    const f = fixture(t), m = await recording(f);
+    const audio = m.rec, file = m.file, timeline = m.speakerTimeline, zero = audio.audioStartedAt, videoFile = m.videoFile;
+    m.videoRec.valid = async () => valid;
+    m.videoRec.error = () => 'meeting page supplied no video frame';
+    m.videoRec.fail();
+    await until(() => !m.videoRec && !m.videoStopping);
+    assert.equal(f.recorders.length, 2);
+    assert.equal(m.rec, audio); assert.equal(m.file, file); assert.equal(m.speakerTimeline, timeline);
+    assert.equal(m.rec.audioStartedAt, zero); assert.equal(m.state, 'recording');
+    assert.equal(fs.existsSync(file), true); assert.equal(fs.existsSync(videoFile), valid);
+    assert.match(f.meetings.view(m).video.error, /no video frame/);
+    assert.equal(f.meetings.view(m).video.on, false); assert.equal(m.videoReserved, false);
+    assert.equal(m.recError, undefined);
+  }
+});
+
+test('an audio failure stops video too', async (t) => {
+  const f = fixture(t), m = await recording(f);
+  m.rec.fail(); await until(() => !m.rec && !m.videoRec && !m.stopping);
+  assert.equal(m.state, 'admitted'); assert.match(m.recError, /recorder exited/);
 });

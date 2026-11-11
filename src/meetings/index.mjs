@@ -28,7 +28,7 @@ import { CHANNEL_PREFIX } from '../events.mjs';
 import { aliasKeys, isAddressed } from './addressed.mjs';
 import { RecordingLinks } from './recording-links.mjs';
 import { SpeakerTimeline, speakerFile } from './speaker-timeline.mjs';
-import { validateVideo, videoCapacity } from './video.mjs';
+import { validateVideo, videoCapacity, validVideo } from './video.mjs';
 
 const recordingBase = (file) => file.replace(/\.(?:ogg|webm)$/, '');
 export const recordingMime = (file) => file.endsWith('.webm') ? 'video/webm' : 'audio/ogg';
@@ -191,8 +191,13 @@ export function sweepRecordings(dir, days, { now = Date.now(), keep = new Set() 
         try { if (!media.some((file) => keep.has(file) || fs.existsSync(file))) fs.rmSync(p, { force: true }); } catch {}
         continue;
       }
-      if (!/^m[0-9a-f]{12}\.(?:ogg|webm)$/.test(f) || keep.has(p)) continue;
-      try { if (now - fs.statSync(p).mtimeMs > days * 86_400_000) { fs.rmSync(p, { force: true }); fs.rmSync(speakerFile(p), { force: true }); removed.push(p); } } catch {}
+      if (!/^m[0-9a-f]{12}\.(?:ogg|webm)$/.test(f)) continue;
+      const media = ['ogg', 'webm'].map((ext) => `${recordingBase(p)}.${ext}`);
+      if (media.some((file) => keep.has(file))) continue;
+      try { if (now - fs.statSync(p).mtimeMs > days * 86_400_000) {
+        for (const file of media) if (fs.existsSync(file)) { fs.rmSync(file, { force: true }); removed.push(file); }
+        fs.rmSync(speakerFile(p), { force: true });
+      } } catch {}
     }
   }
   return removed;
@@ -217,6 +222,11 @@ export class Meetings {
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     this.links = new RecordingLinks({ cfg, resolve: (tenant, id, kind) => {
       const file = this.recordingFile(tenant, id).file;
+      if (kind === 'video') {
+        const video = this.recordingFile(tenant, id).video;
+        if (!video) throw new Error(`no video for meeting ${id}`);
+        return video.file;
+      }
       return kind === 'speakers' ? speakerFile(file) : file;
     } });
     this.sweep();
@@ -226,19 +236,15 @@ export class Meetings {
 
   sweep() {
     this.links.sweep();
-    const keep = new Set([...this.active.values()].filter((m) => m.rec || m.stopping).map((m) => m.file));
+    const keep = new Set([...this.active.values()].filter((m) => m.rec || m.stopping || m.videoRec || m.videoStopping).flatMap((m) => [m.file, m.videoFile]));
     const removed = sweepRecordings(this.dir, this.cfg.recordingRetentionDays, { now: this.now(), keep });
     // A URL out for a recording the retention just deleted is dead too, and so is a transfer of it under way.
     for (const p of removed) this.links.revoke(path.basename(path.dirname(p)), path.basename(recordingBase(p)));
     return removed;
   }
 
-  file(tenant, id, video = null) {
-    const base = path.join(this.dir, tenant, id);
-    // In-memory recording choices, then disk discovery for recordings from before a restart.
-    if (video === null) video = (this.active.get(id) || this.ended.get(id))?.recordVideo ?? fs.existsSync(`${base}.webm`);
-    return `${base}.${video ? 'webm' : 'ogg'}`;
-  }
+  file(tenant, id) { return path.join(this.dir, tenant, `${id}.ogg`); }
+  videoFile(tenant, id) { return path.join(this.dir, tenant, `${id}.webm`); }
 
   videoCapacity() {
     videoCapacity(this.dir, this.cfg, [...this.active.values()].filter((m) => m.videoReserved).length, this.diskStat);
@@ -497,7 +503,7 @@ export class Meetings {
     // record() overwrites the Ogg; a new recording therefore owns a fresh timeline and zero.
     fs.rmSync(speakerFile(m.file), { force: true });
     this.links.revoke(m.tenant, m.id);
-    m.rec = m.rig.record(m.file, m.recordVideo ? { page: m.session.page, fps: m.videoFps } : undefined);
+    m.rec = m.rig.record(m.file);
     m.recMs = 0;
     m.timelineSaving = null;
     m.speakerTimelineCount = 0;
@@ -506,27 +512,56 @@ export class Meetings {
     const initial = m.speakerLog.at(-1);
     if (initial) m.speakerTimeline.sample(initial);
     const rec = m.rec;
-    if (m.state !== 'recording') transition(m, 'recording'); // the audio-only fallback after a video failure stays in it
+    if (m.state !== 'recording') transition(m, 'recording');
     rec.exited.then(() => {
       if (m.rec !== rec || m.state !== 'recording') return;
       // The recorder died on its own (ffmpeg error): the meeting goes on without recording, and without the live
       // transcript, which only runs with the recording (the text so far is kept, like the file).
       m.recError = rec.error() || 'recorder exited';
-      if (m.recordVideo && !m.deleted && !m.optedOut && !m.noRecord) {
-        // Video capture failed: keep the meeting's audio. Drop the partial WebM and record audio-only from here on.
-        m.videoError = m.recError; m.recError = null;
-        m.recordVideo = false; m.videoReserved = false;
-        const partial = m.file;
-        m.rec = null;
-        try { fs.rmSync(partial, { force: true }); fs.rmSync(speakerFile(partial), { force: true }); } catch {}
-        console.error(`bosun meeting ${m.id}: video failed (${m.videoError}); recording audio only`);
-        try { this.startRecording(m); } catch (e) { m.recError = oneLine(e); }
-        return;
-      }
       this.stopRecording(m, { del: false }).catch((e) => { m.speakerTimelineError = oneLine(e); });
       this.stopTranscript(m, 'recording-failed').catch(() => {});
     });
+    // Video is independent: no failure here can replace the audio recorder or its timeline.
+    if (m.recordVideo) {
+      m.videoFile = this.videoFile(m.tenant, m.id);
+      try {
+        const video = m.videoRec = m.rig.recordVideo(m.videoFile, { page: m.session.page, fps: m.videoFps });
+        video.exited.then(() => {
+          if (m.videoRec !== video) return;
+          this.stopVideo(m, { error: video.error() || 'video recorder exited' }).catch(() => {});
+        });
+      } catch (e) {
+        m.videoError = oneLine(e); m.videoReserved = false;
+        fs.rmSync(m.videoFile, { force: true }); m.videoFile = null;
+      }
+    }
   }
+
+  async stopVideo(m, { del = false, error = null } = {}) {
+    const rec = m.videoRec || m.videoStopping;
+    if (error) m.videoError = error;
+    m.videoRec = null;
+    if (rec) m.videoStopping = rec;
+    else if (m.videoCleanup) return m.videoCleanup;
+    m.videoReserved = false;
+    const cleanup = (async () => {
+      try {
+        if (rec) await (del ? rec.kill() : rec.stop());
+        const file = m.videoFile;
+        if (file && (del || m.deleted || !(await (rec?.valid ? rec.valid() : validVideo(file))))) {
+          fs.rmSync(file, { force: true });
+          if (m.videoFile === file) m.videoFile = null;
+        }
+      } catch (e) {
+        m.videoError ||= oneLine(e);
+        if (m.videoFile) fs.rmSync(m.videoFile, { force: true });
+        m.videoFile = null;
+      } finally { if (m.videoStopping === rec) m.videoStopping = null; }
+    })();
+    m.videoCleanup = cleanup;
+    return cleanup;
+  }
+
 
   // The live transcript, once the recording may start (same consent), for a meeting that asked for it.
   startTranscript(m) {
@@ -1254,7 +1289,7 @@ export class Meetings {
       const inputAt = rec.audioStartedAt;
       const aligned = Number.isFinite(inputAt) && Math.abs(inputAt - rec.startedAt) < 60_000;
       const audioStartedAt = aligned ? inputAt : rec.startedAt;
-      const seconds = m.file && !m.deleted ? await probeSeconds(m.file, m.recordVideo ? 'matroska' : 'ogg') : null;
+      const seconds = m.file && !m.deleted ? await probeSeconds(m.file, 'ogg') : null;
       timeline.until = seconds === null ? stoppedAt : audioStartedAt + seconds * 1000;
       let timer;
       try {
@@ -1495,8 +1530,9 @@ export class Meetings {
       this.links.revoke(m.tenant, m.id);
       this.forget(m.tenant, m.id);
       m.deleted = true;
-      m.file = null;
+      m.file = null; m.videoFile = null;
     }
+    const videoStopped = this.stopVideo(m, { del });
     if (rec) {
       m.stopping = rec;
       try {
@@ -1504,6 +1540,7 @@ export class Meetings {
         if (!del) await this.saveSpeakerTimeline(m, rec, stoppedAt).catch((e) => { m.speakerTimelineError = oneLine(e); });
       } finally { if (m.stopping === rec) m.stopping = null; m.videoReserved = false; }
     }
+    await videoStopped;
     if (!rec) m.videoReserved = false;
     let bytes = null;
     if (m.file) bytes = fs.statSync(m.file, { throwIfNoEntry: false })?.size ?? null;
@@ -1547,7 +1584,7 @@ export class Meetings {
       this.emit(m, 'ended', {
         reason, ...(m.error ? { error: m.error } : {}),
         duration_s: Math.round(((m.endedAt - (m.admittedAt ?? m.endedAt))) / 1000),
-        recording: m.file && bytes ? { path: m.file, bytes, mime_type: recordingMime(m.file), seconds: Math.round(m.recMs / 1000), next: `call recording_get { meeting_id: "${m.id}" }` } : null,
+        recording: m.file && bytes ? { path: m.file, bytes, mime_type: recordingMime(m.file), ...(m.videoFile ? { video: { path: m.videoFile, bytes: fs.statSync(m.videoFile, { throwIfNoEntry: false })?.size ?? 0 } } : {}), seconds: Math.round(m.recMs / 1000), next: `call recording_get { meeting_id: "${m.id}" }` } : null,
         bytes, speaker_timeline: { intervals: this.timelineCount(m), ...(m.speakerTimelineError ? { error: m.speakerTimelineError } : {}) },
       });
     })();
@@ -1563,7 +1600,7 @@ export class Meetings {
       ...(m.info.warning ? { warning: m.info.warning } : {}),
       ...(m.reason ? { reason: m.reason } : {}), ...(m.error ? { error: m.error } : {}),
       participants: m.participants, recording_seconds: Math.round(recMs / 1000),
-      video: { on: !!(m.recordVideo && m.rec), fps: m.videoFps ?? 2, bytes: m.recordVideo ? bytes ?? 0 : 0, ...(m.videoError ? { error: m.videoError, fallback: 'audio-only' } : {}) },
+      video: { on: !!m.videoRec, fps: m.videoFps ?? 2, bytes: m.videoFile ? fs.statSync(m.videoFile, { throwIfNoEntry: false })?.size ?? 0 : 0, ...(m.videoError ? { error: m.videoError } : {}) },
       speaker_timeline: { intervals: this.timelineCount(m), ...(m.speakerTimelineError ? { error: m.speakerTimelineError } : {}) },
       recording: m.file ? { path: m.file, bytes, ...(m.state === 'ended' && bytes ? { next: `call recording_get { meeting_id: "${m.id}" }` } : {}) } : m.deleted ? 'deleted' : null,
       ...(m.recError ? { recording_error: m.recError } : {}),
@@ -2022,14 +2059,16 @@ export class Meetings {
     if (!ID_RE.test(String(id))) throw new Error(`no recording for meeting ${id}`);
     const m = this.active.get(id) || this.ended.get(id);
     if (m && m.tenant !== tenant) throw new Error(`no recording for meeting ${id}`);
-    if (m && (m.rec || m.stopping) && this.active.has(id)) throw new Error(`meeting ${id} is still recording; call recording_get once it has ended (meeting_leave) or its recording was stopped without delete`);
+    if (m && (m.rec || m.stopping || m.videoRec || m.videoStopping) && this.active.has(id)) throw new Error(`meeting ${id} is still recording; call recording_get once it has ended (meeting_leave) or its recording was stopped without delete`);
     const file = this.file(tenant, id);
     if (m?.deleted || fs.existsSync(`${recordingBase(file)}.deleted`)) throw new Error(`the recording of meeting ${id} was deleted`);
     const st = fs.statSync(file, { throwIfNoEntry: false });
     if (!st?.size) throw new Error(`no recording for meeting ${id}`);
     // Not in memory (a run before a restart): the file may still be written by a recorder that outlived Bosun.
     if (!m && this.now() - st.mtimeMs < ORPHAN_QUIET_MS) throw new Error(`the recording of meeting ${id} was written to a moment ago (an earlier run); try again in a minute`);
-    return { file, bytes: st.size, seconds: m ? Math.round(m.recMs / 1000) : null };
+    const videoFile = this.videoFile(tenant, id);
+    const videoStat = fs.statSync(videoFile, { throwIfNoEntry: false });
+    return { file, bytes: st.size, ...(videoStat?.size ? { video: { file: videoFile, bytes: videoStat.size } } : {}), seconds: m ? Math.round(m.recMs / 1000) : null };
   }
 
   // recording_get: a one-time GET URL for the recording.
@@ -2044,7 +2083,7 @@ export class Meetings {
           : { file, size, secret: this.links.issue(tenant, id, 'speakers') };
       }
     } catch { speakers_error = 'speaker timeline could not be read'; }
-    return { ...r, speakers, ...(speakers_error ? { speakers_error } : {}), secret: this.links.issue(tenant, id) };
+    return { ...r, ...(r.video ? { video: { ...r.video, secret: this.links.issue(tenant, id, 'video') } } : {}), speakers, ...(speakers_error ? { speakers_error } : {}), secret: this.links.issue(tenant, id) };
   }
 
   // Deletes a recording: a meeting still recording stops first. Works for recordings of earlier runs too.
@@ -2056,10 +2095,10 @@ export class Meetings {
     if (m) await this.stopTranscript(m, 'stopped', { clear: true }); // the transcript goes with the recording
     if (m && (m.rec || m.stopping)) { m.noRecord = true; return { ...(await this.stopRecording(m, { del: true })), meeting_id: id }; }
     const f = this.file(tenant, id);
-    const existed = fs.existsSync(f);
+    const existed = fs.existsSync(f) || fs.existsSync(this.videoFile(tenant, id)) || fs.existsSync(speakerFile(f));
     if (existed || m) this.links.revoke(tenant, id); // only the tenant's own
     if (existed || m || fs.existsSync(speakerFile(f))) this.forget(tenant, id);
-    if (m && m.file === f) { m.file = null; m.deleted = true; }
+    if (m && m.file === f) { m.file = null; m.videoFile = null; m.deleted = true; }
     if (!existed && !m) throw new Error(`no recording for meeting ${id}`);
     return { meeting_id: id, deleted: existed };
   }

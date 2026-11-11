@@ -80,3 +80,31 @@ test('local browser page: capture updates the meeting page while another window 
   const pixel = execFileSync('ffmpeg', ['-v', 'error', '-ss', '3', '-i', file, '-frames:v', '1', '-vf', 'crop=2:2:640:360,scale=1:1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']);
   assert.ok(pixel[1] > 180 && pixel[0] < 80 && pixel[2] < 80, `wrong page or stale frame: ${[...pixel]}`);
 });
+
+// The exact audio path is used in both modes: a second reader must not change its format or zero.
+test('Ogg recorder keeps identical audio format and full duration alongside video, even when video dies', { skip: why || false }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bosun-video-audio-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const plain = make(path.join(dir, 'plain.ogg'));
+  const audio = make(path.join(dir, 'with-video.ogg'));
+  const cdp = new EventEmitter(), frame = jpeg('red');
+  cdp.send = async (method) => { if (method === 'Page.startScreencast') cdp.emit('Page.screencastFrame', { data: frame.toString('base64'), sessionId: 1 }); };
+  cdp.detach = async () => {};
+  const file = path.join(dir, 'separate.webm');
+  const video = startPageVideo({ page: { context: () => ({ newCDPSession: async () => cdp }) }, fps: 2, file, makeRecorder: () => make(file, 2) });
+  t.after(async () => { await Promise.all([plain.kill(), audio.kill(), video.kill()]); });
+  await pause(2500); await video.kill(); await pause(2500);
+  await Promise.all([plain.stop(), audio.stop()]);
+  const shape = (file) => { const p = probe(file), a = p.streams[0];
+    return { container: p.format.format_name, codec: a.codec_name, rate: a.sample_rate, channels: a.channels,
+      streams: p.streams.length, start: p.format.start_time };
+  };
+  assert.deepEqual(shape(audio.file), shape(plain.file));
+  assert.equal(shape(audio.file).container, 'ogg'); assert.equal(shape(audio.file).codec, 'opus');
+  assert.equal(shape(audio.file).channels, 1);
+  for (const file of [plain.file, audio.file]) {
+    const pcm = execFileSync('ffmpeg', ['-v', 'error', '-i', file, '-ar', '16000', '-f', 's16le', 'pipe:1']);
+    assert.ok(pcm.length / 32000 >= 4, 'audio continued after video died');
+  }
+  assert.ok(audio.audioStartedAt >= audio.startedAt - 100);
+});

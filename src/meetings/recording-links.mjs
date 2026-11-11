@@ -22,14 +22,14 @@ export class RecordingLinks {
   // A new URL secret for the tenant's meeting; it replaces the previous one.
   issue(tenant, id, kind = 'audio') {
     const secret = crypto.randomBytes(24).toString('base64url');
-    this.links.set(kind === 'audio' ? id : `${id}:speakers`, { tenant, kind, secret, expiresAt: Date.now() + this.cfg.downloadUrlTtlMs });
+    this.links.set(kind === 'audio' ? id : `${id}:${kind}`, { tenant, kind, secret, expiresAt: Date.now() + this.cfg.downloadUrlTtlMs });
     return secret;
   }
 
   // The tenant's recording is gone (deleted): no URL works any more and a transfer under way is cut off. Another
   // tenant's links and transfers are not touched, whatever id it names.
   revoke(tenant, id) {
-    for (const k of [id, `${id}:speakers`]) if (this.links.get(k)?.tenant === tenant) this.links.delete(k);
+    for (const k of [id, `${id}:speakers`, `${id}:video`]) if (this.links.get(k)?.tenant === tenant) this.links.delete(k);
     for (const t of this.transfers) if (t.id === id && t.tenant === tenant) t.abort();
   }
 
@@ -41,7 +41,7 @@ export class RecordingLinks {
   // Answers the request itself; returns true when the path was ours.
   async handle(req, res, { authTenant }) {
     const u = new URL(req.url, 'http://x');
-    const m = /^\/recording\/([^/]+)(\/speakers)?$/.exec(u.pathname);
+    const m = /^\/recording\/([^/]+)(\/(?:speakers|video))?$/.exec(u.pathname);
     if (!m) return false;
     const reply = (code, body) => {
       if (res.headersSent) return res.destroy();
@@ -50,8 +50,8 @@ export class RecordingLinks {
       req.resume();
     };
     if (req.method !== 'GET') { reply(405, { error: 'GET only' }); return true; }
-    const id = m[1], kind = m[2] ? 'speakers' : 'audio';
-    const linkKey = kind === 'audio' ? id : `${id}:speakers`;
+    const id = m[1], kind = m[2] ? m[2].slice(1) : 'audio';
+    const linkKey = kind === 'audio' ? id : `${id}:${kind}`;
     const secret = u.searchParams.get('t');
     if (secret === null) { reply(401, { error: 'give the URL from recording_get (with ?t=)' }); return true; }
     const l = ID_RE.test(id) ? this.links.get(linkKey) : null;
