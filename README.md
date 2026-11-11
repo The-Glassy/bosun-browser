@@ -14,6 +14,8 @@ calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 > [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md); a Linux deployment guide is in
 > [docs/DEPLOY-SYSTEMD.md](docs/DEPLOY-SYSTEMD.md).
 
+For agents: [skills/bosun-browser/SKILL.md](skills/bosun-browser/SKILL.md) is a short usage guide in the Agent Skill format; copy it into your agent's skills folder.
+
 ## What it does today
 
 - Headful Chromium (Playwright) under Xvfb — fewer bot flags than headless.
