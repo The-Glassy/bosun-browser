@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.1 (2026-11-12)
+
+- Fix: `read` and `screenshot` failed on pages that shadow `labels` on their own inputs with a non-iterable value (YouTube: "could not inspect a frame of the page for sensitive fields … (el.labels || []) is not iterable"). The sensitive-field scan now takes only label elements from `labels`, whatever the page puts there.
+
 ## 0.26.0 (2026-11-11): separate meeting video and macro control flow
 
 - `record_video` now delivers three artifacts: unchanged `<id>.ogg` Ogg/Opus audio (16 kHz mono input),

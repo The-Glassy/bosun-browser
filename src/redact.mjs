@@ -33,13 +33,22 @@ function inPage(subject, options) {
   const formatRE = new RegExp(formats, 'g');
   const normalizeHint = (v) => `${v} ${v.replace(/([a-z])([A-Z])/g, '$1 $2')}`.replace(/[_\-.[\]]+/g, ' ');
   const text = (el) => el?.textContent || '';
+  // el.labels is a NodeList for labelable form controls, but a page may shadow it on its own elements with
+  // anything (YouTube's custom inputs: a non-iterable object). Only label elements count.
+  const labelsOf = (el) => {
+    let l;
+    try { l = el.labels; } catch { return []; }
+    if (!l || typeof l === 'string') return [];
+    const list = typeof l[Symbol.iterator] === 'function' ? [...l] : typeof l.length === 'number' ? Array.from(l) : [];
+    return list.filter((n) => n && n.nodeType === 1);
+  };
   const hints = (el) => {
     const root = el.getRootNode();
     const byId = (id) => root.getElementById?.(id) || document.getElementById(id);
     const by = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => text(byId(id)));
     const data = [...el.attributes].filter((a) => a.name.startsWith('data-') && !a.name.startsWith('data-bosun-')).flatMap((a) => [a.name.slice(5), a.value]);
     return re.test(normalizeHint([el.getAttribute('name'), el.id, el.getAttribute('autocomplete'), el.getAttribute('aria-label'), el.getAttribute('placeholder'),
-      ...[...(el.labels || [])].map(text), ...by, ...data].filter(Boolean).join(' ')));
+      ...labelsOf(el).map(text), ...by, ...data].filter(Boolean).join(' ')));
   };
   const matches = (v, entropy) => {
     const found = [...v.matchAll(formatRE)].map((m) => m[0]);

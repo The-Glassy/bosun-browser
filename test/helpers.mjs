@@ -28,6 +28,8 @@ const PAGES = {
   '/late': `<title>Late</title><p>waiting</p><script>setTimeout(() => { const d = document.createElement('div'); d.id = 'late'; d.textContent = 'arrived'; document.body.append(d); }, 800)</script>`,
   '/toggle': `<title>Toggle</title><input id="t" type="password" value="pre-scan-toggled"><script>document.getElementById('t').type = 'text'</script>`,
   '/shadow': `<title>Shadow</title><div id="host"></div><script>const r = document.getElementById('host').attachShadow({ mode: 'open' }); r.innerHTML = '<span id="l">PIN</span><input id="s" aria-labelledby="l">';</script>`,
+  // A page that shadows `labels` on its own inputs with a non-iterable value (seen on YouTube).
+  '/odd-labels': `<title>Odd labels</title><input id="q" name="search_query"><input id="pw" type="password"><script>for (const id of ['q', 'pw']) Object.defineProperty(document.getElementById(id), 'labels', { get: () => ({ weird: true }) });</script><p>results</p>`,
   '/bigshadow': `<title>Big</title><div id="host"></div><script>document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<i></i>'.repeat(500);</script>`,
   '/probe': `<title>Probe</title><button id="check" onclick="document.getElementById('out').textContent = 'syms=' + JSON.stringify(Object.getOwnPropertySymbols(window).map(String)) + ' shadow=' + (/native code/.test(Element.prototype.attachShadow.toString()) ? 'native' : 'patched')">check</button><p id="out"></p>`,
   '/toggle-later': `<title>Toggle later</title><input id="t" type="password" value="pre-scan-toggled"><script>setTimeout(() => { document.getElementById('t').type = 'text'; }, 400)</script>`,

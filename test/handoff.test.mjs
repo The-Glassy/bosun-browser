@@ -275,6 +275,17 @@ test('inputs labelled inside an open shadow root are detected (mask, clear)', as
   await c.close();
 });
 
+test('a page whose inputs shadow labels with a non-iterable value still reads (YouTube)', async () => {
+  const c = await connect(svc);
+  const s = await c.open();
+  await c.call('navigate', { session: s, url: `${pages.base}/odd-labels` });
+  await c.call('type', { session: s, selector: '#pw', value: 'odd-label-secret' });
+  const r = await c.call('read', { session: s, mode: 'text' });
+  assert.match(r.text, /results/);
+  assert.ok(!(await c.call('read', { session: s })).text.includes('odd-label-secret'));
+  await c.close();
+});
+
 test('if credential clearing fails after give-up, the session is closed instead of resumed', async () => {
   const c = await connect(svc);
   const s = await c.open();
