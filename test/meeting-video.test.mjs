@@ -279,3 +279,57 @@ test('an audio failure stops video too', async (t) => {
   m.rec.fail(); await until(() => !m.rec && !m.videoRec && !m.stopping);
   assert.equal(m.state, 'admitted'); assert.match(m.recError, /recorder exited/);
 });
+
+
+test('video probe and shutdown errors retain media; explicit deletion still removes it', async (t) => {
+  for (const mode of ['unknown', 'probe throws', 'stop throws']) {
+    const f = fixture(t), m = await recording(f), file = m.videoFile;
+    m.videoRec.valid = async () => { if (mode === 'probe throws') throw new Error('probe unavailable'); return null; };
+    if (mode === 'stop throws') m.videoRec.stop = async () => { throw new Error('stop unavailable'); };
+    await f.meetings.stopVideo(m);
+    assert.equal(fs.existsSync(file), true, mode); assert.equal(m.videoFile, file);
+    assert.match(m.videoError, /probe|stop|verif|valid/i);
+    await f.meetings.stopVideo(m, { del: true });
+    assert.equal(fs.existsSync(file), false);
+  }
+});
+
+test('video reservation covers slow shutdown across tenants and overlapping stops', async (t) => {
+  const f = fixture(t), m = await recording(f), gate = deferred();
+  t.after(() => gate.resolve());
+  let stops = 0, kills = 0;
+  m.videoRec.stop = async () => { stops++; await gate.p; };
+  m.videoRec.kill = async () => { kills++; gate.resolve(); };
+  const first = f.meetings.stopRecording(m, { del: false });
+  await until(() => !!m.videoStopping);
+  const second = f.meetings.stopVideo(m);
+  try {
+    assert.equal(m.videoReserved, true);
+    await assert.rejects(f.meetings.join('bob', { url: 'https://meet.google.com/abc-defg-hij', recordVideo: true }), /limit 1/);
+    assert.equal(stops, 1);
+  } finally { await f.meetings.stopVideo(m, { del: true }); gate.resolve(); await Promise.all([first, second]); }
+  assert.equal(kills, 1); assert.equal(m.videoReserved, false);
+  await f.meetings.join('bob', { url: 'https://meet.google.com/abc-defg-hij', recordVideo: true });
+});
+
+test('CDP detach is attempted after a hung stop; hung detach and late acquisition stay bounded', async () => {
+  const f = fakePage(), done = deferred(); let detached = 0;
+  const send = f.cdp.send;
+  f.cdp.send = (method, args) => method === 'Page.stopScreencast' ? new Promise(() => {}) : send(method, args);
+  f.cdp.detach = async () => { detached++; return new Promise(() => {}); };
+  let made = 0;
+  const rec = startPageVideo({ page: f.page, fps: 2, makeRecorder: () => { made++; return { frames: new PassThrough(), startedAt: Date.now(), audioStartedAt: Date.now(), exited: done.p, stop: async () => done.resolve() }; } });
+  await until(() => made === 1);
+  const keepAlive = setInterval(() => {}, 100);
+  try {
+    const start = Date.now(); await rec.stop();
+    assert.equal(detached, 1); assert.ok(Date.now() - start < 6500);
+    assert.equal(f.cdp.listenerCount('Page.screencastFrame'), 0);
+    const late = fakePage(), gate = deferred();
+    late.page.context = () => ({ newCDPSession: () => gate.p });
+    const pending = startPageVideo({ page: late.page, fps: 2, makeRecorder: () => assert.fail('cancelled acquisition started recorder') });
+    await pending.kill(); gate.resolve(late.cdp);
+    await until(() => late.commands.some(([cmd]) => cmd === 'detach'));
+    assert.ok(!late.commands.some(([cmd]) => cmd === 'Page.startScreencast'));
+  } finally { clearInterval(keepAlive); }
+});

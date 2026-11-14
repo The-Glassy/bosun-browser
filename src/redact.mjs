@@ -26,21 +26,58 @@ const maskedValue = (v) => {
 // there, and aria-labelledby can include text from an aria-hidden element.
 function inPage(subject, options) {
   // Frame.evaluate passes the options; Locator.evaluate additionally passes its selected root.
-  const { op, css, hint, attr, formats, prefixes, max, values = [] } = options || subject;
+  const { op, css, hint, attr, formats, prefixes, max, values = [], singleFrameOnly = false } = options || subject;
   const KEY = Symbol.for('bosun.sensitive');
   const seen = window[KEY] || (window[KEY] = new WeakSet());
   const re = new RegExp(hint, 'i');
   const formatRE = new RegExp(formats, 'g');
   const normalizeHint = (v) => `${v} ${v.replace(/([a-z])([A-Z])/g, '$1 $2')}`.replace(/[_\-.[\]]+/g, ' ');
   const text = (el) => el?.textContent || '';
-  // el.labels is a NodeList for labelable form controls, but a page may shadow it on its own elements with
-  // anything (YouTube's custom inputs: a non-iterable object). Only label elements count.
+  // Read the native association, bypassing an own `labels` property shadowed by a component.
+  // Preserve custom widget hints too; an actual native control's failed inspection fails closed.
+  const labelTypes = { input: HTMLInputElement, textarea: HTMLTextAreaElement, select: HTMLSelectElement,
+    button: HTMLButtonElement, output: HTMLOutputElement, meter: HTMLMeterElement, progress: HTMLProgressElement };
+  const labelAssociations = new WeakMap();
+  const domLabels = (el) => {
+    const root = el.getRootNode();
+    let associations = labelAssociations.get(root);
+    if (!associations) {
+      associations = new WeakMap();
+      const control = Object.getOwnPropertyDescriptor(HTMLLabelElement.prototype, 'control').get;
+      for (const label of root.querySelectorAll('label')) {
+        if (!(label instanceof HTMLLabelElement)) continue;
+        const target = control.call(label);
+        if (!target) continue;
+        if (!associations.has(target)) associations.set(target, []);
+        associations.get(target).push(label);
+      }
+      labelAssociations.set(root, associations);
+    }
+    return associations.get(el) || [];
+  };
   const labelsOf = (el) => {
-    let l;
-    try { l = el.labels; } catch { return []; }
-    if (!l || typeof l === 'string') return [];
-    const list = typeof l[Symbol.iterator] === 'function' ? [...l] : typeof l.length === 'number' ? Array.from(l) : [];
-    return list.filter((n) => n && n.nodeType === 1);
+    const type = Object.hasOwn(labelTypes, el.localName) ? labelTypes[el.localName] : null;
+    if (type && el instanceof type) {
+      const getter = Object.getOwnPropertyDescriptor(type.prototype, 'labels')?.get;
+      if (!getter) throw new Error('could not inspect control label associations');
+      return [...(getter.call(el) || [])];
+    }
+    // Custom value widgets can expose their own label collection. Preserve these hints while
+    // tolerating unrelated components with a non-iterable or throwing `labels` property.
+    const associated = domLabels(el); // also works when custom JS getters live in another evaluation world
+    let labels;
+    try { labels = el.labels; } catch { return associated; }
+    if (!labels || typeof labels === 'string') return associated;
+    // Bounded: a hostile or broken component may expose an infinite iterator or a huge length.
+    const list = [];
+    try {
+      if (typeof labels[Symbol.iterator] === 'function') {
+        for (const n of labels) { list.push(n); if (list.length >= 64) break; }
+      } else if (typeof labels.length === 'number') {
+        for (let i = 0; i < Math.min(labels.length, 64); i++) list.push(labels[i]);
+      }
+    } catch { return associated; }
+    return [...associated, ...list.filter((n) => n && n.nodeType === 1)];
   };
   const hints = (el) => {
     const root = el.getRootNode();
@@ -124,6 +161,10 @@ function inPage(subject, options) {
     }
   }
   if (op === 'text') {
+    // A separate frame can rotate a credential and its reflection after the cross-frame scan.
+    // Assertions omit matched text on frame-bearing pages: no multi-frame protocol read is atomic.
+    // Check within this evaluation too, so a frame added after the earlier scan cannot bypass it.
+    if (singleFrameOnly && (window.parent !== window || window.length > 0 || roots.some((r) => r.querySelector('iframe,frame,object,embed')))) return [0, null];
     const el = subject;
     const walk = (n) => {
       if (n.nodeType === Node.TEXT_NODE) return n.nodeValue;
@@ -173,7 +214,7 @@ export const clearSensitive = (page) => scan(page, 'clear');
 // Read visible text, including when the selected root itself is hidden (innerText would fall back to
 // textContent there). Skip aria-hidden reveal copies too. Redact before truncating in the browser so a cut
 // through the middle of a token cannot expose its leading characters.
-export const readText = (root, max, values) => root.evaluate(inPage, { ...scanOptions('text'), max, values }, { timeout: 15000 });
+export const readText = (root, max, values, singleFrameOnly = false) => root.evaluate(inPage, { ...scanOptions('text'), max, values, singleFrameOnly }, { timeout: 15000 });
 
 // Remember the inputs that are type=password right now (in Bosun's evaluation world), so they stay sensitive if
 // they are later switched to type=text. Polled while a human has the tab.

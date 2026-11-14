@@ -444,7 +444,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.26.1' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.26.2' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -1028,9 +1028,22 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
           if (c.text !== undefined) await s.page.getByText(c.text).filter({ visible: true }).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`text "${c.text}" is not visible`));
           if (c.text !== undefined || c.selector !== undefined) {
             const l = c.text !== undefined ? s.page.getByText(c.text) : s.page.locator(c.selector);
-            // Use read's masking path for any matched text returned to the caller.
-            const values = await sensitiveValues(s.page);
-            matched = maskText(await l.filter({ visible: true }).first().innerText({ timeout: t }), values);
+            // Omit text if a credential-source frame existed at any point during this read,
+            // including one removed before extraction. The in-page guard also checks current DOM frames.
+            let hadFrames = s.page.frames().length > 1;
+            const frameChanged = () => { hadFrames = true; };
+            s.page.on('frameattached', frameChanged);
+            s.page.on('framedetached', frameChanged);
+            try {
+              const values = await sensitiveValues(s.page);
+              if (!hadFrames) {
+                const [, text] = await readText(l.filter({ visible: true }).first(), 10000, values, true);
+                if (!hadFrames) matched = text === null ? null : maskText(text, values);
+              }
+            } finally {
+              s.page.off('frameattached', frameChanged);
+              s.page.off('framedetached', frameChanged);
+            }
           }
           return matched;
         }), hooks).catch(clean),
@@ -1060,7 +1073,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       };
     };
 
-    const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {target, timeoutMs?} where target is role+name | selector | text (no ref), optionally with nth (which visible match, -1 = last) and after / before (count from a text on the page: {"role": "button", "after": "Share"} is the first button after Share; for icon buttons without a name); hover {target, timeoutMs?}; type {target, timeoutMs?, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value, timeoutMs?}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. if_exists {target: {role+name | selector | text, nth?, after?, before?}, then: [steps], else?: [steps]} checks presence instantly; repeat {while: {target fields}, max: 1–100 (required), steps: [steps]} checks instantly each iteration and reports count/max_hit. Nesting depth <=3; at most 100 steps including nested steps; action timeoutMs 100–60000, default unchanged. read returns reads [{step, as?, text}]; assert returns matched text in its step result. Any string may use {{param}}; a step that uses a param not given is skipped.`;
+    const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {target, timeoutMs?} where target is role+name | selector | text (no ref), optionally with nth (which visible match, -1 = last) and after / before (count from a text on the page: {"role": "button", "after": "Share"} is the first button after Share; for icon buttons without a name); hover {target, timeoutMs?}; type {target, timeoutMs?, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value, timeoutMs?}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. if_exists {target: {role+name | selector | text, nth?, after?, before?}, then: [steps], else?: [steps]} checks presence instantly; repeat {while: {target fields}, max: 1–100 (required), steps: [steps]} checks instantly each iteration and reports count/max_hit. Nesting depth <=3; at most 100 saved steps including nested steps; each run at most 1000 executed steps, 4 MiB retained text/metadata, 20 images and 8 MiB image data; action timeoutMs 100–60000, default unchanged. read returns reads [{step, as?, text}]; assert returns matched text in its step result (omitted on pages containing frames, where a cross-frame scan cannot be atomic). Any string may use {{param}}; a step that uses a param not given is skipped.`;
     tool('macro_save', `Save a multi-step flow on a site as a macro to rerun with macro_run (saving an existing name makes a new version; the last 20 are kept). site: the hosts it may run on (e.g. ["web.plaud.ai", "*.plaud.ai"]); a page outside them stops the run. params: {name: {type: string|number|file_id|secret_id, required?, default?, description?}}; a secret or file goes in only as a {{param}} of type secret_id / file_id, never stored. ${stepsHelp} A step whose text says pay, buy, purchase, submit/place order, checkout or delete account is refused unless confirm_risky: true.`,
       { name: str(64).describe('lowercase letters, digits, . _ -'), description: str(2000).optional(), site: z.array(str(300)).min(1).max(MAX_SITES),
         params: z.record(z.string().max(40), z.record(z.string(), z.unknown())).optional(), steps: z.array(z.record(z.string(), z.unknown())).min(1).max(MAX_STEPS),
@@ -1074,7 +1087,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     tool('macro_get', 'A macro in full (steps and all), the latest version or version.', { name: str(64), version: z.number().int().min(1).optional() },
       async (a) => ok(macros.get(tenant, a.name, a.version)));
     tool('macro_delete', 'Delete a macro with all its versions.', { name: str(64) }, async (a) => ok(macros.delete(tenant, a.name)));
-    tool('macro_run', `Run a macro in session, step by step; each step works like the tool of that name and has its deadline, the whole run at most timeout_sec (default ${RUN_DEFAULT_SEC}, up to ${RUN_MAX_SEC}; raise your MCP client's request timeout above that, or send a progressToken: Bosun reports progress after every step). Returns per-step status, reads (read text with its 1-based step index and optional as), assert matched text in steps[].text, branches and loop count/max_hit, downloads (download_id to fetch with download_get) and screenshots (images). On failure: the step, its error, the URL, the start of the page's a11y snapshot and a screenshot, so you can fix the macro and save a new version. A page outside the macro's site stops the run. dry_run: check args and show the steps as they would run, without touching the page.`,
+    tool('macro_run', `Run a macro in session, step by step; each step works like the tool of that name and has its deadline, the whole run at most timeout_sec (default ${RUN_DEFAULT_SEC}, up to ${RUN_MAX_SEC}; raise your MCP client's request timeout above that, or send a progressToken: Bosun reports progress after every step). Returns per-step status, reads (read text with its 1-based step index and optional as), assert matched text in steps[].text (omitted on pages containing frames), branches and loop count/max_hit, downloads (download_id to fetch with download_get) and screenshots (images). On failure: the step, its error, the URL, the start of the page's a11y snapshot and a screenshot, so you can fix the macro and save a new version. A page outside the macro's site stops the run. dry_run: check args and show the steps as they would run, without touching the page.`,
       { name: str(64), session: str(40).optional().describe('required unless dry_run'), args: z.record(z.string().max(40), z.union([z.string().max(10000), z.number()])).optional(),
         version: z.number().int().min(1).optional(), dry_run: z.boolean().optional(), timeout_sec: z.number().int().min(10).max(RUN_MAX_SEC).optional() },
       async (a, extra) => {
