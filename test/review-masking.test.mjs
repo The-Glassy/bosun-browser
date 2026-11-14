@@ -17,18 +17,26 @@ test('shadowed labels preserve wrapping and for label credentials, reflection an
   const { page } = await fixture(t);
   await page.setContent(`<label>API key <input id="a" value="opaque-wrap-value"></label><p id="ra">opaque-wrap-value</p>
     <label for="b">Password</label><input id="b" value="opaque-for-value"><p id="rb">opaque-for-value</p>
-    <div id="host"></div><input id="q" name="search_query" value="ordinary-search">`);
+    <div id="host"></div><input id="q" name="search_query" value="ordinary-search">
+    <span id="custom-label">API key</span><div id="widget">opaque-widget-value</div><p id="rw">opaque-widget-value</p>
+    <label for="cf">API key</label><x-field id="cf" value="opaque-associated-value">opaque-associated-value</x-field><p id="rcf">opaque-associated-value</p><script>
+    customElements.define('x-field', class extends HTMLElement {
+      static formAssociated = true;
+      constructor() { super(); this.internals = this.attachInternals(); }
+      get labels() { return this.internals.labels; }
+    });</script>`);
   await page.evaluate(() => {
+    document.querySelector('#widget').labels = [document.querySelector('#custom-label')];
     document.querySelector('#host').attachShadow({ mode: 'open' }).innerHTML = '<label for="c">API key</label><input id="c" value="opaque-shadow-value"><p id="rc">opaque-shadow-value</p>';
     for (const el of [...document.querySelectorAll('input'), document.querySelector('#host').shadowRoot.querySelector('input')]) Object.defineProperty(el, 'labels', { get() { if (el.id === 'b') throw new Error('shadowed'); return { weird: true }; } });
   });
   const values = await sensitiveValues(page);
-  for (const value of ['opaque-wrap-value', 'opaque-for-value', 'opaque-shadow-value']) assert.ok(values.includes(value), value);
+  for (const value of ['opaque-wrap-value', 'opaque-for-value', 'opaque-shadow-value', 'opaque-widget-value', 'opaque-associated-value']) assert.ok(values.includes(value), value);
   assert.ok(!values.includes('ordinary-search'));
   const [, text] = await readText(page.locator('body'), 10000, values);
   assert.ok(!text.includes('opaque-')); assert.ok(text.includes('[masked]'));
   await maskedScreenshot(page, async (mask) => {
-    for (const id of ['a', 'b', 'c', 'ra', 'rb', 'rc']) assert.equal(await page.locator(`#${id}`).getAttribute('data-bosun-sensitive'), '');
+    for (const id of ['a', 'b', 'c', 'ra', 'rb', 'rc', 'widget', 'rw', 'cf', 'rcf']) assert.equal(await page.locator(`#${id}`).getAttribute('data-bosun-sensitive'), '');
     const covered = await page.screenshot({ mask });
     const plain = await page.screenshot();
     assert.ok(!covered.equals(plain), 'screenshot pixels change when the masks are applied');

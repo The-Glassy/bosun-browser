@@ -34,15 +34,42 @@ function inPage(subject, options) {
   const normalizeHint = (v) => `${v} ${v.replace(/([a-z])([A-Z])/g, '$1 $2')}`.replace(/[_\-.[\]]+/g, ' ');
   const text = (el) => el?.textContent || '';
   // Read the native association, bypassing an own `labels` property shadowed by a component.
-  // Unrelated elements need no labels inspection; an actual control's failed inspection fails closed.
+  // Preserve custom widget hints too; an actual native control's failed inspection fails closed.
   const labelTypes = { input: HTMLInputElement, textarea: HTMLTextAreaElement, select: HTMLSelectElement,
     button: HTMLButtonElement, output: HTMLOutputElement, meter: HTMLMeterElement, progress: HTMLProgressElement };
+  const labelAssociations = new WeakMap();
+  const domLabels = (el) => {
+    const root = el.getRootNode();
+    let associations = labelAssociations.get(root);
+    if (!associations) {
+      associations = new WeakMap();
+      const control = Object.getOwnPropertyDescriptor(HTMLLabelElement.prototype, 'control').get;
+      for (const label of root.querySelectorAll('label')) {
+        if (!(label instanceof HTMLLabelElement)) continue;
+        const target = control.call(label);
+        if (!target) continue;
+        if (!associations.has(target)) associations.set(target, []);
+        associations.get(target).push(label);
+      }
+      labelAssociations.set(root, associations);
+    }
+    return associations.get(el) || [];
+  };
   const labelsOf = (el) => {
     const type = Object.hasOwn(labelTypes, el.localName) ? labelTypes[el.localName] : null;
-    if (!type || !(el instanceof type)) return [];
-    const getter = Object.getOwnPropertyDescriptor(type.prototype, 'labels')?.get;
-    if (!getter) throw new Error('could not inspect control label associations');
-    return [...(getter.call(el) || [])];
+    if (type && el instanceof type) {
+      const getter = Object.getOwnPropertyDescriptor(type.prototype, 'labels')?.get;
+      if (!getter) throw new Error('could not inspect control label associations');
+      return [...(getter.call(el) || [])];
+    }
+    // Custom value widgets can expose their own label collection. Preserve these hints while
+    // tolerating unrelated components with a non-iterable or throwing `labels` property.
+    const associated = domLabels(el); // also works when custom JS getters live in another evaluation world
+    let labels;
+    try { labels = el.labels; } catch { return associated; }
+    if (!labels || typeof labels === 'string') return associated;
+    const list = typeof labels[Symbol.iterator] === 'function' ? [...labels] : typeof labels.length === 'number' ? Array.from(labels) : [];
+    return [...associated, ...list.filter((n) => n && n.nodeType === 1)];
   };
   const hints = (el) => {
     const root = el.getRootNode();
