@@ -538,27 +538,38 @@ export class Meetings {
   }
 
   async stopVideo(m, { del = false, error = null } = {}) {
-    const rec = m.videoRec || m.videoStopping;
     if (error) m.videoError = error;
+    if (del) m.videoDelete = true;
+    // One cleanup owns the reservation and validation. A later deletion can escalate its encoder stop.
+    if (m.videoCleanup) {
+      if (del && m.videoStopping && !m.videoKill) m.videoKill = Promise.resolve().then(() => m.videoStopping?.kill()).catch((e) => { m.videoError ||= oneLine(e); });
+      await m.videoCleanup;
+      if (del && m.videoFile) { fs.rmSync(m.videoFile, { force: true }); m.videoFile = null; }
+      return;
+    }
+    const rec = m.videoRec;
     m.videoRec = null;
-    if (rec) m.videoStopping = rec;
-    else if (m.videoCleanup) return m.videoCleanup;
-    m.videoReserved = false;
-    const cleanup = (async () => {
+    m.videoStopping = rec;
+    const cleanup = Promise.resolve().then(async () => {
       try {
-        if (rec) await (del ? rec.kill() : rec.stop());
+        if (rec) await (m.videoDelete ? rec.kill() : rec.stop());
         const file = m.videoFile;
-        if (file && (del || m.deleted || !(await (rec?.valid ? rec.valid() : validVideo(file))))) {
-          if (!del && !m.deleted) m.videoError ||= 'video recording contains no readable frames';
+        if (!file) return;
+        const valid = m.videoDelete || m.deleted ? false : await (rec?.valid ? rec.valid() : validVideo(file));
+        if (m.videoDelete || m.deleted || valid === false) {
+          if (!m.videoDelete && !m.deleted) m.videoError ||= 'video recording contains no readable frames';
           fs.rmSync(file, { force: true });
           if (m.videoFile === file) m.videoFile = null;
-        }
+        } else if (valid !== true) m.videoError ||= 'video validation unavailable; recording retained';
       } catch (e) {
         m.videoError ||= oneLine(e);
-        if (m.videoFile) fs.rmSync(m.videoFile, { force: true });
-        m.videoFile = null;
-      } finally { if (m.videoStopping === rec) m.videoStopping = null; }
-    })();
+        if ((m.videoDelete || m.deleted) && m.videoFile) { fs.rmSync(m.videoFile, { force: true }); m.videoFile = null; }
+      } finally {
+        await m.videoKill;
+        if (m.videoStopping === rec) m.videoStopping = null;
+        m.videoReserved = false;
+      }
+    });
     m.videoCleanup = cleanup;
     return cleanup;
   }
@@ -1538,10 +1549,9 @@ export class Meetings {
       try {
         await (del ? rec.kill() : rec.stop());
         if (!del) await this.saveSpeakerTimeline(m, rec, stoppedAt).catch((e) => { m.speakerTimelineError = oneLine(e); });
-      } finally { if (m.stopping === rec) m.stopping = null; m.videoReserved = false; }
+      } finally { if (m.stopping === rec) m.stopping = null; }
     }
     await videoStopped;
-    if (!rec) m.videoReserved = false;
     let bytes = null;
     if (m.file) bytes = fs.statSync(m.file, { throwIfNoEntry: false })?.size ?? null;
     return { stopped: !!rec, deleted: del && m.deleted, ...(bytes !== null ? { bytes } : {}) };
@@ -1643,7 +1653,7 @@ export class Meetings {
   async stopRecordingTool(tenant, id, del = true) {
     const m = this.get(tenant, id);
     m.noRecord = true;
-    if (!m.rec && !m.stopping) m.videoReserved = false;
+    if (!m.rec && !m.stopping && !m.videoRec && !m.videoStopping) m.videoReserved = false;
     const live = await this.stopTranscript(m, 'stopped', { clear: del });
     if (!m.rec && !m.stopping && !(del && m.file)) return { stopped: false, deleted: false, recording_disabled: true, ...(m.live ? { live_transcript_stopped: live } : {}), state: m.state };
     const r = await this.stopRecording(m, { del });
@@ -2091,7 +2101,7 @@ export class Meetings {
     if (!ID_RE.test(String(id))) throw new Error(`no meeting ${id}`);
     const m = this.active.get(id) || this.ended.get(id);
     if (m && m.tenant !== tenant) throw new Error(`no meeting ${id}`);
-    if (m && m.state !== 'ended') { m.noRecord = true; if (!m.rec && !m.stopping) m.videoReserved = false; } // a meeting not recording yet never starts (nor its transcript)
+    if (m && m.state !== 'ended') { m.noRecord = true; if (!m.rec && !m.stopping && !m.videoRec && !m.videoStopping) m.videoReserved = false; } // a meeting not recording yet never starts (nor its transcript)
     if (m) await this.stopTranscript(m, 'stopped', { clear: true }); // the transcript goes with the recording
     if (m && (m.rec || m.stopping)) { m.noRecord = true; return { ...(await this.stopRecording(m, { del: true })), meeting_id: id }; }
     const f = this.file(tenant, id);

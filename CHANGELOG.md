@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.26.2 (2026-11-14)
+
+- Preserve native label-only credential detection when page components shadow `labels`, including reflections and screenshot masks.
+- Read macro assertion text through the shared atomic masking/visibility path, capped at 10,000 characters.
+- Preserve independent CHIPS session-cookie partitions and each partition's existing-cookie precedence.
+- Bound each macro run to 1,000 executed steps, 4 MiB retained text/metadata, 20 images and 8 MiB image data, across nested loops and failure diagnostics.
+- Require ffprobe before video recording; probe only an initial video packet and retain media with a status warning when validation is unavailable.
+- Attempt CDP detachment even when stop-screencast stalls; retain video capacity reservations through shared encoder/capture cleanup and overlapping stop/delete calls.
+
 ## 0.26.1 (2026-11-12)
 
 - Fix: `read` and `screenshot` failed on pages that shadow `labels` on their own inputs with a non-iterable value (YouTube: "could not inspect a frame of the page for sensitive fields … (el.labels || []) is not iterable"). The sensitive-field scan now takes only label elements from `labels`, whatever the page puts there.

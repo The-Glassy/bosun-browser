@@ -33,14 +33,16 @@ function inPage(subject, options) {
   const formatRE = new RegExp(formats, 'g');
   const normalizeHint = (v) => `${v} ${v.replace(/([a-z])([A-Z])/g, '$1 $2')}`.replace(/[_\-.[\]]+/g, ' ');
   const text = (el) => el?.textContent || '';
-  // el.labels is a NodeList for labelable form controls, but a page may shadow it on its own elements with
-  // anything (YouTube's custom inputs: a non-iterable object). Only label elements count.
+  // Read the native association, bypassing an own `labels` property shadowed by a component.
+  // Unrelated elements need no labels inspection; an actual control's failed inspection fails closed.
+  const labelTypes = { input: HTMLInputElement, textarea: HTMLTextAreaElement, select: HTMLSelectElement,
+    button: HTMLButtonElement, output: HTMLOutputElement, meter: HTMLMeterElement, progress: HTMLProgressElement };
   const labelsOf = (el) => {
-    let l;
-    try { l = el.labels; } catch { return []; }
-    if (!l || typeof l === 'string') return [];
-    const list = typeof l[Symbol.iterator] === 'function' ? [...l] : typeof l.length === 'number' ? Array.from(l) : [];
-    return list.filter((n) => n && n.nodeType === 1);
+    const type = Object.hasOwn(labelTypes, el.localName) ? labelTypes[el.localName] : null;
+    if (!type || !(el instanceof type)) return [];
+    const getter = Object.getOwnPropertyDescriptor(type.prototype, 'labels')?.get;
+    if (!getter) throw new Error('could not inspect control label associations');
+    return [...(getter.call(el) || [])];
   };
   const hints = (el) => {
     const root = el.getRootNode();

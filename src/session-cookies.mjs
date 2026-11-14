@@ -8,7 +8,7 @@ import { driverLogsValues } from './secrets.mjs';
 export const SESSION_COOKIES_FILE = 'session-cookies.json';
 export const DEFAULT_MAX_AGE_MS = 30 * 86400_000;
 const fileFor = (dir) => path.join(dir, SESSION_COOKIES_FILE);
-const key = (c) => JSON.stringify([c.domain, c.name, c.path]);
+const key = (c) => JSON.stringify([c.domain, c.name, c.path, c.partitionKey ?? null]);
 
 // These diagnostics bypass Bosun's logger and can print cookie API payloads. Match the typed-secret guard.
 export function checkSessionCookieLogs() {

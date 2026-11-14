@@ -444,7 +444,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.26.1' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.26.2' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -1030,7 +1030,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
             const l = c.text !== undefined ? s.page.getByText(c.text) : s.page.locator(c.selector);
             // Use read's masking path for any matched text returned to the caller.
             const values = await sensitiveValues(s.page);
-            matched = maskText(await l.filter({ visible: true }).first().innerText({ timeout: t }), values);
+            const [, text] = await readText(l.filter({ visible: true }).first(), 10000, values);
+            matched = maskText(text, values);
           }
           return matched;
         }), hooks).catch(clean),
@@ -1060,7 +1061,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       };
     };
 
-    const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {target, timeoutMs?} where target is role+name | selector | text (no ref), optionally with nth (which visible match, -1 = last) and after / before (count from a text on the page: {"role": "button", "after": "Share"} is the first button after Share; for icon buttons without a name); hover {target, timeoutMs?}; type {target, timeoutMs?, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value, timeoutMs?}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. if_exists {target: {role+name | selector | text, nth?, after?, before?}, then: [steps], else?: [steps]} checks presence instantly; repeat {while: {target fields}, max: 1–100 (required), steps: [steps]} checks instantly each iteration and reports count/max_hit. Nesting depth <=3; at most 100 steps including nested steps; action timeoutMs 100–60000, default unchanged. read returns reads [{step, as?, text}]; assert returns matched text in its step result. Any string may use {{param}}; a step that uses a param not given is skipped.`;
+    const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {target, timeoutMs?} where target is role+name | selector | text (no ref), optionally with nth (which visible match, -1 = last) and after / before (count from a text on the page: {"role": "button", "after": "Share"} is the first button after Share; for icon buttons without a name); hover {target, timeoutMs?}; type {target, timeoutMs?, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value, timeoutMs?}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. if_exists {target: {role+name | selector | text, nth?, after?, before?}, then: [steps], else?: [steps]} checks presence instantly; repeat {while: {target fields}, max: 1–100 (required), steps: [steps]} checks instantly each iteration and reports count/max_hit. Nesting depth <=3; at most 100 saved steps including nested steps; each run at most 1000 executed steps, 4 MiB retained text/metadata, 20 images and 8 MiB image data; action timeoutMs 100–60000, default unchanged. read returns reads [{step, as?, text}]; assert returns matched text in its step result. Any string may use {{param}}; a step that uses a param not given is skipped.`;
     tool('macro_save', `Save a multi-step flow on a site as a macro to rerun with macro_run (saving an existing name makes a new version; the last 20 are kept). site: the hosts it may run on (e.g. ["web.plaud.ai", "*.plaud.ai"]); a page outside them stops the run. params: {name: {type: string|number|file_id|secret_id, required?, default?, description?}}; a secret or file goes in only as a {{param}} of type secret_id / file_id, never stored. ${stepsHelp} A step whose text says pay, buy, purchase, submit/place order, checkout or delete account is refused unless confirm_risky: true.`,
       { name: str(64).describe('lowercase letters, digits, . _ -'), description: str(2000).optional(), site: z.array(str(300)).min(1).max(MAX_SITES),
         params: z.record(z.string().max(40), z.record(z.string(), z.unknown())).optional(), steps: z.array(z.record(z.string(), z.unknown())).min(1).max(MAX_STEPS),

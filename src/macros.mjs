@@ -16,6 +16,11 @@ const PARAM_RE = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/;
 const ID_RE = /^[A-Za-z0-9_-]{1,60}$/; // a file_id or secret_id passed as an argument
 export const PARAM_TYPES = ['string', 'number', 'file_id', 'secret_id'];
 export const MAX_STEPS = 100;
+// Shared by every branch and iteration, including optional steps and failure diagnostics.
+export const RUN_MAX_STEPS = 1000;
+export const RUN_MAX_TEXT_BYTES = 4 * 1024 * 1024;
+export const RUN_MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+export const RUN_MAX_IMAGES = 20;
 export const MAX_PARAMS = 30;
 export const MAX_SITES = 20;
 export const MAX_MACROS = 200; // per tenant
@@ -340,7 +345,15 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
   const end = hardEnd - Math.min(REPORT_MS, Math.floor(maxMs / 3));
   const total = allSteps.length;
   const seenSteps = new Set();
-  let failure = null;
+  let failure = null, executed = 0, textBytes = 0, imageBytes = 0;
+  const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
+  const retain = (value, image) => {
+    const textSize = bytes(value), imageSize = image ? Buffer.byteLength(image) : 0;
+    if (textBytes + textSize > RUN_MAX_TEXT_BYTES) throw refusal('retained text output byte budget exceeded');
+    if (image && images.length >= RUN_MAX_IMAGES) throw refusal('retained image count budget exceeded');
+    if (imageBytes + imageSize > RUN_MAX_IMAGE_BYTES) throw refusal('retained image byte budget exceeded');
+    textBytes += textSize; imageBytes += imageSize;
+  };
   const execute = async (steps, iterations = []) => {
     for (const raw of steps) {
       if (failure) break;
@@ -349,6 +362,14 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
       const r = resolved[i], tool = raw.tool, n = i + 1;
       const t0 = Date.now();
       const rec = { step: n, tool, ...(iterations.length ? { iterations } : {}) };
+      if (executed >= RUN_MAX_STEPS) {
+        failure = { step: n, tool, error: 'executed-step budget exceeded' };
+        break;
+      }
+      executed++;
+      // Reserve fixed per-step metadata too, before retaining the record.
+      try { retain({ metadata: ' '.repeat(1024) }); }
+      catch (e) { failure = { step: n, tool, error: e.message }; break; }
       res.steps.push(rec);
       if (!r.step) { Object.assign(rec, { status: 'skipped', reason: `param ${r.missing.join(', ')} not given` }); continue; }
       const st = r.step;
@@ -397,6 +418,7 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
           }
         } else {
           const out = await runStep(st, { ops, end, signal, guard, off, sites, confirmRisky: m.confirm_risky, pending });
+          retain({ rec: out.rec, read: out.read, downloads: out.downloads }, out.image);
           Object.assign(rec, out.rec);
           if (out.read !== undefined) reads.push({ step: n, ...(iterations.length ? { iterations } : {}), ...(st.as ? { as: st.as } : {}), text: out.read });
           if (out.downloads) {
@@ -433,8 +455,19 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
   if (failure) {
     res.ok = false;
     const { noPage, ...f } = failure;
-    res.failure = { ...f, ...(noPage ? {} : await ops.failure(hardEnd).catch(() => ({}))) };
-    if (res.failure.screenshot) { images.push({ step: failure.step, data: res.failure.screenshot, failure: true }); res.failure.screenshot = 'attached (image after this text)'; }
+    res.failure = f;
+    if (!noPage) {
+      const { screenshot, ...diagnostics } = await ops.failure(hardEnd).catch(() => ({}));
+      try { retain(diagnostics); Object.assign(res.failure, diagnostics); }
+      catch { res.failure.diagnostics_omitted = 'retained text output byte budget exceeded'; }
+      if (screenshot) {
+        try {
+          retain({}, screenshot);
+          images.push({ step: failure.step, data: screenshot, failure: true });
+          res.failure.screenshot = 'attached (image after this text)';
+        } catch { res.failure.screenshot = 'omitted: retained image output budget exceeded'; }
+      }
+    }
     res.next = 'fix the step (macro_get, then macro_save a new version) or the page state, and run again';
   }
   return { result: res, images };

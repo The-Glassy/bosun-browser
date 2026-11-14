@@ -111,3 +111,42 @@ test('read text and assert matched text are returned with stable pre-order step 
   const dry = await run(m, opsFor({ exists: () => { throw new Error('must not check'); } }), { dryRun: true });
   assert.equal(dry.dry_run, true); assert.equal(dry.steps.length, 3);
 });
+
+
+const nested = (body) => macro([{ tool: 'repeat', while: { text: 'More' }, max: 100, steps: [
+  { tool: 'repeat', while: { text: 'More' }, max: 100, steps: [body] },
+] }]);
+
+test('nested repeats share an executed-step budget', async () => {
+  let executed = 0;
+  const result = await run(nested(click), opsFor({ step: async () => { executed++; return { content: [] }; } }));
+  assert.equal(result.ok, false);
+  assert.match(result.failure.error, /executed.step budget/);
+  assert.ok(executed <= 1000); assert.ok(result.steps.length <= 1003);
+});
+
+for (const kind of ['read', 'image', 'image count', 'assert']) test(`nested repeats bound retained ${kind} output`, async () => {
+  const text = '✓'.repeat(200_000), image = 'a'.repeat(kind === 'image count' ? 4 : 1024 * 1024);
+  const body = kind === 'assert' ? { tool: 'assert', text: 'Ready', optional: true } : { tool: kind === 'read' || kind === 'diagnostics' ? 'read' : 'screenshot', optional: true };
+  const out = await runMacro(nested(body), { args: {}, ops: opsFor({
+    step: async () => ({ content: [{ type: 'text', text: `chars: 600000\n\n${text}` }, { type: 'image', data: image }] }),
+    assert: async () => text,
+    failure: async () => ({ page: text.repeat(10), screenshot: image.repeat(20) }),
+  }) });
+  assert.equal(out.result.ok, false); assert.match(out.result.failure.error, /budget/);
+  assert.ok(Buffer.byteLength(JSON.stringify(out.result)) < 6 * 1024 * 1024);
+  assert.ok(out.images.length <= 20);
+  assert.ok(out.images.reduce((n, x) => n + Buffer.byteLength(x.data), 0) <= 8 * 1024 * 1024);
+});
+
+
+test('failure diagnostics and screenshots obey retained output budgets', async () => {
+  const out = await runMacro(macro([click]), { args: {}, ops: opsFor({
+    step: async () => { throw new Error('page action failed'); },
+    failure: async () => ({ page: 'x'.repeat(6 * 1024 * 1024), screenshot: 'a'.repeat(10 * 1024 * 1024) }),
+  }) });
+  assert.equal(out.result.ok, false);
+  assert.equal(out.result.failure.error, 'page action failed');
+  assert.match(out.result.failure.diagnostics_omitted, /budget/);
+  assert.ok(JSON.stringify(out.result).length < 10000); assert.equal(out.images.length, 0);
+});

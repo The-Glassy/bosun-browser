@@ -241,3 +241,21 @@ test('keepalive restores before navigation, saves refreshed session cookies, and
   const visible = JSON.stringify({ logs, events, list: (await c.call('keepalive_list')).json(), opened: (await c.call('sessions')).json() });
   for (const value of [secret, 'refreshed-private-value']) assert.ok(!visible.includes(value));
 });
+
+
+test('CHIPS partitions retain independent precedence through two save/open cycles', async (t) => {
+  const dir = temp(t);
+  const cookies = [cookie(), cookie({ partitionKey: 'https://first.example' }), cookie({ partitionKey: 'https://second.example' })];
+  await saveSessionCookies({ cookies: async () => cookies }, dir);
+  for (const existing of [[], [cookie({ value: 'new-unpartitioned' })], [cookie({ partitionKey: 'https://first.example', value: 'new-partitioned' })]]) {
+    const jar = [...existing];
+    await restoreSessionCookies({ cookies: async () => jar, addCookies: async (cs) => jar.push(...cs) }, dir);
+    assert.equal(jar.length, 3);
+    for (const c of cookies) assert.deepEqual(jar.find((x) => x.partitionKey === c.partitionKey), existing.find((x) => x.partitionKey === c.partitionKey) ?? c);
+    await saveSessionCookies({ cookies: async () => jar }, dir);
+    const reopened = [];
+    await restoreSessionCookies({ cookies: async () => [], addCookies: async (cs) => reopened.push(...cs) }, dir);
+    assert.deepEqual(reopened, jar);
+    await saveSessionCookies({ cookies: async () => cookies }, dir);
+  }
+});

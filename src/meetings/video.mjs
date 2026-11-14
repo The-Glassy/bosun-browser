@@ -19,7 +19,8 @@ let support;
 export function videoUnsupported() {
   return support ??= new Promise((resolve) => {
     execFile('ffmpeg', ['-hide_banner', '-encoders'], { timeout: 10_000 }, (e, out) => {
-      resolve(!e && /\blibvpx-vp9\b/.test(out) && /\blibopus\b/.test(out) ? null : 'record_video needs ffmpeg with libvpx-vp9 and libopus');
+      if (e || !/\blibvpx-vp9\b/.test(out) || !/\blibopus\b/.test(out)) return resolve('record_video needs ffmpeg with libvpx-vp9 and libopus');
+      execFile('ffprobe', ['-version'], { timeout: 5000 }, (error) => resolve(error ? 'record_video needs ffprobe' : null));
     });
   });
 }
@@ -39,20 +40,23 @@ export function startPageVideo({ page, fps, file, makeRecorder }) {
     pending.add(event.sessionId);
     firstResolve();
   };
-  const detach = async () => {
+  let detaching;
+  const detach = () => {
     clearInterval(timer);
     clearTimeout(setupTimer);
     latest = null;
-    if (cdp) {
-      const session = cdp;
-      cdp = null;
-      session.off('Page.screencastFrame', frame);
-      await Promise.race([(async () => {
-        await session.send('Page.stopScreencast').catch(() => {});
-        await session.detach().catch(() => {});
-      })(), new Promise((r) => { const t = setTimeout(r, 2000); t.unref?.(); })]);
-    }
+    if (!cdp) return detaching || Promise.resolve();
+    const session = cdp;
+    cdp = null;
+    session.off('Page.screencastFrame', frame);
+    // Bound each operation separately: a stalled stop must never prevent the detach attempt.
+    detaching = (async () => {
+      try { await bounded(() => session.send('Page.stopScreencast'), 1000); }
+      finally { await bounded(() => session.detach(), 1000); }
+    })();
+    return detaching;
   };
+
   const fail = (e) => {
     if (closed) return;
     err = String(e?.message || e);
@@ -113,13 +117,26 @@ export function startPageVideo({ page, fps, file, makeRecorder }) {
     exited, error: () => err || rec?.error() || null, stop: () => end(false), kill: () => end(true) };
 }
 
-// A partial video is retained only if ffprobe can read actual video packets. Never trust a nonempty header.
+// true: at least one video packet; false: positive evidence of empty/invalid media;
+// null: validation could not complete. Operational failures must never authorize deletion.
 export function validVideo(file) {
   return new Promise((resolve) => {
-    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-count_packets',
-      '-show_entries', 'stream=nb_read_packets', '-of', 'json', file], { timeout: 5000 }, (e, out) => {
-      try { resolve(!e && JSON.parse(out).streams.some((s) => Number(s.nb_read_packets) > 0)); }
-      catch { resolve(false); }
+    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-read_intervals', '%+#1',
+      '-show_packets', '-show_entries', 'packet=size', '-of', 'json', file], { timeout: 5000 }, (e, out, stderr) => {
+      if (e) {
+        const invalid = !e.killed && typeof e.code === 'number' && /Invalid data found when processing input|EBML header parsing failed/.test(stderr);
+        return resolve(invalid ? false : null);
+      }
+      try {
+        const packets = JSON.parse(out).packets;
+        resolve(Array.isArray(packets) ? packets.some((p) => Number(p.size) > 0) : null);
+      } catch { resolve(null); }
     });
   });
+}
+
+async function bounded(fn, ms) {
+  let timer;
+  try { await Promise.race([Promise.resolve().then(fn).catch(() => {}), new Promise((r) => { timer = setTimeout(r, ms); timer.unref?.(); })]); }
+  finally { clearTimeout(timer); }
 }
