@@ -1028,10 +1028,22 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
           if (c.text !== undefined) await s.page.getByText(c.text).filter({ visible: true }).first().waitFor({ state: 'visible', timeout: t }).catch(failed(`text "${c.text}" is not visible`));
           if (c.text !== undefined || c.selector !== undefined) {
             const l = c.text !== undefined ? s.page.getByText(c.text) : s.page.locator(c.selector);
-            // Use read's masking path for any matched text returned to the caller.
-            const values = await sensitiveValues(s.page);
-            const [, text] = await readText(l.filter({ visible: true }).first(), 10000, values, true);
-            matched = text === null ? null : maskText(text, values);
+            // Omit text if a credential-source frame existed at any point during this read,
+            // including one removed before extraction. The in-page guard also checks current DOM frames.
+            let hadFrames = s.page.frames().length > 1;
+            const frameChanged = () => { hadFrames = true; };
+            s.page.on('frameattached', frameChanged);
+            s.page.on('framedetached', frameChanged);
+            try {
+              const values = await sensitiveValues(s.page);
+              if (!hadFrames) {
+                const [, text] = await readText(l.filter({ visible: true }).first(), 10000, values, true);
+                if (!hadFrames) matched = text === null ? null : maskText(text, values);
+              }
+            } finally {
+              s.page.off('frameattached', frameChanged);
+              s.page.off('framedetached', frameChanged);
+            }
           }
           return matched;
         }), hooks).catch(clean),

@@ -3,7 +3,7 @@
 ## 0.26.2 (2026-11-14)
 
 - Preserve native label-only credential detection when page components shadow `labels`, including reflections and screenshot masks.
-- Read macro assertion text through the shared atomic masking/visibility path, capped at 10,000 characters; omit matched text on pages with frames, where scan freshness cannot be guaranteed.
+- Read macro assertion text through the shared atomic masking/visibility path, capped at 10,000 characters; omit matched text if frames are present or change during extraction, where scan freshness cannot be guaranteed.
 - Preserve independent CHIPS session-cookie partitions and each partition's existing-cookie precedence, including Chromium's cross-site ancestor bit.
 - Bound each macro run to 1,000 executed steps, 4 MiB retained text/metadata, 20 images and 8 MiB image data, across nested loops and failure diagnostics.
 - Require ffprobe before video recording; probe only an initial video packet and retain media with a status warning when validation is unavailable.
