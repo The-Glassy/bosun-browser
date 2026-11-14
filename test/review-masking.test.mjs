@@ -58,3 +58,29 @@ test('macro assert rescans rotated credentials atomically and keeps failure diag
   assert.equal(result.ok, false);
   assert.ok(!response.text.includes('rotated-secret')); assert.ok(!response.text.includes('old-secret'));
 });
+
+test('macro assert omits matched text when a credential source is in another frame', async (t) => {
+  const { c, s, page } = await fixture(t);
+  await page.setContent(`<iframe srcdoc='<input type="password" value="old-frame-secret">'></iframe><p id="mirror">old-frame-secret</p>`);
+  const frames = page.frames(); assert.equal(frames.length, 2);
+  const originals = frames.map((f) => f.evaluate.bind(f)); let scans = 0;
+  frames.forEach((frame, i) => {
+    frame.evaluate = async (fn, arg) => {
+      const result = await originals[i](fn, arg);
+      if (arg?.op === 'values' && ++scans === frames.length) await originals[0](() => {
+        document.querySelector('iframe').contentDocument.querySelector('input').value = 'rotated-frame-secret';
+        document.querySelector('#mirror').textContent = 'rotated-frame-secret';
+      });
+      return result;
+    };
+  });
+  t.after(() => frames.forEach((f, i) => { f.evaluate = originals[i]; }));
+  assert.equal((await c.call('macro_save', { name: 'frame-rotation', site: ['example.test'], steps: [
+    { tool: 'assert', selector: '#mirror' }, { tool: 'assert', selector: '#missing', timeoutMs: 100 },
+  ] })).isError, false);
+  const response = await c.call('macro_run', { name: 'frame-rotation', session: s });
+  assert.ok(scans >= frames.length);
+  assert.equal(response.json().steps[0].status, 'ok');
+  assert.equal(response.json().steps[0].text, undefined);
+  assert.ok(!response.text.includes('rotated-frame-secret')); assert.ok(!response.text.includes('old-frame-secret'));
+});

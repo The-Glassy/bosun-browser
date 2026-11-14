@@ -26,7 +26,7 @@ const maskedValue = (v) => {
 // there, and aria-labelledby can include text from an aria-hidden element.
 function inPage(subject, options) {
   // Frame.evaluate passes the options; Locator.evaluate additionally passes its selected root.
-  const { op, css, hint, attr, formats, prefixes, max, values = [] } = options || subject;
+  const { op, css, hint, attr, formats, prefixes, max, values = [], singleFrameOnly = false } = options || subject;
   const KEY = Symbol.for('bosun.sensitive');
   const seen = window[KEY] || (window[KEY] = new WeakSet());
   const re = new RegExp(hint, 'i');
@@ -126,6 +126,10 @@ function inPage(subject, options) {
     }
   }
   if (op === 'text') {
+    // A separate frame can rotate a credential and its reflection after the cross-frame scan.
+    // Assertions omit matched text on frame-bearing pages: no multi-frame protocol read is atomic.
+    // Check within this evaluation too, so a frame added after the earlier scan cannot bypass it.
+    if (singleFrameOnly && (window.parent !== window || window.length > 0 || roots.some((r) => r.querySelector('iframe,frame,object,embed')))) return [0, null];
     const el = subject;
     const walk = (n) => {
       if (n.nodeType === Node.TEXT_NODE) return n.nodeValue;
@@ -175,7 +179,7 @@ export const clearSensitive = (page) => scan(page, 'clear');
 // Read visible text, including when the selected root itself is hidden (innerText would fall back to
 // textContent there). Skip aria-hidden reveal copies too. Redact before truncating in the browser so a cut
 // through the middle of a token cannot expose its leading characters.
-export const readText = (root, max, values) => root.evaluate(inPage, { ...scanOptions('text'), max, values }, { timeout: 15000 });
+export const readText = (root, max, values, singleFrameOnly = false) => root.evaluate(inPage, { ...scanOptions('text'), max, values, singleFrameOnly }, { timeout: 15000 });
 
 // Remember the inputs that are type=password right now (in Bosun's evaluation world), so they stay sensitive if
 // they are later switched to type=text. Polled while a human has the tab.

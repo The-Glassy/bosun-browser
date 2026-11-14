@@ -259,3 +259,22 @@ test('CHIPS partitions retain independent precedence through two save/open cycle
     await saveSessionCookies({ cookies: async () => cookies }, dir);
   }
 });
+
+test('CHIPS ancestor bits have independent precedence and normalize the omitted true default', async (t) => {
+  const dir = temp(t), partitionKey = 'https://first.example';
+  const direct = cookie({ partitionKey, _crHasCrossSiteAncestor: false, value: 'direct' });
+  const embedded = cookie({ partitionKey, _crHasCrossSiteAncestor: true, value: 'embedded' });
+  const defaulted = cookie({ partitionKey, value: 'default-true' });
+  for (const existing of [[], [direct], [embedded], [defaulted]]) {
+    await saveSessionCookies({ cookies: async () => [direct, embedded, defaulted] }, dir);
+    const jar = [...existing];
+    await restoreSessionCookies({ cookies: async () => jar, addCookies: async (cs) => jar.push(...cs) }, dir);
+    assert.equal(jar.length, 2);
+    assert.deepEqual(jar.find((c) => c._crHasCrossSiteAncestor === false), direct);
+    assert.deepEqual(jar.find((c) => c._crHasCrossSiteAncestor !== false), existing[0]?._crHasCrossSiteAncestor !== false && existing.length ? existing[0] : embedded);
+    await saveSessionCookies({ cookies: async () => jar }, dir);
+    const reopened = [];
+    await restoreSessionCookies({ cookies: async () => [], addCookies: async (cs) => reopened.push(...cs) }, dir);
+    assert.deepEqual(reopened, jar);
+  }
+});
