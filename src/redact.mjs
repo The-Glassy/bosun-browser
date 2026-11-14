@@ -68,7 +68,15 @@ function inPage(subject, options) {
     let labels;
     try { labels = el.labels; } catch { return associated; }
     if (!labels || typeof labels === 'string') return associated;
-    const list = typeof labels[Symbol.iterator] === 'function' ? [...labels] : typeof labels.length === 'number' ? Array.from(labels) : [];
+    // Bounded: a hostile or broken component may expose an infinite iterator or a huge length.
+    const list = [];
+    try {
+      if (typeof labels[Symbol.iterator] === 'function') {
+        for (const n of labels) { list.push(n); if (list.length >= 64) break; }
+      } else if (typeof labels.length === 'number') {
+        for (let i = 0; i < Math.min(labels.length, 64); i++) list.push(labels[i]);
+      }
+    } catch { return associated; }
     return [...associated, ...list.filter((n) => n && n.nodeType === 1)];
   };
   const hints = (el) => {
