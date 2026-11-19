@@ -5,10 +5,10 @@
 **The boatswain browser for agents.** A self-hosted browser service that gives AI agents a real browser — and
 calls a human on deck when it needs one (CAPTCHA, cookie wall, 2FA).
 
-> Status: **in daily use** (v0.26) by a few agent teams on a shared deployment; tool APIs may still change between
+> Status: **in daily use** (v0.27) by a few agent teams on a shared deployment; tool APIs may still change between
 > minor versions. See [docs/DESIGN.md](docs/DESIGN.md) and [CHANGELOG.md](CHANGELOG.md).
 
-> Security: Chromium runs **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), downloads are refused
+> Security: Chromium runs **with its own sandbox** ([`CHROMIUM_SANDBOX`](#chromium-sandbox)), browser downloads are refused
 > unless a tenant is given [download hosts](#downloading-files), and a tenant can be kept to a [host allowlist](#per-tenant-host-allowlist)
 > (`BROWSER_TENANT_ALLOW`). A review of 0.7.0, and what is still risky, is in
 > [docs/SECURITY-REVIEW-0.7.0.md](docs/SECURITY-REVIEW-0.7.0.md); a Linux deployment guide is in
@@ -25,8 +25,9 @@ For agents: [skills/bosun-browser/SKILL.md](skills/bosun-browser/SKILL.md) is a 
 - MCP server over **stdio** (Claude Code, Codex, …) or **WebSocket** (shared service).
 - Tools: `session_open` / `session_close` / `sessions`, `navigate`, `read` (accessibility snapshot with element
   refs), `click`, `type`, `select`, `press`, `back`, `wait_for`, `screenshot`, `request_human`, `handoff_wait`,
-  `keepalive_set` / `keepalive_list` / `keepalive_remove`, `secret_create`, `upload_create` / `upload` (unless `FEATURES_UPLOADS=0`),
-  `download_wait` / `downloads` / `download_get` (tenants with download hosts),
+  `keepalive_set` / `keepalive_list` / `keepalive_remove`, `secret_create`, `secret_save`, `secret_reveal`,
+  `secret_settings_get` / `secret_settings_set`, `upload_create` / `upload` (unless `FEATURES_UPLOADS=0`),
+  `download_wait` / `downloads` (tenants with download hosts), `download_get` (browser downloads and saved secrets),
   `macro_save` / `macro_list` / `macro_get` / `macro_delete` / `macro_run`,
   and (unless `FEATURES_MEETINGS=0`) `meeting_join` /
   `meeting_status` / `meeting_chat_read` / `meeting_chat_send` / `meeting_stop_recording` /
@@ -115,6 +116,7 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `DOWNLOAD_MAX_BYTES` | 314572800 (300 MB) | largest file a download may be; past it the browser cancels it mid-stream |
 | `DOWNLOAD_TENANT_QUOTA_BYTES` | 1073741824 (1 GB) | downloaded bytes one tenant may hold at a time, running and kept (at least `DOWNLOAD_MAX_BYTES`) |
 | `DOWNLOAD_TTL_SEC` / `DOWNLOAD_URL_TTL_SEC` | 3600 / 900 | a download not fetched is deleted this long after it finished; a GET URL is valid this long |
+| `SECRETS_REVEAL` | `0` | fallback for `secrets_reveal`; an explicit tenant setting takes precedence (see [Secrets](#secrets)) |
 | `DOWNLOADS` | `0` | before 0.11 the service-wide switch; `0` is still accepted, `1` stops the service with a hint (use `BROWSER_TENANT_DOWNLOAD_ALLOW`, `*` for any host) |
 | `WS_HOST` / `WS_PORT` | `127.0.0.1` / – | WebSocket MCP listener (stdio when `WS_PORT` is unset) |
 | `WS_ALLOWED_ORIGINS` | – | comma list of browser Origins allowed to connect (non-browser clients send none) |
@@ -431,7 +433,7 @@ type { session, selector: "#password", secret_id: "s9c…", submit: true }
   e-mail address or a user name pass `allow_non_password: true`; any text `<input>` or `<textarea>` then takes it.
   Checkboxes, buttons, file inputs and non-inputs are refused. A refusal before the fill leaves the secret unused.
 - **Masked afterwards.** A field Bosun typed a secret into counts as a credential field from then on, whatever its
-  type or label: `read` shows `[masked]` for it (and for the value wherever else it appears in the page dump),
+  type or label: by default `read` shows `[masked]` for it (and for the value wherever else it appears in the page dump),
   `screenshot` blacks it out, and it is cleared after a handoff that ends with Give up, like a password field.
 - **Read-only tokens** (policy `ephemeral`) get no secrets: `secret_create` is refused, so is `type` with
   `secret_id`, and so is a PUT with such a token.
@@ -441,6 +443,39 @@ What this does not change: once the secret is in the page, the page has it. A pa
 into its title or URL in a form Bosun doesn't recognise, or send it anywhere it can reach, and on engine `chromium` a
 page can switch off the masking helpers (see [Security notes](#security-notes)). Type secrets only into pages you
 would give them to by hand.
+
+## Secrets
+
+Use `secret_save` to keep a value the browser displays once, such as a newly created Linear personal API key.
+Give the session and a target as you would for `click`. Use `ref`, `role` with optional `name`, `selector`, or `text`.
+Use `nth`, `after` or `before` to select among visible matches. An input supplies its live value. Other elements,
+including `<code>` and `<span>`, supply their `textContent`. Set `attribute` to `"value"` or `"text"` to choose
+explicitly. Bosun refuses empty or whitespace-only values and preserves the exact contents of other values.
+
+```text
+secret_save { session, selector: "#new-api-key code", filename: "linear.key" }
+  -> { download_id, length, sha256_prefix, curl, next }
+download_get { download_id, inline: false }
+  -> { get_url, curl, ... }
+```
+
+Run the `curl` line from `download_get` in the agent's shell. It writes directly to the chosen filename with
+`curl -o` and creates new files with private permissions. The default filename is `secret.txt`. The save result
+reports the UTF-8 byte length and the first eight hex digits of SHA-256. Bosun removes the staged file after a
+complete fetch, after 15 minutes, or at service restart. The one-time GET is served on the WebSocket MCP port.
+Saved secrets always use this URL, even if `inline: true` is requested. Bosun stages these files itself,
+so they are available regardless of the browser download host allowlist.
+
+To see values in tool results, call `secret_settings_set { secrets_reveal: true }` for your tenant.
+`secret_reveal { session, selector: "#new-api-key code" }` then returns `{ value }`, and `read` returns raw values
+in its accessibility snapshot or visible text, including when run as a macro step. Clients can retain those
+results in their transcripts. Screenshots continue to mask secrets with either setting. `secret_settings_get {}`
+reports the stored setting, effective value and source. Set `false` to turn reveal off, or pass `null` to restore
+the `SECRETS_REVEAL` fallback (false by default).
+
+Full-policy tenants can save and reveal in sessions owned by the calling connection. Ephemeral tokens always get
+masked reads. Bosun audits saves and reveals with tenant, page host, element type and byte length. The value
+stays out of these audit lines and out of save and download tool results.
 
 ## Downloading files
 
@@ -1558,14 +1593,16 @@ browser with upstream's own flags. An egress exit, when selected, still applies 
 - Secrets sent for `type { secret_id }` stay in the service's memory (at most 4 KB each, 20 per tenant, 10 min),
   never on disk or in its log, and are zeroed once typed. They keep the password out of the agent's transcript, not
   out of the page: the page that receives one can do with it what it likes.
-- `read` (a11y/text) and `screenshot`, including macro steps, always mask credential/token field values and known
+- `read` (a11y/text) masks by default and `screenshot` always masks credential/token field values and known
   secret formats: GitLab (`glpat-`, `glft-`, `glrt-`, `glptt-`), GitHub (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
-  `github_pat_`), OpenAI/Anthropic (`sk-`, `sk-ant-`), Slack (`xox[abprs]-`), AWS (`AKIA`/`ASIA` plus 16 characters),
-  JWTs and PEM private keys. Inputs, code/pre and readonly elements also mask high-entropy base64url/hex strings
-  of at least 32 characters. Ordinary long words and URLs without a secret component stay readable. Hidden
+  `github_pat_`), Linear (`lin_api_`, `lin_oauth_`), OpenAI/Anthropic (`sk-`, `sk-ant-`), Slack (`xox[abprs]-`),
+  AWS (`AKIA`/`ASIA` plus 16 characters), JWTs and PEM private keys. Inputs, code/pre and readonly elements also
+  mask high-entropy base64url/hex strings of at least 32 characters. Ordinary long words and URLs without a
+  secret component stay readable. Hidden
   reveal copies are excluded from text reads; redaction happens before truncation. Text keeps only fixed public
-  prefixes, screenshots draw opaque boxes, and there is no general unmask flag. Credential-shaped documentation
-  examples, hashes or random identifiers in code/readonly elements can be false positives.
+  prefixes and screenshots draw opaque boxes. Full-policy tenants can explicitly opt in to unmasked reads via
+  [Secrets](#secrets). Credential-shaped documentation examples, hashes or random identifiers in code/readonly
+  elements can be false positives. See [Linear's key and token formats](https://linear.app/changelog/2021-08-19-github-secret-scanning).
 - Masking is heuristic. Arbitrary passwords echoed into ordinary text after the credential field is cleared,
   unlabelled custom widgets and closed shadow roots can still escape it. On `chromium` a page can also neutralize
   the masking helpers (they run in its own JavaScript world; `patchright` uses an isolated one). Treat a page where

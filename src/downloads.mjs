@@ -1,5 +1,5 @@
-// Files a page downloads, kept for the agent (download_wait, downloads, download_get). Only a tenant named in
-// BROWSER_TENANT_DOWNLOAD_ALLOW gets them; every other tenant's browser refuses downloads outright, as before.
+// Files a page downloads, kept for the agent (download_wait, downloads, download_get). A tenant named in
+// BROWSER_TENANT_DOWNLOAD_ALLOW can keep browser downloads. Bosun also stages secret_save files here for GET only.
 //
 // Which download is kept: one whose URL's host is on the tenant's list, or one started by a page whose top-level
 // origin is (a popup with no origin of its own counts as its opener). blob: and data: URLs are made by the page
@@ -20,10 +20,12 @@ import path from 'path';
 import { EventEmitter } from 'events';
 import { pipeline } from 'stream/promises';
 import { allowsUrl } from './allow.mjs';
-import { policyOf } from './auth.mjs';
+import { NOT_ALLOWED, policyOf } from './auth.mjs';
+import { DRIVER_LOGS_REFUSED, driverLogsValues } from './secrets.mjs';
 import { safeName } from './uploads.mjs';
 
 export const INLINE_MAX_BYTES = 256 * 1024;
+export const SAVED_SECRET_TTL_MS = 15 * 60_000;
 const POLL_MS = 250; // how often a running download's size is checked
 const FILES_PER_TENANT = 50; // downloads a tenant holds at a time (running or ready)
 const NOTICES_PER_TENANT = 100; // refused and failed downloads remembered per tenant, for the agent to read
@@ -213,6 +215,41 @@ export class Downloads extends EventEmitter {
     this.settle(f);
   }
 
+  // Reserve a slot and its bytes before writing. The record becomes fetchable only after the write completes.
+  async saveSecret(tenant, name, content) {
+    if (policyOf(this.cfg, tenant) === 'ephemeral') throw new Error(NOT_ALLOWED);
+    if (this.closed) throw new Error('service is shutting down');
+    if (this.count(tenant) >= FILES_PER_TENANT) throw new Error(`this token holds ${FILES_PER_TENANT} downloads already; fetch them or let them expire`);
+    const id = `d${crypto.randomBytes(8).toString('hex')}`;
+    const dir = path.join(this.root, tenant, id);
+    const f = {
+      id, tenant, name: safeName(name), dir, state: 'downloading', size: content.length,
+      source: 'secret_save', mime: 'application/octet-stream', savedSecret: true,
+    };
+    f.file = path.join(dir, f.name);
+    this.files.set(id, f);
+    const over = this.overLimit(f);
+    if (over) {
+      this.files.delete(id);
+      throw new Error(over);
+    }
+    try {
+      await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+      await fs.promises.writeFile(f.file, content, { mode: 0o600, flag: 'wx' });
+    } catch {
+      await this.remove(f);
+      throw new Error('could not save the secret file');
+    }
+    if (this.closed) {
+      await this.remove(f);
+      throw new Error('service is shutting down');
+    }
+    f.state = 'ready';
+    f.expiresAt = Date.now() + SAVED_SECRET_TTL_MS;
+    f.expiryTimer = setTimeout(() => { if (!f.sending) this.remove(f); }, SAVED_SECRET_TTL_MS).unref();
+    return f;
+  }
+
   // d: null when the browser refused the download itself (nothing to cancel).
   async refuse(f, d, reason) {
     f.cleaning = true; // still charged, and kept, until dropPartial has made sure its file is gone
@@ -312,13 +349,17 @@ export class Downloads extends EventEmitter {
   }
 
   list(tenant, sessionId = null) {
-    return [...this.files.values()].filter((f) => f.tenant === tenant && f.state !== 'deleted' && (!sessionId || f.session === sessionId)).sort((a, b) => a.seq - b.seq);
+    return [...this.files.values()].filter((f) => f.tenant === tenant && !f.savedSecret && f.state !== 'deleted' && (!sessionId || f.session === sessionId)).sort((a, b) => a.seq - b.seq);
   }
 
   // Same message for "never existed", "another tenant's" and "already fetched", so ids can't be probed.
   get(tenant, id) {
     const f = this.files.get(id);
-    if (!f || f.tenant !== tenant || f.state === 'deleted') throw new Error(`no download ${String(id).slice(0, 40)} (deleted once fetched, ${Math.round(this.cfg.downloadTtlMs / 60000)} min after it finished, or on a service restart)`);
+    if (f?.savedSecret && f.tenant === tenant && Date.now() >= f.expiresAt) {
+      if (!f.sending) this.remove(f);
+      throw new Error('no download (the saved secret expired after 15 min)');
+    }
+    if (!f || f.tenant !== tenant || f.state === 'deleted') throw new Error(`no download ${String(id).slice(0, 40)} (deleted once fetched, after its retention period, or on a service restart)`);
     if (f.state === 'downloading') throw new Error(`download ${id} is still running (${f.size} bytes so far); call download_wait`);
     if (f.state !== 'ready') throw new Error(`download ${id} was ${f.state}: ${f.reason}`);
     if (f.sending) throw new Error(`download ${id} is being fetched right now; it is deleted once that completes (call download_get again if it fails)`);
@@ -328,13 +369,13 @@ export class Downloads extends EventEmitter {
   // A one-time GET URL secret, valid DOWNLOAD_URL_TTL_SEC; a new one replaces the previous one.
   issue(f) {
     f.secret = crypto.randomBytes(24).toString('base64url');
-    f.urlExpiresAt = Date.now() + this.cfg.downloadUrlTtlMs;
+    f.urlExpiresAt = Math.min(Date.now() + this.cfg.downloadUrlTtlMs, f.savedSecret ? f.expiresAt : Infinity);
     return f.secret;
   }
 
   // The file's text, if it is small and UTF-8 text (no NUL), and then it counts as fetched; otherwise null.
   async inline(f) {
-    if (f.size > INLINE_MAX_BYTES || f.sending) return null;
+    if (f.savedSecret || f.size > INLINE_MAX_BYTES || f.sending) return null;
     f.sending = true; // claimed before anything is awaited: a second fetch meanwhile is refused (get())
     let text = null;
     try {
@@ -349,6 +390,7 @@ export class Downloads extends EventEmitter {
   // The file is unusable at once; its bytes (quota) and its slot are released only once the directory is gone. A
   // removal that fails is retried by the sweep.
   remove(f) {
+    clearTimeout(f.expiryTimer);
     if (f.state !== 'deleted') {
       f.state = 'deleted';
       f.secret = null;
@@ -357,7 +399,7 @@ export class Downloads extends EventEmitter {
     f.removing ??= fs.promises.rm(f.dir, { recursive: true, force: true }).then(() => {
       if (this.files.get(f.id) === f) this.files.delete(f.id);
     }, (e) => {
-      console.error(`bosun: download ${f.id} of tenant ${f.tenant} not deleted yet (${e.code || e.message}); retrying`);
+      console.error(`bosun: download ${f.id} of tenant ${f.tenant} not deleted yet (${e.code || 'remove failed'}); retrying`);
     }).finally(() => { f.removing = null; });
     return f.removing;
   }
@@ -400,9 +442,15 @@ export class Downloads extends EventEmitter {
     const okSecret = secret === null || (!!f?.secret && Buffer.byteLength(secret) === f.secret.length && crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(f.secret)));
     const hdr = authTenant(req);
     if (secret === null && !hdr) { reply(401, { error: 'give the URL from download_get (with ?t=), or your token in Authorization: Bearer' }); return true; }
-    if (!f || !okSecret || f.state !== 'ready' || f.sending || (secret !== null && Date.now() > f.urlExpiresAt)) { reply(404, { error: 'no such download URL (used, expired, or never issued); call download_get again' }); return true; }
+    const now = Date.now();
+    const expired = f?.savedSecret && now >= f.expiresAt;
+    if (expired && !f.sending) this.remove(f);
+    if (!f || !okSecret || f.state !== 'ready' || f.sending || expired || (secret !== null && now > f.urlExpiresAt)) { reply(404, { error: 'no such download URL (used, expired, or never issued); call download_get again' }); return true; }
     if (hdr === false || (hdr !== null && hdr !== f.tenant)) { reply(403, { error: 'this token may not fetch that download' }); return true; }
-    if (!this.allowFor(f.tenant)) { reply(403, { error: 'downloads are not allowed for this token' }); return true; }
+    if (f.savedSecret) {
+      if (secret === null || policyOf(this.cfg, f.tenant) === 'ephemeral') { reply(403, { error: 'a saved secret needs the one-time URL from download_get' }); return true; }
+      if (driverLogsValues()) { reply(503, { error: DRIVER_LOGS_REFUSED }); return true; }
+    } else if (!this.allowFor(f.tenant)) { reply(403, { error: 'downloads are not allowed for this token' }); return true; }
     if ([...this.files.values()].filter((x) => x.tenant === f.tenant && x.sending).length >= GETS_PER_TENANT) {
       reply(429, { error: `too many downloads being fetched at once (${GETS_PER_TENANT} per token); retry this URL in a moment` });
       return true;
@@ -413,9 +461,9 @@ export class Downloads extends EventEmitter {
     let stream = null;
     const ac = new AbortController();
     f.abort = () => ac.abort();
-    // A client that stops reading is dropped: GET_IDLE_MS without progress, GET_MAX_MS in all.
+    // A client that stops reading is dropped. A saved secret's transfer also ends by its retention deadline.
     res.setTimeout(GET_IDLE_MS, () => ac.abort());
-    const deadline = setTimeout(() => ac.abort(), GET_MAX_MS);
+    const deadline = setTimeout(() => ac.abort(), f.savedSecret ? f.expiresAt - now : GET_MAX_MS);
     try {
       const headers = {
         'content-type': f.mime, 'content-length': String(f.size), 'content-disposition': disposition(f.name),
@@ -430,6 +478,7 @@ export class Downloads extends EventEmitter {
     } catch {
       stream?.destroy();
       f.sending = false;
+      if (f.savedSecret && Date.now() >= f.expiresAt) await this.remove(f);
       if (!res.headersSent) reply(500, { error: 'could not read the file; call download_get again' });
       else res.destroy();
     } finally {

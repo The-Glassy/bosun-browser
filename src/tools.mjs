@@ -444,7 +444,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.26.2' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: '0.27.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -532,9 +532,13 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     });
   });
 
-  tool('read', 'Read the page. mode a11y (default): accessibility snapshot with element refs [ref=eN] usable by click/type. mode text: visible text. Credential/token fields and secret-format values are masked.',
+  const secretSettings = manager.secretSettings;
+  const revealEnabled = () => !ephemeral && secretSettings?.get(tenant).effective.secrets_reveal;
+  tool('read', `Read the page. mode a11y (default): accessibility snapshot with element refs [ref=eN] usable by click/type. mode text: visible text. Credential/token fields and secret-format values are masked${ephemeral ? '' : ' by default (see secret_settings_get)'}.`,
     { session: str(40), mode: z.enum(['a11y', 'text']).optional(), selector: str(2000).optional(), maxChars: z.number().int().min(1).max(200000).optional() },
     async (a) => run(a.session, async (s) => {
+      const reveal = revealEnabled();
+      if (reveal && driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
       const max = a.maxChars ?? 20000;
       // The first visible match (as click finds it), or the first one when none is visible.
       const sel = a.selector ? s.page.locator(a.selector) : null;
@@ -547,14 +551,15 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         }
         out = await (a.selector ? root.ariaSnapshot({ mode: 'ai', timeout: 15000 }) : s.page.ariaSnapshot({ mode: 'ai', timeout: 15000 }));
         total = out.length;
-        values = await sensitiveValues(s.page);
+        if (!reveal) values = await sensitiveValues(s.page);
       } else {
-        values = await sensitiveValues(s.page);
-        [total, out] = await readText(root, max, values);
+        if (!reveal) values = await sensitiveValues(s.page);
+        [total, out] = await readText(root, max, values, false, reveal);
       }
-      out = maskText(out, values);
+      if (!reveal) out = maskText(out, values);
       const info = await pageInfo(s.page);
-      return ok(maskText(`url: ${info.url}\ntitle: ${info.title}\nchars: ${total}${total > max ? ` (truncated to ${max})` : ''}\n\n${out.slice(0, max)}`, values));
+      const result = `url: ${info.url}\ntitle: ${info.title}\nchars: ${total}${total > max ? ` (truncated to ${max})` : ''}\n\n${out.slice(0, max)}`;
+      return ok(reveal ? result : maskText(result, values));
     }));
 
   tool('click', `Click an element (by ref from read, role+name, selector or text).${downloads ? ' A download it starts is reported in downloads (waits up to 5 s for it to finish).' : ''}`, { session: str(40), ...target, ...actionTimeout }, async (a) => run(a.session, async (s) => {
@@ -739,6 +744,70 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       });
   }
 
+  if (secretSettings && manager.downloads) {
+    tool('secret_settings_get', 'Get this tenant’s stored and effective secrets_reveal setting and its source. The default is false.', {},
+      async () => ok(secretSettings.get(tenant)));
+    tool('secret_settings_set', 'Set this tenant’s secrets_reveal to true or false. Pass null to restore the fallback. When true, read and secret_reveal can return raw values. Screenshots still mask secrets.',
+      { secrets_reveal: z.boolean().nullable() }, async (a) => ok(secretSettings.set(tenant, a.secrets_reveal)));
+
+    const secretTarget = { session: str(40), ...target };
+    const secretAction = (name, a, use) => manager.run(owner, a.session, async (s) => {
+      const call = currentCall();
+      const host = new URL(s.page.url()).host || '(no host)';
+      const kind = a.ref ? 'ref' : a.role ? 'role' : a.selector ? 'selector' : a.text ? 'text' : 'unspecified';
+      let element = kind, length = 0, status = 'refused';
+      try {
+        if (name === 'secret_reveal' && !revealEnabled()) throw new Error('secrets_reveal is off for this tenant; use secret_save to save the value to a file');
+        if (name === 'secret_save' && !cfg.ws) throw new Error('secret_save needs the WebSocket service (WS_PORT) for the one-time download URL');
+        if (driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
+        if (!hasTarget(a)) throw new Error('give ref, role(+name), selector or text for the secret element');
+        if (a.ref && (a.nth !== undefined || a.after || a.before)) throw new Error('nth, after and before go with role, selector or text, not with ref');
+        const until = Date.now() + FIND_MS;
+        let selected;
+        try {
+          selected = await withTarget(s.page, a, { until }, (l) => l.evaluate((el, attr) => {
+            const tag = el.localName;
+            const attribute = attr ?? (tag === 'input' ? 'value' : 'text');
+            const value = attribute === 'value' ? el.value : el.textContent;
+            return { tag, value: typeof value === 'string' ? value : '' };
+          }, a.attribute ?? null, { timeout: left(until) }), { retry: true });
+        } catch {
+          // Driver errors or target strings can quote the secret, for example when text matching fails.
+          throw new Error('could not read the secret element; use a visible target or an up-to-date ref from read');
+        }
+        stillOn(call);
+        element = `${kind} <${tagOf(selected?.tag)}>`;
+        const { value } = selected ?? {};
+        if (typeof value !== 'string' || !value.trim()) throw new Error('the secret element has an empty value');
+        length = Buffer.byteLength(value, 'utf8');
+        if (name === 'secret_reveal' && !revealEnabled()) throw new Error('secrets_reveal was turned off for this tenant; use secret_save to save the value to a file');
+        const result = await use(value, length, call);
+        status = 'ok';
+        return result;
+      } finally {
+        console.error(`bosun: ${name} tenant=${tenant} host=${host} element=${element} length=${length} status=${status}`);
+      }
+    });
+
+    tool('secret_save', 'Save an element’s current value or text to a private, one-time download. Use the same target as click. Returns its ID, UTF-8 byte length, SHA-256 prefix and a curl template. Call download_get with inline=false for the URL. Expires after 15 minutes.',
+      { ...secretTarget, attribute: z.enum(['value', 'text']).optional().describe('Default: current value for an input, textContent for other elements.'), filename: str(255).optional() },
+      async (a) => secretAction('secret_save', a, async (value, length, call) => {
+        if (a.filename?.includes(value)) throw new Error('use a filename without the secret value');
+        const f = await capture.saveSecret(tenant, a.filename ?? 'secret.txt', Buffer.from(value, 'utf8'));
+        if (call?.expired || call?.done) {
+          await capture.remove(f);
+          stillOn(call);
+        }
+        return ok({
+          download_id: f.id, length, sha256_prefix: crypto.createHash('sha256').update(value).digest('hex').slice(0, 8),
+          curl: `(umask 077; curl -fsS -o ${shq(f.name)} '<get_url from download_get>')`,
+          next: `download_get { download_id: "${f.id}", inline: false }`,
+        });
+      }));
+    tool('secret_reveal', 'Return the exact current value of an input or the textContent of another element. Requires secrets_reveal=true for this tenant.',
+      secretTarget, async (a) => secretAction('secret_reveal', a, (value) => ok({ value })));
+  }
+
   // Uploads: files of this tenant only, put into a page with upload.
   const uploads = manager.uploads;
   if (uploads) {
@@ -798,22 +867,26 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       });
     tool('downloads', 'List the downloads of this token (or of one session): running, ready to fetch, refused or failed, with download_id, filename, size and reason.', { session: str(40).optional() },
       async (a) => ok(downloads.list(tenant, a.session ?? null).map((f) => downloads.info(f))));
-    tool('download_get', `Fetch a finished download: returns a one-time GET URL (valid ${Math.round(cfg.downloadUrlTtlMs / 60000)} min, this token only) and a ready curl -o line; the file is deleted once it has been fetched in full. inline=true returns the content in the result instead, for UTF-8 text up to ${INLINE_MAX_BYTES / 1024} KB (then the file is deleted too).`,
+  }
+  if (downloads || (capture && cfg.ws)) {
+    tool('download_get', `Fetch a finished download or a saved secret: returns a one-time GET URL and a ready curl -o line. The file is deleted once it has been fetched in full. inline=true returns ordinary UTF-8 downloads up to ${INLINE_MAX_BYTES / 1024} KB in the result. Saved secrets always use the GET URL.`,
       { download_id: str(40), inline: z.boolean().optional() }, async (a) => {
-        const f = downloads.get(tenant, a.download_id);
+        const f = capture.get(tenant, a.download_id);
+        if (f.savedSecret && driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
         const meta = { download_id: f.id, filename: f.name, size: f.size, mime: f.mime, source_host: f.source };
-        if (a.inline) {
-          const text = await downloads.inline(f);
+        if (a.inline && !f.savedSecret) {
+          const text = await capture.inline(f);
           if (text !== null) return ok({ ...meta, inline: true, content: text });
         }
-        if (!cfg.ws) return ok({ ...meta, path: f.file, note: `no MCP port (stdio): read the file at path; it is deleted ${ttlMin} min after it finished or on a restart` });
-        const where = `/download/${f.id}?t=${downloads.issue(f)}`;
+        if (!cfg.ws) return ok({ ...meta, path: f.file, note: `no MCP port (stdio): read the file at path; it is deleted ${Math.round(cfg.downloadTtlMs / 60000)} min after it finished or on a restart` });
+        const where = `/download/${f.id}?t=${capture.issue(f)}`;
         const url = uploadBase ? `${uploadBase}${where}` : null;
+        const curl = `curl ${f.savedSecret ? '-fsS' : '-sS --fail-with-body'} -o ${shq(f.name)} ${shq(url ?? `http://<mcp host:port>${where}`)}`;
         return ok({
-          ...meta, ...(a.inline ? { inline: false, inline_note: `not inline: only UTF-8 text up to ${INLINE_MAX_BYTES / 1024} KB` } : {}),
+          ...meta, ...(a.inline ? { inline: false, inline_note: f.savedSecret ? 'saved secrets are fetched over the one-time GET URL' : `not inline: only UTF-8 text up to ${INLINE_MAX_BYTES / 1024} KB` } : {}),
           get_url: url ?? where, ...(url ? {} : { get_url_note: 'GET from the host:port of your MCP URL, http, with this path' }),
-          curl: `curl -sS --fail-with-body -o ${shq(f.name)} ${shq(url ?? `http://<mcp host:port>${where}`)}`,
-          valid_min: Math.round(cfg.downloadUrlTtlMs / 60000), next: 'GET it once (curl); the file is deleted after a complete fetch',
+          curl: f.savedSecret ? `(umask 077; ${curl})` : curl,
+          valid_min: Math.round((f.urlExpiresAt - Date.now()) / 60000), next: 'GET it once (curl); the file is deleted after a complete fetch',
         });
       });
   }
