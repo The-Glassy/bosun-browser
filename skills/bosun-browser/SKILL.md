@@ -30,7 +30,7 @@ Rules of thumb:
 - Prefer `role`+`name` or `text` targets over CSS selectors; they survive redesigns.
 - Don't fire dependent browser calls in parallel. One action, then look.
 - Use `screenshot` when the a11y tree doesn't explain what you see (overlays, canvases, layout).
-  Credential fields and secret-looking values are masked in `read` and `screenshot`.
+  Credential fields and recognized secret formats are masked by default in `read` and always in `screenshot`.
 - Every call has a deadline; `timeoutMs` (100–60000) shortens the wait for an element.
 
 ## Passwords and other secrets
@@ -41,6 +41,15 @@ Never put a password in a `type` value. Instead:
    so it never appears in your context or a log.
 3. `type {session, secret_id, selector:"input[type=password]", submit:true}`.
    Secrets go only into password inputs unless you set `allow_non_password:true` (OTP or e-mail fields).
+
+To keep a newly displayed key, call `secret_save {session, selector:"#new-api-key", filename:"api.key"}`
+using the same target fields as `click`. It reads the live input value or the element's text. Then call
+`download_get {download_id, inline:false}` and run its `curl -o` line to write the secret directly to
+disk. The one-time download expires after 15 minutes.
+
+To expose a value in the tool result, enable `secret_settings_set {secrets_reveal:true}` for your tenant,
+then call `secret_reveal {session, selector:"#new-api-key"}`. This setting also exposes values in `read`.
+Use `secret_settings_get {}` to check the setting and set it to `false` to restore masking.
 
 ## When a human is needed
 

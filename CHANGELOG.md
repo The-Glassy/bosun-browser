@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.27.0 (2026-11-19)
+
+- `secret_save` keeps a value from an input or a text element for 15 minutes. Fetch it directly to disk using
+  `download_get` and a one-time URL. Saved secrets are tenant-scoped and work without browser download hosts.
+- `secret_settings_get` and `secret_settings_set` manage the server-side, per-tenant `secrets_reveal` setting.
+  Opting in exposes raw values in `read` and enables `secret_reveal`. Screenshots stay masked, and ephemeral
+  tokens always get masked reads. Save and reveal audit lines record metadata without the value.
+- Mask Linear API keys and OAuth tokens by format, including when rendered as plain text.
+
 ## 0.26.2 (2026-11-14)
 
 - Preserve native label-only credential detection when page components shadow `labels`, including reflections and screenshot masks; preserve custom value widgets’ label hints.

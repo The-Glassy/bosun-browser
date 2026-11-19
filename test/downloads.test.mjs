@@ -130,12 +130,13 @@ test('config: off by default, per-tenant host patterns, limits, and the old swit
   assert.throws(() => loadConfig({ DOWNLOAD_MAX_BYTES: '10', DOWNLOAD_TENANT_QUOTA_BYTES: '5' }), /DOWNLOAD_TENANT_QUOTA_BYTES must be between 10/);
 });
 
-test('a tenant that is not named cannot download at all, and has no download tools', async () => {
+test('a tenant that is not named cannot keep browser downloads', async () => {
   const svc = await start({ BROWSER_TENANT_DOWNLOAD_ALLOW: `alice=${A.host}` });
   try {
     const c = await connect(svc, TOKEN_B);
     const names = (await c.listTools()).tools.map((t) => t.name);
-    for (const n of ['download_wait', 'downloads', 'download_get']) assert.ok(!names.includes(n), n);
+    for (const n of ['download_wait', 'downloads']) assert.ok(!names.includes(n), n);
+    assert.ok(names.includes('download_get'), 'available for secret_save');
     const id = await openAt(c, `${a}/page?to=/dl`);
     const s = svc.manager.sessions.get(id);
     assert.equal(s.dlDir, null);

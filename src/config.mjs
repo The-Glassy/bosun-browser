@@ -35,6 +35,7 @@ export function loadConfig(env = process.env) {
     idleTimeoutMs: int(env, 'IDLE_TIMEOUT_SEC', 900, 0, 7 * 86400) * 1000, // 0 = never reap idle sessions
     handoffTtlMs: int(env, 'HANDOFF_TTL_SEC', 900, 10, 86400) * 1000,
     saveShots: env.SAVE_SHOTS === '1',
+    secretsRevealEnv: flag(env, 'SECRETS_REVEAL', null),
     shotsPerSession: int(env, 'SHOTS_PER_SESSION', 20, 1, 1000),
     maxInflight: int(env, 'MAX_INFLIGHT', 8, 1, 1000), // concurrent tool calls per connection
     maxPagesPerSession: int(env, 'MAX_PAGES_PER_SESSION', 5, 1, 100),

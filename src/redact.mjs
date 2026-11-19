@@ -13,10 +13,10 @@ const MARK_ATTR = 'data-bosun-sensitive';
 // Separators (including snake_case and camelCase metadata) are normalized before matching. In particular,
 // "pin" must not match "pinned"/"spinner", and "token" must not match "Tokenized".
 const HINT_WORDS = String.raw`\b(?:token|secret|api ?key|private ?key|client ?secret|feed ?token|password|passcode|otp|pin|pwd|totp|pincode|passphrase|2fa|mfa|tan|cvc|cvv|csc)\b|passw|kennw|mot de passe|contrase|senha|heslo|hasło|parol|wachtwoord|lösenord|salasana|one ?time|security code|verification code|sicherheitscode|bestätigungscode`;
-const FORMAT_SOURCE = String.raw`-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)|(?<![A-Za-z0-9])(?:gl(?:pat|ft|rt|ptt)-[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]+|(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)`;
+const FORMAT_SOURCE = String.raw`-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)|(?<![A-Za-z0-9])(?:gl(?:pat|ft|rt|ptt)-[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_(?:api|oauth)_[A-Za-z0-9_-]+|sk-ant-[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]+|(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)`;
 const hintText = (v) => `${v} ${v.replace(/([a-z])([A-Z])/g, '$1 $2')}`.replace(/[_\-.[\]]+/g, ' ');
 // Only these public, fixed prefixes survive masking. Never retain a suffix or an arbitrary part of a value.
-const PREFIX_SOURCE = String.raw`^(?:gl(?:pat|ft|rt|ptt)-|gh[pousr]_|github_pat_|sk-ant-|sk-|xox[abprs]-|AKIA|ASIA)`;
+const PREFIX_SOURCE = String.raw`^(?:gl(?:pat|ft|rt|ptt)-|gh[pousr]_|github_pat_|lin_(?:api|oauth)_|sk-ant-|sk-|xox[abprs]-|AKIA|ASIA)`;
 const maskedValue = (v) => {
   const prefix = new RegExp(PREFIX_SOURCE).exec(v)?.[0];
   return prefix ? `${prefix}…[masked]` : '[masked]';
@@ -26,7 +26,7 @@ const maskedValue = (v) => {
 // there, and aria-labelledby can include text from an aria-hidden element.
 function inPage(subject, options) {
   // Frame.evaluate passes the options; Locator.evaluate additionally passes its selected root.
-  const { op, css, hint, attr, formats, prefixes, max, values = [], singleFrameOnly = false } = options || subject;
+  const { op, css, hint, attr, formats, prefixes, max, values = [], singleFrameOnly = false, unmasked = false } = options || subject;
   const KEY = Symbol.for('bosun.sensitive');
   const seen = window[KEY] || (window[KEY] = new WeakSet());
   const re = new RegExp(hint, 'i');
@@ -110,7 +110,7 @@ function inPage(subject, options) {
   const out = new Set();
   const candidates = [];
   const roots = [document];
-  for (let i = 0; i < roots.length; i++) {
+  for (let i = 0; !unmasked && i < roots.length; i++) {
     const root = roots[i];
     const labels = new Set([...root.querySelectorAll('[aria-labelledby]')].flatMap((el) =>
       (el.getAttribute('aria-labelledby') || '').split(/\s+/).map((id) => root.getElementById?.(id) || document.getElementById(id))).filter(Boolean));
@@ -183,6 +183,7 @@ function inPage(subject, options) {
     }
     let t = walk(el).replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     const total = t.length;
+    if (unmasked) return [total, t.slice(0, max)];
     const variants = [...new Set([...values, ...out].filter(Boolean).flatMap((v) => [v, v.replace(/[\u200b\u00ad]/g, '').trim().replace(/\s+/g, ' ')]))];
     for (const value of variants.sort((a, b) => b.length - a.length)) if (value.length >= 3) {
       const prefix = new RegExp(prefixes).exec(value)?.[0];
@@ -214,7 +215,7 @@ export const clearSensitive = (page) => scan(page, 'clear');
 // Read visible text, including when the selected root itself is hidden (innerText would fall back to
 // textContent there). Skip aria-hidden reveal copies too. Redact before truncating in the browser so a cut
 // through the middle of a token cannot expose its leading characters.
-export const readText = (root, max, values, singleFrameOnly = false) => root.evaluate(inPage, { ...scanOptions('text'), max, values, singleFrameOnly }, { timeout: 15000 });
+export const readText = (root, max, values, singleFrameOnly = false, unmasked = false) => root.evaluate(inPage, { ...scanOptions('text'), max, values, singleFrameOnly, unmasked }, { timeout: 15000 });
 
 // Remember the inputs that are type=password right now (in Bosun's evaluation world), so they stay sensitive if
 // they are later switched to type=text. Polled while a human has the tab.

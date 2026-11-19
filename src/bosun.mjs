@@ -12,6 +12,7 @@ import { Meetings } from './meetings/index.mjs';
 import { Uploads } from './uploads.mjs';
 import { Downloads } from './downloads.mjs';
 import { Secrets } from './secrets.mjs';
+import { SecretSettings } from './secret-settings.mjs';
 import { Macros } from './macros.mjs';
 
 export async function startService(cfg, { engines, keepalive: kaOpts = {}, meetings: mOpts = {} } = {}) {
@@ -31,10 +32,11 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
     if (cfg.features.meetings) manager.meetings = new Meetings({ cfg, manager, bus: events, ...mOpts });
     // FEATURES_UPLOADS=0: no upload tools, no PUT endpoint, no uploads directory.
     if (cfg.features.uploads) manager.uploads = new Uploads(cfg);
-    // Downloads (tenants named in BROWSER_TENANT_DOWNLOAD_ALLOW). Also wipes what an earlier process left.
+    // Browser downloads and saved secrets. Also wipes what an earlier process left.
     manager.downloads = new Downloads(cfg, { events });
     // Secrets to type (type with secret_id): in memory only, so a restart drops them.
     manager.secrets = new Secrets();
+    manager.secretSettings = new SecretSettings(cfg);
     // Macros: JSON files per tenant in the data volume.
     manager.macros = new Macros(cfg);
   } catch (e) { await live?.close(); throw e; }
