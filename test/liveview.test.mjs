@@ -142,7 +142,8 @@ test('invalid input is ignored', () => {
   assert.deepEqual(parseInput('{"type":"key","key":"Enter"}'), { type: 'key', key: 'Enter' });
   assert.deepEqual(parseInput('{"type":"move","x":1.5,"y":2}'), { type: 'move', x: 1.5, y: 2 });
   assert.deepEqual(parseInput('{"type":"wheel","x":1,"y":2,"dy":3}'), { type: 'wheel', x: 1, y: 2, dx: 0, dy: 3 });
-  assert.deepEqual(parseInput('{"type":"down","x":1,"y":2,"extra":1}'), { type: 'down', x: 1, y: 2 });
+  assert.deepEqual(parseInput('{"type":"down","x":1,"y":2,"extra":1}'), { type: 'down', x: 1, y: 2, count: 1 });
+  assert.deepEqual(parseInput('{"type":"down","x":1,"y":2,"count":2}'), { type: 'down', x: 1, y: 2, count: 2 });
 });
 
 test('oversized live-view messages close only that socket', async () => {
@@ -182,55 +183,65 @@ test('close() ends every handoff and disconnects viewers', async () => {
   assert.equal(live.size, 0);
 });
 
-// Firefox/Camoufox path: frames from page.screencast, input through page.mouse / page.keyboard.
+// Firefox/Camoufox path: viewport screenshots and input through page.mouse / page.keyboard.
 function fakePlaywrightPage({ gates = {} } = {}) {
   const calls = [];
   const gated = async (name, ...a) => { calls.push([name, ...a]); if (gates[name]) await gates[name].promise; };
-  let onFrame = null, timer = null;
-  const page = {
+  return {
     calls,
     viewportSize: () => null,
     evaluate: async () => { if (gates.evaluate) await gates.evaluate.promise; return { width: 800, height: 600 }; },
-    screencast: {
-      async start(o) {
-        calls.push(['start', o.size]);
-        onFrame = o.onFrame;
-        let busy = false;
-        timer = setInterval(async () => {
-          if (busy || !onFrame) return;
-          busy = true;
-          await onFrame({ data: Buffer.from('jpeg'), viewportWidth: 800, viewportHeight: 600 }); // awaits the ack
-          busy = false;
-        }, 5);
-      },
-      async stop() { calls.push(['stop']); clearInterval(timer); onFrame = null; },
-    },
-    mouse: { move: (x, y) => gated('move', x, y), down: () => gated('down'), up: () => gated('up'), wheel: (dx, dy) => gated('wheel', dy) },
+    async screenshot(options) { await gated('snapshot', options); return Buffer.from('jpeg'); },
+    mouse: { move: (x, y) => gated('move', x, y), down: ({ clickCount }) => gated('down', clickCount),
+      up: ({ clickCount }) => gated('up', clickCount), wheel: (dx, dy) => gated('wheel', dy) },
     keyboard: { insertText: async (t) => calls.push(['text', t]), down: async (k) => calls.push(['keydown', k]), up: async (k) => calls.push(['keyup', k]) },
   };
-  return page;
 }
 
-test('playwright driver: screencast frames, mouse/keyboard input, stopped on finish', async () => {
+test('playwright driver: CSS viewport snapshots and mouse/keyboard input stop on finish', async () => {
   await withLive(async (live) => {
     const page = fakePlaywrightPage();
     const h = live.start(page, 'r', { driver: 'playwright' });
     const v = await viewer(h.url);
-    await until(() => v.frames > 2);
-    assert.deepEqual(page.calls[0], ['start', { width: 800, height: 600 }]);
+    await until(() => v.frames >= 2);
+    const [, options] = page.calls[0];
+    assert.equal(options.scale, 'css');
+    assert.deepEqual(options.clip, { x: 0, y: 0, width: 800, height: 600 });
+    assert.deepEqual(v.messages.find((m) => m.frame), { frame: Buffer.from('jpeg').toString('base64') });
+    assert.deepEqual(v.cursor, { x: 400, y: 300 });
     v.ws.send(JSON.stringify({ type: 'click', x: 10, y: 20 }));
     v.ws.send(JSON.stringify({ type: 'wheel', x: 1, y: 2, dy: 50 }));
     v.ws.send(JSON.stringify({ type: 'text', text: 'hi' }));
     v.ws.send(JSON.stringify({ type: 'key', key: 'Enter' }));
     await until(() => page.calls.some((c) => c[0] === 'keyup'));
-    const input = page.calls.filter((c) => c[0] !== 'start');
-    assert.deepEqual(input, [['move', 10, 20], ['down'], ['up'], ['move', 1, 2], ['wheel', 50], ['text', 'hi'], ['keydown', 'Enter'], ['keyup', 'Enter']]);
+    const input = page.calls.filter((c) => c[0] !== 'snapshot');
+    assert.deepEqual(input, [['move', 10, 20], ['down', 1], ['up', 1], ['move', 1, 2], ['wheel', 50], ['text', 'hi'], ['keydown', 'Enter'], ['keyup', 'Enter']]);
     v.ws.send(JSON.stringify({ type: 'done' }));
     assert.equal(await h.wait, 'human-done');
-    assert.deepEqual(page.calls.at(-1), ['stop']);
     const n = page.calls.length;
-    await sleep(50);
-    assert.equal(page.calls.length, n); // nothing after finish
+    await sleep(250);
+    assert.equal(page.calls.length, n);
+  });
+});
+
+test('playwright driver: Done drains the single snapshot in flight', async () => {
+  await withLive(async (live) => {
+    const snapshot = deferred();
+    const page = fakePlaywrightPage({ gates: { snapshot } });
+    const h = live.start(page, 'r', { driver: 'playwright' });
+    const v = await viewer(h.url);
+    await until(() => page.calls.length === 1);
+    await sleep(250);
+    assert.equal(page.calls.length, 1);
+    v.ws.send(JSON.stringify({ type: 'done' }));
+    await until(() => v.closed);
+    let resolved = false;
+    h.wait.then(() => { resolved = true; });
+    await sleep(25);
+    assert.equal(resolved, false);
+    snapshot.resolve();
+    assert.equal(await h.wait, 'human-done');
+    assert.equal(v.frames, 0);
   });
 });
 
@@ -240,7 +251,7 @@ test('unknown live-view driver is refused', async () => {
   });
 });
 
-test('playwright driver: a handoff ending while the stream is starting never starts capture after resolving', async () => {
+test('playwright driver: cancellation during viewport measurement never starts capture', async () => {
   await withLive(async (live) => {
     const evaluate = deferred();
     const page = fakePlaywrightPage({ gates: { evaluate } });
@@ -254,7 +265,7 @@ test('playwright driver: a handoff ending while the stream is starting never sta
     assert.equal(resolved, false); // waits for the start path
     evaluate.resolve();
     assert.equal(await h.wait, 'cancelled');
-    assert.ok(!page.calls.some((c) => c[0] === 'start'), JSON.stringify(page.calls));
+    assert.deepEqual(page.calls, []);
   });
 });
 
@@ -287,16 +298,16 @@ test('a reconnecting viewer waits until the previous viewer has drained and stop
     await until(() => page.calls.some((c) => c[0] === 'down'));
     v1.ws.close(); // phone drops; its press is still in flight
     await until(() => v1.closed);
+    const snapshots = page.calls.filter((c) => c[0] === 'snapshot').length;
     const v2 = await viewer(h.url);
     v2.ws.send(JSON.stringify({ type: 'text', text: 'second' }));
     await sleep(100);
     assert.ok(!page.calls.some((c) => c[0] === 'text'), 'second viewer ran before the first drained');
-    const starts = page.calls.filter((c) => c[0] === 'start').length;
-    assert.equal(starts, 1); // and no second stream yet
+    assert.equal(page.calls.filter((c) => c[0] === 'snapshot').length, snapshots);
     down.resolve();
-    await until(() => page.calls.filter((c) => c[0] === 'start').length === 2);
+    await until(() => page.calls.some((c) => c[0] === 'text'));
     const names = page.calls.map((c) => c[0]);
-    assert.ok(names.lastIndexOf('stop') < names.lastIndexOf('start'), names.join()); // old stream stopped first
+    assert.ok(names.indexOf('up') < names.indexOf('text'), names.join());
     h.cancel();
     await h.wait;
   });
@@ -472,17 +483,13 @@ test('glidePath: eased, slightly curved, bounded steps ending on the target', ()
   assert.ok(p[1].x - p[0].x < p[12].x - p[11].x); // accelerates out of the start
 });
 
-test('playwright driver: moves, drag and snapshot refresh', async () => {
+test('playwright driver: drag preserves the press count while moving', async () => {
   await withLive(async (live) => {
     const page = fakePlaywrightPage();
-    page.screenshot = async () => { page.calls.push(['screenshot']); return Buffer.from('shot'); };
-    page.screencast.start = async (o) => { page.calls.push(['start', o.size]); }; // a static page: no frames
     const h = live.start(page, 'r', { driver: 'playwright' });
     const v = await viewer(h.url);
-    await until(() => v.frames >= 2, 3000);
-    assert.equal(v.messages.find((m) => m.frame).frame, Buffer.from('shot').toString('base64'));
-    assert.deepEqual(v.cursor, { x: 400, y: 300 });
-    v.ws.send(JSON.stringify({ type: 'down', x: 400, y: 300 }));
+    await until(() => v.frames > 0);
+    v.ws.send(JSON.stringify({ type: 'down', x: 400, y: 300, count: 2 }));
     v.ws.send(JSON.stringify({ type: 'move', x: 500, y: 300 }));
     v.ws.send(JSON.stringify({ type: 'up', x: 500, y: 300 }));
     await until(() => page.calls.some((c) => c[0] === 'up'));
@@ -490,7 +497,8 @@ test('playwright driver: moves, drag and snapshot refresh', async () => {
     assert.equal(seq[0][0], 'move'); // to the press point first
     const iDown = seq.findIndex((c) => c[0] === 'down');
     assert.ok(seq.slice(iDown + 1, -1).length >= 5 && seq.slice(iDown + 1, -1).every((c) => c[0] === 'move'));
-    assert.deepEqual(seq.at(-1), ['up']);
+    assert.deepEqual(seq[iDown], ['down', 2]);
+    assert.deepEqual(seq.at(-1), ['up', 2]);
     h.cancel();
   }, { refreshMs: 100 });
 });

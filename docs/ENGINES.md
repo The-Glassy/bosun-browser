@@ -6,7 +6,7 @@ Bosun can drive three browsers. Pick one per deployment (`ENGINE`) or per sessio
 |---|---|---|---|
 | `chromium` | Playwright's Chromium, `--disable-blink-features=AutomationControlled` | one shared browser, a context per session | CDP screencast + `Input.*` |
 | `patchright` | [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) 1.64.1: Playwright fork that avoids `Runtime.enable` and the other CDP/automation leaks | a browser per session; persistent context (temp profile for ephemeral sessions), `channel: chromium`, no custom UA, `viewport: null` | CDP screencast + `Input.*` |
-| `camoufox` | [Camoufox](https://github.com/daijro/camoufox) 152.0.4-beta.30 (anti-detect Firefox) via [camoufox-js](https://github.com/apify/camoufox-js) 0.13.0 | a browser per session; persistent context (temp profile for ephemeral sessions); fingerprint (UA, screen, window, fonts, WebGL) generated per launch for the host OS | Playwright `page.screencast` + `page.mouse`/`keyboard` |
+| `camoufox` | [Camoufox](https://github.com/daijro/camoufox) 152.0.4-beta.30 (anti-detect Firefox) via [camoufox-js](https://github.com/apify/camoufox-js) 0.13.0 | a browser per session; persistent context (temp profile for ephemeral sessions); fingerprint (UA, screen, window, fonts, WebGL) generated per launch for the host OS | Playwright viewport snapshots + `page.mouse`/`keyboard` |
 
 ## Results
 
@@ -95,9 +95,14 @@ Not measured: no such host was available for this run. Expected differences, rou
   launcher, which is on 0.5.9 betas.
 - Camoufox `humanize` (curved cursor paths) is **off**: with Playwright 1.64 it makes clicks hang in Playwright's
   actionability checks when the viewport matches the fingerprint window. Revisit when camoufox-js supports 1.64.
-- Live view on Firefox uses Playwright's cross-browser `page.screencast` (JPEG frames, acked after each WebSocket
-  write) and `page.mouse` / `page.keyboard` for input, with the same link rules (one viewer at a time, dead after the handoff), input drain and
-  teardown guarantees as the CDP path.
+- Live view on Firefox takes paced JPEG snapshots of the visible viewport in CSS pixels and uses
+  Playwright `page.mouse` / `page.keyboard` for input. It shares the CDP path's viewer and handoff lifecycle.
+- `npm test` includes the live-view input regression for Chromium and installed Patchright. To run it against an
+  existing Camoufox installation in headful mode, use:
+  ```sh
+  TEST_CAMOUFOX=1 CAMOUFOX_INSTALL_DIR=/path/to/camoufox TEST_HEADFUL=1 ENGINE=camoufox \
+    xvfb-run -a node --test --test-concurrency=1 test/liveview-input.test.mjs
+  ```
 - Password masking: Bosun's sensitive-field scans run in an isolated world on patchright and camoufox (pages can't see
   them) and in the page's world on plain Chromium. The "was once a password field" tracker (a MutationObserver that
   follows open and declarative shadow roots, no prototype patching) must run in that same world: it is an init
