@@ -98,7 +98,7 @@ Not measured: no such host was available for this run. Expected differences, rou
 - Live view on Firefox takes paced JPEG snapshots of the visible viewport in CSS pixels and uses
   Playwright `page.mouse` / `page.keyboard` for input. It shares the CDP path's viewer and handoff lifecycle.
 - `npm test` includes the live-view input regression for Chromium and installed Patchright. To run it against an
-  existing Camoufox installation in headful mode, use:
+  existing Camoufox installation in headful mode, run this command.
   ```sh
   TEST_CAMOUFOX=1 CAMOUFOX_INSTALL_DIR=/path/to/camoufox TEST_HEADFUL=1 ENGINE=camoufox \
     xvfb-run -a node --test --test-concurrency=1 test/liveview-input.test.mjs
