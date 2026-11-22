@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.27.1 (unreleased)
+## 0.27.1 (2026-11-22)
 
 - Fix desktop clicks and phone taps on scrolled Camoufox live views by streaming the visible viewport in CSS pixels.
 - Preserve desktop double-clicks during live handoffs on Chromium, Patchright and Camoufox.
