@@ -1,13 +1,23 @@
-// The live-view page itself, driven in a headless Chromium as the human's phone (390x844, touch) or desktop:
+// The live-view page itself, driven in Chromium as the human's phone (390x844, touch) or desktop:
 // paste bar, trackpad and tap modes, reopening a link, mobile layout. The tab being handed off runs on ENGINE.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright';
-import { startBosun, startPageServer, connect, until, sleep } from './helpers.mjs';
+import { startBosun, startPageServer, connect, until, sleep, ENGINE } from './helpers.mjs';
 
 let pages, svc, browser;
-before(async () => { pages = await startPageServer(); svc = await startBosun(); browser = await chromium.launch({ headless: true }); });
-after(async () => { await browser.close(); await svc.stop(); await pages.close(); });
+before(async () => {
+  pages = await startPageServer();
+  svc = await startBosun();
+  browser = ENGINE === 'chromium'
+    ? await svc.manager.getBrowser(svc.manager.engines.get(ENGINE), chromium)
+    : await chromium.launch({ headless: true });
+});
+after(async () => {
+  if (ENGINE !== 'chromium') await browser?.close();
+  await svc?.stop();
+  await pages?.close();
+});
 
 const PHONE = { viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true };
 

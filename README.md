@@ -282,7 +282,7 @@ deadline of the call that set them up.
 |---|---|---|---|
 | `chromium` | one shared browser, a context per session | CDP screencast | Playwright's Chromium |
 | `patchright` | a browser per session (persistent context; temp profile for ephemeral sessions) | CDP screencast | patchright's recommended setup: no custom UA, no automation-flag args, window-sized viewport |
-| `camoufox` | a browser per session | Playwright screencast + `page.mouse`/`keyboard` | fingerprint (window, screen, fonts, UA) from Camoufox; `humanize` off (hangs clicks with Playwright 1.64) |
+| `camoufox` | a browser per session | Playwright viewport snapshots + `page.mouse`/`keyboard` | fingerprint (window, screen, fonts, UA) from Camoufox; `humanize` off (hangs clicks with Playwright 1.64) |
 
 Only the engines in `FEATURES_ENGINES` (default: all three; `ENGINE` is always included) can be asked for;
 `session_open`'s schema lists exactly those, and the session manager refuses the others. A session asking for an

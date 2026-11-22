@@ -1,5 +1,5 @@
 // Live view + human handoff.
-// GET /v/<token> serves a page with a canvas streaming the tab (CDP screencast) and forwarding input (CDP Input.*).
+// GET /v/<token> serves a page with a canvas streaming the tab and forwarding input.
 // One viewer at a time: a WebSocket on /ws/<token> attaches while nobody else is connected (or the connected viewer
 // has gone quiet for staleMs: no pong or message); the link can be reopened until Done, Give up, timeout or cancel
 // revoke it for good. There is no per-tab credential: a duplicated tab or a reconnect waits like any other viewer.
@@ -51,7 +51,7 @@ footer .row{flex-wrap:wrap} #pf{flex-wrap:nowrap} #keys{flex-wrap:nowrap}
 <script nonce="${nonce}">
 const tok='${token}',$=(id)=>document.getElementById(id);
 const c=$('c'),x=c.getContext('2d'),st=$('st'),t=$('t'),wrap=$('wrap'),stage=$('stage'),cur=$('cur'),p=$('p'),ins=$('ins'),eye=$('eye');
-let vw=1366,vh=900,ws=null,ended=false,cx=683,cy=450,mode='tap',rt=0;
+let vw=1366,vh=900,ws=null,ended=false,cx=683,cy=450,mode='tap',rt=0,frameId=0,paintedFrame=0;
 const status=(s)=>{st.textContent=s};
 const hint=()=>{if(!ended&&ws&&ws.readyState===1)status(mode==='pad'?'live — drag to move · tap to click · 2 fingers scroll · hold to drag':'live — tap to click, drag to scroll')};
 // Canvas fitted into the space between the bars; the cursor overlay is positioned in page coordinates.
@@ -72,7 +72,11 @@ function connect(){
   fetch(location.pathname,{method:'HEAD',cache:'no-store'}).then((r)=>{if(r.ok)retry(1000);else finish('This link has expired or the handoff is over.')},()=>retry(3000))};
  s.onmessage=(e)=>{const m=JSON.parse(e.data);
   if(m.cursor){cx=m.cursor.x;cy=m.cursor.y;drawCur()}
-  if(m.frame){vw=m.w;vh=m.h;const i=new Image();i.onload=()=>{if(c.width!==i.width||c.height!==i.height){c.width=i.width;c.height=i.height;layout()}x.drawImage(i,0,0)};i.src='data:image/jpeg;base64,'+m.frame}
+  if(m.frame){const id=++frameId,i=new Image();i.onload=()=>{if(ws!==s||id<paintedFrame)return;paintedFrame=id;
+   // CSS-sized snapshots carry their coordinate space in the JPEG itself.
+   vw=m.w??i.width;vh=m.h??i.height;
+   if(c.width!==i.width||c.height!==i.height){c.width=i.width;c.height=i.height;layout()}else drawCur();
+   x.drawImage(i,0,0)};i.src='data:image/jpeg;base64,'+m.frame}
   if(m.end)finish(m.end)};
 }
 connect();
@@ -88,11 +92,12 @@ function flushMove(){if(!mvDirty)return false;mvDirty=false;send({type:'move',x:
 function moveTo(nx,ny){cx=Math.max(0,Math.min(vw-1,nx));cy=Math.max(0,Math.min(vh-1,ny));drawCur();mvDirty=true;if(!mvT){flushMove();mvT=setInterval(()=>{if(!flushMove()){clearInterval(mvT);mvT=0}},33)}}
 let wh=null;
 function wheel(wx,wy,dx,dy){if(!wh){wh={x:wx,y:wy,dx:0,dy:0};setTimeout(()=>{const w=wh;wh=null;if(Math.round(w.dx)||Math.round(w.dy))send({type:'wheel',x:w.x,y:w.y,dx:Math.round(w.dx),dy:Math.round(w.dy)})},40)}wh.dx+=dx;wh.dy+=dy}
-// Mouse/pen: direct pointing, real hover moves, press and release.
-const isMouse=(e)=>e.pointerType==='mouse'||e.pointerType==='pen';
+// Mouse/pen: pointer capture keeps releases on the canvas. mousedown supplies the native click count.
+const isMouse=(e)=>e.pointerType!=='touch';
 let mdown=false;
 c.addEventListener('pointermove',(e)=>{if(isMouse(e)){const q=at(e.clientX,e.clientY);moveTo(q.x,q.y)}});
-c.addEventListener('pointerdown',(e)=>{if(!isMouse(e)||e.button!==0)return;e.preventDefault();const q=at(e.clientX,e.clientY);moveTo(q.x,q.y);flushMove();mdown=send({type:'down',x:q.x,y:q.y});try{c.setPointerCapture(e.pointerId)}catch{}});
+c.addEventListener('pointerdown',(e)=>{if(isMouse(e)&&e.button===0){try{c.setPointerCapture(e.pointerId)}catch{}}});
+c.addEventListener('mousedown',(e)=>{if(e.button!==0)return;e.preventDefault();const q=at(e.clientX,e.clientY);moveTo(q.x,q.y);flushMove();mdown=send({type:'down',x:q.x,y:q.y,count:e.detail});});
 const mup=(e)=>{if(!isMouse(e)||!mdown)return;mdown=false;const q=at(e.clientX,e.clientY);moveTo(q.x,q.y);flushMove();send({type:'up',x:q.x,y:q.y})};
 c.addEventListener('pointerup',mup);c.addEventListener('pointercancel',mup);
 c.addEventListener('wheel',(e)=>{e.preventDefault();const q=at(e.clientX,e.clientY);wheel(q.x,q.y,e.deltaX,e.deltaY)},{passive:false});
@@ -177,18 +182,16 @@ const MAX_DROPS = 200; // ... and disconnect one that stays slow
 const PING_MS = 2_000; // viewer liveness probe
 const DEAD_MS = 20_000; // no pong/message this long: the viewer is gone
 const STALE_MS = 5_000; // ... this long: another viewer may take over
-const REFRESH_MS = 2_000; // a static page gets a fresh frame at least this often
+const REFRESH_MS = 2_000; // a static CDP stream gets a fresh frame at least this often
+const SNAPSHOT_MS = 100; // Firefox viewport capture, at most 10 frames per second
 const STEP_MS = 4; // pause between interpolated mouse moves (skipped while more input is queued)
 const STEP_PX = 8, MAX_STEPS = 24, JITTER_PX = 0.8;
 const DRAIN_DEADLINE_MS = 10_000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Live-view drivers: stream frames and forward input. cdp (Chromium engines): CDP screencast with per-frame acks and
-// Input.* events. playwright (any engine, used for Firefox/Camoufox): Playwright's page.screencast and page.mouse /
-// page.keyboard. start(onFrame(base64Jpeg, cssWidth, cssHeight, ack), guard). guard() throws once the viewer is
-// revoked; drivers call it between the steps of compound actions, so nothing is dispatched after that. snapshot()
-// captures the viewport once (static pages produce no screencast frames). size is the CSS viewport after start().
+// Chromium streams CDP frames and uses Input.*. Firefox streams paced Playwright viewport snapshots and uses
+// page.mouse / page.keyboard. A driver calls guard() between steps of compound input to check for revocation.
 async function cdpDriver(page) {
   const cdp = await page.context().newCDPSession(page);
   // The CSS viewport; measured where the page has no fixed viewport (patchright: the window decides).
@@ -197,7 +200,7 @@ async function cdpDriver(page) {
     return m?.cssLayoutViewport?.clientWidth ? { width: m.cssLayoutViewport.clientWidth, height: m.cssLayoutViewport.clientHeight } : null;
   };
   const vp = page.viewportSize() || await measure() || { width: 1366, height: 900 };
-  const mouse = (type, x, y, buttons) => cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons, clickCount: 1 });
+  const mouse = (type, x, y, buttons, clickCount) => cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons, clickCount });
   return {
     size: vp,
     async start(onFrame, guard) {
@@ -212,7 +215,7 @@ async function cdpDriver(page) {
       return r?.data ? { data: r.data, w: size.width, h: size.height } : null;
     },
     move: (x, y, pressed) => cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: pressed ? 'left' : 'none', buttons: pressed ? 1 : 0 }),
-    mouse: (dir, x, y) => (dir === 'down' ? mouse('mousePressed', x, y, 1) : mouse('mouseReleased', x, y, 0)),
+    mouse: (dir, x, y, count) => (dir === 'down' ? mouse('mousePressed', x, y, 1, count) : mouse('mouseReleased', x, y, 0, count)),
     wheel: (x, y, dx, dy) => cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: dx, deltaY: dy }),
     text: (text) => cdp.send('Input.insertText', { text }),
     key(k, dir) {
@@ -226,31 +229,37 @@ async function cdpDriver(page) {
 }
 
 async function playwrightDriver(page) {
-  const d = {
-    size: null,
-    async start(onFrame, guard) {
-      const size = d.size = page.viewportSize() || await page.evaluate(() => ({ width: innerWidth, height: innerHeight })).catch(() => ({ width: 1366, height: 900 }));
-      guard(); // revoked while measuring: don't start capturing
-      await page.screencast.start({
-        size, quality: 60,
-        onFrame: (f) => new Promise((ack) => onFrame(f.data.toString('base64'), f.viewportWidth || size.width, f.viewportHeight || size.height, ack)),
-      });
-    },
+  const measure = () => page.evaluate(() => ({
+    width: Math.floor(visualViewport?.width || innerWidth),
+    height: Math.floor(visualViewport?.height || innerHeight),
+  }));
+  const size = await measure().catch(() => page.viewportSize() || { width: 1366, height: 900 });
+  return {
+    size,
+    snapshotInterval: SNAPSHOT_MS,
     async snapshot() {
-      const size = page.viewportSize() || await page.evaluate(() => ({ width: innerWidth, height: innerHeight })).catch(() => d.size);
-      const buf = await page.screenshot({ type: 'jpeg', quality: 60, timeout: 5000 });
-      return { data: buf.toString('base64'), w: size.width, h: size.height };
+      // Camoufox's headful screencast captures from document (0, 0) even when it is scrolled. Its frame
+      // dimensions are also bitmap pixels. Playwright offsets the screenshot clip by the current scroll and
+      // scale:'css' gives the viewer the same coordinates that page.mouse expects.
+      const { width, height } = await measure();
+      const buf = await page.screenshot({
+        type: 'jpeg', quality: 60, scale: 'css', caret: 'initial', timeout: 5000,
+        clip: { x: 0, y: 0, width, height },
+      });
+      return { data: buf.toString('base64') };
     },
     move: (x, y) => page.mouse.move(x, y),
-    async mouse(dir, x, y, guard) {
-      if (dir === 'down') { await page.mouse.move(x, y); guard(); await page.mouse.down(); } else await page.mouse.up();
+    async mouse(dir, x, y, clickCount, guard) {
+      if (dir === 'down') {
+        await page.mouse.move(x, y);
+        guard();
+        await page.mouse.down({ clickCount });
+      } else await page.mouse.up({ clickCount });
     },
     async wheel(x, y, dx, dy, guard) { await page.mouse.move(x, y); guard(); await page.mouse.wheel(dx, dy); },
     text: (text) => page.keyboard.insertText(text),
     key: (k, dir) => (dir === 'down' ? page.keyboard.down(k) : page.keyboard.up(k)),
-    async stop() { await page.screencast.stop().catch(() => {}); },
   };
-  return d;
 }
 
 const DRIVERS = { cdp: cdpDriver, playwright: playwrightDriver };
@@ -265,7 +274,8 @@ export function parseInput(raw) {
   try { m = JSON.parse(raw); } catch { return null; }
   if (!m || typeof m !== 'object') return null;
   switch (m.type) {
-    case 'click': case 'move': case 'down': case 'up': return point(m) ? { type: m.type, x: m.x, y: m.y } : null;
+    case 'click': case 'move': case 'up': return point(m) ? { type: m.type, x: m.x, y: m.y } : null;
+    case 'down': return point(m) ? { type: 'down', x: m.x, y: m.y, count: [2, 3].includes(m.count) ? m.count : 1 } : null;
     case 'wheel': return finite(m.x, MAX_COORD) && finite(m.y, MAX_COORD) && finite(m.dy, MAX_DELTA) && (m.dx === undefined || finite(m.dx, MAX_DELTA))
       ? { type: 'wheel', x: m.x, y: m.y, dx: m.dx ?? 0, dy: m.dy } : null;
     case 'text': return typeof m.text === 'string' && m.text.length > 0 ? { type: 'text', text: m.text.slice(0, MAX_TEXT) } : null;
@@ -371,14 +381,16 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       const drv = await DRIVERS[h.driver](h.page);
       v.drv = drv; // from here on cleanup() stops it
       if (!active(h, v)) return;
-      await drv.start((data, w, ht, ack) => onFrame(h, v, data, w, ht, ack), () => { if (!active(h, v)) throw new Error('inactive'); });
+      await drv.start?.((data, w, ht, ack) => onFrame(h, v, data, w, ht, ack), () => { if (!active(h, v)) throw new Error('inactive'); });
       if (!active(h, v)) return;
       if (!h.mouse && drv.size) {
         h.mouse = { x: Math.round(drv.size.width / 2), y: Math.round(drv.size.height / 2) };
         ws.send(JSON.stringify({ cursor: h.mouse }));
       }
-      v.refresh = setInterval(() => refresh(h, v), Math.max(50, Math.min(500, refreshMs / 4)));
+      const interval = drv.snapshotInterval ?? Math.max(50, Math.min(500, refreshMs / 4));
+      v.refresh = setInterval(() => refresh(h, v), interval);
       v.refresh.unref();
+      if (drv.snapshotInterval) refresh(h, v);
       pump(h, v);
     })().catch(() => { if (!v.closed) teardown(h, v); });
   }
@@ -400,9 +412,10 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     sendFrame(h, v, { frame: data, w, h: ht }, ack);
   }
 
-  // The screencast only produces frames when something changes; a still page is captured every refreshMs instead.
+  // At most one snapshot in flight. CDP uses snapshots only when the screencast has gone quiet.
   function refresh(h, v) {
-    if (!active(h, v) || v.snapP || !v.drv?.snapshot || Date.now() - v.lastFrameAt < refreshMs) return;
+    if (!active(h, v) || v.snapP || !v.drv?.snapshot) return;
+    if (!v.drv.snapshotInterval && Date.now() - v.lastFrameAt < refreshMs) return;
     v.snapP = (async () => {
       const s = await v.drv.snapshot();
       if (s && active(h, v)) sendFrame(h, v, { frame: s.data, w: s.w, h: s.h }, () => {});
@@ -440,7 +453,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       if (!final && v.queue[0]?.type === 'move') return;
       guard(); await v.drv.move(pt.x, pt.y, !!v.pressed);
       h.mouse = pt;
-      if (v.pressed) v.pressed = pt; // a drag cut off by teardown is released where the pointer is
+      if (v.pressed) Object.assign(v.pressed, pt); // a drag cut off by teardown is released where the pointer is
       if (stepMs && !v.queue.length) await sleep(stepMs);
     }
   }
@@ -452,9 +465,9 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
         const m = v.queue.shift();
         try {
           if (m.type === 'click') {
-            v.pressed = { x: m.x, y: m.y }; // set first: teardown must release even if it lands mid-press
-            guard(); await d.mouse('down', m.x, m.y, guard);
-            guard(); await d.mouse('up', m.x, m.y, guard);
+            v.pressed = { x: m.x, y: m.y, count: 1 }; // set first: teardown must release even if it lands mid-press
+            guard(); await d.mouse('down', m.x, m.y, v.pressed.count, guard);
+            guard(); await d.mouse('up', m.x, m.y, v.pressed.count, guard);
             v.pressed = false;
             h.mouse = { x: m.x, y: m.y };
           } else if (m.type === 'move') {
@@ -462,12 +475,12 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
           } else if (m.type === 'down') {
             if (v.pressed) continue;
             await glide(h, v, m, { final: true });
-            v.pressed = { x: m.x, y: m.y };
-            guard(); await d.mouse('down', m.x, m.y, guard);
+            v.pressed = { x: m.x, y: m.y, count: m.count };
+            guard(); await d.mouse('down', m.x, m.y, v.pressed.count, guard);
           } else if (m.type === 'up') {
             if (!v.pressed) continue;
             await glide(h, v, m, { final: true });
-            guard(); await d.mouse('up', m.x, m.y, guard);
+            guard(); await d.mouse('up', m.x, m.y, v.pressed.count, guard);
             v.pressed = false;
           } else if (m.type === 'wheel') {
             guard(); await d.wheel(m.x, m.y, m.dx, m.dy, guard);
@@ -492,9 +505,9 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     const d = v.drv;
     if (!d || v.cleaned) return;
     v.cleaned = true;
-    if (v.pressed) await d.mouse('up', v.pressed.x, v.pressed.y, () => {}).catch(() => {});
+    if (v.pressed) await d.mouse('up', v.pressed.x, v.pressed.y, v.pressed.count, () => {}).catch(() => {});
     v.pressed = false;
-    await d.stop();
+    await d.stop?.();
   }
 
   // Revokes the viewer at once; the returned promise settles when its in-flight input and capture have returned and

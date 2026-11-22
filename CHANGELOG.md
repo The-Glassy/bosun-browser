@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.27.1 (2026-11-22)
+
+- Fix desktop clicks and phone taps on scrolled Camoufox live views by streaming the visible viewport in CSS pixels.
+- Preserve desktop double-clicks during live handoffs on Chromium, Patchright and Camoufox.
+
 ## 0.27.0 (2026-11-19)
 
 - `secret_save` keeps a value from an input or a text element for 15 minutes. Fetch it directly to disk using

@@ -1,0 +1,26 @@
+name: Live-view input
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  liveview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      - run: npx playwright install --with-deps chromium
+      - run: npx patchright install chromium
+      - run: node --test --test-concurrency=1 test/liveview.test.mjs test/liveview-input.test.mjs test/liveview-ui.test.mjs
