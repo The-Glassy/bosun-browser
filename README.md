@@ -102,7 +102,7 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `BROWSER_MACRO_SOURCE` | – | `swarm=me`: the read-only tenant `swarm` lists, gets and runs the macros of tenant `me` (see [Macros](#macros)) |
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
 | `BROWSER_EGRESS_PROXY` | – (direct) | default browser exit: `http://[user:pass@]host:port` or unauthenticated `socks5://host:port`; see [Egress](#egress) |
-| `BROWSER_EGRESS_PROXIES` | – | JSON map of named exits for `session_open.egress`, e.g. `{"home":"http://exit:3128"}` |
+| `BROWSER_EGRESS_PROXIES` | – | JSON map of named exits for `session_open.egress`. Entries can be URLs or objects with `url` and optional `required` |
 | `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist, enforced by a per-tenant forward proxy: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
 | `FEATURES_MEETINGS` | `1` | `0` = the meeting tools are not listed and their handlers not wired |
 | `FEATURES_UPLOADS` | `1` | `0` = no upload tools and no PUT endpoint |
@@ -189,8 +189,10 @@ For profile-specific exits, configure a JSON map (at most 32 names):
 
 ```sh
 BROWSER_EGRESS_PROXY=http://old-host:3128
-BROWSER_EGRESS_PROXIES='{"home":"http://home-exit:3128","residential":"http://user:pass@provider:8000"}'
+BROWSER_EGRESS_PROXIES='{"home":"http://home-exit:3128","office":{"url":"http://office-exit:3128","required":true}}'
 ```
+
+Named exits default to `required: false`. Set `required: true` to make that exit part of service readiness.
 
 `session_open({profile: "shopping", egress: "home"})` selects that named exit. `egress: "default"` uses
 `BROWSER_EGRESS_PROXY` (direct if unset); `egress: "direct"` explicitly selects a direct exit. An existing host
@@ -212,12 +214,24 @@ Routing scope:
   deliberately keep their own networking. MCP, live view, upload/download/recording transfers to the caller and
   browser installation/update operations also keep their existing networking.
 
-WebSocket deployments expose `GET /health` on the MCP port, authenticated with the same Bearer token. It reports
-`egress` (the default exit) and `proxies` (named exits), with credential-free server URLs and `ok` flags. HTTP
-health checks use a bounded OPTIONS/authentication probe, SOCKS5 health checks negotiate a connection; neither
-contacts an arbitrary Internet target, so a successful probe does not guarantee a particular site is permitted.
-Any configured exit failing its probe makes health return 503; otherwise it returns 200. Without a Bearer token
-it returns 401. The status is also available to embedders as `manager.health()`; stdio has no HTTP listener.
+WebSocket deployments expose these endpoints on the MCP port:
+
+- `GET /health` returns 200 when the service is running, its enabled engines can launch, and the default
+  egress and any required named exits pass their probes. Shutdown or a failed readiness check returns 503.
+  The JSON retains `ok`, `egress` and `proxies`, and adds an `engines` array with a status per enabled engine.
+  `proxies` still shows every named exit. An optional exit can have `ok: false` while the top-level `ok` is
+  `true`. The default egress is always required. In direct mode there is no upstream proxy to probe.
+- `GET /health/exits` returns 200 with `{ "exits": [...] }` even when an exit is down. Each named exit has
+  `name`, `ok`, `error` (null on success) and `checked_at` (UTC ISO 8601). An empty configuration yields `[]`
+  in `exits`. Both health endpoints use the MCP Bearer token and return 401 without it.
+- `GET /metrics` exposes the unauthenticated Prometheus gauge `bosun_exit_up{name="home"}` (1 for up, 0 for
+  down). Samples carry only named exit labels and status. Limit access to the MCP port or this path at the
+  reverse proxy if the exit names are private.
+
+Exit probes are shared for up to 10 seconds. They use bounded HTTP OPTIONS/authentication or SOCKS5
+negotiation and keep credentials out of responses. They check the exit protocol without contacting an
+Internet destination. Engine launch results are shared for up to a minute. Embedders can call
+`manager.health()` and `manager.exitHealth()` directly. Stdio has no HTTP listener.
 
 ### Session cookies in persistent profiles
 

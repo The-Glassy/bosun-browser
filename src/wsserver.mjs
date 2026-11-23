@@ -70,11 +70,23 @@ export async function startWsServer({ cfg, manager }) {
   };
   const srv = http.createServer(async (req, res) => {
     try {
-      if (req.method === 'GET' && req.url === '/health') {
+      if (req.method === 'GET' && (req.url === '/health' || req.url === '/health/exits')) {
         if (!authTenant(req)) { res.writeHead(401); return res.end(); }
-        const health = await manager.health();
-        res.writeHead(health.ok ? 200 : 503, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-        return res.end(JSON.stringify(health));
+        const report = req.url === '/health' ? await manager.health() : {
+          exits: (await manager.exitHealth()).map(({ name, ok, error = null, checked_at }) => ({ name, ok, error, checked_at })),
+        };
+        res.writeHead(report.ok === false ? 503 : 200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        return res.end(JSON.stringify(report));
+      }
+      if (req.method === 'GET' && req.url === '/metrics') {
+        const exits = await manager.exitHealth();
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' });
+        return res.end([
+          '# HELP bosun_exit_up Whether the named egress exit passed its last probe.',
+          '# TYPE bosun_exit_up gauge',
+          ...exits.map(({ name, ok }) => `bosun_exit_up{name="${name}"} ${Number(ok)}`),
+          '',
+        ].join('\n'));
       }
       // Checked without a tick in between: an upload's body must reach its handler before Node buffers more of it.
       if (secrets && Secrets.owns(req) && await secrets.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
