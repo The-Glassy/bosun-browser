@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.27.2 (Unreleased)
+
+- Keep `/health` ready when an optional named exit is down. Readiness checks engine launches, the default
+  egress and any named exit configured with `required: true`.
+- Report each named exit and its probe timestamp at `/health/exits`. Export `bosun_exit_up` at `/metrics`.
+
 ## 0.27.1 (2026-11-22)
 
 - Fix desktop clicks and phone taps on scrolled Camoufox live views by streaming the visible viewport in CSS pixels.

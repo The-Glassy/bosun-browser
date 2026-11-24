@@ -16,6 +16,8 @@ import { currentCall, timeoutMessage } from './deadline.mjs';
 export const HANDOFF_ACTIVE = 'a human is working in this tab (handoff active) — call handoff_wait first';
 const CLOSE_DEADLINE_MS = 10_000; // default; manager.closeDeadlineMs
 const NOTE_POLL_MS = 500;
+const ENGINE_HEALTH_MS = 60_000;
+const EXIT_HEALTH_MS = 10_000;
 // After a call ran out of time (deadline.mjs): a page that doesn't evaluate 1 this fast counts as wedged; what the
 // call started gets this long to stop on a page that still answers before the tab is replaced to stop it; opening
 // the replacement tab; what the call started gets this long to fail once its tab is closed.
@@ -368,11 +370,48 @@ export class SessionManager {
   }
 
   async health() {
-    const [egress, proxies] = await Promise.all([
+    const [egress, exits, engines] = await Promise.all([
       probeEgress(this.cfg.egressProxy),
-      Promise.all([...(this.cfg.egressProxies || [])].map(async ([name, p]) => ({ name, ...await probeEgress(p) }))),
+      this.exitHealth(),
+      this.engineHealth(),
     ]);
-    return { ok: !this.closing && egress.ok && proxies.every((p) => p.ok), egress, proxies };
+    const ok = !this.closing && egress.ok && engines.every((e) => e.ok)
+      && exits.every((e) => e.ok || !this.cfg.egressProxies.get(e.name)?.required);
+    const proxies = exits.map(({ checked_at, ...proxy }) => proxy);
+    return { ok, egress, proxies, engines };
+  }
+
+  // Share both the result and any in-flight work between health requests and scrapes.
+  exitHealth() {
+    const now = Date.now();
+    if (!this.exitSample || now >= this.exitSample.expires) {
+      const report = Promise.all([...(this.cfg.egressProxies || [])].map(async ([name, p]) => ({
+        name, ...await probeEgress(p), checked_at: new Date().toISOString(),
+      })));
+      this.exitSample = { report, expires: now + EXIT_HEALTH_MS };
+    }
+    return this.exitSample.report;
+  }
+
+  engineHealth() {
+    const now = Date.now();
+    if (!this.engineSample || now >= this.engineSample.expires) {
+      const report = (async () => {
+        const engines = [];
+        // Keep at most one probe browser alive alongside tenant sessions.
+        for (const name of this.cfg.engines) {
+          try {
+            await this.engines.checkLaunch(name, this.cfg);
+            engines.push({ name, ok: true });
+          } catch {
+            engines.push({ name, ok: false, error: 'browser launch check failed' });
+          }
+        }
+        return engines;
+      })();
+      this.engineSample = { report, expires: now + ENGINE_HEALTH_MS };
+    }
+    return this.engineSample.report;
   }
 
   // Whether the tenant's allowlist covers this URL (true when it has no allowlist).

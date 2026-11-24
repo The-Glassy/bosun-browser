@@ -127,13 +127,18 @@ export async function probeEgress(p, timeoutMs = 2000) {
 export function parseEgressProxies(raw) {
   if (raw === undefined || raw === '') return new Map();
   let values;
-  try { values = JSON.parse(raw); } catch { throw new Error('BROWSER_EGRESS_PROXIES must be a JSON object of name -> proxy URL'); }
+  try { values = JSON.parse(raw); } catch { throw new Error('BROWSER_EGRESS_PROXIES must be a JSON object of named exits'); }
   if (!values || Array.isArray(values) || typeof values !== 'object' || Object.keys(values).length > 32) throw new Error('BROWSER_EGRESS_PROXIES must be an object with at most 32 named proxies');
   const proxies = new Map();
   for (const [name, value] of Object.entries(values)) {
     if (!/^[a-z0-9_-]{1,40}$/.test(name) || ['default', 'direct'].includes(name)) throw new Error('BROWSER_EGRESS_PROXIES names must match [a-z0-9_-]{1,40}, excluding default and direct');
-    const proxy = parseEgress(value, 'BROWSER_EGRESS_PROXIES entry');
+    const object = value && typeof value === 'object' && !Array.isArray(value);
+    if (object && ('required' in value && typeof value.required !== 'boolean')) {
+      throw new Error('BROWSER_EGRESS_PROXIES entry required must be a boolean');
+    }
+    const proxy = parseEgress(object ? value.url : value, 'BROWSER_EGRESS_PROXIES entry');
     if (!proxy) throw new Error('BROWSER_EGRESS_PROXIES entries must have a proxy URL');
+    if (object && value.required) proxy.required = true;
     proxies.set(name, proxy);
   }
   return proxies;
@@ -143,7 +148,10 @@ export function selectEgress(cfg, name = 'default') {
   protectEgressCredentials([cfg.egressProxy, ...(cfg.egressProxies?.values() || [])]);
   if (name === 'default') return cfg.egressProxy || null;
   if (name === 'direct') return null;
-  if (cfg.egressProxies?.has(name)) return cfg.egressProxies.get(name);
+  if (cfg.egressProxies?.has(name)) {
+    const { required, ...proxy } = cfg.egressProxies.get(name);
+    return proxy;
+  }
   // Saved profiles must fail closed if their named exit is removed. Never use the default or go direct instead.
   throw new Error('unknown egress proxy name; use default, direct, or a name in BROWSER_EGRESS_PROXIES');
 }
