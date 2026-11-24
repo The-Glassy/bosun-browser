@@ -75,7 +75,31 @@ export function isPrivateAddress(ip) {
 const resolve = (host) => dns.promises.lookup(host, { verbatim: true }).then((r) => r.address);
 
 // What this connection may do: {ip, host, port} to go ahead, or {denied: <reason>}.
-export async function resolveTarget(allow, host, port, lookup = resolve, remote = false) {
+// Sandbox relays also protect tenants without an allowlist. An exact IP entry is required for private addresses.
+function publicAddress(ip) {
+  if (net.isIPv4(ip)) return !isPrivateAddress(ip);
+  const h = new URL(`http://[${ip}]`).hostname.slice(1, -1);
+  if (h.startsWith('::ffff:')) {
+    const parts = h.slice(7).split(':').map((word) => parseInt(word, 16));
+    return !isPrivateAddress(parts.flatMap((word) => [word >> 8, word & 255]).join('.'));
+  }
+  return /^[23][a-f0-9]{3}:/.test(h) && !isPrivateAddress(h) && !/^2001:(?:[0-9a-f]{0,2}|1[0-9a-f]{2}):/.test(h);
+}
+
+export async function resolveTarget(allow, host, port, lookup = resolve, remote = false, pin = false) {
+  if (pin) {
+    // Match Docker/loopback-style numeric aliases in the same canonical form as ordinary HTTP URLs.
+    try { host = new URL(`http://${bracketed(host)}`).hostname.replace(/^\[|\]$/g, ''); }
+    catch { return { denied: 'malformed destination' }; }
+    if (allow && !allowsUrl(allow, `http://${bracketed(host)}:${port}`)) return { denied: 'not in the host allowlist' };
+    let ip;
+    try { ip = net.isIP(host) ? host : await lookup(host); } catch { return { denied: 'could not be resolved' }; }
+    if (!net.isIP(ip) || ip.includes('%')) return { denied: 'could not be resolved' };
+    const canonical = new URL(`http://${bracketed(ip)}`).hostname.replace(/^\[|\]$/g, '');
+    const explicit = allow?.some((p) => !p.any && !p.wild && p.host === canonical && (p.port === null || p.port === port));
+    if (!publicAddress(ip) && !explicit) return { denied: 'private destination is not explicitly allowed' };
+    return { ip: canonical, host: canonical, port, pinned: true };
+  }
   if (!allowsUrl(allow, `http://${bracketed(host)}:${port}`)) return { denied: 'not in the host allowlist' };
   if (net.isIP(host)) return { ip: host, host, port };
   let ip;
@@ -92,7 +116,7 @@ export async function resolveTarget(allow, host, port, lookup = resolve, remote 
 
 // Starts the proxy for one tenant. Returns Playwright proxy options plus close() and the counters tests look at.
 // log is called, not captured: tests replace console.error after the proxy is already running.
-export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log = (...a) => console.error(...a), lookup = resolve, egress = null }) {
+export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', socketPath, log = (...a) => console.error(...a), lookup = resolve, egress = null, pin = false }) {
   const username = 'bosun';
   const password = crypto.randomBytes(24).toString('base64url');
   const expected = digest(`Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`);
@@ -158,7 +182,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     try { u = new URL(req.url); } catch { return end(400, 'malformed request target'); }
     const authority = parseAuthority(u.host, 80);
     if (!authority) return end(400, 'malformed request target');
-    const target = await resolveTarget(allow, authority.host, authority.port, lookup, !!egress);
+    const target = await resolveTarget(allow, authority.host, authority.port, lookup, !!egress, pin);
     if (closing || res.destroyed || req.socket.destroyed) return res.destroy(); // closed or gone while resolving
     if (target.denied) {
       deny(authority.host, authority.port, target.denied);
@@ -167,15 +191,16 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     stats.allowed++;
     const headers = { ...req.headers };
     for (const h of HOP_BY_HOP) delete headers[h];
-    const viaHttp = egress?.server.startsWith('http:');
+    if (pin) headers.host = u.host;
+    const viaHttp = !pin && egress?.server.startsWith('http:');
     const exit = viaHttp ? new URL(egress.server) : null;
     if (viaHttp) Object.assign(headers, proxyAuth(egress));
     // HTTP uses absolute-form forwarding at the exit. SOCKS5 supplies a tunnel to the origin to http.Agent.
-    const socksAgent = egress && !viaHttp ? new http.Agent({ keepAlive: false }) : null;
-    if (socksAgent) socksAgent.createConnection = (_opts, cb) => { connectEgress(egress, target, track).then((sock) => cb(null, sock), cb); };
+    const tunnelAgent = egress && !viaHttp ? new http.Agent({ keepAlive: false }) : null;
+    if (tunnelAgent) tunnelAgent.createConnection = (_opts, cb) => { connectEgress(egress, target, track).then((sock) => cb(null, sock), cb); };
     const out = http.request({ host: exit ? exit.hostname.replace(/^\[|\]$/g, '') : target.ip,
       port: exit ? Number(exit.port || 80) : target.port, path: viaHttp ? u.href : `${u.pathname}${u.search}`,
-      method: req.method, headers, setHost: false, agent: socksAgent || agent }, (up) => {
+      method: req.method, headers, setHost: false, agent: tunnelAgent || agent }, (up) => {
       clearTimeout(timer);
       // A 407 belongs to the exit; origin 5xx responses must retain their browser semantics.
       if (egress && up.statusCode === 407) {
@@ -187,7 +212,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     out.on('socket', track);
     out.setTimeout(CONNECT_TIMEOUT_MS, () => out.destroy(new Error('timeout')));
     const timer = egress ? setTimeout(() => out.destroy(new Error('timeout')), CONNECT_TIMEOUT_MS) : null;
-    out.on('close', () => { clearTimeout(timer); socksAgent?.destroy(); });
+    out.on('close', () => { clearTimeout(timer); tunnelAgent?.destroy(); });
     out.on('error', () => { const message = failed(); if (!res.headersSent) end(502, message); else res.destroy(); });
     res.on('close', () => out.destroy());
     req.pipe(out);
@@ -201,7 +226,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     if (!authenticated(req)) return refuse(`407 Proxy Authentication Required\r\n${AUTH_REALM}`, 'proxy authentication required');
     const authority = parseAuthority(req.url, 443);
     if (!authority) return refuse('400 Bad Request', 'malformed CONNECT target');
-    const target = await resolveTarget(allow, authority.host, authority.port, lookup, !!egress);
+    const target = await resolveTarget(allow, authority.host, authority.port, lookup, !!egress, pin);
     if (closing || sock.destroyed) return sock.destroy(); // closed or gone while resolving
     if (target.denied) {
       deny(authority.host, authority.port, target.denied);
@@ -227,7 +252,7 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     try { u = new URL(req.url); } catch { return refuse('400 Bad Request', 'malformed request target'); }
     const authority = parseAuthority(u.host, 80);
     if (!authority) return refuse('400 Bad Request', 'malformed request target');
-    const target = await resolveTarget(allow, authority.host, authority.port, lookup, !!egress);
+    const target = await resolveTarget(allow, authority.host, authority.port, lookup, !!egress, pin);
     if (closing || sock.destroyed) return sock.destroy(); // closed or gone while resolving
     if (target.denied) {
       deny(authority.host, authority.port, target.denied);
@@ -238,20 +263,21 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', log 
     stats.allowed++;
     if (closing || sock.destroyed) { sock.destroy(); return up.destroy(); }
     const lines = [`${req.method} ${u.pathname}${u.search} HTTP/1.1`];
+    if (pin) lines.push(`Host: ${u.host}`);
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
-      if (!/^proxy-/i.test(req.rawHeaders[i])) lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
+      if (!/^proxy-/i.test(req.rawHeaders[i]) && !(pin && /^host$/i.test(req.rawHeaders[i]))) lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
     }
     up.write(`${lines.join('\r\n')}\r\n\r\n`);
     if (head?.length) up.write(head);
     tunnel(sock, up);
   });
 
-  await new Promise((ok, no) => { srv.once('error', no); srv.listen(0, host, () => { srv.off('error', no); ok(); }); });
+  await new Promise((ok, no) => { srv.once('error', no); srv.listen(socketPath ? { path: socketPath } : { port: 0, host }, () => { srv.off('error', no); ok(); }); });
   const port = srv.address().port;
   return {
     // Playwright proxy options. bypass "<-loopback>" removes Chromium's built-in exception for localhost and
     // 127.0.0.1, so even those go through the allowlist.
-    server: `http://${host}:${port}`,
+    server: socketPath ? null : `http://${host}:${port}`,
     username,
     password,
     bypass: '<-loopback>',

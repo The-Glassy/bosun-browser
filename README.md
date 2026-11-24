@@ -78,10 +78,10 @@ npm run test:engines  # the same suite once per installed engine
 # stdio (an MCP client spawns it)
 xvfb-run -a node src/server.mjs
 
-# WebSocket service + live view, reachable over a VPN interface (here 100.64.0.10; for a systemd service with
+# WebSocket service + live view, reachable over a VPN interface (replace 192.0.2.10 with its address; for a systemd service with
 # both listeners on loopback behind a private-network proxy see docs/DEPLOY-SYSTEMD.md)
-WS_HOST=100.64.0.10 WS_PORT=7360 BROWSER_TOKEN=<32+ random chars> \
-LIVE_HOST=100.64.0.10 LIVE_PORT=7350 LIVE_BASE_URL=http://100.64.0.10:7350 \
+WS_HOST=192.0.2.10 WS_PORT=7360 BROWSER_TOKEN=<32+ random chars> \
+LIVE_HOST=192.0.2.10 LIVE_PORT=7350 LIVE_BASE_URL=http://192.0.2.10:7350 \
   xvfb-run -a -s "-screen 0 1366x900x24" node src/server.mjs
 ```
 
@@ -92,17 +92,25 @@ The two listeners are separate: `WS_HOST`/`WS_PORT` carry MCP (token-protected),
 human's live view (protected by the handoff link). Both default to `127.0.0.1`; bind them to a VPN/mesh address or
 put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the human's phone uses.
 
+With two or more configured tokens, Bosun starts a separate Linux bubblewrap worker per tenant. Install `bwrap`
+and preinstall the browser engines before starting. See [Tenant sandbox](docs/TENANT-SANDBOX.md) for egress,
+state migration and host requirements.
+
 ### Environment
 
 | variable | default | |
 |---|---|---|
 | `BROWSER_TOKEN` | – | token for tenant `default` (16+ chars) |
 | `BROWSER_TOKENS` | – | more tenants: `alice:<token>,bob:<token>` |
+| `BOSUN_TENANT_SANDBOX` | `auto` | `auto` enables bwrap with two or more configured tokens. Use `on` to opt in with one tenant |
+| `BOSUN_ALLOW_UNSAFE_SHARED` | `0` | `1` permits multiple distinct tenants when sandboxing is `off` and logs a warning |
+| `BOSUN_METRICS_TOKEN` | – | optional separate bearer for `/metrics` (16+ characters). MCP bearers also work |
 | `BROWSER_TOKEN_POLICIES` | – (all `full`) | per-tenant policy: `swarm=ephemeral` (see [Read-only tokens for subagents](#read-only-tokens-for-subagents)) |
-| `BROWSER_MACRO_SOURCE` | – | `swarm=me`: the read-only tenant `swarm` lists, gets and runs the macros of tenant `me` (see [Macros](#macros)) |
+| `BROWSER_MACRO_SOURCE` | – | `swarm=me`: the read-only tenant `swarm` lists, gets and runs the macros of tenant `me` in shared mode (see [Macros](#macros)) |
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
 | `BROWSER_EGRESS_PROXY` | – (direct) | default browser exit: `http://[user:pass@]host:port` or unauthenticated `socks5://host:port`; see [Egress](#egress) |
 | `BROWSER_EGRESS_PROXIES` | – | JSON map of named exits for `session_open.egress`. Entries can be URLs or objects with `url` and optional `required` |
+| `BROWSER_TENANT_EGRESS` | all configured exits | optional per-tenant exit list, e.g. `alice=default,direct;bob=default,office` |
 | `BROWSER_TENANT_ALLOW` | – (unrestricted) | per-tenant host allowlist, enforced by a per-tenant forward proxy: `ops=*.example.org,127.0.0.1:4848; swarm=*.example.org` (see [Per-tenant host allowlist](#per-tenant-host-allowlist)) |
 | `FEATURES_MEETINGS` | `1` | `0` = the meeting tools are not listed and their handlers not wired |
 | `FEATURES_UPLOADS` | `1` | `0` = no upload tools and no PUT endpoint |
@@ -112,7 +120,7 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `UPLOAD_BASE_URL` | – (the `Host` the client connected with, `http://`) | where tenants reach the MCP port, for the PUT URL; set it behind TLS or another name |
 | `FEATURES_ENGINES` | all three | engines a session may ask for, comma list (e.g. `chromium`); `ENGINE` is always included |
 | `CHROMIUM_SANDBOX` | `1` | `0` = run Chromium without its own sandbox (logged at every start); see [Chromium sandbox](#chromium-sandbox) |
-| `BROWSER_TENANT_DOWNLOAD_ALLOW` | – (no downloads) | `glassy=web.plaud.ai,*.plaud.ai; ops=*`: which tenants keep downloads, and from which hosts (see [Downloading files](#downloading-files)) |
+| `BROWSER_TENANT_DOWNLOAD_ALLOW` | – (no downloads) | `alice=app.example.org,*.example.org; ops=*`: which tenants keep downloads, and from which hosts (see [Downloading files](#downloading-files)) |
 | `DOWNLOAD_MAX_BYTES` | 314572800 (300 MB) | largest file a download may be; past it the browser cancels it mid-stream |
 | `DOWNLOAD_TENANT_QUOTA_BYTES` | 1073741824 (1 GB) | downloaded bytes one tenant may hold at a time, running and kept (at least `DOWNLOAD_MAX_BYTES`) |
 | `DOWNLOAD_TTL_SEC` / `DOWNLOAD_URL_TTL_SEC` | 3600 / 900 | a download not fetched is deleted this long after it finished; a GET URL is valid this long |
@@ -127,28 +135,30 @@ put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the hum
 | `TOOL_TIMEOUTS` | – | per tool, overriding `TOOL_TIMEOUT_SEC`: `read=90,upload=120` |
 | `LIVE_HOST` / `LIVE_PORT` / `LIVE_BASE_URL` | `127.0.0.1` / – / derived | live view listener and the URL put in links |
 | `HANDOFF_TTL_SEC` | 900 | handoff link lifetime |
-| `BROWSER_DATA` | `./data` | profiles (`profiles/<tenant>/<name>`) and saved screenshots |
+| `BROWSER_DATA` | `./data` | data root. Workers are scoped to `tenants/<tenant>/` inside it |
 | `HEADLESS` | – | `1` = headless browser (more detectable; use for tests) |
 | `ENGINE` | `chromium` | default engine: `chromium`, `patchright`, `camoufox` (must be installed, or startup fails) |
 | `CAMOUFOX_OS` | host OS | OS of the Camoufox fingerprint: `macos`, `windows`, `linux` |
-| `MAX_SESSIONS` | 3 | sessions across all tenants |
+| `MAX_SESSIONS` | 3 | sessions per worker, or across all tenants in shared mode |
 | `MAX_SESSIONS_PER_TENANT` | `MAX_SESSIONS` | |
 | `IDLE_TIMEOUT_SEC` | 900 | close sessions unused this long (`0` = never; a session in handoff is never idle) |
 | `MAX_PAGES_PER_SESSION` | 5 | popups beyond this are closed |
 | `SESSION_COOKIES_MAX_AGE_DAYS` | `30` | maximum age of a saved session-cookie snapshot (1–3650 days); older files are deleted on open |
 | `KEEPALIVE` | `1` | `0` = don't run scheduled keepalive visits (schedules are kept) |
-| `TZ` | `Europe/Vienna` | IANA time zone for keepalive `quiet_hours` |
+| `TZ` | `UTC` | IANA time zone for keepalive quiet hours, transcript quotas and browser contexts |
+| `BROWSER_TIMEZONE` / `BROWSER_LOCALE` | `TZ` / `en` | default browser context time zone and language tag. Session overrides take precedence |
 | `RECORDING_RETENTION_DAYS` | 30 | meeting recordings are deleted this many days after they were written |
-| `MEETING_VIDEO_LIMIT` | 1 | concurrent video slots per Bosun process, across tenants (including joins waiting for admission); `0` disables video |
+| `MEETING_VIDEO_LIMIT` | 1 | concurrent video slots per worker or shared process (including joins waiting for admission); `0` disables video |
 | `MEETING_VIDEO_MIN_FREE_GB` | 2 | minimum free disk in GiB for a video join and again before capture starts (whole number; `0` disables the floor) |
-| `MEETING_OWNER` | – | name in the meeting announcement ("Hi, I'm Glassy, `<owner>`'s AI notetaker"); unset: "an AI notetaker" |
+| `MEETING_BOT_NAME` | `Notetaker` | default guest display name. A signed-in account supplies its own name |
+| `MEETING_ANNOUNCE_TEXT` | – | custom chat notice for meeting recording. Unset uses a neutral English notice for the enabled capture |
 | `ELEVENLABS_API_KEY` | – | ElevenLabs key: the live meeting transcript (`meeting_join` `live_transcript`) and the `elevenlabs` voice of `meeting_speak`; unset: both refused. Kept in the service only (removed from its environment at start) |
 | `ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io` | another ElevenLabs API host (`https://*.elevenlabs.io`, e.g. `https://api.eu.residency.elevenlabs.io`); nothing else gets the key (http on loopback is accepted, for tests) |
 | `ELEVENLABS_VOICE` | `EXAVITQu4vr4xnSDxMaL` ("Sarah") | fallback ElevenLabs voice id for `meeting_speak` with `backend: "elevenlabs"` (a tenant's speech setting wins) |
 | `ELEVENLABS_TTS_MODEL` | `eleven_v4_turbo` | fallback ElevenLabs text-to-speech model for `meeting_speak` (`[a-z0-9_]`, 3–60 characters), e.g. `eleven_flash_v2_5` |
 | `LIVE_TRANSCRIPT_DAILY_MIN` | 180 | minutes of live transcript per tenant and local day (`TZ`); at the cap the stream stops (`bosun:meeting-transcript-stopped`, `daily-cap`) |
 | `LIVE_TRANSCRIPT_VAD_SILENCE_S` | 0.5 | fallback for the pause (seconds, 0.2–3) that ends a live transcript segment (`vad_silence_s`) |
-| `TTS_URL` | – | the local text-to-speech service for `meeting_speak` (OpenAI-style `POST /v1/audio/speech`, WAV out; Supertonic), e.g. `http://10.78.0.11:5000`; unset: only uploaded audio or `backend: "elevenlabs"` |
+| `TTS_URL` | – | the local text-to-speech service for `meeting_speak` (OpenAI-style `POST /v1/audio/speech`, WAV out; Supertonic), e.g. `http://tts.example.org:5000`; unset: only uploaded audio or `backend: "elevenlabs"` |
 | `TTS_VOICE` | – (the service's own) | fallback Supertonic voice: `supertonic-F1`..`F5`, `supertonic-M1`..`M5` |
 | `TTS_DEFAULT_BACKEND` | `supertonic` | fallback `backend` of `meeting_speak` when none is passed: `supertonic` or `elevenlabs`; `elevenlabs` without `ELEVENLABS_API_KEY` falls back to `supertonic`, with a warning at start |
 | `MAX_DOM_NODES` | 60000 | `read` (a11y, whole page) refuses larger pages; pass `selector` |
@@ -162,7 +172,7 @@ All numbers are validated at startup; a bad value stops the service instead of s
 
 ### Egress
 
-Set `BROWSER_EGRESS_PROXY=http://[user:pass@]old-host:3128` to send browser traffic through an upstream exit.
+Set `BROWSER_EGRESS_PROXY=http://[user:pass@]egress.example.org:3128` to send browser traffic through an upstream exit.
 An empty value preserves direct behaviour. HTTP proxies (optional Basic authentication) and unauthenticated
 `socks5://host:port` proxies work with Chromium, patchright and camoufox. SOCKS5 credentials are refused at startup;
 [Playwright's proxy interface](https://playwright.dev/docs/api/class-browsertype#browser-type-launch-option-proxy)
@@ -177,19 +187,17 @@ through the exit. A refused, unreachable or unauthenticated exit never causes a 
 `egress proxy <scheme>://<host>:<port> failed ... no direct fallback`. Changing an exit requires a service restart
 and reopening sessions.
 
-A tenant with `BROWSER_TENANT_ALLOW` keeps its local allowlist proxy. That proxy still checks every destination,
-then forwards plain HTTP through the HTTP exit and uses CONNECT for HTTPS and WebSockets (SOCKS5 uses tunnels for
-all protocols). Destination hostnames reach the exit unchanged, so the exit resolves them. The allowlist proxy
-still performs a **local DNS preflight** and refuses a locally private address unless that address is explicitly
-allowed; an unresolvable name is refused too. Consequently the exit's DNS can differ from the preflight: hostname
-allowlists trust the exit's DNS and private-network policy. Use literal public IP entries when address pinning is
-required. DNS for the exit itself, and this allowlist preflight, remain local.
+In tenant sandbox mode, the host relay checks and resolves destinations for direct and named exits. It sends the
+checked IP to a named exit and preserves the original origin in the browser. In shared mode, a tenant's
+allowlist proxy locally checks DNS for private addresses before an upstream sends traffic to the original hostname.
+For shared mode with hostname allowlists, the upstream exit's DNS and private-network policy must also be trusted.
+See [Tenant sandbox](docs/TENANT-SANDBOX.md#egress).
 
 For profile-specific exits, configure a JSON map (at most 32 names):
 
 ```sh
-BROWSER_EGRESS_PROXY=http://old-host:3128
-BROWSER_EGRESS_PROXIES='{"home":"http://home-exit:3128","office":{"url":"http://office-exit:3128","required":true}}'
+BROWSER_EGRESS_PROXY=http://egress.example.org:3128
+BROWSER_EGRESS_PROXIES='{"home":"http://home-exit.example.org:3128","office":{"url":"http://office-exit.example.org:3128","required":true}}'
 ```
 
 Named exits default to `required: false`. Set `required: true` to make that exit part of service readiness.
@@ -224,14 +232,14 @@ WebSocket deployments expose these endpoints on the MCP port:
 - `GET /health/exits` returns 200 with `{ "exits": [...] }` even when an exit is down. Each named exit has
   `name`, `ok`, `error` (null on success) and `checked_at` (UTC ISO 8601). An empty configuration yields `[]`
   in `exits`. Both health endpoints use the MCP Bearer token and return 401 without it.
-- `GET /metrics` exposes the unauthenticated Prometheus gauge `bosun_exit_up{name="home"}` (1 for up, 0 for
-  down). Samples carry only named exit labels and status. Limit access to the MCP port or this path at the
-  reverse proxy if the exit names are private.
+- `GET /metrics` exposes the Prometheus gauge `bosun_exit_up{name="home"}` (1 for up, 0 for down). Send an MCP
+  bearer or set `BOSUN_METRICS_TOKEN` and configure the scraper to send it. Requests without a valid
+  `Authorization: Bearer …` header get HTTP 401 without exit names.
 
 Exit probes are shared for up to 10 seconds. They use bounded HTTP OPTIONS/authentication or SOCKS5
 negotiation and keep credentials out of responses. They check the exit protocol without contacting an
-Internet destination. Engine launch results are shared for up to a minute. Embedders can call
-`manager.health()` and `manager.exitHealth()` directly. Stdio has no HTTP listener.
+Internet destination. Engine launch results are shared per worker for up to a minute. Embedders can call
+`manager.health(tenant)` and `manager.exitHealth()` directly. Shared mode ignores the tenant argument. Stdio has no HTTP listener.
 
 ### Session cookies in persistent profiles
 
@@ -722,7 +730,7 @@ keepalive_remove({ "profile": "shop" })
 
 The interval is `every_hours` (default 12) or `every_minutes` (at least 30), each visit shifted by up to
 ± `jitter_min` (default 30, or a quarter of a shorter interval). `quiet_hours` (`"22-08"`, `"22:30-07:00"`, local
-time in `TZ`, default `Europe/Vienna`) makes the interval **four times longer** while it lasts, so a 30-minute
+time in `TZ`, default `UTC`) makes the interval **four times longer** while it lasts, so a 30-minute
 watch visits about every two hours at night. An interval that starts before a quiet window is stretched only for
 its part inside it. Quiet hours follow the wall clock, and on DST nights the time is counted as it really passes. Calling `keepalive_set` again replaces the whole configuration of that profile.
 
@@ -895,7 +903,7 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
    - Microphone and camera must be **verifiably off** before joining. Bosun switches a device off and checks it,
      unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden") and no control shows
      it on; then it already counts as off. If neither can be confirmed, Bosun does not join.
-   - A guest types its name (default `Glassy (notetaker)`). A signed-in Meet profile has no name field and joins
+   - A guest types its name (default `Notetaker`, configurable with `MEETING_BOT_NAME`). A signed-in Meet profile has no name field and joins
      under the account's name, so `name` is ignored. Zoom fills in a signed-in account's name, and Bosun keeps it; an
      empty field (Zoom's web client shows one to signed-in accounts too) gets `name`.
    - **Zoom:** "Do you want people to see you in the meeting?" and then "Do you want people to hear you in the
@@ -949,14 +957,17 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
    the announcement didn't reach everyone: `chat-restricted` (the chat can't be addressed to everyone),
    `chat-unavailable` (no chat), `sent-privately`, `not-sent` (still in the box), `not-confirmed` (it never showed
    up as Bosun's), and for the host `host-unreachable`. Later messages (`meeting_chat_send`, the opt-out
-   confirmation) go where the announcement went. The default text is in English and German: *"Hi, I'm Glassy, an AI notetaker. I'm recording audio for notes. If you'd
-   rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the
-   recording."* With `MEETING_OWNER` set it says whose notetaker it is.
+   confirmation) go where the announcement went. The default notice describes the enabled capture and invites
+   objections in chat. Set `MEETING_ANNOUNCE_TEXT` for a deployment-wide custom notice or pass `announce_text`
+   for one meeting. Make sure custom wording describes any video recording and live transcription enabled for that call.
 5. While in the call:
    - Every chat message from someone else is pushed to the agent as `bosun:meeting-chat`, with `meeting_id`,
      `sender` and `text`. `meeting_chat_read` returns them too.
-   - Bosun leaves by itself when the meeting ends, when it is removed, or when it is alone. That is **30 s** after
-     everyone else left (`alone_leave_sec`), or 2 minutes if nobody else has joined yet.
+   - Bosun leaves when the meeting ends, when it is removed, or when it has been alone long enough.
+     `first_joiner_wait_sec` defaults to **120 s** after admission if nobody else has joined.
+     `alone_leave_sec` defaults to **30 s** once everyone else has left. Set either with
+     `speech_settings_set` or override it for one `meeting_join` (whole seconds, 5–3600).
+     `meeting_status` reports the effective values for that meeting.
    - The agent can leave with `meeting_leave`.
    - On leaving, `bosun:meeting-ended` carries `meeting_id`, `reason`, `duration_s`, `bytes` and the `recording`:
      path (inside the browser container), size and the hint `call recording_get { meeting_id }`. There is no `file://`
@@ -1171,7 +1182,7 @@ A process crash before finalization can leave audio without a sidecar.
   (`audio_file_id` from `upload_create`, any format ffmpeg reads).
 - **Speech settings** (`speech_settings_get`, `speech_settings_set`; per tenant, kept in
   `BROWSER_DATA/speech-settings/<tenant>.json`): `backend`, `elevenlabs_model`, `elevenlabs_voice`,
-  `supertonic_voice`, `vad_silence_s`, checked like the env values; `null` removes one. What a call leaves out comes
+  `supertonic_voice`, `vad_silence_s`, `alone_leave_sec` and `first_joiner_wait_sec`. Pass `null` to reset a setting. What a call leaves out comes
   from the tenant's setting, then the env fallback, then Bosun's default; `speech_settings_get` shows the effective
   values and where each comes from (`tenant`, `env`, `default`). `backend` `elevenlabs` without `ELEVENLABS_API_KEY`
   falls back to `supertonic` (with a `warning`). A read-only (ephemeral) token may read them, not set them.
@@ -1442,7 +1453,7 @@ With policy `ephemeral` the server enforces, not just hides:
 
 - `tools/list` shows only `session_open`, `session_close`, `navigate`, `read`, `click`, `type`, `select`, `press`,
   `hover`, `back`, `wait_for`, `screenshot`, `sessions`, `macro_list`, `macro_get` and `macro_run` (a macro's steps hold
-  to the same set; its macros are those of `BROWSER_MACRO_SOURCE`, see [Macros](#macros)). Any other tool answers `not allowed for this token`, whatever its
+  to the same set. In shared mode, `BROWSER_MACRO_SOURCE` can point at another tenant's macros. See [Macros](#macros)). Any other tool answers `not allowed for this token`, whatever its
   arguments; its handler is never wired up for the connection.
 - `session_open` refuses `profile` ("profiles are not allowed for this token") and any engine but the default
   (`ENGINE`, which startup checked, so a session never installs a browser). The session manager enforces both for
@@ -1455,8 +1466,9 @@ With policy `ephemeral` the server enforces, not just hides:
   that carries this token.
 - No MCPL push events.
 
-A policy only narrows what the token can do; the tenant is still separate from yours, so it never sees your profiles
-anyway. Egress is not narrowed: block private networks around the service (see [Security notes](#security-notes)).
+The policy limits which tools a token can use. Set a tenant host allowlist and exit list to set its network reach.
+Sandboxed tenants reach the network through their own host relays and need an explicit allowlist entry for private
+addresses.
 
 ### stdio bridge
 
@@ -1530,7 +1542,8 @@ Entries are separated by `;` (or newlines), hosts within an entry by `,`. A host
 
 ### How it is enforced
 
-A tenant that is named gets **its own forward proxy inside the service** (`src/proxy.mjs`, on loopback, with a
+Sandbox workers use the [host relay](docs/TENANT-SANDBOX.md#egress) for all browser traffic.
+In shared mode, a tenant that is named gets **its own forward proxy inside the service** (`src/proxy.mjs`, on loopback, with a
 random password of its own), and **each of its sessions runs in a browser of its own** (a temporary profile,
 removed with the session), launched with that proxy as its only way out
 (`--proxy-bypass-list=<-loopback>`, so not even loopback is exempt; QUIC off and WebRTC's non-proxied UDP off, so
@@ -1540,8 +1553,7 @@ preference before every proxied launch (a persistent profile loses it again on a
 it).
 `camoufox` gets the same as Firefox preferences: loopback through the proxy too
 (`network.proxy.allow_hijacking_localhost`), WebRTC through the proxy only, no HTTP/3, no DNS prefetching. Those
-settings belong to that browser alone — tenants without an allowlist or egress proxy share a browser launched exactly the way upstream
-launches it, so one tenant's allowlist never changes another tenant's networking. Every
+settings belong to that browser alone. In shared mode, tenants without an allowlist or an egress proxy can share a browser. Every
 connection the browser wants — a navigation, each hop of a redirect, a subresource, XHR, a WebSocket from the page
 **or from a worker**, a service-worker fetch, a prefetch — arrives at the proxy as a request or a `CONNECT` and is
 checked against the allowlist before a byte leaves the host:
@@ -1555,8 +1567,9 @@ checked against the allowlist before a byte leaves the host:
 - **Without an egress exit, DNS is resolved by the proxy, once**, and the connection goes to that address, so the address a decision was
   made about is the address that gets used — a name cannot change where it points between the check and the
   connection. A name that resolves into loopback or a private range is only followed if the allowlist names that
-  address as well, so `127.0.0.1:4848` has to be in the list for a name that resolves there. With an egress exit,
-  the hostname is resolved at the exit after a local private-address preflight; see [Egress](#egress) for the DNS trade-off.
+  address as well, so `127.0.0.1:4848` has to be in the list for a name that resolves there. In sandbox mode the
+  host relay resolves and pins the destination for all exits. In shared mode an upstream exit can resolve the
+  original name after a local private-address preflight. See [Egress](#egress).
 - **Nothing is intercepted.** The proxy tunnels TLS (`CONNECT`) and streams plain HTTP; it never terminates TLS,
   rewrites a response or buffers a body. The browser's own rules therefore all still hold: a redirect to another
   allowed host loads **as that host**, with its own origin, storage and cookies, and the tab shows the URL it
@@ -1564,14 +1577,15 @@ checked against the allowlist before a byte leaves the host:
 - `navigate` and `keepalive_set` also check the allowlist up front, so the agent gets a clear refusal instead of a
   403 page, and `navigate`'s tool description names the hosts it may reach.
 
-A tenant that is not named is unrestricted by the host allowlist. Without an egress exit it gets no proxy and a
-browser with upstream's own flags. An egress exit, when selected, still applies (see [Egress](#egress)).
+A sandboxed tenant without an allowlist can reach public destinations through its relay. Access to a private
+address requires an exact allowlist entry for that address. In shared mode an unrestricted tenant uses its selected
+egress exit directly, or connects without a proxy when the selected exit is direct.
 
 ### What it does not do
 
 - The allowlist is host and port, and a `CONNECT` tunnel is not inspected, so an entry without a port allows a
   tunnel to **any** port on that host. Prefer `host:port` entries.
-- It is not a URL filter: a path or a query is never looked at (and never logged).
+- The filter applies to destination hosts and ports. The path and query stay private.
 - Hosts you allow can talk to each other with the browser's normal rules; the allowlist decides reachability, not
   mutual trust. Keep it to the hosts a tenant needs.
 - Plain `http://` goes through the proxy as HTTP/1.1 (no h2c, no QUIC); `https://` is end-to-end inside the tunnel.

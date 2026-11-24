@@ -1,10 +1,11 @@
 # Deploying Bosun on Linux with systemd
 
-A single-host deployment: Bosun as its own unprivileged user, headful Chromium under Xvfb, both listeners on
-loopback, the live view published to a private network only, and every secret outside this repository.
+This example runs Bosun as an unprivileged user with both listeners on loopback. Publish live view to a private
+network and keep authentication in an environment file. For multiple tokens, prepare the
+[tenant sandbox](TENANT-SANDBOX.md) before starting the unit.
 
 Example files: [`deploy/bosun.service`](../deploy/bosun.service) and
-[`deploy/bosun.env.example`](../deploy/bosun.env.example). Placeholders (`example.org`, `bosun.example.ts.net`) are
+[`deploy/bosun.env.example`](../deploy/bosun.env.example). Placeholders (`example.org`, `bosun.example.org`) are
 meant to be replaced; nothing in this repository knows your hostnames or tokens, and nothing here should learn
 them.
 
@@ -21,7 +22,7 @@ sudo useradd --system --create-home --home-dir /var/lib/bosun --shell /usr/sbin/
 sudo install -d -o bosun -g bosun -m 0700 /var/lib/bosun/data /var/lib/bosun/pw-browsers
 sudo install -d -o root  -g bosun -m 0750 /etc/bosun
 
-sudo apt-get install -y nodejs npm xvfb   # Node 20+; use nodesource if the distro ships an older one
+sudo apt-get install -y nodejs npm xvfb bubblewrap   # Node 20+; use nodesource if the distro ships an older one
 sudo install -d -o root -g root -m 0755 /opt/bosun
 sudo git clone https://github.com/The-Glassy/bosun-browser /opt/bosun   # or unpack a release tarball
 sudo chown -R root:root /opt/bosun        # code is read-only to the service user
@@ -54,10 +55,10 @@ sudo editor /etc/bosun/bosun.env
   `Authorization: Bearer` header).
 - One token per consumer, so revoking one does not disturb the others. Rotation = edit the file,
   `systemctl restart bosun`.
-- The browser, `ffmpeg` and `pulseaudio` children inherit this environment, so anything able to read
-  `/proc/<pid>/environ` as the `bosun` user can read the tokens — every tenant's token, since `BROWSER_TOKENS` is
-  one variable. That is why `bosun` runs nothing else, why the browser keeps its sandbox (§3a), and why hard
-  tenant isolation means one service per tenant.
+- In sandbox mode the gateway holds the MCP and metrics bearers and passes each worker only its tenant
+  configuration over the private bootstrap channel. Browser and media processes receive a minimal environment.
+  In shared mode, child processes can inherit service environment variables. Run the service as a dedicated
+  unprivileged user.
 
 ## 3. The unit
 
@@ -94,6 +95,23 @@ Bosun locates leftover browser processes with `ps` and kills them by their profi
 
 These directives bound what the service **user** may do. They are not a renderer sandbox: that is §3a, and without
 it a page that breaks the renderer is already inside everything the unit allows.
+
+### Start sandboxed workers under systemd
+
+The example `ExecStart` wraps the service in host Xvfb for shared mode. With the tenant sandbox enabled, replace
+that command in a unit drop-in. Each headful worker launches its own Xvfb.
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/node /opt/bosun/src/server.mjs
+ProtectHostname=no
+```
+
+Bubblewrap sets the private hostname and mounts a fresh procfs. If procfs mounting fails inside systemd or a
+container, check for masked or additional mounts under `/proc` introduced by the service manager or container
+profile. Test the actual service policy before migrating production state. The default browser's launch is checked
+at startup, and `GET /health` verifies the other enabled engines.
 
 ## 3a. Chromium's sandbox (the service will not start without it)
 

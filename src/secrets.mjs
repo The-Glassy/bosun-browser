@@ -20,9 +20,12 @@ const wipe = (b) => { if (b) b.fill(0); };
 // Playwright log that prints what is typed: pw:api logs fill("<value>"), pw:protocol and pw:channel the messages
 // that carry it. Then no secret is typed.
 const DRIVER_LOGS = ['pw:api', 'pw:protocol', 'pw:channel'];
+let gatewayDiagnostics = {};
+export function setGatewayDiagnostics(diagnostics) { gatewayDiagnostics = diagnostics; }
+export const nodeDebugOn = () => gatewayDiagnostics.node === true || Boolean(String(process.env.NODE_DEBUG || '').trim());
 // NODE_DEBUG (Node's own diagnostics: stream logs the buffers a PUT body arrives in) counts too, whatever it names.
 export function driverLogsValues(debug = process.env.DEBUG, nodeDebug = process.env.NODE_DEBUG) {
-  if (String(nodeDebug || '').trim()) return true;
+  if (gatewayDiagnostics.driver || String(nodeDebug || '').trim()) return true;
   const on = [], off = [];
   for (const p of String(debug || '').split(/[\s,]+/).filter(Boolean)) {
     const neg = p.startsWith('-');

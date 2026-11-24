@@ -55,6 +55,22 @@ async function readBytes(sock, n) {
   return Buffer.concat(chunks);
 }
 
+function socksDestination({ host, port, pinned }) {
+  const portBytes = Buffer.from([port >> 8, port & 255]);
+  if (pinned && net.isIPv4(host)) return Buffer.concat([Buffer.from([1, ...host.split('.').map(Number)]), portBytes]);
+  if (pinned && net.isIPv6(host)) {
+    const [left, right] = new URL(`http://[${host}]`).hostname.slice(1, -1).split('::');
+    const head = left ? left.split(':') : [], tail = right ? right.split(':') : [];
+    const groups = [...head, ...Array(8 - head.length - tail.length).fill('0'), ...tail];
+    const address = Buffer.alloc(17, 4);
+    for (const [i, group] of groups.entries()) address.writeUInt16BE(parseInt(group, 16), 1 + i * 2);
+    return Buffer.concat([address, portBytes]);
+  }
+  const name = Buffer.from(host);
+  if (!name.length || name.length > 255) throw new Error('invalid SOCKS5 host');
+  return Buffer.concat([Buffer.from([3, name.length]), name, portBytes]);
+}
+
 async function socksConnect(p, target, track, timeoutMs) {
   const u = new URL(p.server);
   const sock = track(net.connect({ host: hostOf(p), port: Number(u.port) }));
@@ -67,10 +83,7 @@ async function socksConnect(p, target, track, timeoutMs) {
     const hello = await readBytes(sock, 2);
     if (hello[0] !== 5 || hello[1] !== 0) throw new Error('SOCKS5 authentication refused');
     if (target) {
-      // Domain form also accepts literal IPs; importantly, names are resolved by the exit, never here.
-      const name = Buffer.from(target.host);
-      if (!name.length || name.length > 255) throw new Error('invalid SOCKS5 host');
-      sock.write(Buffer.concat([Buffer.from([5, 1, 0, 3, name.length]), name, Buffer.from([target.port >> 8, target.port & 255])]));
+      sock.write(Buffer.concat([Buffer.from([5, 1, 0]), socksDestination(target)]));
       const reply = await readBytes(sock, 4);
       if (reply[0] !== 5 || reply[1] !== 0 || reply[2] !== 0) throw new Error('SOCKS5 refused');
       const len = reply[3] === 1 ? 4 : reply[3] === 4 ? 16 : reply[3] === 3 ? (await readBytes(sock, 1))[0] : 0;
@@ -144,7 +157,54 @@ export function parseEgressProxies(raw) {
   return proxies;
 }
 
-export function selectEgress(cfg, name = 'default') {
+export function parseTenantExits(env, tenants, proxies) {
+  const routes = new Map();
+  for (const entry of String(env.BROWSER_TENANT_EGRESS || '').split(/[;\n]/).map((s) => s.trim()).filter(Boolean)) {
+    const [tenant, names, extra] = entry.split('=').map((s) => s.trim());
+    if ((!tenants.has(tenant) && tenant !== 'default') || routes.has(tenant) || !names || extra !== undefined) {
+      throw new Error('BROWSER_TENANT_EGRESS expects one entry per tenant, in the form <tenant>=<exit>,<exit>;…');
+    }
+    const allowed = new Set(names.split(',').map((s) => s.trim()));
+    for (const name of allowed) if (!['default', 'direct'].includes(name) && !proxies.has(name)) {
+      throw new Error('BROWSER_TENANT_EGRESS names an unknown exit');
+    }
+    routes.set(tenant, allowed);
+  }
+  return routes;
+}
+
+export function exitsFor(cfg, tenant) {
+  return cfg.tenantExits?.get(tenant) ?? new Set(['default', 'direct', ...(cfg.egressProxies?.keys() || [])]);
+}
+
+// Share both the report and work in flight between health requests and scrapes.
+export function createExitHealth(cfg) {
+  let sample;
+  return () => {
+    const now = Date.now();
+    if (!sample || now >= sample.expires) {
+      const report = Promise.all([...(cfg.egressProxies || [])].map(async ([name, p]) => ({
+        name, ...await probeEgress(p), checked_at: new Date().toISOString(),
+      })));
+      sample = { report, expires: now + 10_000 };
+    }
+    return sample.report;
+  };
+}
+
+export async function serviceHealth(cfg, exitHealth, engineHealth, closing) {
+  const [egress, exits, engines] = await Promise.all([probeEgress(cfg.egressProxy), exitHealth(), engineHealth()]);
+  const ok = !closing() && egress.ok && engines.every((e) => e.ok)
+    && exits.every((e) => e.ok || !cfg.egressProxies.get(e.name)?.required);
+  return { ok, egress, proxies: exits.map(({ checked_at, ...proxy }) => proxy), engines };
+}
+
+export function selectEgress(cfg, name = 'default', tenant) {
+  if (cfg.sandboxRoutes) {
+    if (!cfg.sandboxRoutes.has(name)) throw new Error('egress exit is not available to this tenant');
+    return cfg.sandboxRoutes.get(name).egress;
+  }
+  if (cfg.tenantExits?.has(tenant) && !cfg.tenantExits.get(tenant).has(name)) throw new Error('egress exit is not available to this tenant');
   protectEgressCredentials([cfg.egressProxy, ...(cfg.egressProxies?.values() || [])]);
   if (name === 'default') return cfg.egressProxy || null;
   if (name === 'direct') return null;

@@ -29,7 +29,7 @@ test('chat text: the UI around a live Meet bubble is gone; times and controls ar
 });
 
 test('matcher: our announcements (default EN/DE, the live custom one, the confirmation) are no opt-out; requests still are', () => {
-  for (const t of [...announcement('Glassy (notetaker)', 'Mykhailo'), ...announcement('Bosun', null), CUSTOM, CONFIRM_DELETED,
+  for (const t of [...announcement(), ...announcement({ live: true }), CUSTOM, CONFIRM_DELETED,
     'To opt out, write "stop" + "recording" here.', 'Zum Abmelden hier schreiben.', 'If you would rather not be recorded, write "please don\'t record".']) {
     assert.equal(matchOptOut(cleanChatText(BUBBLE(t))), null, t);
   }
@@ -48,7 +48,7 @@ test('matcher: our announcements (default EN/DE, the live custom one, the confir
 
 // The meeting manager's chat loop on its own: the panel hands back our announcement as the live page did.
 test('pollChat: our own announcement echoed back (no sender, UI text around it) is neither an event nor an objection', async () => {
-  const sentTexts = [...announcement('Glassy (notetaker)', 'Mykhailo'), CUSTOM];
+  const sentTexts = [...announcement(), CUSTOM];
   for (const echoed of sentTexts) {
     const events = [], optouts = [];
     const queue = [{ id: '1', sender: null, text: BUBBLE(echoed) }, { id: '2', sender: '10:07 AM', text: BUBBLE('Hi all') },
@@ -64,7 +64,7 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
   }
   // Taken out, not dropped: a senderless message that pastes our announcement and adds a request keeps the request.
   // A short message of ours echoed back is ours; the same words from a named participant are theirs.
-  const ann = announcement('Glassy (notetaker)', null)[0];
+  const ann = announcement()[0];
   const run = async (sent, queue) => {
     const events = [], optouts = [];
     const m = { name: 'Glassy (notetaker)', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sent.map((t) => [t, { count: 1, until: Date.now() + 60_000, norm: normalize(t) }])), optedOut: null, state: 'recording',

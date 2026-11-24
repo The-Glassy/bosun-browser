@@ -191,15 +191,27 @@ test('health reports optional exit failures without failing readiness, and expor
   const url = `http://127.0.0.1:${port}`;
   const down = `http://user:exit-secret@127.0.0.1:${port}`;
   const svc = await startBosun({
-    ENGINE: 'chromium', FEATURES_ENGINES: 'chromium',
+    ENGINE: 'chromium', FEATURES_ENGINES: 'chromium', BOSUN_METRICS_TOKEN: 'unique-metrics-bearer',
     BROWSER_EGRESS_PROXIES: JSON.stringify({ ua: down, home: { url, required: true }, office: { url: down, required: false } }),
   }, { engines: { check: async () => {}, checkLaunch: async () => {} } });
   t.after(() => svc.stop());
   const base = `http://127.0.0.1:${svc.ws.port}`;
   const headers = { authorization: `Bearer ${TOKEN}` };
   assert.equal((await fetch(`${base}/health/exits`)).status, 401);
-  const [health, exitHealth, metrics] = await Promise.all([
-    fetch(`${base}/health`, { headers }), fetch(`${base}/health/exits`, { headers }), fetch(`${base}/metrics`),
+  for (const [url, auth] of [
+    ['/metrics', undefined],
+    ['/metrics', { authorization: 'Bearer incorrect-token-for-metrics' }],
+    [`/metrics?token=${TOKEN}`, undefined],
+  ]) {
+    const response = await fetch(base + url, { headers: auth });
+    assert.equal(response.status, 401);
+    assert.doesNotMatch(await response.text(), /bosun_exit_up|office|home/);
+  }
+  assert.equal(probes, 0);
+  const metricsHeaders = { authorization: 'Bearer unique-metrics-bearer' };
+  assert.equal((await fetch(`${base}/health/exits`, { headers: metricsHeaders })).status, 401);
+  const [health, exitHealth, metrics, metricsOnly] = await Promise.all([
+    fetch(`${base}/health`, { headers }), fetch(`${base}/health/exits`, { headers }), fetch(`${base}/metrics`, { headers }), fetch(`${base}/metrics`, { headers: metricsHeaders }),
   ]);
   assert.equal(health.status, 200);
   const report = await health.json();
@@ -216,7 +228,10 @@ test('health reports optional exit failures without failing readiness, and expor
   assert.ok(!JSON.stringify({ report, exits }).includes('exit-secret'));
   assert.equal(metrics.status, 200);
   assert.match(metrics.headers.get('content-type'), /^text\/plain; version=0\.0\.4/);
-  assert.deepEqual((await metrics.text()).trim().split('\n').slice(1), [
+  const exposition = await metrics.text();
+  assert.equal(metricsOnly.status, 200);
+  assert.equal(await metricsOnly.text(), exposition);
+  assert.deepEqual(exposition.trim().split('\n').slice(1), [
     '# TYPE bosun_exit_up gauge', 'bosun_exit_up{name="ua"} 0', 'bosun_exit_up{name="home"} 1', 'bosun_exit_up{name="office"} 0',
   ]);
   assert.equal(probes, 3);

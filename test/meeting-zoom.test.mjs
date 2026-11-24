@@ -105,8 +105,7 @@ test('Zoom with a signed-in profile: account name kept, mic and camera off, Join
     // Computer audio joined (Zoom connected it with a live microphone), then the microphone muted; video stayed off.
     assert.equal(room.media.find((m) => m.audio)?.audio, true);
     assert.deepEqual({ mic: room.media.at(-1).mic, cam: room.media.at(-1).cam }, { mic: false, cam: false });
-    const [en, de] = announcement('Glassy (notetaker)', null);
-    assert.deepEqual(room.chat.map((m) => m.text), [en, de]);
+    assert.deepEqual(room.chat.map((m) => m.text), announcement());
     const announcedAt = room.log.filter((l) => l[0] === 'chat').at(-1)[1];
     assert.ok(audio.recorders[0].startedAt >= announcedAt, 'recording started only after the announcement');
     const s = await status(c, j.meeting_id);
@@ -191,7 +190,7 @@ test('Zoom without the passcode, with a wrong one, sign-in required, a captcha, 
     // A guest (no profile) where the host allows only signed-in users.
     ({ zid, r } = await join({ requireSignIn: true }));
     assert.match(r.text, /Zoom lets only signed-in users into this meeting\. Join with a Bosun profile signed in to Zoom/);
-    assert.equal(fake.room(zid).guest.name, 'Glassy (notetaker)'); // a guest types the name given
+    assert.equal(fake.room(zid).guest.name, 'Notetaker'); // a guest types the name given
     ({ r } = await join({ bigChallenge: true }, { profile: 'zoom' }));
     assert.match(r.text, /Zoom asked for a captcha before joining/);
     ({ zid } = await join({ signedIn: true }, { profile: 'zoom' }));
@@ -230,7 +229,7 @@ test('Zoom chat: switched to Everyone before the announcement, sent with Send wh
     const id = (await c.call('meeting_join', { url, profile: 'zoom' })).json().meeting_id;
     await until(async () => (await status(c, id)).state === 'recording', 20_000);
     const sent = fake.room(zid).chat.filter((m) => m.self);
-    assert.deepEqual(sent.map((m) => [m.to, m.text]), announcement('Glassy (notetaker)', null).map((t) => ['Everyone', t]));
+    assert.deepEqual(sent.map((m) => [m.to, m.text]), announcement().map((t) => ['Everyone', t]));
     assert.deepEqual((await status(c, id)).announce, { mode: 'chat', sent_to: 'everyone' });
     await c.call('meeting_leave', { meeting_id: id });
     await until(() => svc.manager.used === 0, 10_000);
@@ -243,7 +242,7 @@ test('Zoom chat: switched to Everyone before the announcement, sent with Send wh
     // Sent right away, while the announcement is still finding its way: it waits for it and follows it to the host.
     assert.equal((await c.call('meeting_chat_send', { meeting_id: hid, text: 'Early.' })).isError, false);
     await until(async () => (await status(c, hid)).state === 'recording', 30_000);
-    assert.deepEqual(fake.room(h.id).chat.map((m) => [m.to, m.text]), [...announcement('Glassy (notetaker)', null), 'Early.'].map((t) => ['Host and co-hosts', t]));
+    assert.deepEqual(fake.room(h.id).chat.map((m) => [m.to, m.text]), [...announcement(), 'Early.'].map((t) => ['Host and co-hosts', t]));
     const s = await status(c, hid);
     assert.equal(s.error, undefined);
     assert.deepEqual([s.announce.mode, s.announce.sent_to, s.announce.reason], ['chat', 'host', 'chat-restricted']);
@@ -345,7 +344,7 @@ test('Zoom "Meeting Group Chat" (continuous meeting chat, live 2026-10-26) is ev
     const g = fake.newRoom({ signedIn: true, open: true, recipient: 'Meeting Group Chat', hostOnly: true, liveChat: true });
     const gid = (await c.call('meeting_join', { url: g.url, profile: 'zoom' })).json().meeting_id;
     await until(async () => (await status(c, gid)).state === 'recording', 20_000);
-    assert.deepEqual(fake.room(g.id).chat.map((m) => m.to), ['Meeting Group Chat', 'Meeting Group Chat']);
+    assert.deepEqual(fake.room(g.id).chat.map((m) => m.to), ['Meeting Group Chat']);
     assert.deepEqual((await status(c, gid)).announce, { mode: 'chat', sent_to: 'everyone' });
     assert.equal((await c.call('meeting_chat_send', { meeting_id: gid, text: 'Noted.' })).isError, false);
     await sleep(800);
@@ -356,7 +355,7 @@ test('Zoom "Meeting Group Chat" (continuous meeting chat, live 2026-10-26) is ev
     const d = fake.newRoom({ signedIn: true, open: true, recipient: 'Meeting Group Chat', hostOnly: true, dropSends: 'Meeting Group Chat' });
     const did = (await c.call('meeting_join', { url: d.url, profile: 'zoom' })).json().meeting_id;
     await until(async () => (await status(c, did)).state === 'recording', 40_000);
-    assert.deepEqual(fake.room(d.id).chat.map((m) => [m.to, m.text]), announcement('Glassy (notetaker)', null).map((t) => ['Host and co-hosts', t]));
+    assert.deepEqual(fake.room(d.id).chat.map((m) => [m.to, m.text]), announcement().map((t) => ['Host and co-hosts', t]));
     const s = await status(c, did);
     assert.deepEqual([s.announce.sent_to, s.announce.reason], ['host', 'not-confirmed']);
     assert.equal(ev.announce.length, 1);
@@ -373,7 +372,7 @@ test('Zoom announce "host": to "Host and co-hosts" only, though everyone could b
     const h = fake.newRoom({ signedIn: true, open: true });
     const hid = (await c.call('meeting_join', { url: h.url, profile: 'zoom', announce: 'host' })).json().meeting_id;
     await until(async () => (await status(c, hid)).state === 'recording', 20_000);
-    assert.deepEqual(fake.room(h.id).chat.map((m) => m.to), ['Host and co-hosts', 'Host and co-hosts']);
+    assert.deepEqual(fake.room(h.id).chat.map((m) => m.to), ['Host and co-hosts']);
     assert.deepEqual((await status(c, hid)).announce, { mode: 'host', sent_to: 'host' });
     await c.call('meeting_leave', { meeting_id: hid });
     await until(() => svc.manager.used === 0, 10_000);

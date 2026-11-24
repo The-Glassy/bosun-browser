@@ -23,7 +23,7 @@ import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
 import { LiveTranscript, TranscriptUsage, nodeDebugOn, NODE_DEBUG_REFUSED } from './transcript.mjs';
 import { synthesizeWav, splitSpeech, takeSentences, probeSeconds, audioFormat } from './speech.mjs';
-import { SpeechSettings, SETTINGS, PER_CALL, REMOVED, removedSetting } from './settings.mjs';
+import { SpeechSettings, SETTINGS, PER_CALL, REMOVED, removedSetting, DEFAULTS } from './settings.mjs';
 import { CHANNEL_PREFIX } from '../events.mjs';
 import { aliasKeys, isAddressed } from './addressed.mjs';
 import { RecordingLinks } from './recording-links.mjs';
@@ -38,8 +38,6 @@ const ORPHAN_QUIET_MS = 60_000; // a file of an earlier run changed this recentl
 export const ANNOUNCE_MODES = ['chat', 'host', 'none'];
 export const PLATFORMS = [meet, zoom];
 const POLL_MS = 1000;
-const ALONE_MS = 120_000; // alone in the call this long while nobody else has been there yet: leave
-const ALONE_LEAVE_MS = 30_000; // alone this long after everyone else left: leave (meeting_join alone_leave_sec)
 const ECHO_MS = 60_000; // after posting, senderless copies of the post are ours however often the panel renders them
 const ECHO_LONG = 40; // a senderless exact copy of a post at least this long (normalized) is ours at any time
 const JOIN_REPLY_MS = 60_000; // meeting_join answers once the join request is out (or after this)
@@ -112,28 +110,12 @@ export function transition(m, to) {
 }
 
 const botName = (name) => String(name).replace(/\s*\(.*\)\s*$/, '').trim() || 'Bosun';
-// The default announcement, English then German. owner: whose notetaker it is (MEETING_OWNER), or nobody named. live: the
-// audio is also transcribed live.
-export function announcement(name, owner, { live = false, video = false } = {}) {
-  if (video) return announcement(name, owner, { live }).map((text) => text
-    .replace("I'm recording audio for notes.", "I'm recording audio and video of this meeting page for notes.")
-    .replace("This call is recorded and transcribed live for notes.", "Audio and video of this meeting page are recorded and transcribed live for notes.")
-    .replace("Ich nehme den Ton für Notizen auf.", "Ich nehme Ton und Video dieser Meeting-Seite für Notizen auf.")
-    .replace("Dieser Anruf wird für Notizen aufgezeichnet und live transkribiert.", "Ton und Video dieser Meeting-Seite werden für Notizen aufgezeichnet und live transkribiert."));
-  const n = botName(name);
-  if (live) {
-    return [
-      `Hi, I'm ${n}, ${owner ? `${owner}'s` : 'an'} AI notetaker. This call is recorded and transcribed live for notes. If you'd rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop both and delete the recording.`,
-      `Hallo, ich bin ${n}, ${owner ? `KI-Notizassistent von ${owner}` : 'ein KI-Notizassistent'}. Dieser Anruf wird für Notizen aufgezeichnet und live transkribiert. Wenn ihr nicht aufgenommen werden wollt, schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“), dann stoppe ich beides und lösche die Aufnahme.`,
-    ];
-  }
-  return [
-    `Hi, I'm ${n}, ${owner ? `${owner}'s` : 'an'} AI notetaker. I'm recording audio for notes. If you'd rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the recording.`,
-    `Hallo, ich bin ${n}, ${owner ? `KI-Notizassistent von ${owner}` : 'ein KI-Notizassistent'}. Ich nehme den Ton für Notizen auf. Wenn ihr nicht aufgenommen werden wollt, schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“), dann stoppe und lösche ich die Aufnahme.`,
-  ];
+export function announcement({ live = false, video = false } = {}) {
+  const capture = video ? 'The audio and video of this meeting page are being recorded' : 'This meeting’s audio is being recorded';
+  return [`${capture}${live ? ' and the audio is being transcribed live' : ''} for notes, so please object in chat if you prefer not to be recorded.`];
 }
-export const CONFIRM_DELETED = 'Recording stopped and deleted. / Aufnahme gestoppt und gelöscht.';
-export const CONFIRM_DELETED_LIVE = 'Recording and live transcript stopped and deleted. / Aufnahme und Live-Transkript gestoppt und gelöscht.';
+export const CONFIRM_DELETED = 'Recording stopped and deleted.';
+export const CONFIRM_DELETED_LIVE = 'Recording and live transcript stopped and deleted.';
 // Google turned the guest away before anyone could admit it ("You can't join this video call").
 export const REFUSED_BY_GOOGLE = "Google refused to let this guest join (\"You can't join this video call\") before anyone could admit it. " +
   'Google often does this for automated guests, especially from datacenter IPs. Join with a Bosun profile that is signed in to a ' +
@@ -207,8 +189,8 @@ export class Meetings {
   // audio: {unsupported() -> reason|null, open() -> {browserEnv, args?, record(file), close()}, needsHeadful};
   // platformFor(url) -> platform|null; bus: EventBus (meeting events).
   constructor({ cfg, manager, bus, audio = pulseAudio, platformFor = (url) => PLATFORMS.find((p) => p.matches(url)) || null,
-    now = Date.now, pollMs = POLL_MS, aloneMs = ALONE_MS, aloneLeaveMs = ALONE_LEAVE_MS, speechGraceMs = SPEECH_GRACE_MS, speakerDrainMs = 2000, diskStat = fs.statfsSync }) {
-    Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, aloneMs, aloneLeaveMs, speechGraceMs, speakerDrainMs, diskStat });
+    now = Date.now, pollMs = POLL_MS, aloneMs = DEFAULTS.first_joiner_wait_sec * 1000, aloneLeaveMs = DEFAULTS.alone_leave_sec * 1000, speechGraceMs = SPEECH_GRACE_MS, speakerDrainMs = 2000, diskStat = fs.statfsSync }) {
+    Object.assign(this, { cfg, manager, bus, audio, platformFor, now, pollMs, speechGraceMs, speakerDrainMs, diskStat });
     this.dir = path.join(cfg.dataDir, 'recordings');
     this.active = new Map(); // id -> meeting
     this.dryRuns = new Set(); // dry runs in progress: {tenant, session} (capacity)
@@ -217,7 +199,9 @@ export class Meetings {
     // Live transcript minutes per tenant and day (LIVE_TRANSCRIPT_DAILY_MIN).
     this.usage = new TranscriptUsage({ file: path.join(cfg.dataDir, 'live-transcript-usage.json'), tz: cfg.tz, capMin: cfg.liveTranscriptDailyMin ?? 180, now });
     // Speech settings per tenant (speech_settings_get/set): what a call leaves out.
-    this.settings = new SpeechSettings(cfg);
+    this.settings = new SpeechSettings(cfg, {
+      ...DEFAULTS, alone_leave_sec: aloneLeaveMs / 1000, first_joiner_wait_sec: aloneMs / 1000,
+    });
     this.ackCache = new Map(); // acknowledgement clips: JSON [tts, phrase] -> {text, clip, error, failedAt}
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     this.links = new RecordingLinks({ cfg, resolve: (tenant, id, kind) => {
@@ -354,7 +338,7 @@ export class Meetings {
 
   // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
   // meeting could not be joined (denied, not a meeting page, no audio, ...).
-  async join(tenant, { url, name = 'Glassy (notetaker)', announceText, announce = 'chat', maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec = null,
+  async join(tenant, { url, name = this.cfg.meetingBotName ?? 'Notetaker', announceText, announce = 'chat', maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec, firstJoinerWaitSec,
     liveTranscript = false, transcriptPartials = true, vadSilenceS, recordVideo = false, videoFps = 2, settings: perCall = {} }) {
     validateVideo(recordVideo, videoFps);
     if (!ANNOUNCE_MODES.includes(announce)) throw new Error(`announce must be one of ${ANNOUNCE_MODES.join(', ')}`);
@@ -369,7 +353,13 @@ export class Meetings {
       overrides[k] = v;
     }
     if (vadSilenceS !== undefined && SETTINGS.vad_silence_s(vadSilenceS)) throw new Error(SETTINGS.vad_silence_s(vadSilenceS));
-    vadSilenceS ??= this.settings.effective(tenant).values.vad_silence_s;
+    const defaults = this.settings.effective(tenant).values;
+    if (aloneLeaveSec != null && SETTINGS.alone_leave_sec(aloneLeaveSec)) throw new Error(SETTINGS.alone_leave_sec(aloneLeaveSec));
+    if (firstJoinerWaitSec != null && SETTINGS.first_joiner_wait_sec(firstJoinerWaitSec)) throw new Error(SETTINGS.first_joiner_wait_sec(firstJoinerWaitSec));
+    vadSilenceS ??= defaults.vad_silence_s;
+    aloneLeaveSec ??= defaults.alone_leave_sec;
+    firstJoinerWaitSec ??= defaults.first_joiner_wait_sec;
+    announceText ||= this.cfg.meetingAnnounceText;
     if (liveTranscript) {
       if (!this.cfg.elevenlabs) throw new Error('live_transcript needs ElevenLabs (ELEVENLABS_API_KEY is not set on this Bosun); join without it');
       if (nodeDebugOn()) throw new Error(`live_transcript is refused: ${NODE_DEBUG_REFUSED}`);
@@ -388,8 +378,8 @@ export class Meetings {
     const m = {
       id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, leaveOnOptOut,
       recordVideo, videoFps, videoReserved: recordVideo,
-      aloneLeaveMs: aloneLeaveSec !== null ? aloneLeaveSec * 1000 : this.aloneLeaveMs, othersSeen: false,
-      announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner, { live: liveTranscript, video: recordVideo }),
+      aloneLeaveSec, firstJoinerWaitSec, othersSeen: false,
+      announce: announceText ? [announceText] : announcement({ live: liveTranscript, video: recordVideo }),
       live: liveTranscript, partials: transcriptPartials, vadSilenceS, transcript: null, speech: null, speechSeq: 0,
       announceMode: announce, announced: { sent_to: null, failures: [] }, chatTo: announce === 'host' ? 'host' : 'everyone', chatError: null,
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
@@ -471,7 +461,8 @@ export class Meetings {
     await this.page(m, async (p) => {
       if (platform.afterAdmit) await platform.afterAdmit(p); // Zoom: computer audio joined, mic and camera off
       m.participants = await platform.participants(p);
-      if (m.participants > 1) m.othersSeen = true; // someone else was here: leaving after alone_leave_sec once they go
+      if (m.participants === 1) m.aloneSince = m.admittedAt;
+      if (m.participants > 1) m.othersSeen = true;
       // A chat that won't open (turned off by the host) is no reason to leave; the announcement then says why it failed.
       await platform.openChat(p).catch((e) => { m.chatError = oneLine(e); });
       await platform.watchChat(p, m.chatKey);
@@ -579,7 +570,7 @@ export class Meetings {
     if (!m.live || m.transcript || m.noRecord || m.optedOut || m.state === 'ended') return;
     if (!m.rig.capture) { m.transcriptError = 'this audio backend cannot capture the meeting audio'; return; }
     m.transcript = new LiveTranscript({
-      apiKey: this.cfg.elevenlabs.apiKey, baseUrl: this.cfg.elevenlabs.baseUrl, source: m.rig.capture(), tenant: m.tenant, usage: this.usage,
+      apiKey: this.cfg.elevenlabs.apiKey, baseUrl: this.cfg.elevenlabs.baseUrl, socketPath: this.cfg.providerSockets?.elevenlabs, source: m.rig.capture(), tenant: m.tenant, usage: this.usage,
       partials: true, vadSilenceS: m.vadSilenceS, now: this.now,
       on: {
         // Never thrown into the transcript's socket or timers (that would end the process): the text is emitted as it was.
@@ -1367,9 +1358,9 @@ export class Meetings {
     const n = await this.page(m, (p) => m.platform.participants(p));
     m.participants = n;
     if (n !== null && n <= 1) {
-      // Everyone else left: leave soon (aloneLeaveMs). Nobody else has been here yet: wait longer for them (aloneMs).
+      // The first participant and the last departure have independent timers.
       m.aloneSince ??= this.now();
-      if (this.now() - m.aloneSince > (m.othersSeen ? m.aloneLeaveMs : this.aloneMs)) return this.finish(m, 'alone');
+      if (this.now() - m.aloneSince >= 1000 * (m.othersSeen ? m.aloneLeaveSec : m.firstJoinerWaitSec)) return this.finish(m, 'alone');
     } else {
       m.aloneSince = null;
       if (n !== null && n > 1) m.othersSeen = true;
@@ -1609,7 +1600,8 @@ export class Meetings {
       meeting_id: m.id, platform: m.platform.name, url: m.url, state: m.state, ...(m.info.joinedAs ? { joined_as: m.info.joinedAs } : {}),
       ...(m.info.warning ? { warning: m.info.warning } : {}),
       ...(m.reason ? { reason: m.reason } : {}), ...(m.error ? { error: m.error } : {}),
-      participants: m.participants, recording_seconds: Math.round(recMs / 1000),
+      participants: m.participants, alone_leave_sec: m.aloneLeaveSec, first_joiner_wait_sec: m.firstJoinerWaitSec,
+      recording_seconds: Math.round(recMs / 1000),
       video: { on: !!m.videoRec, fps: m.videoFps ?? 2, bytes: m.videoFile ? fs.statSync(m.videoFile, { throwIfNoEntry: false })?.size ?? 0 : 0, ...(m.videoError ? { error: m.videoError } : {}) },
       speaker_timeline: { intervals: this.timelineCount(m), ...(m.speakerTimelineError ? { error: m.speakerTimelineError } : {}) },
       recording: m.file ? { path: m.file, bytes, ...(m.state === 'ended' && bytes ? { next: `call recording_get { meeting_id: "${m.id}" }` } : {}) } : m.deleted ? 'deleted' : null,

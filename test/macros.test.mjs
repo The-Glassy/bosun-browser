@@ -264,7 +264,7 @@ test('runMacro: assert gets the wait_for deadline; every step the guard, click a
 });
 
 test('BROWSER_MACRO_SOURCE: only a read-only tenant reads another tenant\'s macros', () => {
-  const env = { BROWSER_TOKENS: 'me:aaaaaaaaaaaaaaaaaaaa,swarm:bbbbbbbbbbbbbbbbbbbb', BROWSER_TOKEN_POLICIES: 'swarm=ephemeral' };
+  const env = { BOSUN_TENANT_SANDBOX: 'off', BOSUN_ALLOW_UNSAFE_SHARED: '1', BROWSER_TOKENS: 'me:aaaaaaaaaaaaaaaaaaaa,swarm:bbbbbbbbbbbbbbbbbbbb', BROWSER_TOKEN_POLICIES: 'swarm=ephemeral' };
   assert.deepEqual([...loadConfig({ ...env, BROWSER_MACRO_SOURCE: 'swarm=me' }).macroSource], [['swarm', 'me']]);
   assert.equal(loadConfig(env).macroSource.size, 0);
   assert.throws(() => loadConfig({ ...env, BROWSER_MACRO_SOURCE: 'me=swarm' }), /whose policy is full/);

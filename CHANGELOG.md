@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.27.2 (Unreleased)
+## 0.28.0 (Unreleased)
+
+- Isolate each tenant's worker and browsers in bubblewrap on Linux. `BOSUN_TENANT_SANDBOX=auto` enables it for
+  configurations with multiple tokens. Sharing a process across distinct tenants requires `BOSUN_ALLOW_UNSAFE_SHARED=1`.
+  Sandboxed browsers use a host relay that pins destination addresses and enforces the tenant's allowed hosts and exits.
+- Require an MCP bearer or `BOSUN_METRICS_TOKEN` for `/metrics`. The only series is `bosun_exit_up`.
+- Default to the guest name `Notetaker`, a neutral recording notice and UTC. Configure meeting wording and display
+  name with `MEETING_ANNOUNCE_TEXT` and `MEETING_BOT_NAME`.
+- Set `alone_leave_sec` and `first_joiner_wait_sec` per tenant with the speech settings tools. `meeting_join` can
+  override both, and `meeting_status` reports the values in effect.
+- Keep the existing secret tools and workflows.
+
+### Health changes from unreleased 0.27.2
 
 - Keep `/health` ready when an optional named exit is down. Readiness checks engine launches, the default
   egress and any named exit configured with `required: true`.

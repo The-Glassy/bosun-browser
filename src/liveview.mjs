@@ -63,7 +63,7 @@ const retry=(ms)=>{clearTimeout(rt);rt=setTimeout(connect,ms)};
 function finish(msg){ended=true;clearTimeout(rt);status(msg);document.body.classList.add('ended');try{if(ws)ws.close()}catch{}}
 function connect(){
  if(ended||ws)return;
- const s=ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/'+tok);
+ const s=ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+location.pathname.slice(0,location.pathname.lastIndexOf('/v/'))+'/ws/'+tok);
  s.onopen=hint;
  s.onclose=(e)=>{if(ws!==s)return;ws=null;if(ended)return;
   // One viewer at a time: wait while another device has it; otherwise ask whether the link is still valid.
@@ -308,7 +308,7 @@ function reject(sock, code, text) {
   sock.destroy();
 }
 
-export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, ttlMs = 15 * 60 * 1000, staleMs = STALE_MS, refreshMs = REFRESH_MS, stepMs = STEP_MS } = {}) {
+export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, socketPath, ttlMs = 15 * 60 * 1000, staleMs = STALE_MS, refreshMs = REFRESH_MS, stepMs = STEP_MS } = {}) {
   const handoffs = new Map(); // token -> handoff
   let base = baseUrl ? baseUrl.replace(/\/$/, '') : null;
   let origin = base ? new URL(base).origin : null;
@@ -552,7 +552,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
 
   return {
     async listen() {
-      await new Promise((resolve, rej) => { srv.once('error', rej); srv.listen(port, host, () => { srv.off('error', rej); resolve(); }); });
+      await new Promise((resolve, rej) => { srv.once('error', rej); srv.listen(socketPath ? { path: socketPath } : { port, host }, () => { srv.off('error', rej); resolve(); }); });
       const a = srv.address();
       if (!base) {
         const hh = a.family === 'IPv6' ? `[${a.address}]` : a.address;

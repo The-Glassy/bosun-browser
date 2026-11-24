@@ -1,7 +1,7 @@
 // Environment -> validated configuration. Anything malformed or unsafe throws, so the service refuses to start.
-import { isLoopbackHost, parsePolicies, parseTokens } from './auth.mjs';
+import { isLoopbackHost, MIN_TOKEN_LENGTH, parsePolicies, parseTokens } from './auth.mjs';
 import { parseTenantAllow } from './allow.mjs';
-import { parseEgress, parseEgressProxies, protectEgressCredentials } from './egress.mjs';
+import { parseEgress, parseEgressProxies, parseTenantExits, protectEgressCredentials } from './egress.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
 import { parseToolTimeouts } from './deadline.mjs';
 import { parseMacroSource } from './macros.mjs';
@@ -25,6 +25,15 @@ function flag(env, name, def) {
   return raw === '1';
 }
 
+function timeZone(value, key) {
+  try {
+    if (/^[+-]/.test(value)) throw new Error();
+    return new Intl.DateTimeFormat('en', { timeZone: value }).resolvedOptions().timeZone;
+  } catch {
+    throw new Error(`${key} must be an IANA time zone, for example UTC`);
+  }
+}
+
 export function loadConfig(env = process.env) {
   const cfg = {
     egressProxy: parseEgress(env.BROWSER_EGRESS_PROXY),
@@ -46,11 +55,14 @@ export function loadConfig(env = process.env) {
     camoufoxOs: env.CAMOUFOX_OS || null, // null: the host's OS
     sessionCookiesMaxAgeMs: int(env, 'SESSION_COOKIES_MAX_AGE_DAYS', 30, 1, 3650) * 86400_000,
     keepalive: env.KEEPALIVE !== '0', // run scheduled keepalive visits (configured with keepalive_set)
-    tz: env.TZ || 'Europe/Vienna', // local time for keepalive quiet_hours
+    tz: timeZone(env.TZ || 'UTC', 'TZ'),
+    browserTimezone: env.BROWSER_TIMEZONE ? timeZone(env.BROWSER_TIMEZONE, 'BROWSER_TIMEZONE') : null,
+    browserLocale: env.BROWSER_LOCALE || 'en',
+    meetingBotName: env.MEETING_BOT_NAME?.trim() || 'Notetaker',
+    meetingAnnounceText: env.MEETING_ANNOUNCE_TEXT?.trim() || null,
     recordingRetentionDays: int(env, 'RECORDING_RETENTION_DAYS', 30, 1, 3650), // meeting recordings are deleted after this
     meetingVideoLimit: int(env, 'MEETING_VIDEO_LIMIT', 1, 0, 1000),
     meetingVideoMinFreeGb: int(env, 'MEETING_VIDEO_MIN_FREE_GB', 2, 0, 100000),
-    meetingOwner: (env.MEETING_OWNER || '').trim().slice(0, 60) || null, // named in the meeting announcement ("X's AI notetaker")
     // Live transcript of meetings (meeting_join live_transcript): ElevenLabs Scribe realtime, at most this many minutes a
     // day per tenant (local day, TZ). elevenlabs: null without ELEVENLABS_API_KEY (the key is also what elevenlabs TTS
     // uses). ELEVENLABS_BASE_URL: an ElevenLabs API host (https://*.elevenlabs.io, e.g. the EU residency one) or a local
@@ -85,7 +97,22 @@ export function loadConfig(env = process.env) {
   };
   protectEgressCredentials([cfg.egressProxy, ...cfg.egressProxies.values()], env.DEBUG, env.NODE_DEBUG);
   if (!ENGINE_NAMES.includes(cfg.engine)) throw new Error(`ENGINE must be one of ${ENGINE_NAMES.join(', ')} (got "${cfg.engine}")`);
-  try { new Intl.DateTimeFormat('en', { timeZone: cfg.tz }); } catch { throw new Error(`TZ must be an IANA time zone such as Europe/Vienna (got "${cfg.tz}")`); }
+  try { cfg.browserLocale = Intl.getCanonicalLocales(cfg.browserLocale)[0]; } catch { throw new Error('BROWSER_LOCALE must be a valid language tag'); }
+  if (cfg.meetingBotName.length > 60) throw new Error('MEETING_BOT_NAME must be at most 60 characters');
+  if (cfg.meetingAnnounceText?.length > 1000) throw new Error('MEETING_ANNOUNCE_TEXT must be at most 1000 characters');
+
+  const sandbox = env.BOSUN_TENANT_SANDBOX ?? 'auto';
+  if (!['auto', 'on', 'off'].includes(sandbox)) throw new Error('BOSUN_TENANT_SANDBOX must be auto, on or off');
+  const allowShared = flag(env, 'BOSUN_ALLOW_UNSAFE_SHARED', false);
+  cfg.tenantSandbox = sandbox === 'on' || (sandbox === 'auto' && cfg.tokens.length > 1);
+  const tenants = new Set(cfg.tokens.map(({ tenant }) => tenant));
+  cfg.unsafeShared = !cfg.tenantSandbox && tenants.size > 1;
+  if (cfg.unsafeShared && !allowShared) throw new Error('multiple tenants require BOSUN_TENANT_SANDBOX or BOSUN_ALLOW_UNSAFE_SHARED=1');
+  cfg.tenantExits = parseTenantExits(env, tenants, cfg.egressProxies);
+  cfg.metricsToken = env.BOSUN_METRICS_TOKEN || null;
+  if (cfg.metricsToken && (!/^\S+$/.test(cfg.metricsToken) || cfg.metricsToken.length < MIN_TOKEN_LENGTH)) {
+    throw new Error(`BOSUN_METRICS_TOKEN must be a bearer token of at least ${MIN_TOKEN_LENGTH} characters`);
+  }
   if (cfg.camoufoxOs && !['macos', 'windows', 'linux'].includes(cfg.camoufoxOs)) throw new Error('CAMOUFOX_OS must be macos, windows or linux');
   // Engines a session may ask for: FEATURES_ENGINES (default: all of them), plus the configured default engine.
   const wanted = env.FEATURES_ENGINES ? list(env.FEATURES_ENGINES) : ENGINE_NAMES;
@@ -194,5 +221,6 @@ export function loadConfig(env = process.env) {
     }
     cfg.live = { host, port, baseUrl };
   }
+  if (cfg.tenantSandbox && cfg.macroSource.size) throw new Error('BROWSER_MACRO_SOURCE requires shared mode because it shares macro data between tenants');
   return cfg;
 }

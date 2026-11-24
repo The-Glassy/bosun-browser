@@ -94,16 +94,16 @@ test('join parameters, defaults, config validation and no tenant video setting',
   assert.deepEqual(f.meetings.view(m).video, { on: false, fps: 2, bytes: 0 });
 });
 
-test('no recorder or frames before both announcements finish; page and fps passed only afterwards', async (t) => {
+test('no recorder or frames before the announcement finishes; page and fps passed only afterwards', async (t) => {
   const gate = deferred(), f = fixture(t, { announceGate: gate });
   const m = await join(f, { recordVideo: true, videoFps: 4 });
   await until(() => f.log.length > 0);
   assert.equal(m.state, 'admitted'); assert.equal(f.recorders.length, 0); assert.equal(m.file, null);
   gate.resolve(); await until(() => !!m.rec);
-  assert.deepEqual(f.log.map((x) => x[0]), ['announce-start', 'announce-end', 'announce-start', 'announce-end', 'record', 'record']);
+  assert.deepEqual(f.log.map((x) => x[0]), ['announce-start', 'announce-end', 'record', 'record']);
   assert.deepEqual(f.recorders[1].video, { page: f.page, fps: 4 });
   assert.match(f.log[0][1], /audio and video of this meeting page/);
-  assert.match(announcement('Notes', null, { video: true, live: true })[1], /Ton und Video/);
+  assert.match(announcement({ video: true, live: true })[0], /audio and video.*transcribed live/);
   assert.ok(m.file.endsWith('.ogg')); assert.ok(m.videoFile.endsWith('.webm')); assert.notEqual(m.rec, m.videoRec); assert.equal(fs.statSync(m.file).mode & 0o777, 0o600);
   assert.deepEqual(f.meetings.view(m).video, { on: true, fps: 4, bytes: 10 });
 });

@@ -53,7 +53,7 @@ test('Zoom 15:00: computer audio Zoom connected by itself ("Audio", its menu off
     // Not "Audio" (it would ask for the microphone), not "Video", not Chrome's <permission> element, nothing in the menu.
     assert.deepEqual(room.media.filter((m) => m.clicked), []);
     assert.deepEqual(room.media.filter((m) => m.toast).map((m) => m.toast).sort(), ['t1', 't2', 't4']);
-    assert.deepEqual(room.chat.map((m) => m.text), announcement('Glassy Notetaker', null));
+    assert.deepEqual(room.chat.map((m) => m.text), announcement());
     const announcedAt = room.log.filter((l) => l[0] === 'chat').at(-1)[1];
     assert.ok(audio.recorders[0].startedAt >= announcedAt, 'recording started only after the announcement');
     await c.call('meeting_leave', { meeting_id: mid });

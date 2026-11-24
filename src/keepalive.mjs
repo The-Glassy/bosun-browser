@@ -83,7 +83,7 @@ export const periodMin = (e) => e.everyMinutes ?? e.everyHours * 60;
 
 // When the next visit is due: one interval after `from`, shifted by up to ±jitterMin (both stretched during quiet
 // hours), never sooner than MIN_GAP_MS.
-export function nextRun(from, e, rnd = Math.random, tz = 'Europe/Vienna') {
+export function nextRun(from, e, rnd = Math.random, tz = 'UTC') {
   const ms = periodMin(e) * 60_000 + (rnd() * 2 - 1) * e.jitterMin * 60_000;
   const quiet = e.quietHours ? parseQuiet(e.quietHours) : null;
   return Math.round(Math.max(from + MIN_GAP_MS, advance(from, ms, quiet, tz)));
@@ -229,7 +229,7 @@ export class Keepalive {
   // activityMs, wall (bot-check detector).
   constructor({ cfg, manager, emit = () => {}, onWatch = () => {}, wall = async () => null, rnd = Math.random, now = Date.now, tickMs = TICK_MS, gapMs = GAP_MS, activityMs = ACTIVITY_MS }) {
     Object.assign(this, { cfg, manager, emit, onWatch, wall, rnd, now, tickMs, gapMs, activityMs });
-    this.tz = cfg.tz || 'Europe/Vienna';
+    this.tz = cfg.tz || 'UTC';
     this.store = new Store(path.join(cfg.dataDir, 'keepalive.json'));
     this.current = null; // {key, abort, done}
     this.notBefore = 0; // spacing between visits
@@ -420,10 +420,10 @@ export class Keepalive {
         const started = Date.now();
         try {
           const response = await ss.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-          if (ss.egressProxy && response?.status() === 502 && ss.proxyRoute?.failuresSince(started)) throw egressError(ss.egressProxy);
+          if (ss.egressProxy && response?.status() === 502 && ss.proxyRoute?.failuresSince?.(started)) throw egressError(ss.egressProxy);
         } catch (err) {
           const code = /\b(net::ERR_[A-Z_]+|NS_ERROR_[A-Z_]+)\b/.exec(err?.message || '')?.[1];
-          reason = ss.egressProxy && (/PROXY|TUNNEL|SOCKS|AUTH_CREDENTIALS|egress proxy/i.test(String(err?.message)) || ss.proxyRoute?.failuresSince(started)) ? egressError(ss.egressProxy).message : /Timeout/.test(err?.name || '') || /timeout/i.test(err?.message || '') ? 'navigation timeout' : `navigation failed${code ? ` (${code})` : ''}`;
+          reason = ss.egressProxy && (/PROXY|TUNNEL|SOCKS|AUTH_CREDENTIALS|egress proxy/i.test(String(err?.message)) || ss.proxyRoute?.failuresSince?.(started)) ? egressError(ss.egressProxy).message : /Timeout/.test(err?.name || '') || /timeout/i.test(err?.message || '') ? 'navigation timeout' : `navigation failed${code ? ` (${code})` : ''}`;
           throw err;
         }
         await ss.page.waitForLoadState('load', { timeout: 15_000 }).catch(() => {});

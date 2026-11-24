@@ -51,7 +51,7 @@ async function host(svc) {
 const status = async (c, id) => (await c.call('meeting_status', { meeting_id: id })).json();
 async function admitted(c) {
   const { code, url } = fake.newRoom();
-  const r = await c.call('meeting_join', { url, live_transcript: true });
+  const r = await c.call('meeting_join', { url, name: 'Glassy (notetaker)', live_transcript: true });
   assert.equal(r.isError, false, r.text);
   const id = r.json().meeting_id;
   fake.admit(code);

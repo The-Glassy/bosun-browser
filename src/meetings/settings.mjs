@@ -24,8 +24,15 @@ export const ACK_PHRASES_DEFAULT = ['Mhm.', 'One sec.', 'Okay.', 'Right.'];
 const LANG_RE = /^[a-z]{2,3}(?:-[A-Za-z]{2})?$/;
 const num = (v, min, max) => typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
 
+export const LEAVE_TIMER_MIN_SEC = 5;
+export const LEAVE_TIMER_MAX_SEC = 3600;
+const leaveTimer = (name) => (v) => Number.isInteger(v) && num(v, LEAVE_TIMER_MIN_SEC, LEAVE_TIMER_MAX_SEC)
+  ? null : `${name} must be a whole number of seconds from ${LEAVE_TIMER_MIN_SEC} to ${LEAVE_TIMER_MAX_SEC}`;
+
 // Each setting: its check (returns an error or null).
 export const SETTINGS = {
+  alone_leave_sec: leaveTimer('alone_leave_sec'),
+  first_joiner_wait_sec: leaveTimer('first_joiner_wait_sec'),
   backend: (v) => (BACKENDS.includes(v) ? null : `backend must be one of ${BACKENDS.join(', ')}`),
   elevenlabs_model: (v) => (typeof v === 'string' && EL_MODEL_RE.test(v) ? null : 'elevenlabs_model must be an ElevenLabs model id such as eleven_v4_turbo ([a-z0-9_], 3-60 characters)'),
   elevenlabs_voice: (v) => (typeof v === 'string' && EL_VOICE_RE.test(v) ? null : 'elevenlabs_voice must be an ElevenLabs voice id ([A-Za-z0-9], 10-40 characters)'),
@@ -67,7 +74,7 @@ export const SETTINGS = {
   speculative_speech: (v) => (typeof v === 'boolean' ? null : 'speculative_speech must be true or false'),
   // More names the agent answers to, besides the join name: each final says whether it addresses the agent (metadata
   // addressed, src/meetings/addressed.mjs). Spelling variants and Ukrainian/Russian forms of a name match without being
-  // listed ("Glassy": "Гласі", "Глассі", "Гласси").
+  // listed.
   name_aliases: (v) => (Array.isArray(v) && v.length <= 20 && v.every((a) => typeof a === 'string' && a.trim().length >= 1 && a.length <= 60)
     ? null : 'name_aliases must be up to 20 names of 1 to 60 characters'),
 };
@@ -82,6 +89,7 @@ export const REMOVED = {
 export const removedSetting = (k) => `${k} was ${REMOVED[k]}`;
 // Bosun's defaults for the settings without an environment fallback.
 export const DEFAULTS = {
+  alone_leave_sec: 30, first_joiner_wait_sec: 120,
   meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
   ack_on_final: false, ack_phrases: ACK_PHRASES_DEFAULT, ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
   turn_hold_ms: 900, turn_hold_complete_ms: 300, barge_in: true, barge_in_min_words: 2, barge_in_min_s: 0.6,
@@ -89,8 +97,9 @@ export const DEFAULTS = {
 };
 
 export class SpeechSettings {
-  constructor(cfg) {
+  constructor(cfg, defaults = DEFAULTS) {
     this.cfg = cfg;
+    this.defaults = defaults;
     this.dir = path.join(cfg.dataDir, 'speech-settings');
   }
 
@@ -147,7 +156,7 @@ export class SpeechSettings {
       elevenlabs_voice: pick('elevenlabs_voice', cfg.elevenlabs?.voice ?? null, EL_DEFAULT_VOICE),
       supertonic_voice: pick('supertonic_voice', cfg.ttsVoice ?? null, null),
       vad_silence_s: pick('vad_silence_s', cfg.vadSilenceEnv ?? null, VAD_DEFAULT_S),
-      ...Object.fromEntries(Object.entries(DEFAULTS).map(([k, def]) => [k, pick(k, null, def)])),
+      ...Object.fromEntries(Object.entries(this.defaults).map(([k, def]) => [k, pick(k, null, def)])),
     })) { out[k] = v; from[k] = f; }
     let warning = null;
     if (out.backend === 'elevenlabs' && !cfg.elevenlabs) {
