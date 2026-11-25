@@ -151,7 +151,7 @@ export function parseEgressProxies(raw) {
     }
     const proxy = parseEgress(object ? value.url : value, 'BROWSER_EGRESS_PROXIES entry');
     if (!proxy) throw new Error('BROWSER_EGRESS_PROXIES entries must have a proxy URL');
-    if (object && value.required) proxy.required = true;
+    if (object && value.required === false) proxy.required = false;
     proxies.set(name, proxy);
   }
   return proxies;
@@ -177,26 +177,32 @@ export function exitsFor(cfg, tenant) {
   return cfg.tenantExits?.get(tenant) ?? new Set(['default', 'direct', ...(cfg.egressProxies?.keys() || [])]);
 }
 
-// Share both the report and work in flight between health requests and scrapes.
+async function exitStatus(proxy) {
+  const { ok } = await probeEgress(proxy);
+  return { ok, checked_at: new Date().toISOString() };
+}
+
+// Share work in flight. Readiness still takes a fresh sample when no probe is pending.
 export function createExitHealth(cfg) {
-  let sample;
-  return () => {
+  let pending, sample;
+  return ({ fresh = false } = {}) => {
+    if (pending) return pending;
     const now = Date.now();
-    if (!sample || now >= sample.expires) {
-      const report = Promise.all([...(cfg.egressProxies || [])].map(async ([name, p]) => ({
-        name, ...await probeEgress(p), checked_at: new Date().toISOString(),
-      })));
-      sample = { report, expires: now + 10_000 };
-    }
-    return sample.report;
+    if (!fresh && sample && now < sample.expires) return sample.report;
+    const report = Promise.all([...(cfg.egressProxies || [])].map(async ([name, proxy]) => ({
+      name, ...await exitStatus(proxy),
+    })));
+    sample = { report, expires: now + 10_000 };
+    pending = report.finally(() => { pending = null; });
+    return pending;
   };
 }
 
 export async function serviceHealth(cfg, exitHealth, engineHealth, closing) {
-  const [egress, exits, engines] = await Promise.all([probeEgress(cfg.egressProxy), exitHealth(), engineHealth()]);
-  const ok = !closing() && egress.ok && engines.every((e) => e.ok)
-    && exits.every((e) => e.ok || !cfg.egressProxies.get(e.name)?.required);
-  return { ok, egress, proxies: exits.map(({ checked_at, ...proxy }) => proxy), engines };
+  const [egress, proxies, engines] = await Promise.all([exitStatus(cfg.egressProxy), exitHealth({ fresh: true }), engineHealth()]);
+  const ok = !closing() && egress.ok && engines.every((e) => e.ok !== false)
+    && proxies.every((e) => e.ok || cfg.egressProxies.get(e.name)?.required === false);
+  return { ok, egress, proxies, engines };
 }
 
 export function selectEgress(cfg, name = 'default', tenant) {

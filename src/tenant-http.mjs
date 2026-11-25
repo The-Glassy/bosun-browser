@@ -80,9 +80,22 @@ export function forwardUpgrade(req, socket, head, path, url) {
   out.end();
 }
 
-export function workerHealth(path, token) {
+export function workerHasHandoff(path, digest) {
   return new Promise((resolve, reject) => {
-    const out = http.get({ path: '/health', headers: { authorization: `Bearer ${token}` }, createConnection: () => connectSocket(path),
+    const req = http.request({ method: 'HEAD', path: `/handoff/${digest}`, createConnection: () => connectSocket(path),
+      signal: AbortSignal.timeout(1000) }, (res) => {
+      res.resume();
+      if (res.statusCode === 200 || res.statusCode === 404) resolve(res.statusCode === 200);
+      else reject(new Error('unexpected live view response'));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+export function workerHealth(path) {
+  return new Promise((resolve, reject) => {
+    const out = http.get({ path: '/health', createConnection: () => connectSocket(path),
       signal: AbortSignal.timeout(35_000) }, async (res) => {
       try {
         let body = '';

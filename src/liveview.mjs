@@ -308,13 +308,19 @@ function reject(sock, code, text) {
   sock.destroy();
 }
 
+export const handoffDigest = (token) => crypto.createHash('sha256').update(token).digest('hex');
+
 export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, socketPath, ttlMs = 15 * 60 * 1000, staleMs = STALE_MS, refreshMs = REFRESH_MS, stepMs = STEP_MS } = {}) {
   const handoffs = new Map(); // token -> handoff
+  const activeDigests = new Set();
   let base = baseUrl ? baseUrl.replace(/\/$/, '') : null;
   let origin = base ? new URL(base).origin : null;
 
   const srv = http.createServer((req, res) => {
     const [p] = String(req.url).split('?');
+    // The gateway can look up legacy links without disclosing their capability token to other workers.
+    const lookup = socketPath && req.method === 'HEAD' && /^\/handoff\/([a-f0-9]{64})$/.exec(p);
+    if (lookup) return res.writeHead(activeDigests.has(lookup[1]) ? 200 : 404).end();
     const m = /^\/v\/([a-f0-9]{32})$/.exec(p);
     const h = m && handoffs.get(m[1]);
     if (!h || h.done || (req.method !== 'GET' && req.method !== 'HEAD')) {
@@ -534,6 +540,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, s
     h.lastFrame = null;
     clearTimeout(h.timer);
     handoffs.delete(h.token);
+    if (h.digest) activeDigests.delete(h.digest);
     const v = h.viewer;
     if (v) {
       try { v.ws.send(JSON.stringify({ end: status === 'human-done' ? 'Done — the agent continues.' : status })); } catch {}
@@ -570,6 +577,10 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, s
       const driver = opts.driver || 'cdp';
       if (!DRIVERS[driver]) throw new Error(`unknown live-view driver ${driver}`);
       const h = { token, page, reason, driver, resolve, viewer: null, done: false, expiresAt: Date.now() + ttl, teardowns: new Set(), drainFailed: false, lastFrame: null, mouse: null };
+      if (socketPath) {
+        h.digest = handoffDigest(token);
+        activeDigests.add(h.digest);
+      }
       h.timer = setTimeout(() => finish(h, 'handoff-timeout'), ttl);
       h.timer.unref?.();
       handoffs.set(token, h);

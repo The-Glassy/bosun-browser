@@ -101,7 +101,7 @@ test('egress unreachable chain names exit, never connects directly, and health f
   const health = await probeEgress(egress); assert.equal(health.ok, false); assert.ok(!JSON.stringify(health).includes('supersecret'));
 });
 
-test('egress no-allowlist real browser visits only through the configured authenticated exit; health is authenticated', async (t) => {
+test('egress no-allowlist real browser visits only through the configured authenticated exit; health is public and contains only status', async (t) => {
   const f = await fixture(t);
   const svc = await startBosun({ BROWSER_EGRESS_PROXY: f.url, FEATURES_ENGINES: ENGINE }); t.after(() => svc.stop());
   const c = await connect(svc); t.after(() => c.close());
@@ -112,12 +112,12 @@ test('egress no-allowlist real browser visits only through the configured authen
   assert.ok(f.requests.some((r) => r.url === 'http://exit-only.invalid/page'));
   assert.equal(f.directConnections(), 0);
   const base = svc.wsUrl.replace('ws:', 'http:');
-  assert.equal((await fetch(`${base}/health`)).status, 401);
-  const health = await fetch(`${base}/health`, { headers: { authorization: `Bearer ${TOKEN}` } });
+  const health = await fetch(`${base}/health`);
   assert.equal(health.status, 200);
   const report = await health.json();
-  assert.equal(report.egress.server, `http://127.0.0.1:${f.port}`);
-  assert.deepEqual(report.engines, [{ name: ENGINE, ok: true }]);
+  assert.deepEqual(Object.keys(report.egress).sort(), ['checked_at', 'ok']);
+  assert.equal(report.egress.ok, true);
+  assert.deepEqual(report.engines, [{ name: ENGINE }]);
   await f.stopExit();
   const before = f.connections();
   const failed = await c.call('navigate', { session: id, url: `http://127.0.0.1:${f.originPort}/never-direct` });
@@ -192,49 +192,54 @@ test('health reports optional exit failures without failing readiness, and expor
   const down = `http://user:exit-secret@127.0.0.1:${port}`;
   const svc = await startBosun({
     ENGINE: 'chromium', FEATURES_ENGINES: 'chromium', BOSUN_METRICS_TOKEN: 'unique-metrics-bearer',
-    BROWSER_EGRESS_PROXIES: JSON.stringify({ ua: down, home: { url, required: true }, office: { url: down, required: false } }),
+    BROWSER_EGRESS_PROXIES: JSON.stringify({ ua: { url: down, required: false }, home: { url, required: true }, office: { url: down, required: false } }),
   }, { engines: { check: async () => {}, checkLaunch: async () => {} } });
   t.after(() => svc.stop());
   const base = `http://127.0.0.1:${svc.ws.port}`;
-  const headers = { authorization: `Bearer ${TOKEN}` };
-  assert.equal((await fetch(`${base}/health/exits`)).status, 401);
-  for (const [url, auth] of [
+  const metricsHeaders = { authorization: 'Bearer unique-metrics-bearer' };
+  for (const [route, headers] of [
     ['/metrics', undefined],
     ['/metrics', { authorization: 'Bearer incorrect-token-for-metrics' }],
-    [`/metrics?token=${TOKEN}`, undefined],
+    ['/metrics', { authorization: `Bearer ${TOKEN}` }],
+    ['/metrics?token=unique-metrics-bearer', undefined],
   ]) {
-    const response = await fetch(base + url, { headers: auth });
+    const response = await fetch(base + route, { headers });
     assert.equal(response.status, 401);
     assert.doesNotMatch(await response.text(), /bosun_exit_up|office|home/);
   }
   assert.equal(probes, 0);
-  const metricsHeaders = { authorization: 'Bearer unique-metrics-bearer' };
-  assert.equal((await fetch(`${base}/health/exits`, { headers: metricsHeaders })).status, 401);
-  const [health, exitHealth, metrics, metricsOnly] = await Promise.all([
-    fetch(`${base}/health`, { headers }), fetch(`${base}/health/exits`, { headers }), fetch(`${base}/metrics`, { headers }), fetch(`${base}/metrics`, { headers: metricsHeaders }),
+  const [health, exitHealth, metrics] = await Promise.all([
+    fetch(`${base}/health`, { headers: { authorization: 'Bearer ignored' } }),
+    fetch(`${base}/health/exits`),
+    fetch(`${base}/metrics`, { headers: metricsHeaders }),
   ]);
   assert.equal(health.status, 200);
   const report = await health.json();
+  assert.deepEqual(Object.keys(report).sort(), ['egress', 'engines', 'ok', 'proxies']);
   assert.equal(report.ok, true);
-  assert.deepEqual(report.egress, { mode: 'direct', ok: true });
-  assert.deepEqual(report.proxies.map(({ name, ok, server }) => [name, ok, server]),
-    [['ua', false, url], ['home', true, url], ['office', false, url]]);
+  assert.equal(report.egress.ok, true);
+  assert.deepEqual(report.engines, [{ name: 'chromium' }]);
   assert.equal(exitHealth.status, 200);
   const { exits } = await exitHealth.json();
   assert.deepEqual(exits.map(({ name, ok }) => [name, ok]), [['ua', false], ['home', true], ['office', false]]);
-  assert.equal(exits[1].error, null);
-  for (const entry of exits) assert.equal(new Date(entry.checked_at).toISOString(), entry.checked_at);
-  assert.match(exits[0].error, /egress proxy/);
-  assert.ok(!JSON.stringify({ report, exits }).includes('exit-secret'));
+  assert.deepEqual(report.proxies, exits);
+  for (const entry of exits) {
+    assert.deepEqual(Object.keys(entry).sort(), ['checked_at', 'name', 'ok']);
+    assert.equal(new Date(entry.checked_at).toISOString(), entry.checked_at);
+  }
+  assert.doesNotMatch(JSON.stringify({ report, exits }), /exit-secret|127\.0\.0\.1|unique-metrics-bearer|alice|bob/);
   assert.equal(metrics.status, 200);
   assert.match(metrics.headers.get('content-type'), /^text\/plain; version=0\.0\.4/);
   const exposition = await metrics.text();
-  assert.equal(metricsOnly.status, 200);
-  assert.equal(await metricsOnly.text(), exposition);
   assert.deepEqual(exposition.trim().split('\n').slice(1), [
     '# TYPE bosun_exit_up gauge', 'bosun_exit_up{name="ua"} 0', 'bosun_exit_up{name="home"} 1', 'bosun_exit_up{name="office"} 0',
   ]);
-  assert.equal(probes, 3);
+  const open = await startBosun({ BROWSER_EGRESS_PROXIES: JSON.stringify({ office: { url: down, required: false } }) },
+    { engines: { check: async () => {}, checkLaunch: () => assert.fail('engine checks must be opt-in') } });
+  t.after(() => open.stop());
+  const publicMetrics = await fetch(`http://127.0.0.1:${open.ws.port}/metrics`);
+  assert.equal(publicMetrics.status, 200);
+  assert.match(await publicMetrics.text(), /bosun_exit_up\{name="office"\} 0/);
 });
 
 for (const failure of ['required exit', 'default egress', 'engine launch', 'shutdown']) {
@@ -251,8 +256,9 @@ for (const failure of ['required exit', 'default egress', 'engine launch', 'shut
     };
     const svc = await startBosun({
       ENGINE: 'chromium', FEATURES_ENGINES: 'chromium,patchright',
+      BOSUN_HEALTH_CHECK_ENGINES: '1',
       BROWSER_EGRESS_PROXY: failure === 'default egress' ? url : '',
-      BROWSER_EGRESS_PROXIES: failure === 'required exit' ? JSON.stringify({ ua: { url, required: true } }) : '',
+      BROWSER_EGRESS_PROXIES: failure === 'required exit' ? JSON.stringify({ ua: url }) : '',
     }, { engines });
     t.after(() => svc.stop());
     if (failure === 'shutdown') svc.manager.closing = true;

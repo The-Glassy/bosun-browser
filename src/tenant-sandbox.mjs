@@ -13,9 +13,11 @@ import { policyOf } from './auth.mjs';
 import { createExitHealth, exitsFor, selectEgress, serviceHealth } from './egress.mjs';
 import { startTenantProxy } from './proxy.mjs';
 import { forwardTcp } from './tenant-network.mjs';
-import { connectWorker, forwardHttp, forwardUpgrade, workerHealth } from './tenant-http.mjs';
+import { connectWorker, forwardHttp, forwardUpgrade, workerHasHandoff, workerHealth } from './tenant-http.mjs';
 import { startWsServer } from './wsserver.mjs';
 import { driverLogsValues, nodeDebugOn } from './secrets.mjs';
+import { prepareSandboxData } from './migrate-data.mjs';
+import { handoffDigest } from './liveview.mjs';
 
 const APP = fileURLToPath(new URL('../', import.meta.url));
 const RUN = '/run/bosun';
@@ -133,7 +135,7 @@ const routePrefix = (tenant) => `/tenant/${tenant}`;
 
 function workerConfig(cfg, tenant, state, token, live, routes, providerSockets) {
   return {
-    ...cfg, dataDir: state, tenantSandbox: false, unsafeShared: false, metricsToken: null,
+    ...cfg, dataDir: state, tenantSandbox: false, warnUnsafeShared: false, metricsToken: null,
     tokens: [{ tenant, token }], policies: new Map([[tenant, policyOf(cfg, tenant)]]),
     ws: cfg.ws ? { maxConnections: cfg.ws.maxConnections, allowNoToken: false, allowedOrigins: [] } : null,
     live: live ? { baseUrl: `${live.baseUrl}${routePrefix(tenant)}` } : null, uploadBaseUrl: null,
@@ -201,7 +203,7 @@ async function startWorker(cfg, tenant, state, runtime, live, generation) {
   }
 }
 
-export function createSandboxRuntime(dataDir) {
+export function createSandboxRuntime(dataDir, autoMigrate = false) {
   if (process.platform !== 'linux' || process.getuid() === 0) throw new Error('tenant sandbox requires an unprivileged Linux service user');
   const filter = syscallFilter();
   const immutable = [...SYSTEM_MOUNTS, ...caches().map(([source]) => source),
@@ -216,6 +218,7 @@ export function createSandboxRuntime(dataDir) {
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const root = fs.realpathSync(dataDir);
   checkDataRoot(root);
+  prepareSandboxData(root, autoMigrate);
   const tenants = path.join(root, 'tenants');
   directory(tenants);
   // Keep AF_UNIX paths short and leave the writable worker sockets out of every other worker's mount list.
@@ -239,21 +242,43 @@ export function createSandboxRuntime(dataDir) {
   }
 }
 
-async function startLiveGateway(cfg, getExisting) {
-  const extract = (url, kind) => new RegExp(`^/tenant/([a-z0-9_-]{1,40})(/${kind}/[a-f0-9]{32})(?:\\?.*)?$`).exec(url);
-  const server = http.createServer((req, res) => {
-    const match = extract(req.url, 'v');
-    const worker = match && getExisting(match[1]);
-    if (!worker) return res.writeHead(404).end();
-    try { forwardHttp(req, res, worker.live, match[2]); } catch { res.writeHead(503).end(); }
+async function startLiveGateway(cfg, tenants, getExisting) {
+  const basePath = cfg.baseUrl ? new URL(cfg.baseUrl).pathname.replace(/\/$/, '') : '';
+  const route = (url, kind) => new RegExp(`^(?:/tenant/([a-z0-9_-]{1,40}))?(/${kind}/([a-f0-9]{32}))(?:\\?.*)?$`).exec(url);
+  const locate = async (token) => {
+    const digest = handoffDigest(token);
+    const matches = (await Promise.all([...tenants].map(async (tenant) => {
+      const worker = getExisting(tenant);
+      return worker && await workerHasHandoff(worker.live, digest) ? { tenant, worker } : null;
+    }))).filter(Boolean);
+    return matches.length === 1 ? matches[0] : null;
+  };
+  const server = http.createServer(async (req, res) => {
+    const match = route(req.url, 'v');
+    if (!match || !['GET', 'HEAD'].includes(req.method)) return res.writeHead(404).end();
+    const [, tenant, url, token] = match;
+    try {
+      if (!tenant) {
+        const handoff = await locate(token);
+        if (!handoff) return res.writeHead(404).end();
+        return res.writeHead(307, { location: `${basePath}${routePrefix(handoff.tenant)}${url}`,
+          'cache-control': 'no-store', 'referrer-policy': 'no-referrer' }).end();
+      }
+      const worker = getExisting(tenant);
+      if (!worker) return res.writeHead(404).end();
+      forwardHttp(req, res, worker.live, url);
+    } catch { res.writeHead(503).end(); }
   });
   const sockets = new Set();
   server.on('connection', (socket) => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
-  server.on('upgrade', (req, socket, head) => {
-    const match = extract(req.url, 'ws');
-    const worker = match && getExisting(match[1]);
-    if (!worker) return socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-    try { forwardUpgrade(req, socket, head, worker.live, match[2]); } catch { socket.destroy(); }
+  server.on('upgrade', async (req, socket, head) => {
+    socket.on('error', () => {});
+    const match = route(req.url, 'ws');
+    try {
+      const worker = match && (match[1] ? getExisting(match[1]) : (await locate(match[3]))?.worker);
+      if (!worker) return socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+      forwardUpgrade(req, socket, head, worker.live, match[2]);
+    } catch { socket.destroy(); }
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -276,7 +301,7 @@ export async function startTenantService(cfg) {
   const tenants = new Set(cfg.tokens.map(({ tenant }) => tenant));
   if (!tenants.size) tenants.add('default');
   if (!cfg.ws && tenants.size > 1) throw new Error('sandboxed stdio requires one tenant; set WS_PORT for multiple tenants');
-  const sandbox = createSandboxRuntime(cfg.dataDir);
+  const sandbox = createSandboxRuntime(cfg.dataDir, cfg.autoMigrate);
   const generations = new Map();
   let live, ws, closing = false;
   const getExisting = (tenant) => generations.get(tenant)?.worker;
@@ -292,15 +317,16 @@ export async function startTenantService(cfg) {
     return generation.start;
   };
   const exitHealth = createExitHealth(cfg);
-  const engineHealth = async (tenant) => {
-    try {
-      const worker = await getWorker(tenant);
-      const report = await workerHealth(worker.mcp, worker.token);
-      return cfg.engines.map((name) => report.some((entry) => entry.name === name && entry.ok === true)
-        ? { name, ok: true } : { name, ok: false, error: 'browser launch check failed' });
-    } catch { return cfg.engines.map((name) => ({ name, ok: false, error: 'tenant worker unavailable' })); }
+  const engineHealth = async () => {
+    const reports = await Promise.all([...tenants].map(async (tenant) => {
+      const worker = getExisting(tenant);
+      return worker ? workerHealth(worker.mcp).catch(() => []) : [];
+    }));
+    return cfg.engines.map((name) => ({
+      name, ok: reports.every((report) => Array.isArray(report) && report.some((entry) => entry?.name === name && entry.ok === true)),
+    }));
   };
-  const manager = { exitHealth, health: (tenant) => serviceHealth(cfg, exitHealth, () => engineHealth(tenant), () => closing) };
+  const manager = { exitHealth, health: () => serviceHealth(cfg, exitHealth, engineHealth, () => closing) };
 
   const routeHttp = (req, res, authenticated) => {
     const route = /^(?:\/tenant\/([a-z0-9_-]{1,40}))?(\/(?:upload|download|recording|secret)\/[^?]+(?:\?.*)?)$/.exec(req.url);
@@ -329,7 +355,7 @@ export async function startTenantService(cfg) {
   })();
   const connect = (transport, tenant, base) => connectWorker(transport, () => getWorker(tenant), base);
   try {
-    if (cfg.live) live = await startLiveGateway(cfg.live, getExisting);
+    if (cfg.live) live = await startLiveGateway(cfg.live, tenants, getExisting);
     await Promise.all([...tenants].map(getWorker));
     if (cfg.ws) ws = await startWsServer({ cfg, manager, connect, routeHttp });
     const connectStdio = (transport, disconnected) =>

@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { allowFor, parseHostPattern } from '../src/allow.mjs';
+import { startService } from '../src/bosun.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { exitsFor } from '../src/egress.mjs';
 import { forwardTcp, providerConnection, providerFetch } from '../src/tenant-network.mjs';
@@ -96,6 +97,32 @@ function inspectSandbox(sandbox, tenant, files, port) {
   } finally { fs.closeSync(filter); }
 }
 
+test('sandbox refuses legacy data and only auto-migrates when explicitly enabled', { skip }, async (t) => {
+  const dataDir = tmpDir();
+  let service;
+  t.after(async () => {
+    await service?.shutdown();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  const legacy = path.join(dataDir, 'profiles/default/work');
+  fs.mkdirSync(legacy, { recursive: true });
+  fs.writeFileSync(path.join(legacy, 'bosun-profile.json'), '{"egress":"direct"}');
+  const env = {
+    BROWSER_DATA: dataDir, BROWSER_TOKEN: TOKEN, HEADLESS: '1', FEATURES_ENGINES: 'chromium',
+    BOSUN_TENANT_SANDBOX: 'on', WS_PORT: '0',
+  };
+  await assert.rejects(startService(loadConfig(env)), /Legacy BROWSER_DATA layout.*bosun migrate-data/);
+  assert.equal(fs.existsSync(legacy), true);
+  assert.equal(fs.existsSync(path.join(dataDir, 'tenants')), false);
+  assert.equal(fs.existsSync(path.join(dataDir, '.bosun-backups')), false);
+
+  service = await startService(loadConfig({ ...env, BOSUN_AUTO_MIGRATE: '1' }));
+  assert.equal(fs.existsSync(legacy), false);
+  const migrated = path.join(dataDir, 'tenants/default/profiles/default/work/bosun-profile.json');
+  assert.equal(fs.readFileSync(migrated, 'utf8'), '{"egress":"direct"}');
+  assert.equal(fs.readdirSync(path.join(dataDir, '.bosun-backups')).length, 1);
+});
+
 test('two real bwrap tenants isolate profiles, downloads, tmp, connection leases and egress', { skip, timeout: 90_000 }, async (t) => {
   const packets = [];
   const origin = http.createServer((req, res) => {
@@ -116,7 +143,7 @@ test('two real bwrap tenants isolate profiles, downloads, tmp, connection leases
   const host = `127.0.0.1:${port}`, web = `http://${host}`;
   const svc = await startBosun({
     BOSUN_TENANT_SANDBOX: 'auto', BOSUN_ALLOW_UNSAFE_SHARED: '0', ENGINE: 'chromium', FEATURES_ENGINES: 'chromium',
-    CHROMIUM_SANDBOX: '1', HEADLESS: '1', KEEPALIVE: '0', SECRETS_REVEAL: '1',
+    CHROMIUM_SANDBOX: '1', HEADLESS: '1', KEEPALIVE: '0', SECRETS_REVEAL: '1', BROWSER_TIMEZONE: 'UTC',
     BROWSER_TENANT_ALLOW: `alice=${host};bob=${host}`, BROWSER_TENANT_DOWNLOAD_ALLOW: `alice=${host};bob=${host}`,
     BROWSER_EGRESS_PROXIES: JSON.stringify({ alternate: exit.url }), BROWSER_TENANT_EGRESS: 'alice=default,alternate;bob=default',
   });
@@ -127,9 +154,11 @@ test('two real bwrap tenants isolate profiles, downloads, tmp, connection leases
   for (const name of ['secret_create', 'secret_save', 'secret_reveal']) assert.ok(names.includes(name), name);
   assert.deepEqual((await b.listTools()).tools.map(({ name }) => name), names);
   const health = `http://127.0.0.1:${svc.ws.port}`;
-  const metrics = (headers) => fetch(`${health}/metrics`, { headers });
-  assert.equal((await metrics()).status, 401);
-  assert.match(await (await metrics({ authorization: `Bearer ${TOKEN}` })).text(), /bosun_exit_up\{name="alternate"\} 1/);
+  const readiness = await fetch(`${health}/health`);
+  assert.equal(readiness.status, 200);
+  assert.deepEqual((await readiness.json()).engines, [{ name: 'chromium', ok: true }]);
+  assert.equal((await fetch(`${health}/health/exits`)).status, 200);
+  assert.match(await (await fetch(`${health}/metrics`)).text(), /bosun_exit_up\{name="alternate"\} 1/);
   assert.equal((await b.call('session_open', { egress: 'alternate' })).isError, true);
   const alternate = await a.open({ egress: 'alternate' });
   await assertOk(a, 'navigate', { session: alternate, url: web });
@@ -186,10 +215,17 @@ test('two real bwrap tenants isolate profiles, downloads, tmp, connection leases
   const handoff = await assertOk(b, 'request_human', { session: sb, reason: 'test' });
   assert.equal((await fetch(handoff.link)).status, 200);
   assert.equal((await fetch(handoff.link.replace('/tenant/bob/', '/tenant/alice/'))).status, 404);
-  const v = await viewer(handoff.link);
+  const legacy = handoff.link.replace('/tenant/bob/', '/');
+  const redirect = await fetch(legacy, { redirect: 'manual' });
+  assert.equal(redirect.status, 307);
+  assert.equal(redirect.headers.get('location'), new URL(handoff.link).pathname);
+  assert.equal((await fetch(legacy)).status, 200);
+  assert.equal((await fetch(new URL('/v/' + '0'.repeat(32), legacy))).status, 404);
+  const v = await viewer(legacy);
   await until(() => v.frames > 0, 10_000);
   v.ws.send(JSON.stringify({ type: 'done' }));
   assert.equal((await assertOk(b, 'handoff_wait', { session: sb, timeoutSec: 10 })).status, 'human-done');
+  assert.equal((await fetch(legacy)).status, 404);
 });
 
 test('sandbox state rejects a symlink in place of a tenant root', { skip: !canProbe }, (t) => {

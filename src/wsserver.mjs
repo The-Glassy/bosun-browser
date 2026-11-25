@@ -73,17 +73,13 @@ export async function startWsServer({ cfg, manager, socketPath, connect, routeHt
     try {
       const [pathname] = req.url.split('?');
       if (req.method === 'GET' && (pathname === '/health' || pathname === '/health/exits')) {
-        const tenant = auth(tokenFromRequest(req, new URLSearchParams()));
-        if (!tenant) { res.writeHead(401); return res.end(); }
-        const report = pathname === '/health' ? await manager.health(tenant) : {
-          exits: (await manager.exitHealth()).map(({ name, ok, error = null, checked_at }) => ({ name, ok, error, checked_at })),
-        };
+        const report = pathname === '/health' ? await manager.health() : { exits: await manager.exitHealth() };
         res.writeHead(report.ok === false ? 503 : 200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
         return res.end(JSON.stringify(report));
       }
       if (req.method === 'GET' && pathname === '/metrics') {
         const bearer = tokenFromRequest(req, new URLSearchParams());
-        if (!auth(bearer) && !metricsAuth(bearer)) {
+        if (cfg.metricsToken && !metricsAuth(bearer)) {
           res.writeHead(401, { 'www-authenticate': 'Bearer', 'cache-control': 'no-store' });
           return res.end();
         }

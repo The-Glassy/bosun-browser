@@ -372,7 +372,9 @@ export class SessionManager {
   }
 
   health() {
-    return serviceHealth(this.cfg, this.exitHealth, () => this.engineHealth(), () => this.closing);
+    const checkEngines = this.cfg.healthCheckEngines || this.cfg.sandboxRoutes;
+    return serviceHealth(this.cfg, this.exitHealth,
+      () => checkEngines ? this.engineHealth() : this.cfg.engines.map((name) => ({ name })), () => this.closing);
   }
 
   engineHealth() {
@@ -386,7 +388,7 @@ export class SessionManager {
             await this.engines.checkLaunch(name, this.cfg);
             engines.push({ name, ok: true });
           } catch {
-            engines.push({ name, ok: false, error: 'browser launch check failed' });
+            engines.push({ name, ok: false });
           }
         }
         return engines;
