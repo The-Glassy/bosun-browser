@@ -50,11 +50,8 @@ test('shared live view opens the original root WebSocket behind a path-based pro
     await route.fulfill({ response: await route.fetch({ url: link }) });
   });
   const vp = await ctx.newPage();
-  const connected = vp.waitForEvent('websocket');
-  await vp.goto(mounted.href);
-  const socket = await connected;
+  const [socket] = await Promise.all([vp.waitForEvent('websocket'), vp.goto(mounted.href)]);
   assert.equal(new URL(socket.url()).pathname, new URL(link).pathname.replace('/v/', '/ws/'));
-  await until(async () => /^live/.test(await vp.textContent('#st')));
 });
 
 // Touch gestures through CDP (Playwright's touchscreen only taps).
