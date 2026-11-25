@@ -119,17 +119,19 @@ function migrationPlan(root, reverse, force) {
       if (!writes.has(target)) {
         checkParents(root, target);
         const existing = readStore(target, name, reverse ? null : record.tenant);
-        writes.set(target, { name, day: existing?.records.size ? existing.day : day, records: existing?.records ?? new Map() });
+        writes.set(target, {
+          name, existing, day: existing?.records.size ? existing.day : day, records: new Map(existing?.records),
+        });
       }
       const dest = writes.get(target);
+      const old = dest.existing?.records.get(key);
+      if (old && (day !== dest.existing.day || !isDeepStrictEqual(old.data, record.data)) && !force) conflict(`${target} (${key})`);
+      // Shared transcript usage holds one day. Inactive tenants can legitimately have older quota days.
       if (day !== dest.day) {
-        if (!force) conflict(`${target} (different transcript quota dates)`);
         if (day < dest.day) continue;
         dest.day = day;
         dest.records.clear();
       }
-      const old = dest.records.get(key);
-      if (old && !isDeepStrictEqual(old.data, record.data) && !force) conflict(`${target} (${key})`);
       dest.records.set(key, record);
     }
   }

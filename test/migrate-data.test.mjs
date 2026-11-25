@@ -141,6 +141,21 @@ test('reverse migration restores 0.27 paths, combines both stores and backs up u
   assert.equal(fs.readdirSync(f.location('.bosun-backups')).length, 2);
 });
 
+test('reverse migration handles inactive tenants with older transcript quotas', (t) => {
+  const f = fixture(t);
+  const silent = { dataDir: f.data, log: () => {} };
+  migrateData(silent);
+  const latest = { day: '2026-10-22', tenants: { bob: 8 } };
+  f.put('tenants/bob/live-transcript-usage.json', latest);
+  f.put('live-transcript-usage.json', { day: usage.day, tenants: { alice: 9 } });
+  assert.throws(() => migrateData({ ...silent, reverse: true }), /Migration conflict.*live-transcript-usage\.json \(alice\)/);
+  fs.unlinkSync(f.location('live-transcript-usage.json'));
+  const archive = migrateData({ ...silent, reverse: true });
+  assert.deepEqual(f.json('live-transcript-usage.json'), latest);
+  const older = execFileSync('tar', ['-xOzf', archive, './tenants/alice/live-transcript-usage.json'], { encoding: 'utf8' });
+  assert.deepEqual(JSON.parse(older), { day: usage.day, tenants: { alice: usage.tenants.alice } });
+});
+
 test('sandbox startup requires explicit migration, and auto migration takes the same backup', (t) => {
   const f = fixture(t);
   fs.mkdirSync(f.location('tenants/alice'), { recursive: true });

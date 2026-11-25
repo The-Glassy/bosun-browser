@@ -85,8 +85,9 @@ and the normal service startup and retention rules still apply.
 
 The command refuses conflicting data. If you choose `--force`, the source tenant's conflicting category or
 setting file replaces the corresponding destination, and a conflicting keepalive entry takes the source
-value. A transcript quota conflict across dates keeps the newest date and its records. The backup contains both
-layouts as they existed before the run. Successful migrations can be rerun safely. A completed migration has
+value. Conflicting quota records for the same tenant require `--force`. When combining quotas on rollback,
+the shared store keeps the latest day's records because it holds a single day. The backup contains both layouts
+as they existed before the run, including quotas from earlier days. A completed migration has
 nothing left to move. If sandbox startup finds legacy state, including a partially migrated tree, it tells you
 to migrate it. With `BOSUN_AUTO_MIGRATE=1`, startup runs the same migration and prints the backup path.
 
