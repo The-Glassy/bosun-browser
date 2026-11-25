@@ -9,7 +9,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
-const PAGE = (token, reason, nonce) => `<!doctype html><html><head><meta charset="utf-8">
+const PAGE = (token, reason, nonce, tenantRouting) => `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>Agent needs you</title>
 <style>
@@ -63,7 +63,8 @@ const retry=(ms)=>{clearTimeout(rt);rt=setTimeout(connect,ms)};
 function finish(msg){ended=true;clearTimeout(rt);status(msg);document.body.classList.add('ended');try{if(ws)ws.close()}catch{}}
 function connect(){
  if(ended||ws)return;
- const s=ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+location.pathname.slice(0,location.pathname.lastIndexOf('/v/'))+'/ws/'+tok);
+ const prefix=${tenantRouting ? "location.pathname.slice(0,location.pathname.lastIndexOf('/v/'))" : "''"};
+ const s=ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+prefix+'/ws/'+tok);
  s.onopen=hint;
  s.onclose=(e)=>{if(ws!==s)return;ws=null;if(ended)return;
   // One viewer at a time: wait while another device has it; otherwise ask whether the link is still valid.
@@ -337,7 +338,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, s
       'x-frame-options': 'DENY',
       'content-security-policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src data:; connect-src 'self' ${wsOrigin}; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
     });
-    res.end(req.method === 'HEAD' ? undefined : PAGE(h.token, h.reason, nonce));
+    res.end(req.method === 'HEAD' ? undefined : PAGE(h.token, h.reason, nonce, Boolean(socketPath)));
   });
   srv.on('clientError', (_e, sock) => sock.destroy());
   srv.on('error', (e) => console.error(`bosun live view: ${e.message}`));
