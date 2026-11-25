@@ -105,7 +105,7 @@ test('Zoom: a live microphone that mutes on "Mute" is muted, then joined', async
     const { id, url } = fz.newRoom({ hearYou: 'mic', micClick: 'toggles', passcode: 'p1' });
     const r = await c.call('meeting_join', { url, profile: 'zoom' });
     assert.equal(r.isError, false, r.text);
-    assert.deepEqual(fz.room(id).guest, { name: 'Notetaker', mic: false, cam: false });
+    assert.deepEqual(fz.room(id).guest, { name: 'Glassy (notetaker)', mic: false, cam: false });
     assert.deepEqual(used(fz.room(id)), []);
     await c.call('meeting_leave', { meeting_id: r.json().meeting_id });
     await c.close();

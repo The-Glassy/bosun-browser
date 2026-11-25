@@ -129,34 +129,46 @@ test('the server process warns at start when TTS_DEFAULT_BACKEND=elevenlabs has 
   assert.equal(r.code, 0);
 });
 
-test('tenant sandbox chooses by token count and shared mode requires explicit consent for distinct tenants', () => {
+test('tenant sandbox is opt-in and shared mode warns only about distinct, unacknowledged tenants', () => {
   const one = { BROWSER_TOKEN: GOOD };
   const aliases = { ...one, BROWSER_TOKENS: `default:${GOOD}2` };
   const multiple = { ...one, BROWSER_TOKENS: `alice:${GOOD}2`, WS_PORT: '0' };
   assert.equal(loadConfig({}).tenantSandbox, false);
   assert.equal(loadConfig(one).tenantSandbox, false);
   assert.equal(loadConfig({ ...one, BOSUN_TENANT_SANDBOX: 'on' }).tenantSandbox, true);
-  assert.equal(loadConfig(aliases).tenantSandbox, true);
-  assert.equal(loadConfig({ ...aliases, BOSUN_TENANT_SANDBOX: 'off' }).unsafeShared, false);
-  assert.equal(loadConfig({ ...multiple, BOSUN_TENANT_SANDBOX: 'auto', BOSUN_ALLOW_UNSAFE_SHARED: '1' }).tenantSandbox, true);
-  assert.throws(() => loadConfig({ ...multiple, BOSUN_TENANT_SANDBOX: 'off' }), /BOSUN_ALLOW_UNSAFE_SHARED=1/);
-  assert.throws(() => loadConfig({ ...multiple, BOSUN_TENANT_SANDBOX: 'off', BOSUN_ALLOW_UNSAFE_SHARED: '0' }), /BOSUN_ALLOW_UNSAFE_SHARED=1/);
-  assert.equal(loadConfig({ ...multiple, BOSUN_TENANT_SANDBOX: 'off', BOSUN_ALLOW_UNSAFE_SHARED: '1' }).unsafeShared, true);
+  assert.equal(loadConfig({ ...aliases, BOSUN_TENANT_SANDBOX: 'auto' }).tenantSandbox, true);
+  assert.equal(loadConfig(aliases).warnUnsafeShared, false);
+  assert.equal(loadConfig({ ...multiple, BOSUN_TENANT_SANDBOX: 'auto' }).tenantSandbox, true);
+  assert.equal(loadConfig(multiple).tenantSandbox, false);
+  assert.equal(loadConfig(multiple).warnUnsafeShared, true);
+  assert.equal(loadConfig({ ...multiple, BOSUN_TENANT_SANDBOX: 'off', BOSUN_ALLOW_UNSAFE_SHARED: '0' }).warnUnsafeShared, true);
+  assert.equal(loadConfig({ ...multiple, BOSUN_ALLOW_UNSAFE_SHARED: '1' }).warnUnsafeShared, false);
   assert.throws(() => loadConfig({ BOSUN_TENANT_SANDBOX: 'yes' }), /auto, on or off/);
   assert.throws(() => loadConfig({ BOSUN_ALLOW_UNSAFE_SHARED: 'true' }), /must be 0 or 1/);
 });
 
-test('UTC and neutral meeting defaults are valid independently of the host environment', () => {
+test('0.27 locale, time zones and meeting defaults are preserved with optional overrides', () => {
   const defaults = loadConfig({});
-  assert.equal(defaults.tz, 'UTC');
+  assert.equal(defaults.tz, 'Europe/Vienna');
   assert.equal(defaults.browserTimezone, null);
-  assert.equal(defaults.browserLocale, 'en');
-  assert.equal(defaults.meetingBotName, 'Notetaker');
+  assert.equal(defaults.browserLocale, 'de-AT');
+  assert.equal(defaults.meetingBotName, 'Glassy (notetaker)');
   assert.equal(defaults.meetingAnnounceText, null);
   const config = loadConfig({ TZ: 'America/Toronto', BROWSER_TIMEZONE: 'Asia/Tokyo', BROWSER_LOCALE: 'fr-ca' });
   assert.deepEqual([config.tz, config.browserTimezone, config.browserLocale], ['America/Toronto', 'Asia/Tokyo', 'fr-CA']);
-  assert.throws(() => loadConfig({ TZ: '+02:00' }), /IANA/);
+  assert.throws(() => loadConfig({ TZ: 'Mars/Olympus' }), /IANA/);
   assert.throws(() => loadConfig({ BROWSER_TIMEZONE: 'Mars/Olympus' }), /BROWSER_TIMEZONE/);
   assert.throws(() => loadConfig({ BROWSER_LOCALE: 'en_US' }), /BROWSER_LOCALE/);
   assert.throws(() => loadConfig({ BOSUN_METRICS_TOKEN: 'too-short' }), /BOSUN_METRICS_TOKEN/);
+});
+
+test('startup logs one sandbox recommendation unless shared mode was acknowledged', async () => {
+  for (const acknowledgement of ['0', '1']) {
+    const r = await run({
+      WS_PORT: '0', BROWSER_TOKENS: `alice:${GOOD},bob:${GOOD}2`, BOSUN_ALLOW_UNSAFE_SHARED: acknowledgement,
+    }, /MCP over WebSocket/);
+    assert.equal(r.code, 0);
+    assert.equal((r.err.match(/multiple tenants share one process; enable isolation with BOSUN_TENANT_SANDBOX=on/g) || []).length,
+      acknowledgement === '0' ? 1 : 0);
+  }
 });

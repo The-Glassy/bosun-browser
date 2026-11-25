@@ -180,11 +180,7 @@ function definitions(importer) {
       // platform. humanize stays off: with Playwright 1.64 its cursor patch makes actionability checks hang.
       // A proxied tenant's Firefox gets the proxy and PROXY_FIREFOX_PREFS (PROXY_ARGS are Chromium flags).
       async open({ launchOptions, firefox }, { cfg, dir, locale, timezone, proxy, downloads }) {
-        // Camoufox requires a region when it builds its fingerprint. Pick the language's default region for a bare tag.
-        const tag = new Intl.Locale(locale);
-        const region = tag.region ?? tag.maximize().region;
-        const fingerprintLocale = [tag.language, tag.script, region].filter(Boolean).join('-');
-        const opts = await launchOptions({ headless: cfg.headless, os: cfg.camoufoxOs || hostOs(), locale: fingerprintLocale, humanize: false });
+        const opts = await launchOptions({ headless: cfg.headless, os: cfg.camoufoxOs || hostOs(), locale, humanize: false });
         const prefs = proxy ? { firefoxUserPrefs: { ...opts.firefoxUserPrefs, ...PROXY_FIREFOX_PREFS } } : {};
         return { ctx: await firefox.launchPersistentContext(dir, { ...opts, ...prefs, viewport: null, timezoneId: timezone, ...dlOpts(downloads), ...(proxy ? { proxy } : {}) }) };
       },

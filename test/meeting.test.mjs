@@ -34,15 +34,16 @@ test('join as a guest: mic and camera off, name, ask to join; waiting until admi
     const j = r.json();
     assert.match(j.meeting_id, /^m[0-9a-f]{12}$/);
     assert.equal(j.state, 'waiting');
-    assert.deepEqual(fake.room(code).guest, { name: 'Notetaker', mic: false, cam: false });
+    assert.deepEqual(fake.room(code).guest, { name: 'Glassy (notetaker)', mic: false, cam: false });
     await sleep(600);
     assert.equal((await status(c, j.meeting_id)).state, 'waiting');
     assert.equal(audio.recorders.length, 0);
     fake.admit(code);
     await until(async () => (await status(c, j.meeting_id)).state === 'recording', 15_000);
     const room = fake.room(code);
-    assert.deepEqual(room.chat.map((m) => m.text), announcement());
-    assert.match(room.chat[0].text, /^This meeting’s audio is being recorded for notes, so please object in chat/);
+    assert.deepEqual(room.chat.map((m) => m.text), announcement('Glassy (notetaker)', null));
+    assert.match(room.chat[0].text, /^Hi, I'm Glassy, an AI notetaker\. I'm recording audio for notes\. .*'please don't record'/);
+    assert.match(room.chat[1].text, /bitte nicht aufnehmen/);
     const announcedAt = room.log.filter((l) => l[0] === 'chat').at(-1)[1];
     assert.ok(audio.recorders[0].startedAt >= announcedAt, 'recording started only after the announcement');
     const s = await status(c, j.meeting_id);
@@ -265,7 +266,7 @@ test('leave timers use tenant settings and per-join overrides in both participan
         now = meeting.aloneSince + timeout * 1000 - 1;
         await sleep(350);
         assert.equal((await status(alice, id)).state, 'recording');
-        now++;
+        now += 2;
         await until(() => ev.ended.some((e) => e.meeting_id === id));
         const ended = await status(alice, id);
         assert.equal(ended.reason, 'alone');
@@ -343,6 +344,10 @@ test('recording retention and explicit meeting display name and announcement def
   assert.equal(loadConfig({}).recordingRetentionDays, 30);
   assert.equal(loadConfig({ RECORDING_RETENTION_DAYS: '7' }).recordingRetentionDays, 7);
   assert.throws(() => loadConfig({ RECORDING_RETENTION_DAYS: '0' }), /RECORDING_RETENTION_DAYS/);
+  assert.equal(loadConfig({ MEETING_OWNER: ' Alex ' }).meetingOwner, 'Alex');
+  const [en, de] = announcement('Glassy (notetaker)', 'Alex');
+  assert.match(en, /^Hi, I'm Glassy, Alex's AI notetaker\./);
+  assert.match(de, /KI-Notizassistent von Alex/);
   await withService(async (svc) => {
     const c = await connect(svc);
     try {
@@ -385,7 +390,7 @@ test('own messages are recognized by what Bosun just sent, not by name: a partic
     fake.open(code);
     const id = (await c.call('meeting_join', { url })).json().meeting_id;
     await until(async () => (await status(c, id)).state === 'recording', 15_000);
-    fake.say(code, 'Alex Example', announcement()[0]);
+    fake.say(code, 'Alex Example', announcement('Glassy (notetaker)', null)[0]);
     await until(() => ev.chat.length === 1, 5000);
     await sleep(500);
     assert.equal(ev.optout.length, 0);
@@ -529,10 +534,10 @@ test('a German Meet UI without devices (as on a de-AT server): "Ihr Name", "Teil
     assert.equal(r.isError, false, r.text);
     const id = r.json().meeting_id;
     assert.equal(r.json().state, 'waiting');
-    assert.deepEqual(fake.room(code).guest, { name: 'Notetaker', mic: false, cam: false });
+    assert.deepEqual(fake.room(code).guest, { name: 'Glassy (notetaker)', mic: false, cam: false });
     fake.admit(code);
     await until(async () => (await status(c, id)).state === 'recording', 15_000);
-    assert.deepEqual(fake.room(code).chat.map((entry) => entry.text), announcement()); // posted through the German UI
+    assert.deepEqual(fake.room(code).chat.map((entry) => entry.text), announcement('Glassy (notetaker)', null)); // posted through the German UI
     fake.say(code, 'Alex Example', 'Bitte nicht aufnehmen');
     await until(() => ev.optout.length === 1, 5000);
     await until(() => ev.ended.length === 1, 10_000);

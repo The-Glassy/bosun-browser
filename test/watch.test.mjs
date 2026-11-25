@@ -212,7 +212,7 @@ test('extractWatch and watchChanged on their own', async () => {
   assert.equal(watchChanged('text', 'a', 'a'), false);
 });
 
-test('schedule: every_minutes (at least 30), jitter kept, quiet hours stretch the interval x4 in a configured IANA time zone', () => {
+test('schedule: every_minutes (at least 30), jitter kept, quiet hours stretch the interval x4 in TZ (default Europe/Vienna)', () => {
   const tz = 'Europe/Vienna';
   const at = (s) => Date.parse(s);
   const t = at('2026-10-19T12:00:00+02:00');
@@ -243,7 +243,7 @@ test('schedule: every_minutes (at least 30), jitter kept, quiet hours stretch th
   assert.equal(advance(at('2026-10-25T01:00:00+02:00'), 90 * 60_000, parseQuiet('02-03'), tz), at('2026-10-25T03:00:00+01:00'));
   assert.equal(advance(at('2026-10-24T21:00:00+02:00'), 12 * 3_600_000, parseQuiet('22-08'), tz), at('2026-10-25T16:15:00+01:00')); // an 11 h night
   for (const bad of ['8-8', '25-03', '22-08:60', 'night', '']) assert.throws(() => parseQuiet(bad), /quiet_hours/, bad);
-  assert.equal(loadConfig({}).tz, 'UTC');
+  assert.equal(loadConfig({}).tz, 'Europe/Vienna');
   assert.equal(loadConfig({ TZ: 'UTC' }).tz, 'UTC');
   assert.throws(() => loadConfig({ TZ: 'Mars/Olympus' }), /TZ must be an IANA time zone/);
 });
@@ -265,7 +265,7 @@ test('keepalive_set: every_minutes / every_hours / quiet_hours / watch validatio
     for (const [args, re] of bad) assert.match((await c.call('keepalive_set', { ...base, ...args })).text, re, JSON.stringify(args));
     const t0 = Date.now();
     const v = (await c.call('keepalive_set', { ...base, every_minutes: 30, quiet_hours: '22-08' })).json();
-    assert.deepEqual([v.every_minutes, v.every_hours, v.jitter_min, v.quiet_hours, v.tz], [30, undefined, 7, '22-08', 'UTC']);
+    assert.deepEqual([v.every_minutes, v.every_hours, v.jitter_min, v.quiet_hours, v.tz], [30, undefined, 7, '22-08', 'Europe/Vienna']);
     const next = Date.parse(v.next_run) - t0;
     assert.ok(next >= 23 * 60_000 - 1000 && next <= 4 * 37 * 60_000 + 1000, String(next));
     const h = (await c.call('keepalive_set', { ...base, every_hours: 2 })).json();

@@ -69,8 +69,9 @@ test('live transcript: announced first, then the text arrives as events (partial
     await until(() => el.conns.length === conns + 1, 15_000);
     // The chat heard about it first, in words that say so.
     const room = fake.room(code);
-    assert.deepEqual(room.chat.map((m) => m.text), announcement({ live: true }));
-    assert.match(room.chat[0].text, /audio is being transcribed live/);
+    assert.deepEqual(room.chat.map((m) => m.text), announcement('Glassy (notetaker)', null, { live: true }));
+    assert.match(room.chat[0].text, /recorded and transcribed live/);
+    assert.match(room.chat[1].text, /aufgezeichnet und live transkribiert/);
     assert.ok(el.conns.at(-1).sent.length && audio.captures.length === 1);
     assert.equal(el.conns.at(-1).query.enable_logging, 'false');
 
@@ -188,10 +189,7 @@ test('meeting_recording_delete before admission: the meeting never records or st
     await c.call('meeting_recording_delete', { meeting_id: id });
     const conns = el.conns.length;
     fake.admit(code);
-    await until(async () => {
-      const meeting = await status(c, id);
-      return meeting.state === 'admitted' && meeting.announce.sent_to === 'everyone';
-    }, 15_000);
+    await until(async () => (await status(c, id)).state === 'admitted' && fake.room(code).chat.length >= 2, 15_000);
     await sleep(1000);
     assert.equal(audio.recorders.length, 0);
     assert.equal(audio.captures.length, 0);
@@ -209,7 +207,7 @@ test('live transcript refused up front: no ElevenLabs key, or the daily minutes 
     const { id } = await admitted(c, { live: false });
     assert.match((await c.call('meeting_transcript', { meeting_id: id })).text, /has no live transcript/);
     assert.equal((await status(c, id)).live_transcript, undefined);
-    assert.match(fake.room((await status(c, id)).url.split('/').pop()).chat[0].text, /audio is being recorded for notes/);
+    assert.match(fake.room((await status(c, id)).url.split('/').pop()).chat[0].text, /I'm recording audio for notes\./);
     await c.close();
   }, { el: false });
   await withService(async (svc) => {

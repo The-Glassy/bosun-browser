@@ -421,15 +421,3 @@ test('ElevenLabs for real: the speech fixture comes back as text', { skip: !proc
     console.log(`real ElevenLabs: ${ev.final.length} finals, partials ${ev.partial.length}, final lag ${JSON.stringify(s.final_lag_s)}, zero_retention ${s.zero_retention}`);
   } finally { await t.stop('left'); }
 });
-
-test('transcript usage rolls over on UTC midnight by default', () => {
-  const dir = tmpDir();
-  try {
-    let now = Date.parse('2026-11-24T23:59:59.000Z');
-    const usage = new TranscriptUsage({ file: path.join(dir, 'usage.json'), capMin: 1, now: () => now });
-    usage.add('alice', 45);
-    assert.equal(usage.left('alice'), 15);
-    now += 1000;
-    assert.equal(usage.left('alice'), 60);
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});

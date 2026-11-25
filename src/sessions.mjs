@@ -220,7 +220,7 @@ export class SessionManager {
         }
         try {
           ({ ctx, browser = null, dir = null, tmpDir = null } = await this.engines.open(def.name, {
-            cfg: this.cfg, profileDir, locale: locale || this.cfg.browserLocale || 'en', timezone: timezone || this.cfg.browserTimezone || this.cfg.tz || 'UTC', media, proxy, downloads: dlDir,
+            cfg: this.cfg, profileDir, locale: locale || this.cfg.browserLocale || 'de-AT', timezone: timezone || this.cfg.browserTimezone || 'Europe/Vienna', media, proxy, downloads: dlDir,
             shared: (d, bt) => this.getBrowser(d, bt),
           }));
         } catch (e) {

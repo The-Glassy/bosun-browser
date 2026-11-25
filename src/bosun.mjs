@@ -18,7 +18,7 @@ import { startTenantService } from './tenant-sandbox.mjs';
 
 export async function startService(cfg, { engines, keepalive: kaOpts = {}, meetings: mOpts = {}, wsSocket, liveSocket } = {}) {
   if (cfg.tenantSandbox && !wsSocket) return startTenantService(cfg);
-  if (cfg.unsafeShared) console.error('bosun: WARNING — multiple tenants share one process without tenant sandbox isolation (BOSUN_ALLOW_UNSAFE_SHARED=1)');
+  if (cfg.warnUnsafeShared) console.error('bosun: WARNING — multiple tenants share one process; enable isolation with BOSUN_TENANT_SANDBOX=on');
   let live = null;
   if (cfg.live) {
     live = createLiveView({ port: cfg.live.port, host: cfg.live.host, baseUrl: cfg.live.baseUrl, socketPath: liveSocket, ttlMs: cfg.handoffTtlMs });
@@ -102,6 +102,7 @@ export async function main(env = process.env) {
     delete process.env.ELEVENLABS_API_KEY;
     delete process.env.BROWSER_EGRESS_PROXY;
     delete process.env.BROWSER_EGRESS_PROXIES;
+    delete process.env.BOSUN_METRICS_TOKEN;
   }
   guardDriverRejections();
   // Never silent: an unsandboxed browser is said out loud at every start.

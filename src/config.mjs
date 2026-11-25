@@ -55,11 +55,12 @@ export function loadConfig(env = process.env) {
     camoufoxOs: env.CAMOUFOX_OS || null, // null: the host's OS
     sessionCookiesMaxAgeMs: int(env, 'SESSION_COOKIES_MAX_AGE_DAYS', 30, 1, 3650) * 86400_000,
     keepalive: env.KEEPALIVE !== '0', // run scheduled keepalive visits (configured with keepalive_set)
-    tz: timeZone(env.TZ || 'UTC', 'TZ'),
+    tz: env.TZ || 'Europe/Vienna', // keepalive quiet hours and transcript quotas
     browserTimezone: env.BROWSER_TIMEZONE ? timeZone(env.BROWSER_TIMEZONE, 'BROWSER_TIMEZONE') : null,
-    browserLocale: env.BROWSER_LOCALE || 'en',
-    meetingBotName: env.MEETING_BOT_NAME?.trim() || 'Notetaker',
+    browserLocale: env.BROWSER_LOCALE || 'de-AT',
+    meetingBotName: env.MEETING_BOT_NAME?.trim() || 'Glassy (notetaker)',
     meetingAnnounceText: env.MEETING_ANNOUNCE_TEXT?.trim() || null,
+    meetingOwner: (env.MEETING_OWNER || '').trim().slice(0, 60) || null,
     recordingRetentionDays: int(env, 'RECORDING_RETENTION_DAYS', 30, 1, 3650), // meeting recordings are deleted after this
     meetingVideoLimit: int(env, 'MEETING_VIDEO_LIMIT', 1, 0, 1000),
     meetingVideoMinFreeGb: int(env, 'MEETING_VIDEO_MIN_FREE_GB', 2, 0, 100000),
@@ -97,17 +98,19 @@ export function loadConfig(env = process.env) {
   };
   protectEgressCredentials([cfg.egressProxy, ...cfg.egressProxies.values()], env.DEBUG, env.NODE_DEBUG);
   if (!ENGINE_NAMES.includes(cfg.engine)) throw new Error(`ENGINE must be one of ${ENGINE_NAMES.join(', ')} (got "${cfg.engine}")`);
+  try { new Intl.DateTimeFormat('en', { timeZone: cfg.tz }); } catch { throw new Error(`TZ must be an IANA time zone such as Europe/Vienna (got "${cfg.tz}")`); }
   try { cfg.browserLocale = Intl.getCanonicalLocales(cfg.browserLocale)[0]; } catch { throw new Error('BROWSER_LOCALE must be a valid language tag'); }
   if (cfg.meetingBotName.length > 60) throw new Error('MEETING_BOT_NAME must be at most 60 characters');
   if (cfg.meetingAnnounceText?.length > 1000) throw new Error('MEETING_ANNOUNCE_TEXT must be at most 1000 characters');
 
-  const sandbox = env.BOSUN_TENANT_SANDBOX ?? 'auto';
+  const sandbox = env.BOSUN_TENANT_SANDBOX ?? 'off';
   if (!['auto', 'on', 'off'].includes(sandbox)) throw new Error('BOSUN_TENANT_SANDBOX must be auto, on or off');
   const allowShared = flag(env, 'BOSUN_ALLOW_UNSAFE_SHARED', false);
   cfg.tenantSandbox = sandbox === 'on' || (sandbox === 'auto' && cfg.tokens.length > 1);
   const tenants = new Set(cfg.tokens.map(({ tenant }) => tenant));
-  cfg.unsafeShared = !cfg.tenantSandbox && tenants.size > 1;
-  if (cfg.unsafeShared && !allowShared) throw new Error('multiple tenants require BOSUN_TENANT_SANDBOX or BOSUN_ALLOW_UNSAFE_SHARED=1');
+  cfg.warnUnsafeShared = !cfg.tenantSandbox && tenants.size > 1 && !allowShared;
+  cfg.autoMigrate = flag(env, 'BOSUN_AUTO_MIGRATE', false);
+  cfg.healthCheckEngines = flag(env, 'BOSUN_HEALTH_CHECK_ENGINES', false);
   cfg.tenantExits = parseTenantExits(env, tenants, cfg.egressProxies);
   cfg.metricsToken = env.BOSUN_METRICS_TOKEN || null;
   if (cfg.metricsToken && (!/^\S+$/.test(cfg.metricsToken) || cfg.metricsToken.length < MIN_TOKEN_LENGTH)) {

@@ -110,12 +110,28 @@ export function transition(m, to) {
 }
 
 const botName = (name) => String(name).replace(/\s*\(.*\)\s*$/, '').trim() || 'Bosun';
-export function announcement({ live = false, video = false } = {}) {
-  const capture = video ? 'The audio and video of this meeting page are being recorded' : 'This meeting’s audio is being recorded';
-  return [`${capture}${live ? ' and the audio is being transcribed live' : ''} for notes, so please object in chat if you prefer not to be recorded.`];
+// The default announcement, English then German. owner: whose notetaker it is (MEETING_OWNER), or nobody named. live: the
+// audio is also transcribed live.
+export function announcement(name, owner, { live = false, video = false } = {}) {
+  if (video) return announcement(name, owner, { live }).map((text) => text
+    .replace("I'm recording audio for notes.", "I'm recording audio and video of this meeting page for notes.")
+    .replace("This call is recorded and transcribed live for notes.", "Audio and video of this meeting page are recorded and transcribed live for notes.")
+    .replace("Ich nehme den Ton für Notizen auf.", "Ich nehme Ton und Video dieser Meeting-Seite für Notizen auf.")
+    .replace("Dieser Anruf wird für Notizen aufgezeichnet und live transkribiert.", "Ton und Video dieser Meeting-Seite werden für Notizen aufgezeichnet und live transkribiert."));
+  const n = botName(name);
+  if (live) {
+    return [
+      `Hi, I'm ${n}, ${owner ? `${owner}'s` : 'an'} AI notetaker. This call is recorded and transcribed live for notes. If you'd rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop both and delete the recording.`,
+      `Hallo, ich bin ${n}, ${owner ? `KI-Notizassistent von ${owner}` : 'ein KI-Notizassistent'}. Dieser Anruf wird für Notizen aufgezeichnet und live transkribiert. Wenn ihr nicht aufgenommen werden wollt, schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“), dann stoppe ich beides und lösche die Aufnahme.`,
+    ];
+  }
+  return [
+    `Hi, I'm ${n}, ${owner ? `${owner}'s` : 'an'} AI notetaker. I'm recording audio for notes. If you'd rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the recording.`,
+    `Hallo, ich bin ${n}, ${owner ? `KI-Notizassistent von ${owner}` : 'ein KI-Notizassistent'}. Ich nehme den Ton für Notizen auf. Wenn ihr nicht aufgenommen werden wollt, schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“), dann stoppe und lösche ich die Aufnahme.`,
+  ];
 }
-export const CONFIRM_DELETED = 'Recording stopped and deleted.';
-export const CONFIRM_DELETED_LIVE = 'Recording and live transcript stopped and deleted.';
+export const CONFIRM_DELETED = 'Recording stopped and deleted. / Aufnahme gestoppt und gelöscht.';
+export const CONFIRM_DELETED_LIVE = 'Recording and live transcript stopped and deleted. / Aufnahme und Live-Transkript gestoppt und gelöscht.';
 // Google turned the guest away before anyone could admit it ("You can't join this video call").
 export const REFUSED_BY_GOOGLE = "Google refused to let this guest join (\"You can't join this video call\") before anyone could admit it. " +
   'Google often does this for automated guests, especially from datacenter IPs. Join with a Bosun profile that is signed in to a ' +
@@ -338,7 +354,7 @@ export class Meetings {
 
   // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
   // meeting could not be joined (denied, not a meeting page, no audio, ...).
-  async join(tenant, { url, name = this.cfg.meetingBotName ?? 'Notetaker', announceText, announce = 'chat', maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec, firstJoinerWaitSec,
+  async join(tenant, { url, name = this.cfg.meetingBotName ?? 'Glassy (notetaker)', announceText, announce = 'chat', maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec, firstJoinerWaitSec,
     liveTranscript = false, transcriptPartials = true, vadSilenceS, recordVideo = false, videoFps = 2, settings: perCall = {} }) {
     validateVideo(recordVideo, videoFps);
     if (!ANNOUNCE_MODES.includes(announce)) throw new Error(`announce must be one of ${ANNOUNCE_MODES.join(', ')}`);
@@ -379,7 +395,7 @@ export class Meetings {
       id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, leaveOnOptOut,
       recordVideo, videoFps, videoReserved: recordVideo,
       aloneLeaveSec, firstJoinerWaitSec, othersSeen: false,
-      announce: announceText ? [announceText] : announcement({ live: liveTranscript, video: recordVideo }),
+      announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner, { live: liveTranscript, video: recordVideo }),
       live: liveTranscript, partials: transcriptPartials, vadSilenceS, transcript: null, speech: null, speechSeq: 0,
       announceMode: announce, announced: { sent_to: null, failures: [] }, chatTo: announce === 'host' ? 'host' : 'everyone', chatError: null,
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
@@ -461,7 +477,6 @@ export class Meetings {
     await this.page(m, async (p) => {
       if (platform.afterAdmit) await platform.afterAdmit(p); // Zoom: computer audio joined, mic and camera off
       m.participants = await platform.participants(p);
-      if (m.participants === 1) m.aloneSince = m.admittedAt;
       if (m.participants > 1) m.othersSeen = true;
       // A chat that won't open (turned off by the host) is no reason to leave; the announcement then says why it failed.
       await platform.openChat(p).catch((e) => { m.chatError = oneLine(e); });
@@ -1360,7 +1375,7 @@ export class Meetings {
     if (n !== null && n <= 1) {
       // The first participant and the last departure have independent timers.
       m.aloneSince ??= this.now();
-      if (this.now() - m.aloneSince >= 1000 * (m.othersSeen ? m.aloneLeaveSec : m.firstJoinerWaitSec)) return this.finish(m, 'alone');
+      if (this.now() - m.aloneSince > 1000 * (m.othersSeen ? m.aloneLeaveSec : m.firstJoinerWaitSec)) return this.finish(m, 'alone');
     } else {
       m.aloneSince = null;
       if (n !== null && n > 1) m.othersSeen = true;

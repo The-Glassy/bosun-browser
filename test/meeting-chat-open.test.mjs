@@ -23,7 +23,7 @@ async function withService(fn) {
   try { return await fn(svc, c, ev); } finally { await c.close(); await svc.stop(); }
 }
 const status = async (c, id) => (await c.call('meeting_status', { meeting_id: id })).json();
-const [EN] = announcement();
+const [EN, DE] = announcement('Glassy (notetaker)', null);
 
 // Joins a room with the given options and waits for the announcement to be settled (sent or failed).
 async function join(c, opts) {
@@ -45,7 +45,7 @@ for (const [what, opts] of [
     await withService(async (svc, c) => {
       const { code, id, s } = await join(c, opts);
       assert.deepEqual([s.announce.sent_to, s.announce.reason], ['everyone', undefined], JSON.stringify(s.announce));
-      assert.deepEqual(fake.room(code).chat.map((m) => m.text), [EN]);
+      assert.deepEqual(fake.room(code).chat.map((m) => m.text), [EN, DE]);
       // A later post goes out too, without the toggle closing the panel that is already open.
       const r = await c.call('meeting_chat_send', { meeting_id: id, text: 'A short clarification.' });
       assert.equal(r.isError, false, r.text);
@@ -93,7 +93,7 @@ test('Meet chat: Enter that posts but empties the box only 3.5 s later is not se
     const r = await c.call('meeting_chat_send', { meeting_id: id, text: 'Only once, please.' });
     assert.equal(r.isError, false, r.text);
     await sleep(4000);
-    assert.deepEqual(fake.room(code).chat.map((m) => m.text), [EN, 'Only once, please.']);
+    assert.deepEqual(fake.room(code).chat.map((m) => m.text), [EN, DE, 'Only once, please.']);
   });
 });
 
@@ -105,7 +105,7 @@ test('Meet chat: a message with a link (rendered inline as <a>) is confirmed; a 
     const blank = await c.call('meeting_chat_send', { meeting_id: id, text: '   ' });
     assert.equal(blank.isError, true);
     assert.match(blank.text, /empty chat message/);
-    assert.deepEqual(fake.room(code).chat.map((m) => m.text).slice(1), ['The doc: https://example.com/plan. Deadline 14 Nov.']);
+    assert.deepEqual(fake.room(code).chat.map((m) => m.text).slice(2), ['The doc: https://example.com/plan. Deadline 14 Nov.']);
     assert.equal((await status(c, id)).state, 'recording', 'the page still answers');
   });
 });

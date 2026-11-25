@@ -54,7 +54,7 @@ export function realtimeUrl(base, { zeroRetention = true, vadSilenceS = VAD_SILE
 
 // Seconds of live transcript per tenant and local day (tz), kept in a file so a restart doesn't reset the cap.
 export class TranscriptUsage {
-  constructor({ file, tz = 'UTC', capMin, now = Date.now }) {
+  constructor({ file, tz, capMin, now = Date.now }) {
     Object.assign(this, { file, tz, capSec: capMin * 60, now });
     // Tenants in a dictionary without a prototype: a tenant named __proto__ is counted like any other.
     this.state = { day: this.day(), tenants: Object.create(null) };

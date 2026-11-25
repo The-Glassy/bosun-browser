@@ -83,7 +83,7 @@ export const periodMin = (e) => e.everyMinutes ?? e.everyHours * 60;
 
 // When the next visit is due: one interval after `from`, shifted by up to ±jitterMin (both stretched during quiet
 // hours), never sooner than MIN_GAP_MS.
-export function nextRun(from, e, rnd = Math.random, tz = 'UTC') {
+export function nextRun(from, e, rnd = Math.random, tz = 'Europe/Vienna') {
   const ms = periodMin(e) * 60_000 + (rnd() * 2 - 1) * e.jitterMin * 60_000;
   const quiet = e.quietHours ? parseQuiet(e.quietHours) : null;
   return Math.round(Math.max(from + MIN_GAP_MS, advance(from, ms, quiet, tz)));
@@ -229,7 +229,7 @@ export class Keepalive {
   // activityMs, wall (bot-check detector).
   constructor({ cfg, manager, emit = () => {}, onWatch = () => {}, wall = async () => null, rnd = Math.random, now = Date.now, tickMs = TICK_MS, gapMs = GAP_MS, activityMs = ACTIVITY_MS }) {
     Object.assign(this, { cfg, manager, emit, onWatch, wall, rnd, now, tickMs, gapMs, activityMs });
-    this.tz = cfg.tz || 'UTC';
+    this.tz = cfg.tz || 'Europe/Vienna';
     this.store = new Store(path.join(cfg.dataDir, 'keepalive.json'));
     this.current = null; // {key, abort, done}
     this.notBefore = 0; // spacing between visits
