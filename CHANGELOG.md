@@ -17,7 +17,8 @@
 
 - A shared process with multiple distinct tenants logs one startup line recommending the sandbox.
   Set `BOSUN_ALLOW_UNSAFE_SHARED=1` to acknowledge shared mode and silence it.
-- The existing `GET /health` endpoint is now public and returns a reduced set of fields. The new public
+- The existing `GET /health` endpoint is now public and drops addresses and diagnostic text so monitoring
+  can run without access to deployment details. The new public
   `GET /health/exits` reports named exit status and probe times. The new `GET /metrics` is also public by
   default and exports only `bosun_exit_up` by exit name. See the monitoring upgrade steps below.
 
@@ -43,6 +44,8 @@ scraper to send `Authorization: Bearer <that secret>`. MCP tokens belong on the 
 3. Set `BOSUN_TENANT_SANDBOX=on` (or `auto` for two or more tokens) and start Bosun. If legacy data
    still exists, startup refuses with the migration command. Set `BOSUN_AUTO_MIGRATE=1` to explicitly
    choose the same backup-first migration at startup instead of running it manually.
+   If you use the example systemd unit, apply the [sandbox drop-in](docs/DEPLOY-SYSTEMD.md#start-sandboxed-workers-under-systemd)
+   before starting it.
 4. Check `/health`, open an existing profile and verify the tenant's schedules, macros and recordings.
    Sandboxed artifact and live-view links use `/tenant/<tenant>/` prefixes. Update proxy routes to
    accept those paths. An active legacy `/v/<token>` redirects if exactly one worker owns it. Handoffs
@@ -51,7 +54,8 @@ scraper to send `Authorization: Bearer <that secret>`. MCP tokens belong on the 
 **Roll back.** Stop Bosun. With the 0.28 CLI, run `bosun migrate-data --reverse --dry-run --data /var/lib/bosun/data`
 and then `bosun migrate-data --reverse --data /var/lib/bosun/data`, substituting the actual data directory.
 Keep the reverse backup. Set `BOSUN_TENANT_SANDBOX=off` and unset `BOSUN_AUTO_MIGRATE` before starting shared
-mode. If installing 0.27, first convert any named exit objects back to URL strings. Restore the MCP bearer on
+mode. If you applied the example systemd drop-in, remove it to restore the original `xvfb-run` command and run
+`sudo systemctl daemon-reload`. If installing 0.27, first convert any named exit objects back to URL strings. Restore the MCP bearer on
 `/health` probes and remove scrapes of `/health/exits` and `/metrics`. See the
 [backup recovery and conflict instructions](docs/TENANT-SANDBOX.md#roll-back-to-shared-mode-or-027).
 

@@ -1,8 +1,8 @@
 # Deploying Bosun on Linux with systemd
 
 This example runs Bosun as an unprivileged user with both listeners on loopback. Publish live view to a private
-network and keep authentication in an environment file. For multiple tokens, prepare the
-[tenant sandbox](TENANT-SANDBOX.md) before starting the unit.
+network and keep authentication in an environment file. The unit defaults to shared mode. See the sandbox
+setup below to opt in to [tenant isolation](TENANT-SANDBOX.md).
 
 Example files: [`deploy/bosun.service`](../deploy/bosun.service) and
 [`deploy/bosun.env.example`](../deploy/bosun.env.example). Placeholders (`example.org`, `bosun.example.org`) are
@@ -22,7 +22,7 @@ sudo useradd --system --create-home --home-dir /var/lib/bosun --shell /usr/sbin/
 sudo install -d -o bosun -g bosun -m 0700 /var/lib/bosun/data /var/lib/bosun/pw-browsers
 sudo install -d -o root  -g bosun -m 0750 /etc/bosun
 
-sudo apt-get install -y nodejs npm xvfb bubblewrap   # Node 20+; use nodesource if the distro ships an older one
+sudo apt-get install -y nodejs npm xvfb   # Node 20+; use nodesource if the distro ships an older one
 sudo install -d -o root -g root -m 0755 /opt/bosun
 sudo git clone https://github.com/The-Glassy/bosun-browser /opt/bosun   # or unpack a release tarball
 sudo chown -R root:root /opt/bosun        # code is read-only to the service user
@@ -108,8 +108,9 @@ sudo -u bosun /usr/bin/node /opt/bosun/bin/bosun.mjs migrate-data --dry-run --da
 sudo -u bosun /usr/bin/node /opt/bosun/bin/bosun.mjs migrate-data --data /var/lib/bosun/data
 ```
 
-Set `BOSUN_TENANT_SANDBOX=on` in the service's environment file. The example `ExecStart` wraps the service in host Xvfb for shared mode. With the tenant sandbox enabled, replace
-that command in a unit drop-in. Each headful worker launches its own Xvfb.
+Set `BOSUN_TENANT_SANDBOX=on` in the service's environment file. The example `ExecStart` wraps the service in
+host Xvfb for shared mode. Each sandboxed headful worker launches its own Xvfb. Put the following in
+`/etc/systemd/system/bosun.service.d/tenant-sandbox.conf` to replace the command for sandbox mode.
 
 ```ini
 [Service]
@@ -128,6 +129,9 @@ sudo systemctl daemon-reload
 sudo systemctl start bosun
 curl -f http://127.0.0.1:7360/health
 ```
+
+On [rollback](TENANT-SANDBOX.md#roll-back-to-shared-mode-or-027), remove that drop-in and run
+`sudo systemctl daemon-reload` before starting the original unit.
 
 ## 3a. Chromium's sandbox (the service will not start without it)
 
