@@ -92,9 +92,10 @@ The two listeners are separate: `WS_HOST`/`WS_PORT` carry MCP (token-protected),
 human's live view (protected by the handoff link). Both default to `127.0.0.1`; bind them to a VPN/mesh address or
 put a TLS reverse proxy in front, and set `LIVE_BASE_URL` to the address the human's phone uses.
 
-With two or more configured tokens, Bosun starts a separate Linux bubblewrap worker per tenant. Install `bwrap`
-and preinstall the browser engines before starting. See [Tenant sandbox](docs/TENANT-SANDBOX.md) for egress,
-state migration and host requirements.
+Bosun defaults to the shared process and data layout used in 0.27. To run a separate Linux bubblewrap worker
+per tenant, set `BOSUN_TENANT_SANDBOX=on` or set it to `auto` with two or more configured tokens. Install
+bubblewrap and the configured browser engines before starting. See [Tenant sandbox](docs/TENANT-SANDBOX.md)
+for host requirements, egress, and the `bosun migrate-data` command.
 
 ### Environment
 
@@ -102,9 +103,11 @@ state migration and host requirements.
 |---|---|---|
 | `BROWSER_TOKEN` | – | token for tenant `default` (16+ chars) |
 | `BROWSER_TOKENS` | – | more tenants: `alice:<token>,bob:<token>` |
-| `BOSUN_TENANT_SANDBOX` | `auto` | `auto` enables bwrap with two or more configured tokens. Use `on` to opt in with one tenant |
-| `BOSUN_ALLOW_UNSAFE_SHARED` | `0` | `1` permits multiple distinct tenants when sandboxing is `off` and logs a warning |
-| `BOSUN_METRICS_TOKEN` | – | optional separate bearer for `/metrics` (16+ characters). MCP bearers also work |
+| `BOSUN_TENANT_SANDBOX` | `off` | `off` uses the shared process. `on` always runs sandboxed workers. `auto` enables them with two or more configured tokens |
+| `BOSUN_ALLOW_UNSAFE_SHARED` | `0` | `1` acknowledges shared mode and silences the startup warning for multiple distinct tenants |
+| `BOSUN_AUTO_MIGRATE` | `0` | `1` runs the backup-first data migration at startup if sandboxing is enabled and legacy data is found |
+| `BOSUN_METRICS_TOKEN` | – | optional dedicated bearer for `/metrics` (16+ characters). Unset makes metrics public |
+| `BOSUN_HEALTH_CHECK_ENGINES` | `0` | `1` adds browser launch checks to shared-mode readiness. Sandboxed readiness always checks enabled engines |
 | `BROWSER_TOKEN_POLICIES` | – (all `full`) | per-tenant policy: `swarm=ephemeral` (see [Read-only tokens for subagents](#read-only-tokens-for-subagents)) |
 | `BROWSER_MACRO_SOURCE` | – | `swarm=me`: the read-only tenant `swarm` lists, gets and runs the macros of tenant `me` in shared mode (see [Macros](#macros)) |
 | `BROWSER_EPHEMERAL_MAX_SESSIONS` | 2 | session cap of each `ephemeral` tenant (at most `MAX_SESSIONS_PER_TENANT`) |
@@ -135,7 +138,7 @@ state migration and host requirements.
 | `TOOL_TIMEOUTS` | – | per tool, overriding `TOOL_TIMEOUT_SEC`: `read=90,upload=120` |
 | `LIVE_HOST` / `LIVE_PORT` / `LIVE_BASE_URL` | `127.0.0.1` / – / derived | live view listener and the URL put in links |
 | `HANDOFF_TTL_SEC` | 900 | handoff link lifetime |
-| `BROWSER_DATA` | `./data` | data root. Workers are scoped to `tenants/<tenant>/` inside it |
+| `BROWSER_DATA` | `./data` | data root. With the sandbox enabled, each worker uses `tenants/<tenant>/` inside it |
 | `HEADLESS` | – | `1` = headless browser (more detectable; use for tests) |
 | `ENGINE` | `chromium` | default engine: `chromium`, `patchright`, `camoufox` (must be installed, or startup fails) |
 | `CAMOUFOX_OS` | host OS | OS of the Camoufox fingerprint: `macos`, `windows`, `linux` |
@@ -145,13 +148,14 @@ state migration and host requirements.
 | `MAX_PAGES_PER_SESSION` | 5 | popups beyond this are closed |
 | `SESSION_COOKIES_MAX_AGE_DAYS` | `30` | maximum age of a saved session-cookie snapshot (1–3650 days); older files are deleted on open |
 | `KEEPALIVE` | `1` | `0` = don't run scheduled keepalive visits (schedules are kept) |
-| `TZ` | `UTC` | IANA time zone for keepalive quiet hours, transcript quotas and browser contexts |
-| `BROWSER_TIMEZONE` / `BROWSER_LOCALE` | `TZ` / `en` | default browser context time zone and language tag. Session overrides take precedence |
+| `TZ` | `Europe/Vienna` | time zone for keepalive quiet hours and transcript quotas |
+| `BROWSER_TIMEZONE` / `BROWSER_LOCALE` | `Europe/Vienna` / `de-AT` | default browser context time zone and language tag. Session overrides take precedence |
 | `RECORDING_RETENTION_DAYS` | 30 | meeting recordings are deleted this many days after they were written |
 | `MEETING_VIDEO_LIMIT` | 1 | concurrent video slots per worker or shared process (including joins waiting for admission); `0` disables video |
 | `MEETING_VIDEO_MIN_FREE_GB` | 2 | minimum free disk in GiB for a video join and again before capture starts (whole number; `0` disables the floor) |
-| `MEETING_BOT_NAME` | `Notetaker` | default guest display name. A signed-in account supplies its own name |
-| `MEETING_ANNOUNCE_TEXT` | – | custom chat notice for meeting recording. Unset uses a neutral English notice for the enabled capture |
+| `MEETING_BOT_NAME` | `Glassy (notetaker)` | default guest display name. A signed-in account supplies its own name |
+| `MEETING_ANNOUNCE_TEXT` | – | custom chat notice for meeting recording. Unset uses the built-in English and German notice |
+| `MEETING_OWNER` | – | name included in the built-in notice as the notetaker's owner |
 | `ELEVENLABS_API_KEY` | – | ElevenLabs key: the live meeting transcript (`meeting_join` `live_transcript`) and the `elevenlabs` voice of `meeting_speak`; unset: both refused. Kept in the service only (removed from its environment at start) |
 | `ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io` | another ElevenLabs API host (`https://*.elevenlabs.io`, e.g. `https://api.eu.residency.elevenlabs.io`); nothing else gets the key (http on loopback is accepted, for tests) |
 | `ELEVENLABS_VOICE` | `EXAVITQu4vr4xnSDxMaL` ("Sarah") | fallback ElevenLabs voice id for `meeting_speak` with `backend: "elevenlabs"` (a tenant's speech setting wins) |
@@ -197,10 +201,10 @@ For profile-specific exits, configure a JSON map (at most 32 names):
 
 ```sh
 BROWSER_EGRESS_PROXY=http://egress.example.org:3128
-BROWSER_EGRESS_PROXIES='{"home":"http://home-exit.example.org:3128","office":{"url":"http://office-exit.example.org:3128","required":true}}'
+BROWSER_EGRESS_PROXIES='{"home":"http://home-exit.example.org:3128","office":{"url":"http://office-exit.example.org:3128","required":false}}'
 ```
 
-Named exits default to `required: false`. Set `required: true` to make that exit part of service readiness.
+Named exits count toward readiness by default. Set `required: false` in an exit's object to opt out.
 
 `session_open({profile: "shopping", egress: "home"})` selects that named exit. `egress: "default"` uses
 `BROWSER_EGRESS_PROXY` (direct if unset); `egress: "direct"` explicitly selects a direct exit. An existing host
@@ -224,22 +228,21 @@ Routing scope:
 
 WebSocket deployments expose these endpoints on the MCP port:
 
-- `GET /health` returns 200 when the service is running, its enabled engines can launch, and the default
-  egress and any required named exits pass their probes. Shutdown or a failed readiness check returns 503.
-  The JSON retains `ok`, `egress` and `proxies`, and adds an `engines` array with a status per enabled engine.
-  `proxies` still shows every named exit. An optional exit can have `ok: false` while the top-level `ok` is
-  `true`. The default egress is always required. In direct mode there is no upstream proxy to probe.
-- `GET /health/exits` returns 200 with `{ "exits": [...] }` even when an exit is down. Each named exit has
-  `name`, `ok`, `error` (null on success) and `checked_at` (UTC ISO 8601). An empty configuration yields `[]`
-  in `exits`. Both health endpoints use the MCP Bearer token and return 401 without it.
-- `GET /metrics` exposes the Prometheus gauge `bosun_exit_up{name="home"}` (1 for up, 0 for down). Send an MCP
-  bearer or set `BOSUN_METRICS_TOKEN` and configure the scraper to send it. Requests without a valid
-  `Authorization: Bearer …` header get HTTP 401 without exit names.
+- `GET /health` is public. It returns 200 when the service is running and the default egress and all required
+  named exits pass their probes. Readiness also checks browser launches in sandboxed mode or with
+  `BOSUN_HEALTH_CHECK_ENGINES=1`. A readiness failure returns 503. The JSON contains `ok`, `egress`,
+  `proxies` and `engines`. Exit status has `ok` and `checked_at`, plus `name` for named exits. Engine entries
+  have `name` and include `ok` when launch checks are enabled.
+- `GET /health/exits` is public. It returns 200 with `{ "exits": [...] }` even when an exit is down. Each named
+  exit has `name`, `ok` and `checked_at` (UTC ISO 8601). With zero named exits, `exits` is empty.
+- `GET /metrics` is public by default and serves `bosun_exit_up{name="home"}` (1 for up, 0 for down). To require
+  a bearer, set `BOSUN_METRICS_TOKEN` and have the scraper send it as `Authorization: Bearer <token>`.
 
-Exit probes are shared for up to 10 seconds. They use bounded HTTP OPTIONS/authentication or SOCKS5
-negotiation and keep credentials out of responses. They check the exit protocol without contacting an
-Internet destination. Engine launch results are shared per worker for up to a minute. Embedders can call
-`manager.health(tenant)` and `manager.exitHealth()` directly. Shared mode ignores the tenant argument. Stdio has no HTTP listener.
+Choose public-facing labels for named exits. These endpoints expose status, names and probe timestamps.
+Exit probes use bounded HTTP OPTIONS or SOCKS5 negotiation. Exit health and metrics can reuse the latest
+sample for up to 10 seconds. Readiness takes a fresh sample or joins a probe already in progress.
+Browser launch results are shared for up to a minute. Embedders can call `manager.health()` and
+`manager.exitHealth()`. Stdio has no HTTP listener.
 
 ### Session cookies in persistent profiles
 
@@ -730,7 +733,7 @@ keepalive_remove({ "profile": "shop" })
 
 The interval is `every_hours` (default 12) or `every_minutes` (at least 30), each visit shifted by up to
 ± `jitter_min` (default 30, or a quarter of a shorter interval). `quiet_hours` (`"22-08"`, `"22:30-07:00"`, local
-time in `TZ`, default `UTC`) makes the interval **four times longer** while it lasts, so a 30-minute
+time in `TZ`, default `Europe/Vienna`) makes the interval **four times longer** while it lasts, so a 30-minute
 watch visits about every two hours at night. An interval that starts before a quiet window is stretched only for
 its part inside it. Quiet hours follow the wall clock, and on DST nights the time is counted as it really passes. Calling `keepalive_set` again replaces the whole configuration of that profile.
 
@@ -903,7 +906,7 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
    - Microphone and camera must be **verifiably off** before joining. Bosun switches a device off and checks it,
      unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden") and no control shows
      it on; then it already counts as off. If neither can be confirmed, Bosun does not join.
-   - A guest types its name (default `Notetaker`, configurable with `MEETING_BOT_NAME`). A signed-in Meet profile has no name field and joins
+   - A guest types its name (default `Glassy (notetaker)`, configurable with `MEETING_BOT_NAME`). A signed-in Meet profile has no name field and joins
      under the account's name, so `name` is ignored. Zoom fills in a signed-in account's name, and Bosun keeps it; an
      empty field (Zoom's web client shows one to signed-in accounts too) gets `name`.
    - **Zoom:** "Do you want people to see you in the meeting?" and then "Do you want people to hear you in the
@@ -957,14 +960,14 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
    the announcement didn't reach everyone: `chat-restricted` (the chat can't be addressed to everyone),
    `chat-unavailable` (no chat), `sent-privately`, `not-sent` (still in the box), `not-confirmed` (it never showed
    up as Bosun's), and for the host `host-unreachable`. Later messages (`meeting_chat_send`, the opt-out
-   confirmation) go where the announcement went. The default notice describes the enabled capture and invites
-   objections in chat. Set `MEETING_ANNOUNCE_TEXT` for a deployment-wide custom notice or pass `announce_text`
-   for one meeting. Make sure custom wording describes any video recording and live transcription enabled for that call.
+   confirmation) go where the announcement went. The default English and German notice describes the enabled
+   capture and invites objections in chat. Set `MEETING_OWNER` to name whose notetaker it is. Set
+   `MEETING_ANNOUNCE_TEXT` for a deployment-wide custom notice or pass `announce_text` for one meeting. Make sure custom wording describes any video recording and live transcription enabled for that call.
 5. While in the call:
    - Every chat message from someone else is pushed to the agent as `bosun:meeting-chat`, with `meeting_id`,
      `sender` and `text`. `meeting_chat_read` returns them too.
    - Bosun leaves when the meeting ends, when it is removed, or when it has been alone long enough.
-     `first_joiner_wait_sec` defaults to **120 s** after admission if nobody else has joined.
+     `first_joiner_wait_sec` defaults to **120 s** alone if nobody else has joined.
      `alone_leave_sec` defaults to **30 s** once everyone else has left. Set either with
      `speech_settings_set` or override it for one `meeting_join` (whole seconds, 5–3600).
      `meeting_status` reports the effective values for that meeting.

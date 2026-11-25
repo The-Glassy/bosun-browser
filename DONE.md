@@ -3,20 +3,20 @@
 ## What changed
 
 - `v0.28` includes the health changes from PR #47. The gateway keeps the public listeners and one private worker per tenant when sandboxing is enabled. Each worker's browsers, persistent files, temporary paths, process tree, and network are isolated with bubblewrap. Browser traffic uses a tenant-specific host relay.
-- `/metrics` exports `bosun_exit_up` and requires an MCP bearer or the separate `BOSUN_METRICS_TOKEN`. Both health endpoints also require an MCP bearer.
-- The guest name defaults to `Notetaker`. The recording announcement describes the enabled capture, and the default time zone is UTC. The deploy guide explains how to set explicit names, text and time zones.
+- `/health` and `/health/exits` are public and expose status, public names and timestamps. `/metrics` exports `bosun_exit_up` publicly by default and accepts a dedicated bearer when `BOSUN_METRICS_TOKEN` is configured.
+- The guest name, recording announcement and time zone keep their 0.27 defaults. The deploy guide explains how to set explicit names, text and time zones.
 - `speech_settings_get` and `speech_settings_set` expose the two leave timers. `meeting_join` accepts per-call overrides and `meeting_status` reports the effective values. All 48 tool registrations match the PR #47 baseline, including the existing secret tools.
 - README, changelog, and [tenant sandbox documentation](docs/TENANT-SANDBOX.md) cover setup, egress, metrics and state migration.
 
 ## Decisions
 
-- `auto` counts configured token entries. Multiple entries for one tenant enable a single isolated worker. The shared-mode interlock counts distinct tenants and requires `BOSUN_ALLOW_UNSAFE_SHARED=1` to share a process across them.
+- The default is `off`. When configured, `auto` counts token entries. Multiple entries for one tenant enable a single isolated worker. Shared mode logs a startup warning for distinct tenants unless acknowledged with `BOSUN_ALLOW_UNSAFE_SHARED=1`.
 - The gateway pins host DNS answers before dialing, including when it uses a named HTTP or SOCKS5 exit. A private address requires an exact allowlist entry. `BROWSER_TENANT_EGRESS` can restrict the configured exits available to a tenant.
-- Sandboxed workers mount only `BROWSER_DATA/tenants/<tenant>/` as durable state. An operator can migrate selected data using the documented layout. `BROWSER_MACRO_SOURCE` requires shared mode because it reads another tenant's macro directory.
+- Sandboxed workers mount only `BROWSER_DATA/tenants/<tenant>/` as durable state. The `bosun migrate-data` command migrates and backs up existing data, and supports reversing the layout. `BROWSER_MACRO_SOURCE` requires shared mode because it reads another tenant's macro directory.
 - The leave timers accept whole seconds from 5 through 3600. The existing 30-second wait after the last departure and 120-second wait for the first participant remain the defaults. A meeting keeps the values resolved at join time.
 - A configured announcement is a single string and the built-in consent matcher retains its multilingual coverage. The proposal's broader configuration schema, worker resource metrics and credential resolver are outside the implemented scope.
 
-## Test output
+## Initial PR branch verification
 
 `xvfb-run -a npm test` with `BOSUN_TEST_SANDBOX=1` exited 0 on Linux x64, Node 24.22.1 and bubblewrap 0.12.0.
 A disposable mount namespace detached the test host's extra procfs submounts so bubblewrap could mount a private

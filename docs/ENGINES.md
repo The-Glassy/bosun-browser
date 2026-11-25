@@ -11,7 +11,7 @@ Bosun can drive three browsers. Pick one per deployment (`ENGINE`) or per sessio
 ## Results
 
 Measured 2026-10-18 on a Mac (Apple M4, macOS, residential IP in Austria), **headful** on the real display,
-one fresh ephemeral session per engine, the then-default `de-AT` / `Europe/Vienna`. Two full runs; the table shows the
+one fresh ephemeral session per engine, Bosun's default `de-AT` / `Europe/Vienna`. Two full runs; the table shows the
 final run (on the code in this branch), ranges where the runs differed.
 Reproduce with `npm run measure:engines` (needs internet). Raw data: [engines/results-darwin.json](engines/results-darwin.json).
 
@@ -70,7 +70,7 @@ Not measured: no such host was available for this run. Expected differences, rou
    a macOS/Windows fingerprint on Linux fonts is a mismatch. Install a normal desktop font set (e.g. `fonts-noto`,
    `fonts-liberation`, `fonts-dejavu`).
 4. **Screen geometry.** `xvfb-run -s "-screen 0 1366x900x24"` is an uncommon size; prefer `1920x1080x24`.
-5. **Locale/timezone vs IP geolocation.** The measured configuration used `de-AT` and `Europe/Vienna`. Set
+5. **Locale/timezone vs IP geolocation.** Bosun defaults to `de-AT` and `Europe/Vienna`. Set
    `BROWSER_LOCALE` and `BROWSER_TIMEZONE`, or pass `locale` and `timezone` to `session_open`, to match your exit.
 6. **Headless.** Never run production headless: headless patchright still reports `HeadlessChrome` in its UA.
 7. **Memory.** Expect lower absolute numbers than macOS (no Metal/GPU process; smaller font caches), and PSS gives the

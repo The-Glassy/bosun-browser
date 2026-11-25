@@ -10,17 +10,22 @@ The gateway checks public WebSocket and HTTP bearer credentials. Each MCP connec
 its tenant worker. Closing the connection ends its session lease. Keeping the worker alive lets scheduled
 keepalive jobs and meetings continue. A worker exit closes its connections and invalidates its capability URLs.
 A new authenticated connection can start a new worker. Generated artifact and live-view links carry a routing
-prefix `/tenant/<tenant>`; their existing one-time or expiring link credentials authorize access.
+prefix `/tenant/<tenant>`. The existing one-time or expiring link credentials authorize access. The live
+gateway redirects `/v/<token>` to the prefixed path when exactly one running worker owns the active handoff.
+It also forwards a legacy WebSocket at `/ws/<token>` to that worker. Shared mode continues to issue the
+unprefixed URLs. A handoff expires when its service or worker stops, so request a new link after upgrading.
 
 ## Choose a mode
 
-- `BOSUN_TENANT_SANDBOX=auto` (default) selects sandboxing for two or more configured token entries, even if both
-  tokens map to the same tenant. Zero or one token uses a shared-process service.
+- `BOSUN_TENANT_SANDBOX=off` (default) uses the 0.27 process and data layout. Multiple distinct tenants
+  trigger a startup warning recommending the sandbox. Set `BOSUN_ALLOW_UNSAFE_SHARED=1` to acknowledge
+  shared mode and silence the warning.
 - `BOSUN_TENANT_SANDBOX=on` runs the worker with any token count. For stdio, use a single configured tenant or
   no tokens for the local `default` tenant. For multiple tenants use the WebSocket gateway.
-- `BOSUN_TENANT_SANDBOX=off` uses the existing process and data layout. For multiple distinct tenants,
-  `BOSUN_ALLOW_UNSAFE_SHARED=1` is required and produces a startup warning. A failed sandbox launch stops
-  startup.
+- `BOSUN_TENANT_SANDBOX=auto` selects sandboxing for two or more configured token entries, even if both
+  tokens map to the same tenant. Zero or one token uses a shared-process service.
+
+A failed sandbox launch stops startup.
 
 Run as an unprivileged Linux user. Install bubblewrap, the browser dependencies and the configured engines.
 Install Xvfb for headful workers and PulseAudio/FFmpeg for meetings. Install browsers in the service user's
@@ -53,32 +58,63 @@ Proxy credentials stay on the gateway side.
   server name to the destination. An upstream proxy must support tunneling to the checked IP.
 - The worker has dedicated Unix channels for explicitly configured speech providers. These are pinned to the
   configured provider origin; the browser's host relay continues to apply its destination checks.
-- Exit health and metrics remain on the gateway. Protect scraper access with an MCP bearer or
-  `BOSUN_METRICS_TOKEN`. The separate token authorizes only `/metrics`.
+- The gateway serves public `/health`, `/health/exits` and `/metrics`. Set `BOSUN_METRICS_TOKEN` to require
+  that dedicated bearer for metrics scraping.
 
 ## Move existing state
 
-A standard single-tenant upgrade with sandboxing off keeps its existing data directory. To enable the sandbox
-on an existing installation, stop the service and take a backup. For each tenant, copy its own files into
-`BROWSER_DATA/tenants/<tenant>/` under the same relative paths. For example, move the profile data from
-`profiles/alice/work` to `tenants/alice/profiles/alice/work`.
+Stop Bosun before migrating. Run the command as the service user and point it to the service's actual
+`BROWSER_DATA` directory. The installed command is `bosun migrate-data`. From the source checkout use
+`node bin/bosun.mjs migrate-data`. Both forms accept the same options and use `BROWSER_DATA` or `./data`
+if `--data` is omitted. The command uses `tar` with gzip support.
 
-Include `profiles/<tenant>/`, `macros/<tenant>/`, `recordings/<tenant>/`,
-`speech-settings/<tenant>.json` and `secret-settings/<tenant>.json` for each tenant where they exist.
-Split `keepalive.json` by retaining only that tenant's objects in its `entries` array. Split
-`live-transcript-usage.json` by retaining its `day` and just that tenant's entry in `tenants`. Preserve file
-ownership and permissions. Start new sessions after migration and check signed-in profiles, schedules and
-recordings. Temporary files, pending transfers and live links expire at restart.
+```sh
+bosun migrate-data --dry-run --data /var/lib/bosun/data
+bosun migrate-data --data /var/lib/bosun/data
+```
+
+The command prints the path of a private backup tarball inside `.bosun-backups/` before moving data.
+It moves each tenant's `profiles/` (including browser data, profile metadata and cookie snapshots),
+`macros/`, `recordings/` (audio, video and speaker sidecars), `downloads/`, `uploads/` and `shots/`
+subtree, plus `speech-settings/<tenant>.json` and `secret-settings/<tenant>.json`. It splits
+`keepalive.json` by tenant, including watches, state and history, and partitions `live-transcript-usage.json`
+by tenant while preserving the quota date. For example, `profiles/alice/work` moves to
+`tenants/alice/profiles/alice/work`. Temporary browser profiles under `tmp/` have no durable owner.
+Retrieve pending transfers and finish handoffs before stopping. The migration moves their files when present,
+and the normal service startup and retention rules still apply.
+
+The command refuses conflicting data. If you choose `--force`, the source tenant's conflicting category or
+setting file replaces the corresponding destination, and a conflicting keepalive entry takes the source
+value. A transcript quota conflict across dates keeps the newest date and its records. The backup contains both
+layouts as they existed before the run. Successful migrations can be rerun safely. A completed migration has
+nothing left to move. If sandbox startup finds legacy state, including a partially migrated tree, it tells you
+to migrate it. With `BOSUN_AUTO_MIGRATE=1`, startup runs the same migration and prints the backup path.
 
 `BROWSER_MACRO_SOURCE` shares another tenant's macros and therefore requires shared mode. Operators can place
 independent approved copies in a tenant's sandbox data directory.
 
+## Roll back to shared mode or 0.27
+
+Stop Bosun. Run the reverse migration using the 0.28 CLI before switching the installed version or mode.
+
+```sh
+bosun migrate-data --reverse --dry-run --data /var/lib/bosun/data
+bosun migrate-data --reverse --data /var/lib/bosun/data
+```
+
+Inspect any conflict before retrying with `--force`. Reverse migration prints its own backup path and moves
+current worker state back to the shared layout. Set `BOSUN_TENANT_SANDBOX=off` and unset `BOSUN_AUTO_MIGRATE`.
+Before starting 0.27, convert named exit objects back to URL strings, restore bearer authentication to
+the health client and remove scrapes of `/health/exits` and `/metrics`. If a migration is interrupted,
+restore the printed archive into an empty data directory with `tar -xzf /path/to/bosun-data.tar.gz -C /path/to/empty-dir`
+and point `BROWSER_DATA` at the recovered directory.
+
 ## Pin deployment-specific defaults
 
-Use `MEETING_BOT_NAME` for a guest name and `MEETING_ANNOUNCE_TEXT` for explicit wording, including any attribution
-previously supplied through `MEETING_OWNER`. A join's `name` and `announce_text` can override those settings.
-Set an IANA `TZ` if schedules and transcript quotas use local time. Use `BROWSER_LOCALE` and `BROWSER_TIMEZONE`
-if browser sessions need a different language or clock.
+Use `MEETING_BOT_NAME` for a guest name, `MEETING_OWNER` for attribution in the built-in English and German
+notice, and `MEETING_ANNOUNCE_TEXT` for custom wording. A join's `name` and `announce_text` can override those
+settings. Set `TZ` for keepalive quiet hours and transcript quotas. Use `BROWSER_LOCALE` and
+`BROWSER_TIMEZONE` for browser contexts. The default time zone for each is `Europe/Vienna`.
 
 ## Run the containment test
 

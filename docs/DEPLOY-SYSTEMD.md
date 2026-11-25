@@ -69,7 +69,8 @@ sudo systemctl enable --now bosun
 journalctl -u bosun -f
 ```
 
-Expect two lines and no token:
+Startup reports the listener addresses. With multiple distinct tenants in shared mode, it also recommends
+enabling the tenant sandbox.
 
 ```
 bosun: MCP over WebSocket on 127.0.0.1:7360
@@ -98,7 +99,16 @@ it a page that breaks the renderer is already inside everything the unit allows.
 
 ### Start sandboxed workers under systemd
 
-The example `ExecStart` wraps the service in host Xvfb for shared mode. With the tenant sandbox enabled, replace
+On Debian or Ubuntu, install bubblewrap with `sudo apt-get install bubblewrap`. Stop the unit and migrate
+`/var/lib/bosun/data` as the service user before enabling the sandbox on an existing deployment.
+
+```sh
+sudo systemctl stop bosun
+sudo -u bosun /usr/bin/node /opt/bosun/bin/bosun.mjs migrate-data --dry-run --data /var/lib/bosun/data
+sudo -u bosun /usr/bin/node /opt/bosun/bin/bosun.mjs migrate-data --data /var/lib/bosun/data
+```
+
+Set `BOSUN_TENANT_SANDBOX=on` in the service's environment file. The example `ExecStart` wraps the service in host Xvfb for shared mode. With the tenant sandbox enabled, replace
 that command in a unit drop-in. Each headful worker launches its own Xvfb.
 
 ```ini
@@ -110,8 +120,14 @@ ProtectHostname=no
 
 Bubblewrap sets the private hostname and mounts a fresh procfs. If procfs mounting fails inside systemd or a
 container, check for masked or additional mounts under `/proc` introduced by the service manager or container
-profile. Test the actual service policy before migrating production state. The default browser's launch is checked
-at startup, and `GET /health` verifies the other enabled engines.
+profile. After adding the drop-in, reload systemd and start Bosun. The default browser's launch is checked
+at startup, and the public `GET /health` verifies the other enabled engines.
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl start bosun
+curl -f http://127.0.0.1:7360/health
+```
 
 ## 3a. Chromium's sandbox (the service will not start without it)
 

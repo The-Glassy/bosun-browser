@@ -2,21 +2,58 @@
 
 ## 0.28.0 (Unreleased)
 
-- Isolate each tenant's worker and browsers in bubblewrap on Linux. `BOSUN_TENANT_SANDBOX=auto` enables it for
-  configurations with multiple tokens. Sharing a process across distinct tenants requires `BOSUN_ALLOW_UNSAFE_SHARED=1`.
-  Sandboxed browsers use a host relay that pins destination addresses and enforces the tenant's allowed hosts and exits.
-- Require an MCP bearer or `BOSUN_METRICS_TOKEN` for `/metrics`. The only series is `bosun_exit_up`.
-- Default to the guest name `Notetaker`, a neutral recording notice and UTC. Configure meeting wording and display
-  name with `MEETING_ANNOUNCE_TEXT` and `MEETING_BOT_NAME`.
-- Set `alone_leave_sec` and `first_joiner_wait_sec` per tenant with the speech settings tools. `meeting_join` can
-  override both, and `meeting_status` reports the values in effect.
-- Keep the existing secret tools and workflows.
+### New (opt-in)
 
-### Health changes from unreleased 0.27.2
+- Set `BOSUN_TENANT_SANDBOX=on` for one Linux bubblewrap worker per distinct tenant, or `auto` to enable
+  workers when two or more tokens are configured. The host relay enforces tenant host and exit rules.
+- Set `MEETING_BOT_NAME`, `MEETING_ANNOUNCE_TEXT`, `BROWSER_TIMEZONE` or `BROWSER_LOCALE` to customize
+  deployment defaults. Speech settings accept per-tenant `alone_leave_sec` and `first_joiner_wait_sec`.
+  A join can override them, and status reports the values in effect.
+- Use `BROWSER_TENANT_EGRESS` to restrict a tenant to a subset of exits. Existing named exit URL strings
+  still count toward readiness. Use the new object form with `"required": false` to make an exit optional.
+  Set `BOSUN_HEALTH_CHECK_ENGINES=1` to include browser launch checks in shared-mode readiness.
 
-- Keep `/health` ready when an optional named exit is down. Readiness checks engine launches, the default
-  egress and any named exit configured with `required: true`.
-- Report each named exit and its probe timestamp at `/health/exits`. Export `bosun_exit_up` at `/metrics`.
+### Changed defaults
+
+- A shared process with multiple distinct tenants logs one startup line recommending the sandbox.
+  Set `BOSUN_ALLOW_UNSAFE_SHARED=1` to acknowledge shared mode and silence it.
+- The existing `GET /health` endpoint is now public and returns a reduced set of fields. The new public
+  `GET /health/exits` reports named exit status and probe times. The new `GET /metrics` is also public by
+  default and exports only `bosun_exit_up` by exit name. See the monitoring upgrade steps below.
+
+### Breaking changes and upgrade notes
+
+**Monitoring.** Remove the MCP bearer from `GET /health` probes. Both health endpoints ignore authentication.
+For readiness, keep checking the HTTP status or the JSON `.ok` field. Replace reads of `.egress.server`,
+`.proxies[].server`, `mode` or `error` with status checks using `.egress.ok` and `.proxies[] | {name, ok, checked_at}`,
+or use `/health/exits` with `.exits[] | {name, ok, checked_at}`. These fields keep proxy addresses and
+diagnostic text out of the public responses. Use only public-facing exit names. To require authentication on
+`/metrics`, set `BOSUN_METRICS_TOKEN` to a dedicated secret of at least 16 characters and configure the
+scraper to send `Authorization: Bearer <that secret>`. MCP tokens belong on the MCP connection.
+
+**Enable tenant sandboxing on an existing deployment.**
+
+1. Install bubblewrap on the Linux host (on Debian or Ubuntu, run `sudo apt-get install bubblewrap`). Verify
+   the service user can launch bubblewrap and the configured browser engines. See the host requirements in
+   [Tenant sandbox](docs/TENANT-SANDBOX.md).
+2. Stop Bosun. As the service user, run `bosun migrate-data --dry-run --data /var/lib/bosun/data` and then
+   `bosun migrate-data --data /var/lib/bosun/data`, using the deployment's actual `BROWSER_DATA` path.
+   From a checkout, replace `bosun` with `node bin/bosun.mjs`. Keep the printed backup path. The CLI
+   refuses conflicts unless run with `--force`.
+3. Set `BOSUN_TENANT_SANDBOX=on` (or `auto` for two or more tokens) and start Bosun. If legacy data
+   still exists, startup refuses with the migration command. Set `BOSUN_AUTO_MIGRATE=1` to explicitly
+   choose the same backup-first migration at startup instead of running it manually.
+4. Check `/health`, open an existing profile and verify the tenant's schedules, macros and recordings.
+   Sandboxed artifact and live-view links use `/tenant/<tenant>/` prefixes. Update proxy routes to
+   accept those paths. An active legacy `/v/<token>` redirects if exactly one worker owns it. Handoffs
+   and transfer links expire when Bosun restarts, so request new links. Shared mode retains the 0.27 paths.
+
+**Roll back.** Stop Bosun. With the 0.28 CLI, run `bosun migrate-data --reverse --dry-run --data /var/lib/bosun/data`
+and then `bosun migrate-data --reverse --data /var/lib/bosun/data`, substituting the actual data directory.
+Keep the reverse backup. Set `BOSUN_TENANT_SANDBOX=off` and unset `BOSUN_AUTO_MIGRATE` before starting shared
+mode. If installing 0.27, first convert any named exit objects back to URL strings. Restore the MCP bearer on
+`/health` probes and remove scrapes of `/health/exits` and `/metrics`. See the
+[backup recovery and conflict instructions](docs/TENANT-SANDBOX.md#roll-back-to-shared-mode-or-027).
 
 ## 0.27.1 (2026-11-22)
 
