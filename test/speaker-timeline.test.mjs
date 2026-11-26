@@ -112,6 +112,8 @@ function fixture(t, { aligned = true } = {}) {
   const m = { id: 'm123456789abc', tenant: 'alice', name: 'Bosun', info: { selfName: 'Account' }, state: 'admitted', recMs: 0, speakerLog: [],
     platform: { name: 'meet', drainSpeakers: async () => pending.splice(0) }, session: { id: 'session', page: {} },
     ac: new AbortController(), joined: deferred(), announceDone: deferred(), createdAt: now, admittedAt: now, announced: { failures: [] },
+    announceMode: 'chat', optOutMode: 'on',
+    meetingSettings: { announce: { value: 'chat', source: 'default' }, optout_detection: { value: true, source: 'default' } },
     channelGen: 0, consentGen: 0, specStreams: new Map(), prepared: new Map(), overrides: {}, leaveOnOptOut: false,
     rig: { close: async () => {}, record(file) {
       fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, 'fake audio');
