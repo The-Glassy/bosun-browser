@@ -149,7 +149,7 @@ export async function clickThrough(page, l, { what, overlays, timeoutMs = 25_000
 // wasn't found while no control shows it on. A control showing it on is clicked (if enabled) and checked again; a
 // disabled one is waited out, never taken as "off". Throws if "off" can't be established: joining with a live
 // microphone or camera is not risked. state(page) may end the wait (denied, refused, ended...): returned as is.
-export async function ensureOff(page, { what, onLabel, offLabel, missing, text, state, stop = [], site = 'the site', timeoutMs = 10_000 }) {
+export async function ensureOff(page, { what, onLabel, offLabel, missing, unavailableLabel, text, state, stop = [], site = 'the site', timeoutMs = 10_000 }) {
   const until = Date.now() + timeoutMs;
   for (;;) {
     if (await visible(button(page, offLabel))) return 'off';
@@ -157,7 +157,8 @@ export async function ensureOff(page, { what, onLabel, offLabel, missing, text, 
     if (stop.includes(st)) return st;
     const on = button(page, onLabel);
     const live = await visible(on);
-    if (!live && missing && missing.test(await text(page).catch(() => ''))) return 'no device';
+    if (!live && ((unavailableLabel && await visible(button(page, unavailableLabel)))
+      || (missing && missing.test(await text(page).catch(() => ''))))) return 'no device';
     if (live && !(await disabled(on))) await on.first().click({ timeout: 3000 }).catch(() => {});
     if (Date.now() > until) throw new Error(`could not make sure the ${what} is off before joining (${site} changed?); not joining`);
     await page.waitForTimeout(300);

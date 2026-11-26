@@ -21,6 +21,12 @@
   still count toward readiness. Use the new object form with `"required": false` to make an exit optional.
   Set `BOSUN_HEALTH_CHECK_ENGINES=1` to include browser launch checks in shared-mode readiness.
 
+### Meeting fixes
+
+- Join Google Meet calls that admit the signed-in profile on page load. Close the share-link dialog and verify
+  the mic and camera are off before announcing or recording.
+- Meet dry runs report direct admission and display the lobby button label when Meet offers Join now or Ask to join.
+
 ### Breaking/default changes
 
 - The default guest display name is now `Notetaker`. The built-in English and German recording notices use

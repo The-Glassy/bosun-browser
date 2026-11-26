@@ -306,7 +306,7 @@ export class Meetings {
 
   // dry_run: loads the meeting page exactly as a join would (same profile, engine, devices and language) and reports
   // what Bosun sees there (platform.inspect): the lobby kind, the button it would click, microphone and camera,
-  // whether a challenge is shown. Nothing is joined: the session is closed again right after.
+  // and whether a challenge is shown. Meet can admit the profile on load. The session is closed right after.
   async inspect(tenant, { url, profile, engine }) {
     const checked = await this.check(tenant, { url, profile, engine });
     const { platform, eng } = checked;
@@ -337,7 +337,10 @@ export class Meetings {
         const u = new URL(s.page.url());
         return { ...seen, page: `${u.origin}${u.pathname}`, title: await s.page.title().catch(() => '') };
       });
-      return { dry_run: true, platform: platform.name, ...(profile ? { profile } : {}), engine: eng, ...r, note: 'nothing was joined or clicked except the page\'s own tips and device questions' };
+      const note = platform.name === 'meet' && r.state === 'admitted'
+        ? 'Meet admitted the profile on load. Bosun verified microphone and camera were off and closed the session.'
+        : 'nothing was joined or clicked except the page\'s own tips and device questions';
+      return { dry_run: true, platform: platform.name, ...(profile ? { profile } : {}), engine: eng, ...r, note };
     })();
     // The slot stays tracked until its cleanup is done, so shutdown can wait for it.
     slot.task = task.finally(async () => {
