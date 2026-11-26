@@ -20,6 +20,7 @@ test('defaults without env or settings; env fallbacks; the tenant\'s settings ov
     from: { backend: 'default', elevenlabs_model: 'default', elevenlabs_voice: 'default', supertonic_voice: 'default', vad_silence_s: 'default', ...Object.fromEntries(Object.keys(DEFAULTS).map((k) => [k, 'default'])) },
   });
   assert.deepEqual(DEFAULTS, {
+    bot_name: 'Notetaker', announce: 'chat', announce_text: null, owner_name: null, optout_detection: true,
     alone_leave_sec: 30, first_joiner_wait_sec: 120,
     meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
     ack_on_final: false, ack_phrases: ['Mhm.', 'One sec.', 'Okay.', 'Right.'], ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,

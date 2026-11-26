@@ -10,6 +10,8 @@ export const DEFAULT_MEETING_BOT_NAME = 'Notetaker';
 export const ANNOUNCE_MODES = ['chat', 'host', 'none'];
 export const DEFAULT_MEETING_ANNOUNCE = 'chat';
 export const DEFAULT_MEETING_OPTOUT = 'on';
+export const LEAVE_TIMER_MIN_SEC = 5;
+export const LEAVE_TIMER_MAX_SEC = 3600;
 
 function int(env, name, def, min, max) {
   const raw = env[name];
@@ -40,6 +42,7 @@ function timeZone(value, key) {
 }
 
 export function loadConfig(env = process.env) {
+  const meetingBotName = env.MEETING_BOT_NAME?.trim();
   const meetingAnnounce = env.MEETING_ANNOUNCE?.trim();
   const meetingOptOut = env.MEETING_OPTOUT?.trim();
   const cfg = {
@@ -65,13 +68,16 @@ export function loadConfig(env = process.env) {
     tz: env.TZ || 'Europe/Vienna', // keepalive quiet hours and transcript quotas
     browserTimezone: env.BROWSER_TIMEZONE ? timeZone(env.BROWSER_TIMEZONE, 'BROWSER_TIMEZONE') : null,
     browserLocale: env.BROWSER_LOCALE || 'de-AT',
-    meetingBotName: env.MEETING_BOT_NAME?.trim() || DEFAULT_MEETING_BOT_NAME,
+    meetingBotName: meetingBotName || DEFAULT_MEETING_BOT_NAME,
+    meetingBotNameSource: meetingBotName ? 'installation' : 'default',
     meetingAnnounce: meetingAnnounce ?? DEFAULT_MEETING_ANNOUNCE,
-    meetingAnnounceSource: meetingAnnounce === undefined ? 'default' : 'config',
+    meetingAnnounceSource: meetingAnnounce === undefined ? 'default' : 'installation',
     meetingAnnounceText: env.MEETING_ANNOUNCE_TEXT?.trim() || null,
     meetingOptOut: meetingOptOut ?? DEFAULT_MEETING_OPTOUT,
-    meetingOptOutSource: meetingOptOut === undefined ? 'default' : 'config',
+    meetingOptOutSource: meetingOptOut === undefined ? 'default' : 'installation',
     meetingOwner: (env.MEETING_OWNER || '').trim().slice(0, 60) || null,
+    meetingAloneLeaveSec: int(env, 'MEETING_ALONE_LEAVE_SEC', null, LEAVE_TIMER_MIN_SEC, LEAVE_TIMER_MAX_SEC),
+    meetingFirstJoinerWaitSec: int(env, 'MEETING_FIRST_JOINER_WAIT_SEC', null, LEAVE_TIMER_MIN_SEC, LEAVE_TIMER_MAX_SEC),
     recordingRetentionDays: int(env, 'RECORDING_RETENTION_DAYS', 30, 1, 3650), // meeting recordings are deleted after this
     meetingVideoLimit: int(env, 'MEETING_VIDEO_LIMIT', 1, 0, 1000),
     meetingVideoMinFreeGb: int(env, 'MEETING_VIDEO_MIN_FREE_GB', 2, 0, 100000),

@@ -164,10 +164,19 @@ test('locale, time zones and meeting defaults support optional overrides', () =>
   assert.throws(() => loadConfig({ BOSUN_METRICS_TOKEN: 'too-short' }), /BOSUN_METRICS_TOKEN/);
 });
 
+test('installation meeting timers accept only whole seconds in range', () => {
+  for (const [name, key] of [['MEETING_ALONE_LEAVE_SEC', 'meetingAloneLeaveSec'], ['MEETING_FIRST_JOINER_WAIT_SEC', 'meetingFirstJoinerWaitSec']]) {
+    assert.equal(loadConfig({})[key], null);
+    assert.equal(loadConfig({ [name]: '5' })[key], 5);
+    assert.equal(loadConfig({ [name]: '3600' })[key], 3600);
+    for (const bad of ['4', '3601', '5.5']) assert.throws(() => loadConfig({ [name]: bad }), new RegExp(name));
+  }
+});
+
 test('MEETING_ANNOUNCE accepts chat, host and none and rejects invalid values at startup', async () => {
   for (const mode of ['chat', 'host', 'none']) {
     const cfg = loadConfig({ MEETING_ANNOUNCE: mode });
-    assert.deepEqual([cfg.meetingAnnounce, cfg.meetingAnnounceSource], [mode, 'config']);
+    assert.deepEqual([cfg.meetingAnnounce, cfg.meetingAnnounceSource], [mode, 'installation']);
   }
   for (const bad of ['', ' ', 'NONE', 'everyone']) {
     assert.throws(() => loadConfig({ MEETING_ANNOUNCE: bad }), /MEETING_ANNOUNCE must be one of chat, host, none/);
@@ -182,7 +191,7 @@ test('MEETING_OPTOUT defaults to on, accepts on and off, and rejects invalid val
   assert.deepEqual([defaults.meetingOptOut, defaults.meetingOptOutSource], ['on', 'default']);
   for (const mode of ['on', 'off']) {
     const cfg = loadConfig({ MEETING_OPTOUT: mode });
-    assert.deepEqual([cfg.meetingOptOut, cfg.meetingOptOutSource], [mode, 'config']);
+    assert.deepEqual([cfg.meetingOptOut, cfg.meetingOptOutSource], [mode, 'installation']);
   }
   for (const bad of ['', ' ', 'OFF', '0', 'false']) {
     assert.throws(() => loadConfig({ MEETING_OPTOUT: bad }), /MEETING_OPTOUT must be on or off/);

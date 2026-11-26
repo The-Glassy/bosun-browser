@@ -375,7 +375,7 @@ test('Zoom MEETING_ANNOUNCE=host announces to the host only, allows a per-call o
     await until(async () => (await status(c, hid)).state === 'recording', 20_000);
     assert.deepEqual(fake.room(h.id).chat.map((m) => m.to), ['Host and co-hosts', 'Host and co-hosts']);
     const hostStatus = await status(c, hid);
-    assert.deepEqual(hostStatus.announce, { mode: 'host', source: 'config', sent_to: 'host' });
+    assert.deepEqual(hostStatus.announce, { mode: 'host', source: 'installation', sent_to: 'host' });
     fake.say(h.id, 'Guest Two', "please don't record");
     await until(() => ev.ended.length === 1, 15_000);
     assert.equal(ev.ended[0].reason, 'opted-out');

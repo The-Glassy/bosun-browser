@@ -3,7 +3,7 @@
 // (transcript.mjs, ElevenLabs realtime), under the same consent as the recording: it starts and stops with it. The agent
 // can speak into the call (speech.mjs: text to speech, or an uploaded file, played into the browser's microphone),
 // unmute and mute, and raise a hand; when to do any of that is the agent's call, never Bosun's. Consent: the chat is told before recording starts (announce: everyone, else the host where the host allows
-// chat with the host only; or the host only or nobody, as configured for the instance or the call), every chat message reaches the agent
+// chat with the host only; or the host only or nobody, as configured for the installation, tenant or call), every chat message reaches the agent
 // as an event. With opt-out detection on, a clear request not to be recorded (any of five languages, see optout.mjs)
 // stops the recording and deletes it at once, whatever the announcement mode.
 //
@@ -16,7 +16,6 @@ import crypto from 'crypto';
 import { httpUrl } from '../sessions.mjs';
 import { readProfileMeta } from '../engines.mjs';
 import { TENANT_RE } from '../auth.mjs';
-import { ANNOUNCE_MODES, DEFAULT_MEETING_ANNOUNCE, DEFAULT_MEETING_BOT_NAME, DEFAULT_MEETING_OPTOUT } from '../config.mjs';
 import { matchOptOut, normalize } from './optout.mjs';
 import { cleanChatText, cleanSender } from './platforms/common.mjs';
 import { meet } from './platforms/meet.mjs';
@@ -24,7 +23,7 @@ import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
 import { LiveTranscript, TranscriptUsage, nodeDebugOn, NODE_DEBUG_REFUSED } from './transcript.mjs';
 import { synthesizeWav, splitSpeech, takeSentences, probeSeconds, audioFormat } from './speech.mjs';
-import { SpeechSettings, SETTINGS, PER_CALL, REMOVED, removedSetting, DEFAULTS } from './settings.mjs';
+import { SpeechSettings, SETTINGS, PER_CALL, REMOVED, removedSetting, DEFAULTS, MEETING_DEFAULTS } from './settings.mjs';
 import { CHANNEL_PREFIX } from '../events.mjs';
 import { aliasKeys, isAddressed } from './addressed.mjs';
 import { RecordingLinks } from './recording-links.mjs';
@@ -110,7 +109,7 @@ export function transition(m, to) {
 }
 
 const botName = (name) => String(name).replace(/\s*\(.*\)\s*$/, '').trim() || 'Bosun';
-// The built-in notice is in English and German. Only MEETING_OWNER supplies a name.
+// The built-in notice is in English and German and can include the configured owner.
 export function announcement(owner, { live = false, video = false, optOutDetection = true } = {}) {
   const notetakerEn = owner ? `${owner}'s AI notetaker` : 'An AI notetaker';
   const notetakerDe = owner ? `Der KI-Notizassistent von ${owner}` : 'Ein KI-Notizassistent';
@@ -354,14 +353,9 @@ export class Meetings {
 
   // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
   // meeting could not be joined (denied, not a meeting page, no audio, ...).
-  async join(tenant, { url, name = this.cfg.meetingBotName ?? DEFAULT_MEETING_BOT_NAME, announceText, announce, maxWaitAdmitMin = 10, profile, engine, optOutDetection, leaveOnOptOut = true, aloneLeaveSec, firstJoinerWaitSec,
+  async join(tenant, { url, name, announceText, announce, ownerName, maxWaitAdmitMin = 10, profile, engine, optOutDetection, leaveOnOptOut = true, aloneLeaveSec, firstJoinerWaitSec,
     liveTranscript = false, transcriptPartials = true, vadSilenceS, recordVideo = false, videoFps = 2, settings: perCall = {} }) {
     validateVideo(recordVideo, videoFps);
-    const announceMode = announce === undefined ? this.cfg.meetingAnnounce ?? DEFAULT_MEETING_ANNOUNCE : announce;
-    const announceSource = announce === undefined ? this.cfg.meetingAnnounceSource ?? 'default' : 'call';
-    if (!ANNOUNCE_MODES.includes(announceMode)) throw new Error(`announce must be one of ${ANNOUNCE_MODES.join(', ')}`);
-    const optOutMode = optOutDetection === undefined ? this.cfg.meetingOptOut ?? DEFAULT_MEETING_OPTOUT : optOutDetection ? 'on' : 'off';
-    const optOutSource = optOutDetection === undefined ? this.cfg.meetingOptOutSource ?? 'default' : 'call';
     // Speech settings for this meeting only (PER_CALL), over the tenant's.
     const overrides = {};
     for (const [k, v] of Object.entries(perCall || {})) {
@@ -373,13 +367,29 @@ export class Meetings {
       overrides[k] = v;
     }
     if (vadSilenceS !== undefined && SETTINGS.vad_silence_s(vadSilenceS)) throw new Error(SETTINGS.vad_silence_s(vadSilenceS));
-    const defaults = this.settings.effective(tenant).values;
-    if (aloneLeaveSec != null && SETTINGS.alone_leave_sec(aloneLeaveSec)) throw new Error(SETTINGS.alone_leave_sec(aloneLeaveSec));
-    if (firstJoinerWaitSec != null && SETTINGS.first_joiner_wait_sec(firstJoinerWaitSec)) throw new Error(SETTINGS.first_joiner_wait_sec(firstJoinerWaitSec));
-    vadSilenceS ??= defaults.vad_silence_s;
-    aloneLeaveSec ??= defaults.alone_leave_sec;
-    firstJoinerWaitSec ??= defaults.first_joiner_wait_sec;
-    announceText ||= this.cfg.meetingAnnounceText;
+    const defaults = this.settings.effective(tenant);
+    const call = {
+      bot_name: name || undefined, announce, announce_text: announceText, owner_name: ownerName,
+      optout_detection: optOutDetection, alone_leave_sec: aloneLeaveSec, first_joiner_wait_sec: firstJoinerWaitSec,
+    };
+    const meetingSettings = {};
+    for (const key of Object.keys(MEETING_DEFAULTS)) {
+      const value = call[key];
+      if (value != null) {
+        const error = SETTINGS[key](value);
+        if (error) throw new Error(error);
+        meetingSettings[key] = { value, source: 'call' };
+      } else {
+        meetingSettings[key] = { value: defaults.values[key], source: defaults.from[key] };
+      }
+    }
+    const announceMode = meetingSettings.announce.value;
+    const optOutMode = meetingSettings.optout_detection.value ? 'on' : 'off';
+    const notice = meetingSettings.announce_text.value;
+    meetingSettings.announce_text.value = notice ? [notice] : announcement(
+      meetingSettings.owner_name.value, { live: liveTranscript, video: recordVideo, optOutDetection: optOutMode === 'on' },
+    );
+    vadSilenceS ??= defaults.values.vad_silence_s;
     if (liveTranscript) {
       if (!this.cfg.elevenlabs) throw new Error('live_transcript needs ElevenLabs (ELEVENLABS_API_KEY is not set on this Bosun); join without it');
       if (nodeDebugOn()) throw new Error(`live_transcript is refused: ${NODE_DEBUG_REFUSED}`);
@@ -396,12 +406,12 @@ export class Meetings {
     this.capacity(tenant);
     const id = `m${crypto.randomBytes(6).toString('hex')}`;
     const m = {
-      id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, optOutMode, optOutSource, leaveOnOptOut,
+      id, tenant, url, name: meetingSettings.bot_name.value, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, optOutMode, leaveOnOptOut,
       recordVideo, videoFps, videoReserved: recordVideo,
-      aloneLeaveSec, firstJoinerWaitSec, othersSeen: false,
-      announce: announceText ? [announceText] : announcement(this.cfg.meetingOwner, { live: liveTranscript, video: recordVideo, optOutDetection: optOutMode === 'on' }),
+      aloneLeaveSec: meetingSettings.alone_leave_sec.value, firstJoinerWaitSec: meetingSettings.first_joiner_wait_sec.value, othersSeen: false,
+      meetingSettings, announce: meetingSettings.announce_text.value,
       live: liveTranscript, partials: transcriptPartials, vadSilenceS, transcript: null, speech: null, speechSeq: 0,
-      announceMode, announceSource, announced: { sent_to: null, failures: [] }, chatTo: announceMode === 'host' ? 'host' : 'everyone', chatError: null,
+      announceMode, announced: { sent_to: null, failures: [] }, chatTo: announceMode === 'host' ? 'host' : 'everyone', chatError: null,
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
       createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, stopping: null, recMs: 0, file: null, deleted: false,
       info: {}, noRecord: false, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
@@ -1626,8 +1636,9 @@ export class Meetings {
       recording: m.file ? { path: m.file, bytes, ...(m.state === 'ended' && bytes ? { next: `call recording_get { meeting_id: "${m.id}" }` } : {}) } : m.deleted ? 'deleted' : null,
       ...(m.recError ? { recording_error: m.recError } : {}),
       ...(m.optedOut ? { opted_out: { sender: m.optedOut.sender, at: m.optedOut.at } } : {}),
-      optout: { mode: m.optOutMode, source: m.optOutSource },
-      announce: { mode: m.announceMode, source: m.announceSource, sent_to: m.announced.sent_to, ...(m.announced.failures.length ? { reason: m.announced.failures[0].reason, failures: m.announced.failures } : {}) },
+      meeting_settings: m.meetingSettings,
+      optout: { mode: m.optOutMode, source: m.meetingSettings.optout_detection.source },
+      announce: { mode: m.announceMode, source: m.meetingSettings.announce.source, sent_to: m.announced.sent_to, ...(m.announced.failures.length ? { reason: m.announced.failures[0].reason, failures: m.announced.failures } : {}) },
       ...(m.chatError ? { chat_error: m.chatError } : {}),
       ...(m.live ? { live_transcript: m.transcript ? m.transcript.status() : { state: m.transcriptError ? 'unavailable' : m.state === 'ended' || m.noRecord ? 'off' : 'not-started', ...(m.transcriptError ? { error: m.transcriptError } : {}) } } : {}),
       ...(m.speech ? { speaking: { utterance_id: m.speech.id, ...(m.speech.kind !== 'speak' ? { kind: m.speech.kind } : {}), state: m.speech.state, ...(m.speech.seconds ? { duration_s: m.speech.seconds } : {}) } } : {}),

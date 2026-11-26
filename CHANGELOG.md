@@ -6,17 +6,16 @@
 
 - Set `BOSUN_TENANT_SANDBOX=on` for one Linux bubblewrap worker per distinct tenant, or `auto` to enable
   workers when two or more tokens are configured. The host relay enforces tenant host and exit rules.
-- Set `MEETING_BOT_NAME`, `MEETING_ANNOUNCE_TEXT`, `BROWSER_TIMEZONE` or `BROWSER_LOCALE` to customize
-  deployment defaults. Speech settings accept per-tenant `alone_leave_sec` and `first_joiner_wait_sec`.
-  A join can override them, and status reports the values in effect.
-- Set `MEETING_ANNOUNCE` to `chat` (default), `host`, or `none` for instance-wide control of recording notices.
-  A per-call `announce` takes precedence. `meeting_status.announce` reports the mode and its source. In `none` mode
-  the operator must inform participants about recording.
-- Set `MEETING_OPTOUT` to `on` (default) or `off` for instance-wide control of automatic chat opt-outs.
-  The setting is validated at startup. A per-call `optout_detection` boolean takes precedence, and
-  `meeting_status.optout` reports the mode and its source. With detection off, `bosun:meeting-chat` events
-  continue and the operator or agent must honor objections by stopping and deleting the recording and leaving
-  when appropriate.
+- Set `MEETING_BOT_NAME`, `MEETING_ANNOUNCE`, `MEETING_ANNOUNCE_TEXT`, `MEETING_OWNER`, `MEETING_OPTOUT`,
+  `MEETING_ALONE_LEAVE_SEC` or `MEETING_FIRST_JOINER_WAIT_SEC` for installation defaults. The existing
+  `speech_settings_get/set` tools persist tenant overrides, and `meeting_join` can override each for one call.
+  Set a tenant field to `null` to fall back to the installation or built-in default.
+  `meeting_status.meeting_settings` reports each effective value and source.
+- Notice mode accepts `chat` (default), `host` or `none`. In `none` mode the operator informs participants
+  about recording. Automatic chat opt-out detection defaults to on. With detection off,
+  `bosun:meeting-chat` events continue and the operator or agent must honor objections by stopping
+  and deleting the recording and leaving when appropriate.
+- Set `BROWSER_TIMEZONE` or `BROWSER_LOCALE` to customize browser context defaults.
 - Use `BROWSER_TENANT_EGRESS` to restrict a tenant to a subset of exits. Existing named exit URL strings
   still count toward readiness. Use the new object form with `"required": false` to make an exit optional.
   Set `BOSUN_HEALTH_CHECK_ENGINES=1` to include browser launch checks in shared-mode readiness.

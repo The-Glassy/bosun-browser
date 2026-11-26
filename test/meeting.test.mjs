@@ -133,6 +133,68 @@ test('announce: chat turned off by the host (Meet has no chat to the host alone)
   });
 });
 
+test('meeting defaults resolve from call, tenant, installation, then Bosun', async () => {
+  const installation = {
+    bot_name: 'Installation bot', announce: 'none', announce_text: 'Installation notice',
+    owner_name: 'Installation owner', optout_detection: false, alone_leave_sec: 60, first_joiner_wait_sec: 180,
+  };
+  const tenant = {
+    bot_name: 'Tenant bot', announce: 'chat', announce_text: 'Tenant notice',
+    owner_name: 'Tenant owner', optout_detection: true, alone_leave_sec: 45, first_joiner_wait_sec: 90,
+  };
+  const call = {
+    bot_name: 'Call bot', announce: 'chat', announce_text: '', owner_name: 'Call owner',
+    optout_detection: false, alone_leave_sec: 12, first_joiner_wait_sec: 24,
+  };
+  const defaults = {
+    bot_name: 'Notetaker', announce: 'chat', announce_text: null, owner_name: null,
+    optout_detection: true, alone_leave_sec: 30, first_joiner_wait_sec: 120,
+  };
+  async function check(client, expected, source, args = {}) {
+    const { code, url } = fake.newRoom();
+    fake.open(code);
+    const joined = await client.call('meeting_join', { url, ...args });
+    assert.equal(joined.isError, false, joined.text);
+    const id = joined.json().meeting_id;
+    await until(async () => (await status(client, id)).state === 'recording', 15_000);
+    const notice = expected.announce_text ? [expected.announce_text] : announcement(
+      expected.owner_name, { optOutDetection: expected.optout_detection },
+    );
+    const values = { ...expected, announce_text: notice };
+    assert.deepEqual((await status(client, id)).meeting_settings, Object.fromEntries(
+      Object.entries(values).map(([key, value]) => [key, { value, source }]),
+    ));
+    assert.equal(fake.room(code).guest.name, expected.bot_name);
+    assert.deepEqual(fake.room(code).chat.map(({ text }) => text), expected.announce === 'none' ? [] : notice);
+    await client.call('meeting_leave', { meeting_id: id });
+  }
+  await withService(async (svc) => {
+    const alice = await connect(svc);
+    const bob = await connect(svc, TOKEN_B);
+    try {
+      const saved = await alice.call('speech_settings_set', tenant);
+      assert.equal(saved.isError, false, saved.text);
+      assert.deepEqual(saved.json().settings, tenant);
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(svc.dataDir, 'speech-settings', 'alice.json'), 'utf8')), tenant);
+      await check(alice, tenant, 'tenant');
+      const { bot_name, ...args } = call;
+      await check(alice, call, 'call', { ...args, name: bot_name });
+      await check(bob, installation, 'installation');
+      const reset = await alice.call('speech_settings_set', Object.fromEntries(Object.keys(tenant).map((key) => [key, null])));
+      assert.deepEqual(reset.json().settings, {});
+      await check(alice, installation, 'installation');
+    } finally { await Promise.all([alice.close(), bob.close()]); }
+  }, { env: {
+    MEETING_BOT_NAME: installation.bot_name, MEETING_ANNOUNCE: installation.announce,
+    MEETING_ANNOUNCE_TEXT: installation.announce_text, MEETING_OWNER: installation.owner_name,
+    MEETING_OPTOUT: 'off', MEETING_ALONE_LEAVE_SEC: '60', MEETING_FIRST_JOINER_WAIT_SEC: '180',
+  } });
+  await withService(async (svc) => {
+    const client = await connect(svc);
+    try { await check(client, defaults, 'default'); } finally { await client.close(); }
+  });
+});
+
 test('MEETING_ANNOUNCE=none suppresses the configured notice, preserves opt-out and can be overridden per call', async () => {
   await withService(async (svc, ev) => {
     const c = await connect(svc);
@@ -140,7 +202,7 @@ test('MEETING_ANNOUNCE=none suppresses the configured notice, preserves opt-out 
     fake.open(n.code);
     const nid = (await c.call('meeting_join', { url: n.url })).json().meeting_id;
     await until(async () => (await status(c, nid)).state === 'recording', 15_000);
-    assert.deepEqual((await status(c, nid)).announce, { mode: 'none', source: 'config', sent_to: 'none' });
+    assert.deepEqual((await status(c, nid)).announce, { mode: 'none', source: 'installation', sent_to: 'none' });
     assert.equal(fake.room(n.code).chat.length, 0);
     const file = (await status(c, nid)).recording.path;
     fake.say(n.code, 'Alex Example', "please don't record");
@@ -160,7 +222,7 @@ test('MEETING_ANNOUNCE=none suppresses the configured notice, preserves opt-out 
   }, { env: { MEETING_ANNOUNCE: 'none', MEETING_ANNOUNCE_TEXT: 'This call is recorded.' } });
 });
 
-for (const [config, args, source] of [['off', {}, 'config'], ['on', { optout_detection: false }, 'call']]) {
+for (const [config, args, source] of [['off', {}, 'installation'], ['on', { optout_detection: false }, 'call']]) {
   test(`opt-out detection off from ${source} delivers chat and leaves recording under manual control`, async () => {
     await withService(async (svc, ev, audio) => {
       const c = await connect(svc);

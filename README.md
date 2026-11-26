@@ -159,6 +159,8 @@ for host requirements, egress, and the `bosun migrate-data` command.
 | `MEETING_ANNOUNCE_TEXT` | – | custom chat notice for meeting recording. Unset uses the built-in English and German notice |
 | `MEETING_OPTOUT` | `on` | automatic handling of recording objections in chat. Use `on` or `off`. When off, the operator or agent must honor objections |
 | `MEETING_OWNER` | – | name included in the built-in notice as the notetaker's owner |
+| `MEETING_ALONE_LEAVE_SEC` | `30` | seconds alone after everyone else has left (5–3600) |
+| `MEETING_FIRST_JOINER_WAIT_SEC` | `120` | seconds alone waiting for the first participant (5–3600) |
 | `ELEVENLABS_API_KEY` | – | ElevenLabs key: the live meeting transcript (`meeting_join` `live_transcript`) and the `elevenlabs` voice of `meeting_speak`; unset: both refused. Kept in the service only (removed from its environment at start) |
 | `ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io` | another ElevenLabs API host (`https://*.elevenlabs.io`, e.g. `https://api.eu.residency.elevenlabs.io`); nothing else gets the key (http on loopback is accepted, for tests) |
 | `ELEVENLABS_VOICE` | `EXAVITQu4vr4xnSDxMaL` ("Sarah") | fallback ElevenLabs voice id for `meeting_speak` with `backend: "elevenlabs"` (a tenant's speech setting wins) |
@@ -910,7 +912,7 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
    - Microphone and camera must be **verifiably off** before joining. Bosun switches a device off and checks it,
      unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden") and no control shows
      it on; then it already counts as off. If neither can be confirmed, Bosun does not join.
-   - A guest types its name (default `Notetaker`, configurable with `MEETING_BOT_NAME`). A signed-in Meet profile has no name field and joins
+   - A guest uses the resolved display name (built-in default `Notetaker`). A signed-in Meet profile has no name field and joins
      under the account's name, so `name` is ignored. Zoom fills in a signed-in account's name, and Bosun keeps it; an
      empty field (Zoom's web client shows one to signed-in accounts too) gets `name`.
    - **Zoom:** "Do you want people to see you in the meeting?" and then "Do you want people to hear you in the
@@ -947,12 +949,12 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
      reCAPTCHA" on every join; that alone is not a captcha, for meetings or for `navigate`. Being removed from Zoom's
      waiting room counts as `denied`; Meet's "No one responded to your request" too.
    - **`dry_run: true`** loads the lobby exactly as a join would (profile, engine, devices) and reports what Bosun
-     sees there, without joining: lobby kind, the button it would click, microphone and camera, a shown challenge,
-     and for Zoom whether the profile is signed in. Use it to check a link or a profile before a meeting.
+     sees there: lobby kind, the button it would click, microphone and camera, a shown challenge, and for Zoom
+     whether the profile is signed in. If Meet admits the profile on load, Bosun verifies the mic and camera are
+     off and closes the session. Use it to check a link or a profile before a meeting.
      [docs/MEETING-BOT-REFERENCES.md](docs/MEETING-BOT-REFERENCES.md) compares the flows with other open-source bots.
 4. Once admitted (Zoom: computer audio joined first, since without it nothing is heard, then microphone and
-   camera checked off again), Bosun opens the chat and handles the announcement before recording. A per-call
-   `announce` overrides the instance setting `MEETING_ANNOUNCE`. The accepted modes are the same for both.
+   camera checked off again), Bosun opens the chat and handles the announcement before recording.
    - **`"chat"` (default): everyone.** On Zoom the chat is set to Everyone (or "Meeting Group Chat", a meeting with
      continuous meeting chat), and the announcement has to show up in the chat, not marked as private. If the chat
      can't reach everyone (Zoom allows chat with the host only, Meet's chat is turned off, the message doesn't show
@@ -964,7 +966,7 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
      Use a per-call `announce: "none"` only with the meeting owner's approval.
 
    The chat is watched in every announcement mode. `meeting_status.announce` shows the effective `mode`, its
-   `source` (`call`, `config`, or `default`), and `sent_to`
+   `source` (`call`, `tenant`, `installation`, or `default`), and `sent_to`
    (`everyone`, `host`, `none`, or `failed` after the announcement step). `announce.reason` says why
    the announcement didn't reach everyone: `chat-restricted` (the chat can't be addressed to everyone),
    `chat-unavailable` (no chat), `sent-privately`, `not-sent` (still in the box), `not-confirmed` (it never showed
@@ -972,22 +974,41 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
    confirmation) follow the announcement's destination and default to everyone in `none` mode. The built-in
    English and German notice calls the bot an AI notetaker and describes the enabled capture. It invites objections
    in chat with opt-out detection on and directs objections to the meeting organizer with detection off. It names
-   the owner only when `MEETING_OWNER` is set. Set `MEETING_ANNOUNCE_TEXT` for a deployment-wide custom notice or pass
-   `announce_text` for one meeting. Include any enabled video recording and live transcription in the custom wording
-   and explain how participants can object.
+   the resolved owner when a name is configured. Include any enabled video recording and live transcription in
+   custom wording and explain how participants can object.
 5. While in the call:
    - Every chat message from someone else is pushed to the agent as `bosun:meeting-chat`, with `meeting_id`,
      `sender` and `text`. `meeting_chat_read` returns them too.
    - Bosun leaves when the meeting ends, when it is removed, or when it has been alone long enough.
      `first_joiner_wait_sec` defaults to **120 s** alone if nobody else has joined.
-     `alone_leave_sec` defaults to **30 s** once everyone else has left. Set either with
-     `speech_settings_set` or override it for one `meeting_join` (whole seconds, 5–3600).
-     `meeting_status` reports the effective values for that meeting.
+     `alone_leave_sec` defaults to **30 s** once everyone else has left. Both timers take whole seconds from 5 to 3600.
    - The agent can leave with `meeting_leave`.
    - On leaving, `bosun:meeting-ended` carries `meeting_id`, `reason`, `duration_s`, `bytes` and the `recording`:
      path (inside the browser container), size and the hint `call recording_get { meeting_id }`. There is no `file://`
      link: an agent host refuses it, and nothing outside the container can open it. `meeting_status` (ended) has the
      same `path` and hint.
+
+### Meeting defaults
+
+Each `meeting_join` argument overrides the tenant's saved value, which overrides the installation environment,
+which overrides Bosun's built-in default. Use `speech_settings_get` to read and `speech_settings_set` to update the
+tenant's defaults. They use the existing `BROWSER_DATA/speech-settings/<tenant>.json` store and persist across
+restarts. Pass `null` to the setter to return a field to the installation or built-in default.
+
+| Setting | Installation environment | Tenant setting | `meeting_join` argument |
+| --- | --- | --- | --- |
+| Guest display name | `MEETING_BOT_NAME` | `bot_name` | `name` |
+| Notice mode | `MEETING_ANNOUNCE` | `announce` | `announce` |
+| Notice wording | `MEETING_ANNOUNCE_TEXT` | `announce_text` | `announce_text` |
+| Owner in the built-in notice | `MEETING_OWNER` | `owner_name` | `owner_name` |
+| Automatic chat opt-outs | `MEETING_OPTOUT` (`on` / `off`) | `optout_detection` (boolean) | `optout_detection` (boolean) |
+| Wait alone after others leave | `MEETING_ALONE_LEAVE_SEC` | `alone_leave_sec` | `alone_leave_sec` |
+| Wait alone for the first participant | `MEETING_FIRST_JOINER_WAIT_SEC` | `first_joiner_wait_sec` | `first_joiner_wait_sec` |
+
+An empty tenant or call `announce_text` selects the built-in notice. An empty `owner_name` omits the owner from
+that notice. `meeting_status.meeting_settings` reports the values fixed at join time, each with `value` and `source`
+(`call`, `tenant`, `installation`, or `default`). The guest name applies when joining as a guest. The resolved
+notice is an array of chat messages, and `announce.sent_to` reports actual delivery.
 
 **Signed-in profile.** Google turns away anonymous automated guests far more often than signed-in users, and Zoom
 may turn anonymous browser guests away (it admitted them in our tests, but a profile is the dependable way in).
@@ -1013,7 +1034,7 @@ Events use the MCPL feature set **`bosun.meeting`** (tags `bosun:meeting-chat`, 
 operator responsible for informing participants. `MEETING_OPTOUT` controls automatic chat opt-outs independently
 of the announcement mode. It accepts `on` (default) or `off` and is validated at startup.
 Pass `optout_detection: true` or `false` to `meeting_join` to override it for one meeting.
-`meeting_status.optout` shows the effective `mode` (`on` or `off`) and `source` (`call`, `config`, or `default`).
+`meeting_status.optout` shows the effective `mode` (`on` or `off`) and `source` (`call`, `tenant`, `installation`, or `default`).
 
 - **With detection on**, a plain-language request in English, German, Ukrainian, Russian or Slovak is enough
   (`please don't record`, `stop recording`, `bitte nicht aufnehmen`, `не записуй`, `не записывай`, `nenahrávaj`, …).
@@ -1206,7 +1227,7 @@ A process crash before finalization can leave audio without a sidecar.
   (`audio_file_id` from `upload_create`, any format ffmpeg reads).
 - **Speech settings** (`speech_settings_get`, `speech_settings_set`; per tenant, kept in
   `BROWSER_DATA/speech-settings/<tenant>.json`): `backend`, `elevenlabs_model`, `elevenlabs_voice`,
-  `supertonic_voice`, `vad_silence_s`, `alone_leave_sec` and `first_joiner_wait_sec`. Pass `null` to reset a setting. What a call leaves out comes
+  `supertonic_voice` and `vad_silence_s`, alongside the [meeting defaults](#meeting-defaults). Pass `null` to reset a setting. What a call leaves out comes
   from the tenant's setting, then the env fallback, then Bosun's default; `speech_settings_get` shows the effective
   values and where each comes from (`tenant`, `env`, `default`). `backend` `elevenlabs` without `ELEVENLABS_API_KEY`
   falls back to `supertonic` (with a `warning`). A read-only (ephemeral) token may read them, not set them.

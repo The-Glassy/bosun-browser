@@ -1,4 +1,4 @@
-// Speech settings per tenant (speech_settings_get / speech_settings_set): the backend meeting_speak uses, the ElevenLabs
+// Speech and meeting settings per tenant (speech_settings_get / speech_settings_set): the backend meeting_speak uses, the ElevenLabs
 // model and voice, the Supertonic voice, and the pause that ends a live transcript segment; how a meeting talks with
 // the agent over its MCPL channel (meeting_channel, transcript_events, agent_partials, channel_prepare_chunks); the
 // acknowledgement played when someone finishes (ack_*); how long a final is held for more of the same turn (turn_hold_*)
@@ -11,6 +11,10 @@
 // Stored under <BROWSER_DATA>/speech-settings/<tenant>.json (written atomically, 0600).
 import fs from 'fs';
 import path from 'path';
+import { ANNOUNCE_MODES, DEFAULT_MEETING_ANNOUNCE, DEFAULT_MEETING_BOT_NAME, DEFAULT_MEETING_OPTOUT,
+  LEAVE_TIMER_MIN_SEC, LEAVE_TIMER_MAX_SEC } from '../config.mjs';
+
+export { LEAVE_TIMER_MIN_SEC, LEAVE_TIMER_MAX_SEC };
 import { BACKENDS, SUPERTONIC_VOICES, EL_DEFAULT_TTS_MODEL, EL_DEFAULT_VOICE } from './speech.mjs';
 
 export const EL_MODEL_RE = /^[a-z0-9_]{3,60}$/;
@@ -24,13 +28,19 @@ export const ACK_PHRASES_DEFAULT = ['Mhm.', 'One sec.', 'Okay.', 'Right.'];
 const LANG_RE = /^[a-z]{2,3}(?:-[A-Za-z]{2})?$/;
 const num = (v, min, max) => typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
 
-export const LEAVE_TIMER_MIN_SEC = 5;
-export const LEAVE_TIMER_MAX_SEC = 3600;
+const meetingText = (name, max, allowEmpty = false) => (v) =>
+  typeof v === 'string' && v.length <= max && (allowEmpty || v.trim())
+    ? null : `${name} must be ${allowEmpty ? '' : 'nonempty '}text of at most ${max} characters`;
 const leaveTimer = (name) => (v) => Number.isInteger(v) && num(v, LEAVE_TIMER_MIN_SEC, LEAVE_TIMER_MAX_SEC)
   ? null : `${name} must be a whole number of seconds from ${LEAVE_TIMER_MIN_SEC} to ${LEAVE_TIMER_MAX_SEC}`;
 
 // Each setting: its check (returns an error or null).
 export const SETTINGS = {
+  bot_name: meetingText('bot_name', 60),
+  announce: (v) => ANNOUNCE_MODES.includes(v) ? null : `announce must be one of ${ANNOUNCE_MODES.join(', ')}`,
+  announce_text: meetingText('announce_text', 1000, true),
+  owner_name: meetingText('owner_name', 60, true),
+  optout_detection: (v) => typeof v === 'boolean' ? null : 'optout_detection must be true or false',
   alone_leave_sec: leaveTimer('alone_leave_sec'),
   first_joiner_wait_sec: leaveTimer('first_joiner_wait_sec'),
   backend: (v) => (BACKENDS.includes(v) ? null : `backend must be one of ${BACKENDS.join(', ')}`),
@@ -87,9 +97,19 @@ export const REMOVED = {
   draft_max_new_words: 'removed in Bosun 0.19.0 with meeting_draft; leave it out',
 };
 export const removedSetting = (k) => `${k} was ${REMOVED[k]}`;
-// Bosun's defaults for the settings without an environment fallback.
+export const MEETING_DEFAULTS = {
+  bot_name: DEFAULT_MEETING_BOT_NAME,
+  announce: DEFAULT_MEETING_ANNOUNCE,
+  announce_text: null,
+  owner_name: null,
+  optout_detection: DEFAULT_MEETING_OPTOUT === 'on',
+  alone_leave_sec: 30,
+  first_joiner_wait_sec: 120,
+};
+
+// Bosun's defaults for the speech settings without an environment fallback.
 export const DEFAULTS = {
-  alone_leave_sec: 30, first_joiner_wait_sec: 120,
+  ...MEETING_DEFAULTS,
   meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
   ack_on_final: false, ack_phrases: ACK_PHRASES_DEFAULT, ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
   turn_hold_ms: 900, turn_hold_complete_ms: 300, barge_in: true, barge_in_min_words: 2, barge_in_min_s: 0.6,
@@ -143,12 +163,22 @@ export class SpeechSettings {
   }
 
   // What a call without its own values gets: {backend, elevenlabs_model, elevenlabs_voice, supertonic_voice,
-  // vad_silence_s, and the channel and ack settings}, and where each comes from (tenant, env, default). backend
+  // vad_silence_s, and the meeting, channel and ack settings}. Meeting settings label the environment
+  // 'installation'; existing speech settings still use 'env'. backend
   // elevenlabs without a key: supertonic, with a warning.
   effective(tenant) {
     const s = this.stored(tenant);
     const cfg = this.cfg;
-    const pick = (k, env, def) => (s[k] !== undefined ? [s[k], 'tenant'] : env != null ? [env, 'env'] : [def, 'default']);
+    const pick = (k, env, def, source = 'env') => (s[k] !== undefined ? [s[k], 'tenant'] : env != null ? [env, source] : [def, 'default']);
+    const meeting = {
+      bot_name: cfg.meetingBotNameSource === 'default' ? null : cfg.meetingBotName,
+      announce: cfg.meetingAnnounceSource === 'default' ? null : cfg.meetingAnnounce,
+      announce_text: cfg.meetingAnnounceText,
+      owner_name: cfg.meetingOwner,
+      optout_detection: cfg.meetingOptOut == null || cfg.meetingOptOutSource === 'default' ? null : cfg.meetingOptOut === 'on',
+      alone_leave_sec: cfg.meetingAloneLeaveSec,
+      first_joiner_wait_sec: cfg.meetingFirstJoinerWaitSec,
+    };
     const out = {}, from = {};
     for (const [k, [v, f]] of Object.entries({
       backend: pick('backend', cfg.ttsDefaultBackendEnv ?? null, 'supertonic'),
@@ -156,7 +186,7 @@ export class SpeechSettings {
       elevenlabs_voice: pick('elevenlabs_voice', cfg.elevenlabs?.voice ?? null, EL_DEFAULT_VOICE),
       supertonic_voice: pick('supertonic_voice', cfg.ttsVoice ?? null, null),
       vad_silence_s: pick('vad_silence_s', cfg.vadSilenceEnv ?? null, VAD_DEFAULT_S),
-      ...Object.fromEntries(Object.entries(this.defaults).map(([k, def]) => [k, pick(k, null, def)])),
+      ...Object.fromEntries(Object.entries(this.defaults).map(([k, def]) => [k, pick(k, meeting[k], def, 'installation')])),
     })) { out[k] = v; from[k] = f; }
     let warning = null;
     if (out.backend === 'elevenlabs' && !cfg.elevenlabs) {
