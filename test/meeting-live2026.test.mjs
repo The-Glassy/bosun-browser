@@ -116,9 +116,9 @@ test('Zoom, live 2026 preview with a signed-out profile: device question answere
     const j = r.json();
     assert.equal(j.state, 'waiting');
     assert.equal(j.joined_as, 'guest');
-    assert.match(j.warning, /^profile zoom is not signed in to Zoom any more: joined as a guest named "Glassy \(notetaker\)"/);
+    assert.match(j.warning, /^profile zoom is not signed in to Zoom any more: joined as a guest named "Notetaker"/);
     const room = fz.room(id);
-    assert.deepEqual(room.guest, { name: 'Glassy (notetaker)', mic: false, cam: false });
+    assert.deepEqual(room.guest, { name: 'Notetaker', mic: false, cam: false });
     assert.equal(room.media[0].devices, 'declined');
     assert.equal((await status(c, j.meeting_id)).warning, j.warning);
     await c.call('meeting_leave', { meeting_id: j.meeting_id });

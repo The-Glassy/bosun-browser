@@ -37,7 +37,8 @@ For agents: [skills/bosun-browser/SKILL.md](skills/bosun-browser/SKILL.md) is a 
   "43 neue Nachrichten" counter) and push `bosun:watch-changed` when it goes up. See
   [Keeping logins alive](#keeping-logins-alive) and [Watching a value](#watching-a-value).
 - **Meetings (PoC):** joins a Google Meet (as a guest or signed in) or a Zoom meeting (signed in, in Zoom's web
-  client) as a notetaker, announces itself in the chat, records the audio to a file and leaves; a "please don't record" in the chat stops and deletes the recording. The agent fetches the file with
+  client) as a notetaker, can post a recording notice, records the audio to a file and leaves. A "please don't record"
+  in the chat stops and deletes the recording. The agent fetches the file with
   `recording_get` and transcribes it with any tool, or takes part with a live transcript and speech. See [Meetings (PoC)](#meetings-poc).
 - **File uploads** into pages: the agent sends the file with one `curl -T` to a one-time URL on the MCP port
   (streamed to disk, up to 300 MB), then `upload` puts it into a file input, answers the file chooser a button
@@ -153,7 +154,8 @@ for host requirements, egress, and the `bosun migrate-data` command.
 | `RECORDING_RETENTION_DAYS` | 30 | meeting recordings are deleted this many days after they were written |
 | `MEETING_VIDEO_LIMIT` | 1 | concurrent video slots per worker or shared process (including joins waiting for admission); `0` disables video |
 | `MEETING_VIDEO_MIN_FREE_GB` | 2 | minimum free disk in GiB for a video join and again before capture starts (whole number; `0` disables the floor) |
-| `MEETING_BOT_NAME` | `Glassy (notetaker)` | default guest display name. A signed-in account supplies its own name |
+| `MEETING_BOT_NAME` | `Notetaker` | default guest display name. A signed-in account supplies its own name |
+| `MEETING_ANNOUNCE` | `chat` | default recording notice mode. Use `chat`, `host`, or `none`. The operator must inform participants when the notice is disabled |
 | `MEETING_ANNOUNCE_TEXT` | – | custom chat notice for meeting recording. Unset uses the built-in English and German notice |
 | `MEETING_OWNER` | – | name included in the built-in notice as the notetaker's owner |
 | `ELEVENLABS_API_KEY` | – | ElevenLabs key: the live meeting transcript (`meeting_join` `live_transcript`) and the `elevenlabs` voice of `meeting_speak`; unset: both refused. Kept in the service only (removed from its environment at start) |
@@ -827,8 +829,8 @@ arrived on average and up to about 40 minutes after (longer in quiet hours). Sev
 Bosun can attend a **Google Meet** or a **Zoom** meeting, record its audio, optionally capture the meeting page as video, and leave. There are two ways to use it.
 
 **Mode 1, notetaker (record only).** `meeting_join { url }` and nothing else. No ElevenLabs key, no voice, and the
-microphone is never unmuted. Bosun announces itself in the chat, records, and leaves when the meeting ends. Afterwards
-the agent calls **`recording_get { meeting_id }`**, downloads the file with the `curl` line it returns, and transcribes
+microphone is never unmuted. By default Bosun posts a recording notice in the chat. It records and leaves when the
+meeting ends. Afterwards the agent calls **`recording_get { meeting_id }`**, downloads the file with the `curl` line it returns, and transcribes
 it with any tool (whisper, Plaud, ElevenLabs batch, …). This is the mode for a passive notetaker agent.
 
 ```jsonc
@@ -879,7 +881,7 @@ meeting_join({ "url": "https://meet.google.com/abc-defg-hij", "profile": "google
 //  -> { "dry_run": true, "state": "lobby", "lobby": "account", "join_button": "Ask to join without microphone & camera",
 //       "microphone": "on (no device found)", "camera": "no device", "challenge": false, "page": "…/meet/abc-defg-hij", ... }
 meeting_status({ "meeting_id": "m1a2b3c4d5e6" })   // joining | waiting | admitted | recording | ended, participants, recording_seconds,
-                                                   // announce: { mode, sent_to: everyone | host | none | failed, reason, failures }
+                                                   // announce: { mode, source, sent_to, reason?, failures? }
 meeting_chat_read({ "meeting_id": "…", "since": 0 })      meeting_chat_send({ "meeting_id": "…", "text": "…" })
 meeting_stop_recording({ "meeting_id": "…", "delete": true })   meeting_leave({ "meeting_id": "…" })
 meeting_recording_delete({ "meeting_id": "…" })
@@ -906,7 +908,7 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
    - Microphone and camera must be **verifiably off** before joining. Bosun switches a device off and checks it,
      unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden") and no control shows
      it on; then it already counts as off. If neither can be confirmed, Bosun does not join.
-   - A guest types its name (default `Glassy (notetaker)`, configurable with `MEETING_BOT_NAME`). A signed-in Meet profile has no name field and joins
+   - A guest types its name (default `Notetaker`, configurable with `MEETING_BOT_NAME`). A signed-in Meet profile has no name field and joins
      under the account's name, so `name` is ignored. Zoom fills in a signed-in account's name, and Bosun keeps it; an
      empty field (Zoom's web client shows one to signed-in accounts too) gets `name`.
    - **Zoom:** "Do you want people to see you in the meeting?" and then "Do you want people to hear you in the
@@ -944,8 +946,8 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
      and for Zoom whether the profile is signed in. Use it to check a link or a profile before a meeting.
      [docs/MEETING-BOT-REFERENCES.md](docs/MEETING-BOT-REFERENCES.md) compares the flows with other open-source bots.
 4. Once admitted (Zoom: computer audio joined first, since without it nothing is heard, then microphone and
-   camera checked off again), Bosun opens the chat and **posts the announcement first**, then starts recording. Who
-   is told depends on `announce`:
+   camera checked off again), Bosun opens the chat and handles the announcement before recording. A per-call
+   `announce` overrides the instance setting `MEETING_ANNOUNCE`. The accepted modes are the same for both.
    - **`"chat"` (default): everyone.** On Zoom the chat is set to Everyone (or "Meeting Group Chat", a meeting with
      continuous meeting chat), and the announcement has to show up in the chat, not marked as private. If the chat
      can't reach everyone (Zoom allows chat with the host only, Meet's chat is turned off, the message doesn't show
@@ -953,16 +955,20 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
      fails too, Bosun **records anyway**: `meeting_status` shows `announce.sent_to: "failed"`. Anything short of
      everyone sends `bosun:meeting-announce` with `sent_to`, `reason` and every attempt's error.
    - **`"host"`: the host only**, on Zoom.
-   - **`"none"`: nobody.** Recording starts without any message. Use it only when the meeting owner told you so: the
-     caller is then responsible for everyone knowing they are recorded.
+   - **`"none"`: no recording notice.** The operator is responsible for informing participants about recording.
+     Use a per-call `announce: "none"` only with the meeting owner's approval.
 
-   In every mode the chat is watched and an objection stops and deletes the recording. `announce.reason` says why
+   In every mode the chat is watched and an objection stops and deletes the recording. `meeting_status.announce`
+   shows the effective `mode`, its `source` (`call`, `config`, or `default`), and `sent_to`
+   (`everyone`, `host`, `none`, or `failed` after the announcement step). `announce.reason` says why
    the announcement didn't reach everyone: `chat-restricted` (the chat can't be addressed to everyone),
    `chat-unavailable` (no chat), `sent-privately`, `not-sent` (still in the box), `not-confirmed` (it never showed
    up as Bosun's), and for the host `host-unreachable`. Later messages (`meeting_chat_send`, the opt-out
-   confirmation) go where the announcement went. The default English and German notice describes the enabled
-   capture and invites objections in chat. Set `MEETING_OWNER` to name whose notetaker it is. Set
-   `MEETING_ANNOUNCE_TEXT` for a deployment-wide custom notice or pass `announce_text` for one meeting. Make sure custom wording describes any video recording and live transcription enabled for that call.
+   confirmation) follow the announcement's destination and default to everyone in `none` mode. The built-in
+   English and German notice calls the bot an AI notetaker, describes the enabled capture, and invites objections
+   in chat. It names the owner only when `MEETING_OWNER` is set. Set `MEETING_ANNOUNCE_TEXT` for a deployment-wide
+   custom notice or pass `announce_text` for one meeting. Include any enabled video recording and live transcription
+   in the custom wording.
 5. While in the call:
    - Every chat message from someone else is pushed to the agent as `bosun:meeting-chat`, with `meeting_id`,
      `sender` and `text`. `meeting_chat_read` returns them too.
@@ -997,8 +1003,9 @@ Events use the MCPL feature set **`bosun.meeting`** (tags `bosun:meeting-chat`, 
 `bosun:meeting-announce`, `bosun:meeting-ended`, and with 0.15 `bosun:meeting-transcript`,
 `bosun:meeting-transcript-stopped`, `bosun:meeting-speech`); host recipes that list `enabledFeatureSets` need to add it (or `bosun.*`).
 
-**Consent.** Recording starts only after the announcement was tried (or, with `announce: "none"`, without one). No slash commands are needed: a plain-language request
-not to be recorded is enough, in English, German, Ukrainian, Russian or Slovak (`please don't record`, `stop
+**Consent.** Recording starts after the announcement step. The effective `none` mode skips the notice and makes the
+operator responsible for informing participants. A plain-language request in English, German, Ukrainian, Russian
+or Slovak is enough to opt out (`please don't record`, `stop
 recording`, `bitte nicht aufnehmen`, `не записуй`, `не записывай`, `nenahrávaj`, …).
 - **What happens:** Bosun **stops the recording and deletes the file at once**, posts "Recording stopped and
   deleted. / Aufnahme gestoppt und gelöscht." in the chat, sends `bosun:meeting-optout` and leaves. With
@@ -1159,8 +1166,8 @@ A process crash before finalization can leave audio without a sidecar.
     - Two people talking over each other get the one shown longer.
     - The page's highlight lags the voice by a few hundred ms.
   - `meeting_status.speaker_labels` says whether a speaker has been seen at all (`seen` / `none-seen`).
-- **Consent:** it starts and stops **with the recording**: only after the announcement, which then says *"This call
-  is recorded and transcribed live for notes …"* (German too). An opt-out in the chat stops both **at once**, deletes
+- **Consent.** Live transcription starts and stops **with the recording**. When enabled, the built-in notice
+  says in English and German that the audio is also transcribed live. An opt-out in the chat stops both **at once**, deletes
   the recording and forgets the transcript's text, and posts *"Recording and live transcript stopped and deleted."*
   `meeting_stop_recording` stops it too (`delete: true` forgets its text), and so does `meeting_recording_delete`.
 - **Retention at ElevenLabs:** Bosun always asks for zero retention (`enable_logging=false`). ElevenLabs applies it
@@ -1422,14 +1429,14 @@ Russian forms ("Гласі", "Глассі", "Гласси" for "Glassy") don't 
 itself.
 - Speak when `addressed` is true and the turn asks something of the agent.
 - Stay silent otherwise, or put a clarification in the chat.
-- A question to "everyone" or "the notetaker" without the name is not marked, so add such words to `name_aliases`
-  only if the group uses them for the agent. A word that sounds like the name ("glassy eyes") is marked too, so the
-  agent still reads the turn.
+- "The notetaker" matches the default name `Notetaker`. Add other words the group uses for the agent to
+  `name_aliases`. A word that sounds like the name ("glassy eyes" for a bot named "Glassy") is marked too,
+  so the agent still reads the turn.
 
 **Optional page video.** For slides or screen shares in a group call, pass `record_video: true` on that
 `meeting_join` (see [Meeting page video](#meeting-page-video-0250)). The announcement then mentions video as well.
 
-**Announce and privacy.** The announcement goes to the chat before recording starts, as in every call. In a group,
+**Announce and privacy.** The configured announcement runs before recording starts. In a group,
 check `meeting_status.announce.sent_to`: anything but `everyone` means some people may not have seen it. Then say it
 once by voice (`meeting_speak`) or leave. Everyone can still object in the chat ("please don't record"), and the
 agent should take a spoken objection the same way and call `meeting_stop_recording`.

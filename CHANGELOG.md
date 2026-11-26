@@ -9,12 +9,20 @@
 - Set `MEETING_BOT_NAME`, `MEETING_ANNOUNCE_TEXT`, `BROWSER_TIMEZONE` or `BROWSER_LOCALE` to customize
   deployment defaults. Speech settings accept per-tenant `alone_leave_sec` and `first_joiner_wait_sec`.
   A join can override them, and status reports the values in effect.
+- Set `MEETING_ANNOUNCE` to `chat` (default), `host`, or `none` for instance-wide control of recording notices.
+  A per-call `announce` takes precedence. `meeting_status.announce` reports the mode and its source. In `none` mode
+  the operator must inform participants about recording. Chat opt-outs still stop and delete recordings in every mode.
 - Use `BROWSER_TENANT_EGRESS` to restrict a tenant to a subset of exits. Existing named exit URL strings
   still count toward readiness. Use the new object form with `"required": false` to make an exit optional.
   Set `BOSUN_HEALTH_CHECK_ENGINES=1` to include browser launch checks in shared-mode readiness.
 
-### Changed defaults
+### Breaking/default changes
 
+- The default guest display name is now `Notetaker`. The built-in English and German recording notices use
+  generic wording, describe the enabled capture, and include an owner name only if `MEETING_OWNER` is set.
+  To keep the previous name and wording, set `MEETING_BOT_NAME="Glassy (notetaker)"` and set
+  `MEETING_ANNOUNCE_TEXT` to the previous notice you want to send, including wording for any video or live
+  transcription you use.
 - A shared process with multiple distinct tenants logs one startup line recommending the sandbox.
   Set `BOSUN_ALLOW_UNSAFE_SHARED=1` to acknowledge shared mode and silence it.
 - The existing `GET /health` endpoint is now public and drops addresses and diagnostic text so monitoring

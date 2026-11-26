@@ -23,7 +23,7 @@ async function withService(fn) {
   try { return await fn(svc, c, ev); } finally { await c.close(); await svc.stop(); }
 }
 const status = async (c, id) => (await c.call('meeting_status', { meeting_id: id })).json();
-const [EN, DE] = announcement('Glassy (notetaker)', null);
+const [EN, DE] = announcement(null);
 
 // Joins a room with the given options and waits for the announcement to be settled (sent or failed).
 async function join(c, opts) {

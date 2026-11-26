@@ -1,9 +1,9 @@
-// Meetings (PoC): Bosun joins a video meeting as a notetaker (a guest, or with a signed-in profile), says so in the chat, records the
+// Meetings (PoC): Bosun joins a video meeting as a notetaker (a guest, or with a signed-in profile), can announce it in chat, records the
 // meeting's audio to a file and leaves again. With live_transcript the audio is also transcribed as it is spoken
 // (transcript.mjs, ElevenLabs realtime), under the same consent as the recording: it starts and stops with it. The agent
 // can speak into the call (speech.mjs: text to speech, or an uploaded file, played into the browser's microphone),
 // unmute and mute, and raise a hand; when to do any of that is the agent's call, never Bosun's. Consent: the chat is told before recording starts (announce: everyone, else the host where the host allows
-// chat with the host only; or, when the caller says so, the host only or nobody), every chat message reaches the agent
+// chat with the host only; or the host only or nobody, as configured for the instance or the call), every chat message reaches the agent
 // as an event, and a clear request not to be recorded (any of five languages, see optout.mjs) stops the recording and
 // deletes the file at once, whatever the announcement mode.
 //
@@ -16,6 +16,7 @@ import crypto from 'crypto';
 import { httpUrl } from '../sessions.mjs';
 import { readProfileMeta } from '../engines.mjs';
 import { TENANT_RE } from '../auth.mjs';
+import { ANNOUNCE_MODES, DEFAULT_MEETING_ANNOUNCE, DEFAULT_MEETING_BOT_NAME } from '../config.mjs';
 import { matchOptOut, normalize } from './optout.mjs';
 import { cleanChatText, cleanSender } from './platforms/common.mjs';
 import { meet } from './platforms/meet.mjs';
@@ -35,7 +36,6 @@ export const recordingMime = (file) => file.endsWith('.webm') ? 'video/webm' : '
 
 export const ID_RE = /^m[0-9a-f]{12}$/;
 const ORPHAN_QUIET_MS = 60_000; // a file of an earlier run changed this recently may still be growing
-export const ANNOUNCE_MODES = ['chat', 'host', 'none'];
 export const PLATFORMS = [meet, zoom];
 const POLL_MS = 1000;
 const ECHO_MS = 60_000; // after posting, senderless copies of the post are ours however often the panel renders them
@@ -110,24 +110,19 @@ export function transition(m, to) {
 }
 
 const botName = (name) => String(name).replace(/\s*\(.*\)\s*$/, '').trim() || 'Bosun';
-// The default announcement, English then German. owner: whose notetaker it is (MEETING_OWNER), or nobody named. live: the
-// audio is also transcribed live.
-export function announcement(name, owner, { live = false, video = false } = {}) {
-  if (video) return announcement(name, owner, { live }).map((text) => text
-    .replace("I'm recording audio for notes.", "I'm recording audio and video of this meeting page for notes.")
-    .replace("This call is recorded and transcribed live for notes.", "Audio and video of this meeting page are recorded and transcribed live for notes.")
-    .replace("Ich nehme den Ton für Notizen auf.", "Ich nehme Ton und Video dieser Meeting-Seite für Notizen auf.")
-    .replace("Dieser Anruf wird für Notizen aufgezeichnet und live transkribiert.", "Ton und Video dieser Meeting-Seite werden für Notizen aufgezeichnet und live transkribiert."));
-  const n = botName(name);
-  if (live) {
-    return [
-      `Hi, I'm ${n}, ${owner ? `${owner}'s` : 'an'} AI notetaker. This call is recorded and transcribed live for notes. If you'd rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop both and delete the recording.`,
-      `Hallo, ich bin ${n}, ${owner ? `KI-Notizassistent von ${owner}` : 'ein KI-Notizassistent'}. Dieser Anruf wird für Notizen aufgezeichnet und live transkribiert. Wenn ihr nicht aufgenommen werden wollt, schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“), dann stoppe ich beides und lösche die Aufnahme.`,
-    ];
-  }
+// The built-in notice is in English and German. Only MEETING_OWNER supplies a name.
+export function announcement(owner, { live = false, video = false } = {}) {
+  const notetakerEn = owner ? `${owner}'s AI notetaker` : 'An AI notetaker';
+  const notetakerDe = owner ? `Der KI-Notizassistent von ${owner}` : 'Ein KI-Notizassistent';
+  const captureEn = video ? 'audio and video of this meeting page' : 'the audio of this call';
+  const captureDe = video ? 'Ton und Video dieser Meeting-Seite' : 'den Ton dieses Anrufs';
+  const liveEn = live ? ' and transcribing the audio live' : '';
+  const liveDe = live ? ' und transkribiert den Ton live' : '';
+  const optOutEn = live ? 'the recording and live transcription stop, and the recording and transcript are deleted' : 'the recording stops and is deleted';
+  const optOutDe = live ? 'Dann werden Aufnahme und Live-Transkription gestoppt und Aufnahme und Transkript gelöscht.' : 'Dann wird die Aufnahme gestoppt und gelöscht.';
   return [
-    `Hi, I'm ${n}, ${owner ? `${owner}'s` : 'an'} AI notetaker. I'm recording audio for notes. If you'd rather not be recorded, just say so here in chat (e.g. 'please don't record') and I'll stop and delete the recording.`,
-    `Hallo, ich bin ${n}, ${owner ? `KI-Notizassistent von ${owner}` : 'ein KI-Notizassistent'}. Ich nehme den Ton für Notizen auf. Wenn ihr nicht aufgenommen werden wollt, schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“), dann stoppe und lösche ich die Aufnahme.`,
+    `${notetakerEn} is recording ${captureEn} for notes${liveEn}. If you'd rather not be recorded, say so here in chat (e.g. 'please don't record') and ${optOutEn}.`,
+    `${notetakerDe} zeichnet ${captureDe} für Notizen auf${liveDe}. Wenn ihr nicht aufgenommen werden wollt, schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“). ${optOutDe}`,
   ];
 }
 export const CONFIRM_DELETED = 'Recording stopped and deleted. / Aufnahme gestoppt und gelöscht.';
@@ -354,10 +349,12 @@ export class Meetings {
 
   // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
   // meeting could not be joined (denied, not a meeting page, no audio, ...).
-  async join(tenant, { url, name = this.cfg.meetingBotName ?? 'Glassy (notetaker)', announceText, announce = 'chat', maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec, firstJoinerWaitSec,
+  async join(tenant, { url, name = this.cfg.meetingBotName ?? DEFAULT_MEETING_BOT_NAME, announceText, announce, maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec, firstJoinerWaitSec,
     liveTranscript = false, transcriptPartials = true, vadSilenceS, recordVideo = false, videoFps = 2, settings: perCall = {} }) {
     validateVideo(recordVideo, videoFps);
-    if (!ANNOUNCE_MODES.includes(announce)) throw new Error(`announce must be one of ${ANNOUNCE_MODES.join(', ')}`);
+    const announceMode = announce === undefined ? this.cfg.meetingAnnounce ?? DEFAULT_MEETING_ANNOUNCE : announce;
+    const announceSource = announce === undefined ? this.cfg.meetingAnnounceSource ?? 'default' : 'call';
+    if (!ANNOUNCE_MODES.includes(announceMode)) throw new Error(`announce must be one of ${ANNOUNCE_MODES.join(', ')}`);
     // Speech settings for this meeting only (PER_CALL), over the tenant's.
     const overrides = {};
     for (const [k, v] of Object.entries(perCall || {})) {
@@ -395,9 +392,9 @@ export class Meetings {
       id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, leaveOnOptOut,
       recordVideo, videoFps, videoReserved: recordVideo,
       aloneLeaveSec, firstJoinerWaitSec, othersSeen: false,
-      announce: announceText ? [announceText] : announcement(name, this.cfg.meetingOwner, { live: liveTranscript, video: recordVideo }),
+      announce: announceText ? [announceText] : announcement(this.cfg.meetingOwner, { live: liveTranscript, video: recordVideo }),
       live: liveTranscript, partials: transcriptPartials, vadSilenceS, transcript: null, speech: null, speechSeq: 0,
-      announceMode: announce, announced: { sent_to: null, failures: [] }, chatTo: announce === 'host' ? 'host' : 'everyone', chatError: null,
+      announceMode, announceSource, announced: { sent_to: null, failures: [] }, chatTo: announceMode === 'host' ? 'host' : 'everyone', chatError: null,
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
       createdAt: this.now(), admittedAt: null, endedAt: null, rig: null, session: null, rec: null, stopping: null, recMs: 0, file: null, deleted: false,
       info: {}, noRecord: false, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(), participants: null, aloneSince: null, optedOut: null, chatKey: `__b${crypto.randomBytes(8).toString('hex')}`,
@@ -473,7 +470,7 @@ export class Meetings {
     transition(m, 'admitted');
     m.admittedAt = this.now();
     m.joined.resolve();
-    // Consent first: the chat hears about the recording before it starts. The chat is watched in every announce mode.
+    // Handle announcements before recording. The chat is watched in every announce mode.
     await this.page(m, async (p) => {
       if (platform.afterAdmit) await platform.afterAdmit(p); // Zoom: computer audio joined, mic and camera off
       m.participants = await platform.participants(p);
@@ -1622,7 +1619,7 @@ export class Meetings {
       recording: m.file ? { path: m.file, bytes, ...(m.state === 'ended' && bytes ? { next: `call recording_get { meeting_id: "${m.id}" }` } : {}) } : m.deleted ? 'deleted' : null,
       ...(m.recError ? { recording_error: m.recError } : {}),
       ...(m.optedOut ? { opted_out: { sender: m.optedOut.sender, at: m.optedOut.at } } : {}),
-      announce: { mode: m.announceMode, sent_to: m.announced.sent_to, ...(m.announced.failures.length ? { reason: m.announced.failures[0].reason, failures: m.announced.failures } : {}) },
+      announce: { mode: m.announceMode, source: m.announceSource, sent_to: m.announced.sent_to, ...(m.announced.failures.length ? { reason: m.announced.failures[0].reason, failures: m.announced.failures } : {}) },
       ...(m.chatError ? { chat_error: m.chatError } : {}),
       ...(m.live ? { live_transcript: m.transcript ? m.transcript.status() : { state: m.transcriptError ? 'unavailable' : m.state === 'ended' || m.noRecord ? 'off' : 'not-started', ...(m.transcriptError ? { error: m.transcriptError } : {}) } } : {}),
       ...(m.speech ? { speaking: { utterance_id: m.speech.id, ...(m.speech.kind !== 'speak' ? { kind: m.speech.kind } : {}), state: m.speech.state, ...(m.speech.seconds ? { duration_s: m.speech.seconds } : {}) } } : {}),

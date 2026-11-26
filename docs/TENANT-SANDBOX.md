@@ -112,10 +112,13 @@ and point `BROWSER_DATA` at the recovered directory.
 
 ## Pin deployment-specific defaults
 
-Use `MEETING_BOT_NAME` for a guest name, `MEETING_OWNER` for attribution in the built-in English and German
-notice, and `MEETING_ANNOUNCE_TEXT` for custom wording. A join's `name` and `announce_text` can override those
-settings. Set `TZ` for keepalive quiet hours and transcript quotas. Use `BROWSER_LOCALE` and
-`BROWSER_TIMEZONE` for browser contexts. The default time zone for each is `Europe/Vienna`.
+The guest name defaults to `Notetaker` and can be set with `MEETING_BOT_NAME`. The built-in English and German
+notice uses generic wording, with optional attribution from `MEETING_OWNER`. Set `MEETING_ANNOUNCE_TEXT` for
+custom wording. Set `MEETING_ANNOUNCE` to `chat` (default), `host`, or `none`. When the notice is disabled,
+the operator must inform participants about recording. Chat opt-outs apply in every mode. A join's `name`,
+`announce_text`, and `announce` override the instance defaults. Set `TZ` for keepalive quiet hours and
+transcript quotas. Use `BROWSER_LOCALE` and `BROWSER_TIMEZONE` for browser contexts. The default time zone for each
+is `Europe/Vienna`.
 
 ## Run the containment test
 

@@ -147,12 +147,14 @@ test('tenant sandbox is opt-in and shared mode warns only about distinct, unackn
   assert.throws(() => loadConfig({ BOSUN_ALLOW_UNSAFE_SHARED: 'true' }), /must be 0 or 1/);
 });
 
-test('0.27 locale, time zones and meeting defaults are preserved with optional overrides', () => {
+test('locale, time zones and meeting defaults support optional overrides', () => {
   const defaults = loadConfig({});
   assert.equal(defaults.tz, 'Europe/Vienna');
   assert.equal(defaults.browserTimezone, null);
   assert.equal(defaults.browserLocale, 'de-AT');
-  assert.equal(defaults.meetingBotName, 'Glassy (notetaker)');
+  assert.equal(defaults.meetingBotName, 'Notetaker');
+  assert.equal(defaults.meetingAnnounce, 'chat');
+  assert.equal(defaults.meetingAnnounceSource, 'default');
   assert.equal(defaults.meetingAnnounceText, null);
   const config = loadConfig({ TZ: 'America/Toronto', BROWSER_TIMEZONE: 'Asia/Tokyo', BROWSER_LOCALE: 'fr-ca' });
   assert.deepEqual([config.tz, config.browserTimezone, config.browserLocale], ['America/Toronto', 'Asia/Tokyo', 'fr-CA']);
@@ -160,6 +162,19 @@ test('0.27 locale, time zones and meeting defaults are preserved with optional o
   assert.throws(() => loadConfig({ BROWSER_TIMEZONE: 'Mars/Olympus' }), /BROWSER_TIMEZONE/);
   assert.throws(() => loadConfig({ BROWSER_LOCALE: 'en_US' }), /BROWSER_LOCALE/);
   assert.throws(() => loadConfig({ BOSUN_METRICS_TOKEN: 'too-short' }), /BOSUN_METRICS_TOKEN/);
+});
+
+test('MEETING_ANNOUNCE accepts chat, host and none and rejects invalid values at startup', async () => {
+  for (const mode of ['chat', 'host', 'none']) {
+    const cfg = loadConfig({ MEETING_ANNOUNCE: mode });
+    assert.deepEqual([cfg.meetingAnnounce, cfg.meetingAnnounceSource], [mode, 'config']);
+  }
+  for (const bad of ['', ' ', 'NONE', 'everyone']) {
+    assert.throws(() => loadConfig({ MEETING_ANNOUNCE: bad }), /MEETING_ANNOUNCE must be one of chat, host, none/);
+  }
+  const r = await run({ MEETING_ANNOUNCE: 'everyone' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /MEETING_ANNOUNCE must be one of chat, host, none/);
 });
 
 test('startup logs one sandbox recommendation unless shared mode was acknowledged', async () => {

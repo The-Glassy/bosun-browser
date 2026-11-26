@@ -86,12 +86,14 @@ only do that with the human's explicit approval.
 
 ## Meetings (Google Meet, Zoom)
 
-`meeting_join {url, …}` joins as a notetaker (mic and camera off), posts a recording notice, records
+`meeting_join {url, …}` joins as a notetaker (mic and camera off), follows the configured notice mode, records
 audio, and leaves when the meeting ends or everyone leaves.
 - `profile`: join with a signed-in Google/Zoom profile — far fewer refusals than a guest. A guest
-  `name` is used only without a profile.
-- `announce`: `chat` (default, everyone), `host` (host only) or `none` — use `none` only when the
-  meeting owner told you so. An opt-out in the chat ("please don't record") always stops and deletes.
+  `name` defaults to `Notetaker` and applies to guest joins.
+- `announce` overrides the instance's `MEETING_ANNOUNCE` setting. Use `chat` (default, everyone with host
+  fallback), `host` (host only) or `none` (no notice). Use `none` per call only with the meeting owner's
+  approval. The operator must inform participants when the notice is disabled. An opt-out in the chat
+  ("please don't record") always stops and deletes the recording.
 - `record_video:true` adds a separate WebM of the meeting page; audio stays a separate Ogg.
 - `live_transcript:true` gives transcript finals live (`meeting_transcript`, or as an MCPL channel).
 - `dry_run:true` only checks the lobby.
@@ -104,5 +106,4 @@ In group calls, speak only when addressed.
 
 - Don't paste passwords or tokens into `type` values, macro steps, or messages.
 - Don't buy, pay, send or delete on someone's behalf without their explicit OK.
-- Don't record a meeting silently unless the meeting owner asked for `announce:"none"`.
 - Don't leave sessions open; close them when the task is done.

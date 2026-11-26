@@ -216,9 +216,9 @@ the meeting; up to 5000). Reconnects: up to 20 s of audio is buffered; the first
 characters as `previous_text`; fatal errors (auth, quota, terms, invalid request) stop it; others retry with backoff,
 8 failures in a row at most (a session that closes within 10 s counts as one).
 
-**Consent.** The transcript is part of the recording: it starts in the same place (after the announcement, which
-then says "recorded and transcribed live"), and everything that stops or deletes the recording stops it (opt-out:
-both at once, `Promise.all`), and deleting forgets its text. Zero retention is requested on every connection;
+**Consent.** Live transcription starts with the recording after the configured announcement step. The built-in
+notice describes live transcription when enabled. An opt-out stops both concurrently (`Promise.all`), and
+deleting the recording also clears the transcript text. Zero retention is requested on every connection;
 ElevenLabs grants it only to enterprise and trial plans and otherwise says so in a `warning`, which is reported
 (`zero_retention: false`).
 
