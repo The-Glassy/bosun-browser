@@ -345,7 +345,7 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
   const end = hardEnd - Math.min(REPORT_MS, Math.floor(maxMs / 3));
   const total = allSteps.length;
   const seenSteps = new Set();
-  let failure = null, executed = 0, textBytes = 0, imageBytes = 0;
+  let failure = null, executed = 0, reported = 0, textBytes = 0, imageBytes = 0;
   const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
   const retain = (value, image) => {
     const textSize = bytes(value), imageSize = image ? Buffer.byteLength(image) : 0;
@@ -444,7 +444,10 @@ export async function runMacro(m, { args, dryRun = false, maxMs = RUN_DEFAULT_SE
       if (failure) { rec.status = 'failed'; break; }
       rec.status = rec.error ? 'failed_optional' : 'ok';
       // Sent before the answer, in order; a client that doesn't read holds the run up to 5 s, not past its time.
-      if (ops.progress) await settleWithin(ops.progress(n, total, `${n}/${total} ${tool} ${rec.status}`), Math.min(5000, hardEnd - Date.now()), signal);
+      // progress only ever grows (MCP requires it): one more with every step that finished, a loop or a branch
+      // after its own steps; in a loop that passes the number of steps saved, and the total grows with it.
+      reported++;
+      if (ops.progress) await settleWithin(ops.progress(reported, Math.max(total, reported), `${n}/${total} ${tool} ${rec.status}`), Math.min(5000, hardEnd - Date.now()), signal);
     }
   };
   await execute(m.steps);

@@ -12,6 +12,7 @@ import { glidePath } from './liveview.mjs';
 import { readProfileMeta } from './engines.mjs';
 import { egressError } from './egress.mjs';
 import { httpUrl } from './sessions.mjs';
+import { policyOf } from './auth.mjs';
 
 export const HISTORY = 10; // results kept per profile
 const MIN_GAP_MS = 15 * 60_000; // a visit is never scheduled closer than this to the previous one
@@ -227,8 +228,13 @@ class Store {
 export class Keepalive {
   // opts: emit(event) for needs-human, onWatch(event) for a changed watch value; rnd/now for tests; tickMs, gapMs,
   // activityMs, wall (bot-check detector).
-  constructor({ cfg, manager, emit = () => {}, onWatch = () => {}, wall = async () => null, rnd = Math.random, now = Date.now, tickMs = TICK_MS, gapMs = GAP_MS, activityMs = ACTIVITY_MS }) {
+  constructor({ cfg, manager, emit = () => {}, onWatch = () => {}, wall = async () => null, rnd = Math.random, now = Date.now, tickMs = TICK_MS, gapMs = GAP_MS, activityMs = ACTIVITY_MS, visitMaxMs = null }) {
     Object.assign(this, { cfg, manager, emit, onWatch, wall, rnd, now, tickMs, gapMs, activityMs });
+    // The longest a visit may take on the page: navigation, load, activity, and a minute for the checks. A page that
+    // stops answering (a script that never yields) would otherwise hold the one visit slot, and with it every
+    // tenant's keepalive, until a restart.
+    this.visitMaxMs = visitMaxMs ?? 45_000 + 15_000 + Math.max(...[activityMs].flat()) + 60_000;
+    this.orphansLogged = new Set();
     this.tz = cfg.tz || 'Europe/Vienna';
     this.store = new Store(path.join(cfg.dataDir, 'keepalive.json'));
     this.current = null; // {key, abort, done}
@@ -336,7 +342,7 @@ export class Keepalive {
     if (this.current || this.stopped || this.manager.closing) return null;
     const now = this.now();
     if (now < this.notBefore) return null;
-    const due = [...this.store.entries.values()].filter((e) => e.enabled && e.nextAt && e.nextAt <= now).sort((a, b) => a.nextAt - b.nextAt)[0];
+    const due = [...this.store.entries.values()].filter((e) => e.enabled && e.nextAt && e.nextAt <= now && this.served(e)).sort((a, b) => a.nextAt - b.nextAt)[0];
     if (!due) return null;
     const key = `${due.tenant}/${due.profile}`;
     const m = this.manager;
@@ -392,6 +398,20 @@ export class Keepalive {
     return this.cfg.engine === 'camoufox' ? 'chromium' : this.cfg.engine;
   }
 
+  // Whether the entry's tenant can still use keepalive: it has a token (when any are configured) and its policy is
+  // not read-only. An entry left behind by a removed or downgraded tenant stays on disk (it comes back with the
+  // token) but is not visited: nobody could list or remove it, and its logged-in profile would be opened forever.
+  served(e) {
+    const tokens = this.cfg.tokens;
+    const ok = (!Array.isArray(tokens) || !tokens.length || tokens.some((t) => t.tenant === e.tenant)) && policyOf(this.cfg, e.tenant) !== 'ephemeral';
+    const key = `${e.tenant}/${e.profile}`;
+    if (!ok && !this.orphansLogged.has(key)) {
+      this.orphansLogged.add(key);
+      console.error(`bosun: keepalive for ${key} is not run: tenant ${e.tenant} has no token or is read-only (the schedule is kept)`);
+    }
+    return ok;
+  }
+
   // Error reasons are fixed categories or Bosun's own messages, never raw browser errors (which can quote the page).
   async visit(e, signal, run) {
     const t0 = this.now();
@@ -399,7 +419,7 @@ export class Keepalive {
     const owner = `keepalive:${e.tenant}`;
     const key = `${e.tenant}/${e.profile}`;
     const { url, check, watch, watchGen } = { url: e.url, check: { ...e.check }, watch: e.watch && { ...e.watch }, watchGen: e.watchGen }; // this visit's configuration
-    let status = 'error', reason = null, s = null, phase = 'open', watched = null;
+    let status = 'error', reason = null, s = null, phase = 'open', watched = null, timedOut = false, limit = null;
     try {
       try { httpUrl(url); } catch { reason = 'url is not http(s)'; throw new Error(reason); }
       // The tenant's allowlist may have changed since the schedule was set.
@@ -415,7 +435,7 @@ export class Keepalive {
         throw err;
       }
       if (signal.aborted) throw new Error('aborted');
-      const r = await m.run(owner, s.id, async (ss) => {
+      const work = m.run(owner, s.id, async (ss) => {
         phase = 'navigate';
         const started = Date.now();
         try {
@@ -445,12 +465,19 @@ export class Keepalive {
         }
         return { status: 'ok' };
       });
+      work.catch(() => {}); // it may fail later, once the session is gone and nobody waits for it
+      const r = await Promise.race([work, new Promise((_, reject) => {
+        limit = setTimeout(() => { timedOut = true; reject(new Error('visit timed out')); }, this.visitMaxMs);
+        limit.unref?.();
+      })]);
       ({ status, reason = null } = r);
     } catch {
-      if (signal.aborted) status = 'aborted';
+      if (timedOut) { status = 'error'; reason = 'visit timed out (the page stopped responding)'; }
+      else if (signal.aborted) status = 'aborted';
       else if (!reason) reason = `${phase} failed`;
     } finally {
-      if (s) await m.dispose(s, 'keepalive-done');
+      clearTimeout(limit);
+      if (s) await m.dispose(s, timedOut ? 'keepalive-timeout' : 'keepalive-done');
     }
     if (this.store.entries.get(key) !== e) return { status }; // removed (or removed and re-added) meanwhile
     if (status === 'aborted') {

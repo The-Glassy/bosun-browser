@@ -249,14 +249,20 @@ export class Meetings {
   // Deletes a recording for good. The marker is written first and stays (RECORDING_RETENTION_DAYS): a recorder that
   // opens its file only after the unlink, or a crash before it is stopped, cannot bring the recording back, because
   // recordingFile refuses a marked id and the sweep removes what reappeared under it.
+  // A marker that cannot be written (a full disk: video fills it) does not keep the files: they are removed all the
+  // same, and the failure is thrown afterwards.
   forget(tenant, id) {
     const f = this.file(tenant, id);
-    fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(`${recordingBase(f)}.deleted`, '', { mode: 0o600 });
+    let failed = null;
+    try {
+      fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(`${recordingBase(f)}.deleted`, '', { mode: 0o600 });
+    } catch (e) { failed = e; }
     for (const ext of ['ogg', 'webm']) fs.rmSync(`${recordingBase(f)}.${ext}`, { force: true });
     fs.rmSync(speakerFile(f), { force: true });
     const m = this.active.get(id) || this.ended.get(id);
     if (m?.tenant === tenant) { m.speakerTimeline = null; m.speakerTimelineCount = 0; }
+    if (failed) throw failed;
   }
 
   emit(m, kind, data) {
@@ -1429,9 +1435,13 @@ export class Meetings {
   // Posts in the chat (to: everyone, or the host) and remembers it, so the copy that shows up in the chat panel is
   // recognized as ours.
   async say(m, page, text, { to = m.chatTo } = {}) {
-    const e = m.echoes.get(text.trim()) || { count: 0, until: 0, norm: normalize(text) };
-    m.echoes.set(text.trim(), { ...e, count: e.count + 1, until: this.now() + ECHO_MS }); // see withoutOwn
-    m.pendingOwn.push(text.trim());
+    // Remembered as the chat panel's copy will be read (pollChat cleans every bubble: a leading "14:00:" and the
+    // panel's control labels go), or a post that starts with a time would come back as someone else's message, and
+    // "14:00: stop recording and wrap up" would opt Bosun out of its own meeting.
+    const sent = cleanChatText(text) || text.trim();
+    const e = m.echoes.get(sent) || { count: 0, until: 0, norm: normalize(sent) };
+    m.echoes.set(sent, { ...e, count: e.count + 1, until: this.now() + ECHO_MS }); // see withoutOwn
+    m.pendingOwn.push(sent);
     if (m.pendingOwn.length > 50) m.pendingOwn.shift();
     // The chat already failed to open once (at the join): a short second try, so the recording is not held up long.
     await m.platform.sendChat(page, text, { selfName: m.info.selfName || m.name, names: [m.name], to, ...(m.chatError ? { openTimeoutMs: 5000 } : {}) });
@@ -1557,10 +1567,13 @@ export class Meetings {
     }
     // A deletion unlinks the file first, then stops the recorder (which holds it open): a crash in between leaves no
     // file for the next run to serve (recordingFile looks at the disk).
+    // Whatever fails on the way (the marker on a full disk), the recorder is still stopped and the meeting is still
+    // marked deleted: an objection must never end with the recording kept and served.
+    let unmarked = false;
     if (del && m.file) {
       this.links.revoke(m.tenant, m.id);
-      this.forget(m.tenant, m.id);
       m.deleted = true;
+      try { this.forget(m.tenant, m.id); } catch { unmarked = true; }
       m.file = null; m.videoFile = null;
     }
     const videoStopped = this.stopVideo(m, { del });
@@ -1568,6 +1581,9 @@ export class Meetings {
       m.stopping = rec;
       try {
         await (del ? rec.kill() : rec.stop());
+        // Without the marker nothing stops a file the recorder wrote meanwhile from being served: remove it again
+        // now that the recorder is gone.
+        if (unmarked) { try { this.forget(m.tenant, m.id); } catch (e) { console.error(`bosun meeting ${m.id}: the deletion marker could not be written (${e.code || 'error'}); the recording files were removed`); } }
         if (!del) await this.saveSpeakerTimeline(m, rec, stoppedAt).catch((e) => { m.speakerTimelineError = oneLine(e); });
       } finally { if (m.stopping === rec) m.stopping = null; }
     }
@@ -1610,7 +1626,9 @@ export class Meetings {
       const bytes = m.file ? fs.statSync(m.file, { throwIfNoEntry: false })?.size ?? 0 : 0;
       this.active.delete(m.id);
       this.ended.set(m.id, m);
-      if (this.ended.size > 50) this.ended.delete(this.ended.keys().next().value);
+      // The last 50 ended meetings of each tenant: one tenant's meetings never push another's out.
+      const mine = [...this.ended.values()].filter((x) => x.tenant === m.tenant);
+      if (mine.length > 50) this.ended.delete(mine[0].id);
       this.emit(m, 'ended', {
         reason, ...(m.error ? { error: m.error } : {}),
         duration_s: Math.round(((m.endedAt - (m.admittedAt ?? m.endedAt))) / 1000),
@@ -2133,7 +2151,8 @@ export class Meetings {
     if (existed || m || fs.existsSync(speakerFile(f))) this.forget(tenant, id);
     if (m && m.file === f) { m.file = null; m.videoFile = null; m.deleted = true; }
     if (!existed && !m) throw new Error(`no recording for meeting ${id}`);
-    return { meeting_id: id, deleted: existed };
+    // Said out loud: on a meeting still to be recorded this call switched its recording off.
+    return { meeting_id: id, deleted: existed, ...(m && m.state !== 'ended' && !existed ? { recording_disabled: true } : {}) };
   }
 
   async stop() {
