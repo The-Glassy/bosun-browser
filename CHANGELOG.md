@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.29.0 (Unreleased)
+
+### New (opt-in): secret stores
+
+Off unless `BOSUN_SECRET_STORES` is set; without it there is no new tool, argument, socket or log.
+
+- **Stores.** `file`, `env` and `openbao` (KV v2/v1; also `vault`) adapters, plus experimental read-only
+  `1password` (`op`) and `bitwarden` (`bws`) adapters. OpenBao takes a `token_file` or a single-use
+  `wrapping_token_file` that is unwrapped once on first use (`wrapping_creation_path` checks where it was made).
+- **Recipes.** The operator binds a credential to one origin, one field selector, a field type and the destinations
+  its form may submit to, for the installation (`recipes`, every full-policy tenant, `{tenant}` in paths) and per
+  tenant (`tenants.<name>.recipes`, replacing or removing an installation recipe).
+- **`secret_recipes`** lists a tenant's recipes and save targets (bindings only, never store paths).
+  **`secret_fill { session, recipe }`** checks the page, the field and the form, then types the value and returns a
+  status. A recipe with `"store": "client"` applies the same checks to a value sent with `secret_create`.
+- **Write-back.** `secret_save` takes `store_target`, `store_key` and `overwrite`: the element's value goes into the
+  store (a `0600` file, or a KV entry under check-and-set) instead of a download.
+- **Masking.** A value that came from or went to a store is removed from every text result of its session (also
+  URL-encoded, JSON-escaped, base64 and hex), refused by `secret_reveal` and by `secret_save` to a download, covered
+  in screenshots, and taken out of the page before a human handoff.
+- **Tenant sandbox.** Stores and their tokens stay in the gateway; a worker asks over a Unix socket that answers for
+  its own tenant only.
+- **Audit.** `<BROWSER_DATA>/audit/secrets.jsonl` records every resolve, fill and save without values.
+- `secret_create`, `type` with `secret_id`, `secret_save`, `secret_reveal` and `secret_settings_get/set` are kept
+  and work as before.
+
+See README "Secret stores" and `docs/design/0.29-secret-stores.md`.
+
+### Fixes from the 0.28.0 review
+
+- **Tenant proxy:** an upstream response with a malformed reason phrase or header no longer ends the whole service;
+  an origin that stops in the middle of a body ends the request instead of hanging it.
+- **Keepalive:** a page that stops responding ends its visit after a bounded time instead of blocking every tenant's
+  keepalive until a restart.
+- **Secrets:** a secret typed with `secret_id` that the page puts into its URL or title (a form that submits with
+  GET) is masked in later results of that session too, not only in the `type` result.
+- **Meetings:** a chat message Bosun sent that starts with a time ("14:00: stop recording and wrap up") is no longer
+  taken for a participant's objection. An objection deletes the recording and stops the recorder even when the
+  deletion marker cannot be written (full disk). Ended meetings are kept 50 per tenant instead of 50 in all.
+  `meeting_recording_delete` before recording started says `recording_disabled: true`.
+- **Macros:** `macro_run` progress notifications only increase.
+- **Tenant sandbox:** a worker no longer receives the ElevenLabs key when meetings are off.
+- The MCP server reports the package version. Tool descriptions: the `live_transcript` fields of `meeting_status`,
+  what a one-time URL is, and that `confirm_risky` looks at clicks.
+
+### Breaking/default changes
+
+- `secret_save` returns `sha256_prefix: null` (with `sha256_note`) for a value shorter than 16 bytes: eight hex
+  digits of SHA-256 identify a 6-digit code or a PIN uniquely, so the result gave the value away. To check a short
+  saved value, hash the downloaded copy (`sha256sum`). Values of 16 bytes and more are unchanged.
+- Keepalive no longer visits schedules whose tenant has no token (when tokens are configured) or has policy
+  `ephemeral`. The schedules stay in `keepalive.json`; one log line names each. To keep visiting a profile, keep (or
+  restore) its tenant's token with policy `full`.
+- A keepalive visit whose page stops responding is recorded as `error: visit timed out` and its session is closed
+  after navigation (45 s) + load (15 s) + activity (up to 60 s) + 60 s. No setting; visits that complete are
+  unaffected.
+- The tenant proxy no longer forwards an origin's HTTP reason phrase ("OK", "Not Found") on plain-http responses;
+  status code, headers and body are unchanged. Browsers do not use it.
+- `macro_run` progress counts finished steps (so `progress` can pass the number of saved steps in a loop, and
+  `total` grows with it) instead of repeating step positions.
+
 ## 0.28.0 (Unreleased)
 
 ### New (opt-in)

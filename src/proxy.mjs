@@ -206,8 +206,17 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', sock
       if (egress && up.statusCode === 407) {
         up.resume(); return end(502, failed());
       }
-      res.writeHead(up.statusCode, up.statusMessage, up.headers);
+      // What the origin sent is not ours to trust: a reason phrase or header Node will not write must end this
+      // one response, never the process (and with it every tenant's sessions). The reason phrase is not passed on.
+      try {
+        res.writeHead(up.statusCode, up.headers);
+      } catch {
+        up.destroy();
+        return res.headersSent ? res.destroy() : end(502, failed());
+      }
       up.pipe(res);
+      // pipe() leaves res open when the origin stops mid-body: the browser would wait for the rest forever.
+      up.on('close', () => { if (!up.complete) res.destroy(); });
     });
     out.on('socket', track);
     out.setTimeout(CONNECT_TIMEOUT_MS, () => out.destroy(new Error('timeout')));

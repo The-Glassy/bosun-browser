@@ -15,6 +15,8 @@ import { Secrets } from './secrets.mjs';
 import { SecretSettings } from './secret-settings.mjs';
 import { Macros } from './macros.mjs';
 import { startTenantService } from './tenant-sandbox.mjs';
+import { SecretAudit, SecretGuard, SecretStores } from './stores/index.mjs';
+import { connectSecretBroker } from './stores/broker.mjs';
 
 export async function startService(cfg, { engines, keepalive: kaOpts = {}, meetings: mOpts = {}, wsSocket, liveSocket } = {}) {
   if (cfg.tenantSandbox && !wsSocket) return startTenantService(cfg);
@@ -43,6 +45,16 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
     // Secrets to type (type with secret_id): in memory only, so a restart drops them.
     manager.secrets = new Secrets();
     manager.secretSettings = new SecretSettings(cfg);
+    // Values a store handed out (or took in), scrubbed from what the tools return; and the stores themselves: in
+    // this process, or (a sandboxed worker) behind the gateway's socket for this tenant. Neither exists unless
+    // BOSUN_SECRET_STORES is set.
+    manager.guard = new SecretGuard();
+    if (cfg.secretBroker) {
+      const client = await connectSecretBroker(cfg.secretBroker);
+      manager.secretStores = { forTenant: () => client, close() {} };
+    } else if (cfg.secretStores) {
+      manager.secretStores = new SecretStores(cfg.secretStores, { audit: new SecretAudit(cfg.dataDir) });
+    }
     // Macros: JSON files per tenant in the data volume.
     manager.macros = new Macros(cfg);
   } catch (e) { await live?.close(); throw e; }
@@ -54,6 +66,7 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
     await Promise.allSettled([keepalive.stop(), manager.meetings?.stop(), live?.close()]);
     await manager.closeAll();
     manager.secrets?.close();
+    manager.secretStores?.close();
     await Promise.allSettled([manager.uploads?.close(), manager.downloads?.close()]);
     throw e;
   }
@@ -66,6 +79,8 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
     await Promise.allSettled([ws?.close(), live?.close()]);
     await manager.closeAll();
     manager.secrets?.close();
+    manager.secretStores?.close();
+    manager.guard?.close();
     await Promise.allSettled([manager.uploads?.close(), manager.downloads?.close()]);
   })());
   return { cfg, live, manager, ws, keepalive, events, meetings: manager.meetings ?? null, uploads: manager.uploads ?? null, downloads: manager.downloads, secrets: manager.secrets, macros: manager.macros, shutdown };
@@ -103,6 +118,8 @@ export async function main(env = process.env) {
     delete process.env.BROWSER_EGRESS_PROXY;
     delete process.env.BROWSER_EGRESS_PROXIES;
     delete process.env.BOSUN_METRICS_TOKEN;
+    // An env store took its values at loadConfig: no browser or helper inherits them.
+    for (const k of cfg.secretStores?.envKeys ?? []) delete process.env[k];
   }
   guardDriverRejections();
   // Never silent: an unsandboxed browser is said out loud at every start.

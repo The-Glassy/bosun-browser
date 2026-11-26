@@ -5,6 +5,7 @@ import { parseEgress, parseEgressProxies, parseTenantExits, protectEgressCredent
 import { ENGINE_NAMES } from './engines.mjs';
 import { parseToolTimeouts } from './deadline.mjs';
 import { parseMacroSource } from './macros.mjs';
+import { parseSecretStores } from './stores/index.mjs';
 
 export const DEFAULT_MEETING_BOT_NAME = 'Notetaker';
 export const ANNOUNCE_MODES = ['chat', 'host', 'none'];
@@ -177,6 +178,12 @@ export function loadConfig(env = process.env) {
   }
   // A read-only tenant that runs the macros of another tenant (BROWSER_MACRO_SOURCE=swarm=me).
   cfg.macroSource = parseMacroSource(env, cfg.tokens, cfg.policies);
+  // Secret stores, recipes and save targets (BOSUN_SECRET_STORES; src/stores/index.mjs). null: not configured, and
+  // then nothing of it exists (no tools, no audit log). Installation-level entries reach every tenant with policy
+  // full; a read-only tenant never gets any, and naming one is a mistake, not something to ignore.
+  const names = tenants.size ? [...tenants] : ['default'];
+  const readOnly = new Set(names.filter((t) => cfg.policies.get(t) === 'ephemeral'));
+  cfg.secretStores = parseSecretStores(env, new Set(names), { isLoopbackHost, readOnly });
   // Session cap of each tenant with policy "ephemeral".
   cfg.ephemeralMaxSessions = int(env, 'BROWSER_EPHEMERAL_MAX_SESSIONS', Math.min(2, cfg.maxSessionsPerTenant), 1, cfg.maxSessionsPerTenant);
 

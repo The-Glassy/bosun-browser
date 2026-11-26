@@ -129,6 +129,7 @@ for host requirements, egress, and the `bosun migrate-data` command.
 | `DOWNLOAD_TENANT_QUOTA_BYTES` | 1073741824 (1 GB) | downloaded bytes one tenant may hold at a time, running and kept (at least `DOWNLOAD_MAX_BYTES`) |
 | `DOWNLOAD_TTL_SEC` / `DOWNLOAD_URL_TTL_SEC` | 3600 / 900 | a download not fetched is deleted this long after it finished; a GET URL is valid this long |
 | `SECRETS_REVEAL` | `0` | fallback for `secrets_reveal`; an explicit tenant setting takes precedence (see [Secrets](#secrets)) |
+| `BOSUN_SECRET_STORES` | – | JSON, or the path of a JSON file: secret stores, recipes and save targets, for the installation and per tenant (see [Secret stores](#secret-stores-029-opt-in)). Unset: none of it exists |
 | `DOWNLOADS` | `0` | before 0.11 the service-wide switch; `0` is still accepted, `1` stops the service with a hint (use `BROWSER_TENANT_DOWNLOAD_ALLOW`, `*` for any host) |
 | `WS_HOST` / `WS_PORT` | `127.0.0.1` / – | WebSocket MCP listener (stdio when `WS_PORT` is unset) |
 | `WS_ALLOWED_ORIGINS` | – | comma list of browser Origins allowed to connect (non-browser clients send none) |
@@ -137,7 +138,7 @@ for host requirements, egress, and the `bosun migrate-data` command.
 | `MAX_INFLIGHT` | 8 | concurrent tool calls per connection |
 | `TOOL_TIMEOUT_SEC` | 60 | deadline of one tool call, 1 to 120 s (see [Per-call deadline](#per-call-deadline)) |
 | `TOOL_TIMEOUTS` | – | per tool, overriding `TOOL_TIMEOUT_SEC`: `read=90,upload=120` |
-| `LIVE_HOST` / `LIVE_PORT` / `LIVE_BASE_URL` | `127.0.0.1` / – / derived | live view listener and the URL put in links |
+| `LIVE_HOST` / `LIVE_PORT` / `LIVE_BASE_URL` | `127.0.0.1` / – / derived | live view listener and the URL put in links. In shared mode the page opens its WebSocket at the root path `/ws/<token>` of that host, also when `LIVE_BASE_URL` has a path: a reverse proxy that mounts the live view under a prefix has to route `/ws/` as well |
 | `HANDOFF_TTL_SEC` | 900 | handoff link lifetime |
 | `BROWSER_DATA` | `./data` | data root. With the sandbox enabled, each worker uses `tenants/<tenant>/` inside it |
 | `HEADLESS` | – | `1` = headless browser (more detectable; use for tests) |
@@ -491,7 +492,8 @@ download_get { download_id, inline: false }
 
 Run the `curl` line from `download_get` in the agent's shell. It writes directly to the chosen filename with
 `curl -o` and creates new files with private permissions. The default filename is `secret.txt`. The save result
-reports the UTF-8 byte length and the first eight hex digits of SHA-256. Bosun removes the staged file after a
+reports the UTF-8 byte length and the first eight hex digits of SHA-256 (`sha256_prefix` is `null` for a value under
+16 bytes: that much hash would single a short code out among everything it could be). Bosun removes the staged file after a
 complete fetch, after 15 minutes, or at service restart. The one-time GET is served on the WebSocket MCP port.
 Saved secrets always use this URL, even if `inline: true` is requested. Bosun stages these files itself,
 so they are available regardless of the browser download host allowlist.
@@ -506,6 +508,111 @@ the `SECRETS_REVEAL` fallback (false by default).
 Full-policy tenants can save and reveal in sessions owned by the calling connection. Ephemeral tokens always get
 masked reads. Bosun audits saves and reveals with tenant, page host, element type and byte length. The value
 stays out of these audit lines and out of save and download tool results.
+
+## Secret stores (0.29, opt-in)
+
+With `BOSUN_SECRET_STORES` set, a credential can go from the operator's secret store into a page without passing
+through the agent, and a value a page generated can go straight into the store. Nothing of this exists unless the
+setting is there: no tool, no argument, no log.
+
+The operator writes **recipes**. A recipe names one credential in a store and the one place it may go:
+
+```json
+{
+  "stores": {
+    "bao":   { "type": "openbao", "address": "https://bao.example.org:8200", "token_file": "/run/credentials/bosun/bao-token" },
+    "files": { "type": "file", "dir": "/var/lib/bosun-secrets" }
+  },
+  "tenants": {
+    "alice": {
+      "recipes": {
+        "example-login": { "store": "bao", "path": "tenants/alice/example", "field": "password",
+                           "origin": "https://app.example.org", "selector": "input#password",
+                           "submit": true, "submit_to": ["https://app.example.org/session"] }
+      },
+      "save_targets": {
+        "generated": { "store": "files", "path_prefix": "alice/generated/", "origins": ["https://app.example.org"] }
+      }
+    }
+  }
+}
+```
+
+`BOSUN_SECRET_STORES` is that JSON, or the absolute path of a file holding it. It contains no secret values. The
+service refuses to start on an unknown key, store or tenant, or on an origin that is not `https://` (plain http is
+accepted on loopback only).
+
+The agent then works with names:
+
+```text
+secret_recipes {}
+  -> { recipes: [{ name: "example-login", source: "store", origin, selector, field_type, submit, submit_to }], save_targets: [...] }
+navigate { session, url: "https://app.example.org/login" }
+secret_fill { session, recipe: "example-login" }
+  -> { recipe: "example-login", status: "submitted", url, title }
+secret_save { session, selector: "#new-token", store_target: "generated", store_key: "example-pat" }
+  -> { stored: true, store_target: "generated", key: "example-pat", length, sha256_prefix, next }
+```
+
+**Before anything is typed**, `secret_fill` checks that the top-level page has exactly the recipe's origin (scheme,
+host and port; no wildcards, no subdomains) and, if set, its `path_prefix`; that `selector` matches exactly one
+element of the top-level document; that it is an enabled, writable field of the recipe's `field_type` (default
+`password`); and that the field's form, and every `formaction` button of it, submits to a `submit_to` destination
+(default: the recipe's origin). Only then is the store asked. A refusal says which check failed and what Bosun saw
+(the page's origin, the field's type), and types nothing.
+
+**After the fill**, for as long as the session is open, the value is taken out of every text Bosun returns to that
+tenant, also URL-encoded, JSON-escaped, base64 and hex: in `read` (with `secrets_reveal` on as well), in the URL and
+title of every result, in `sessions`, macro results and errors. `secret_reveal` and `secret_save` to a download
+refuse an element that holds it. Screenshots cover it wherever the page shows it. Before a human handoff the value is
+removed from the page, and the handoff is refused if that fails. The same holds for a value written with
+`store_target`.
+
+| | Installation level | Tenant level |
+| --- | --- | --- |
+| Stores | `stores` | – (a recipe names the store it reads) |
+| Recipes | `recipes`: every tenant with policy `full`; `{tenant}` in `path` is replaced by the tenant's name | `tenants.<name>.recipes`: replaces an installation recipe of the same name; `null` removes it |
+| Save targets | `save_targets`, `{tenant}` in `path_prefix` | `tenants.<name>.save_targets`, same rules |
+
+Tenants with policy `ephemeral` get none of this, and tenants cannot define recipes through a tool: an agent must
+not be able to authorise itself.
+
+Recipe keys: `store`, `path`, `field`, `origin`, `path_prefix`, `selector`, `field_type` (`password`, `text`,
+`email`, `tel`, `number`, `url`, `search`, `textarea`, `any`), `submit` (press Enter after the fill; default false),
+`submit_to`, `description`. Save target keys: `store`, `path_prefix` (ends with `/`), `field`, `origins` (required;
+write `["*"]` for any page), `overwrite` (default false: an existing entry is an error), `description`.
+
+| Store `type` | Reads | Writes | Options |
+| --- | --- | --- | --- |
+| `file` | a file under `dir`; with `field`, a string member of a JSON file | `0600` files in `0700` directories, atomically | `dir`, `read_only` |
+| `env` | the variable `<prefix><PATH>` (capitals, other characters become `_`) | – | `prefix` (default `BOSUN_SECRET_`). Values are taken at start and removed from the environment |
+| `openbao` (or `vault`) | KV v2 `data.data[field]` (default field `value`) | read, merge, write under check-and-set | `address`, `mount` (default `secret`), `kv_version` (2 or 1), `token_file` **or** `wrapping_token_file` (+ `wrapping_creation_path`), `namespace`, `ca_file`, `timeout_ms`, `read_only` |
+| `1password` | `op read op://<path>/<field>` | – | `command`, `token_file`, `timeout_ms`. Experimental: tested against a stand-in CLI only |
+| `bitwarden` | `bws secret get <id>` → `value` | – | as above. Experimental |
+
+`wrapping_token_file` holds a single-use OpenBao response-wrapping token (e.g. from
+`bao token create -wrap-ttl=5m -policy=bosun`). Bosun unwraps it once, on first use, and keeps the real token in
+memory only; with `wrapping_creation_path` it first checks where the wrapping token was created. A spent or foreign
+wrapping token is an error, which is how a copied file is noticed. Give the token a policy limited to the paths the
+recipes name.
+
+A recipe with `"store": "client"` has no store: its value comes from the agent's side over the one-time PUT of
+`secret_create`, and `secret_fill { recipe, secret_id }` applies the same page checks to it. That is the way to pin
+where an existing `secret_create` flow may type (a refusal does not use the secret up).
+
+**Tenant sandbox.** Stores, tokens and paths stay in the gateway. A worker whose tenant has a recipe or a save target
+gets one more Unix socket in its relay directory; the socket is the tenant, so a worker can ask only for its own
+tenant's recipes. The worker checks the page, receives one value, types it and holds it in memory until the session
+closes.
+
+**Audit.** Every store operation appends one JSON line to `<BROWSER_DATA>/audit/secrets.jsonl` (`0600`; rotated to
+`.1` at 10 MB) and to stderr: time, tenant, action (`resolve`, `fill`, `save`), recipe or target, store, path, field,
+session, page origin, status and error code. Never a value, its length or a hash.
+
+What it does not do: the page at the recipe's origin gets the value and can do with it what it likes; a value under
+three characters is not scrubbed; a page that transforms the value (hashes it, draws it on a canvas) can show that
+form; and once the login succeeded, the session cookie is the credential. `secret_create`, `type` with `secret_id`,
+`secret_save`, `secret_reveal` and `secret_settings_*` work as before. Design: [docs/design/0.29-secret-stores.md](docs/design/0.29-secret-stores.md).
 
 ## Downloading files
 

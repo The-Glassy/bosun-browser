@@ -154,9 +154,10 @@ function inPage(subject, options) {
   if (op === 'mark') {
     // Resolve after collecting all fields, so a reflected value is protected even when its source field is later
     // in the DOM or hidden. Cover the smallest element containing the match (including split inline text).
-    const values = [...out].filter((v) => v.length >= 3);
+    // values: what the caller knows to be secret whatever field it sits in now (a value a secret store filled).
+    const marks = [...new Set([...out, ...values])].filter((v) => v.length >= 3);
     for (const { el, value, sensitive, attrFound } of candidates) {
-      const ownMatch = values.some((v) => value.includes(v) && ![...el.children].some((c) => text(c).includes(v)));
+      const ownMatch = marks.some((v) => value.includes(v) && ![...el.children].some((c) => text(c).includes(v)));
       if (sensitive || ownMatch || attrFound.length) el.setAttribute(attr, '');
     }
   }
@@ -208,7 +209,7 @@ export async function eachFrame(page, fn, arg) {
   return res.flat();
 }
 const scanOptions = (op) => ({ op, css: SENSITIVE_CSS, hint: HINT_WORDS, attr: MARK_ATTR, formats: FORMAT_SOURCE, prefixes: PREFIX_SOURCE });
-const scan = (page, op) => eachFrame(page, inPage, scanOptions(op));
+const scan = (page, op, values = []) => eachFrame(page, inPage, { ...scanOptions(op), values });
 
 export const sensitiveValues = (page) => scan(page, 'values');
 export const clearSensitive = (page) => scan(page, 'clear');
@@ -335,9 +336,10 @@ export async function countNodes(page, limit) {
 }
 
 // Screenshot with sensitive inputs masked in every frame; the marker attribute is removed afterwards.
-export async function maskedScreenshot(page, take) {
+// values: more text to cover wherever the page shows it.
+export async function maskedScreenshot(page, take, values = []) {
   try {
-    await scan(page, 'mark');
+    await scan(page, 'mark', values);
     return await take(page.frames().map((f) => f.locator(`${SENSITIVE_CSS},[${MARK_ATTR}]`)));
   } finally {
     await scan(page, 'unmark').catch(() => {});

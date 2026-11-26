@@ -61,6 +61,19 @@ Proxy credentials stay on the gateway side.
 - The gateway serves public `/health`, `/health/exits` and `/metrics`. Set `BOSUN_METRICS_TOKEN` to require
   that dedicated bearer for metrics scraping.
 
+## Secret stores
+
+With `BOSUN_SECRET_STORES` set, the stores, their tokens and the store paths stay in the gateway. A worker whose
+tenant has a recipe or a save target gets a Unix socket `secrets` in its read-only relay directory. The socket
+answers for that tenant only: listing its recipes, resolving one of them, saving to one of its targets, and adding
+a line to the audit log, which the gateway stamps with the tenant. The worker configuration carries no store
+address, token path or store path. The audit log (`audit/secrets.jsonl`) is in the data root, outside every
+tenant directory. Keep store directories of a `file` store outside `BROWSER_DATA`.
+
+The speech provider key (`ELEVENLABS_API_KEY`) is the installation's and is passed to every worker that has
+meetings enabled, because the worker talks to the provider itself. Treat it as shared between tenants, or switch
+meetings off (`FEATURES_MEETINGS=0`); a worker then does not receive it.
+
 ## Move existing state
 
 Stop Bosun before migrating. Run the command as the service user and point it to the service's actual
@@ -74,6 +87,9 @@ bosun migrate-data --data /var/lib/bosun/data
 ```
 
 The command prints the path of a private backup tarball inside `.bosun-backups/` before moving data.
+Backups are never removed automatically. Each holds every tenant's profiles, cookie snapshots and recordings as
+they were, including recordings deleted later by an opt-out or by retention: delete it once the migration is
+verified.
 It moves each tenant's `profiles/` (including browser data, profile metadata and cookie snapshots),
 `macros/`, `recordings/` (audio, video and speaker sidecars), `downloads/`, `uploads/` and `shots/`
 subtree, plus `speech-settings/<tenant>.json` and `secret-settings/<tenant>.json`. It splits

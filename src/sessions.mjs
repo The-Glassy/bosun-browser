@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { clearSensitive, installTracker, notePasswords, passwordTracker } from './redact.mjs';
+import { clearSensitive, installTracker, notePasswords, passwordTracker, scrubValue } from './redact.mjs';
 import { createEngines, claimProfile, unclaimProfile, recordProfileUse, readProfileMeta } from './engines.mjs';
 import { NOT_ALLOWED, PROFILES_REFUSED, policyOf } from './auth.mjs';
 import { allowFor, allowsUrl } from './allow.mjs';
@@ -487,6 +487,12 @@ export class SessionManager {
       if (s.handoff) return s.handoff;
       s.gen++;
       await notePasswords(s.page).catch(() => {});
+      // What a secret store put into this page is taken out of it before a person sees it: the live view shows
+      // pixels, and a viewer could switch a password field to plain text. No handoff if that cannot be done.
+      for (const v of this.guard?.values(s.id) ?? []) {
+        const done = await Promise.race([scrubValue(s.page, v).then(() => true, () => false), sleep(5000).then(() => false)]);
+        if (!done) throw new Error('could not take the store-filled secret out of the page before the handoff; navigate away from the page (or close the session) and ask again');
+      }
       const h = this.live.start(s.page, reason, { ttlMs: this.cfg.handoffTtlMs, driver: s.cdp ? 'cdp' : 'playwright' });
       s.handoff = h;
       // settled: resolves with the status once the session is usable by the agent again.
@@ -563,6 +569,7 @@ export class SessionManager {
     s.disposed = true;
     s.closeReason = reason;
     this.sessions.delete(s.id);
+    this.guard?.drop(s.id);
     this.closed.set(s.id, { owner: s.owner, reason });
     if (this.closed.size > 200) this.closed.delete(this.closed.keys().next().value);
     if (s.handoff) s.handoff.cancel();

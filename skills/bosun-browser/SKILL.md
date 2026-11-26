@@ -42,6 +42,11 @@ Never put a password in a `type` value. Instead:
 3. `type {session, secret_id, selector:"input[type=password]", submit:true}`.
    Secrets go only into password inputs unless you set `allow_non_password:true` (OTP or e-mail fields).
 
+If the operator set up secret recipes, prefer them: `secret_recipes {}` lists them, and
+`secret_fill {session, recipe:"<name>"}` types the credential from the operator's store into the recipe's
+field after you navigated to its page. You get a status, never the value. A value a page just generated goes
+straight into the store with `secret_save {session, selector, store_target, store_key}`.
+
 To keep a newly displayed key, call `secret_save {session, selector:"#new-api-key", filename:"api.key"}`
 using the same target fields as `click`. It reads the live input value or the element's text. Then call
 `download_get {download_id, inline:false}` and run its `curl -o` line to write the secret directly to
