@@ -118,7 +118,7 @@ export function meetingEvent(kind, { meeting_id, platform, ...data }) {
     : kind === 'turn-extended' ? `Meeting ${meeting_id}: ${data.speaker || 'the speaker'} went on after turn #${data.turn_seq} ("${data.text_so_far}"); it comes again, merged, when they are done.`
     : kind === 'mic-open' ? `WARNING: Bosun's microphone may still be ON in meeting ${meeting_id}: ${data.mute_error}.${data.gave_up ? ' Bosun stopped retrying.' : ' Bosun keeps trying to mute it.'} meeting_mute {on: true} or meeting_leave if it must be off.`
     : kind === 'optout' ? `Meeting ${meeting_id}: ${data.sender || 'someone'} asked not to be recorded ("${data.text}"). The recording was stopped and deleted${data.left ? ' and Bosun left the meeting' : ''}.`
-    : kind === 'announce' ? `Meeting ${meeting_id}: the recording announcement ${data.sent_to === 'host' ? 'went to the host only' : 'could not be posted in the chat'} (${data.reason}: ${data.error}). Bosun records anyway; a request not to be recorded in the chat still stops it.`
+    : kind === 'announce' ? `Meeting ${meeting_id}: the recording announcement ${data.sent_to === 'host' ? 'went to the host only' : 'could not be posted in the chat'} (${data.reason}: ${data.error}). Bosun records anyway. Check meeting_status.optout for how chat objections are handled.`
     : `Meeting ${meeting_id} ended for Bosun (${data.reason}) after ${data.duration_s} s.${data.recording ? ` Recording: ${data.recording.bytes} bytes, ${data.recording.path} (in the browser container); call recording_get { meeting_id: "${meeting_id}" } to fetch it and its speaker timeline (${data.speaker_timeline?.intervals ?? 0} intervals).` : ' No recording.'}`;
   const content = [{ type: 'text', text }];
   return {

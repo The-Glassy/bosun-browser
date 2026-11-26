@@ -128,3 +128,86 @@ test('the server process warns at start when TTS_DEFAULT_BACKEND=elevenlabs has 
   assert.match(r.err, /bosun: WARNING — TTS_DEFAULT_BACKEND=elevenlabs but ELEVENLABS_API_KEY is not set: meeting_speak uses supertonic/);
   assert.equal(r.code, 0);
 });
+
+test('tenant sandbox is opt-in and shared mode warns only about distinct, unacknowledged tenants', () => {
+  const one = { BROWSER_TOKEN: GOOD };
+  const aliases = { ...one, BROWSER_TOKENS: `default:${GOOD}2` };
+  const multiple = { ...one, BROWSER_TOKENS: `alice:${GOOD}2`, WS_PORT: '0' };
+  assert.equal(loadConfig({}).tenantSandbox, false);
+  assert.equal(loadConfig(one).tenantSandbox, false);
+  assert.equal(loadConfig({ ...one, BOSUN_TENANT_SANDBOX: 'on' }).tenantSandbox, true);
+  assert.equal(loadConfig({ ...aliases, BOSUN_TENANT_SANDBOX: 'auto' }).tenantSandbox, true);
+  assert.equal(loadConfig(aliases).warnUnsafeShared, false);
+  assert.equal(loadConfig({ ...multiple, BOSUN_TENANT_SANDBOX: 'auto' }).tenantSandbox, true);
+  assert.equal(loadConfig(multiple).tenantSandbox, false);
+  assert.equal(loadConfig(multiple).warnUnsafeShared, true);
+  assert.equal(loadConfig({ ...multiple, BOSUN_TENANT_SANDBOX: 'off', BOSUN_ALLOW_UNSAFE_SHARED: '0' }).warnUnsafeShared, true);
+  assert.equal(loadConfig({ ...multiple, BOSUN_ALLOW_UNSAFE_SHARED: '1' }).warnUnsafeShared, false);
+  assert.throws(() => loadConfig({ BOSUN_TENANT_SANDBOX: 'yes' }), /auto, on or off/);
+  assert.throws(() => loadConfig({ BOSUN_ALLOW_UNSAFE_SHARED: 'true' }), /must be 0 or 1/);
+});
+
+test('locale, time zones and meeting defaults support optional overrides', () => {
+  const defaults = loadConfig({});
+  assert.equal(defaults.tz, 'Europe/Vienna');
+  assert.equal(defaults.browserTimezone, null);
+  assert.equal(defaults.browserLocale, 'de-AT');
+  assert.equal(defaults.meetingBotName, 'Notetaker');
+  assert.equal(defaults.meetingAnnounce, 'chat');
+  assert.equal(defaults.meetingAnnounceSource, 'default');
+  assert.equal(defaults.meetingAnnounceText, null);
+  const config = loadConfig({ TZ: 'America/Toronto', BROWSER_TIMEZONE: 'Asia/Tokyo', BROWSER_LOCALE: 'fr-ca' });
+  assert.deepEqual([config.tz, config.browserTimezone, config.browserLocale], ['America/Toronto', 'Asia/Tokyo', 'fr-CA']);
+  assert.throws(() => loadConfig({ TZ: 'Mars/Olympus' }), /IANA/);
+  assert.throws(() => loadConfig({ BROWSER_TIMEZONE: 'Mars/Olympus' }), /BROWSER_TIMEZONE/);
+  assert.throws(() => loadConfig({ BROWSER_LOCALE: 'en_US' }), /BROWSER_LOCALE/);
+  assert.throws(() => loadConfig({ BOSUN_METRICS_TOKEN: 'too-short' }), /BOSUN_METRICS_TOKEN/);
+});
+
+test('installation meeting timers accept only whole seconds in range', () => {
+  for (const [name, key] of [['MEETING_ALONE_LEAVE_SEC', 'meetingAloneLeaveSec'], ['MEETING_FIRST_JOINER_WAIT_SEC', 'meetingFirstJoinerWaitSec']]) {
+    assert.equal(loadConfig({})[key], null);
+    assert.equal(loadConfig({ [name]: '5' })[key], 5);
+    assert.equal(loadConfig({ [name]: '3600' })[key], 3600);
+    for (const bad of ['4', '3601', '5.5']) assert.throws(() => loadConfig({ [name]: bad }), new RegExp(name));
+  }
+});
+
+test('MEETING_ANNOUNCE accepts chat, host and none and rejects invalid values at startup', async () => {
+  for (const mode of ['chat', 'host', 'none']) {
+    const cfg = loadConfig({ MEETING_ANNOUNCE: mode });
+    assert.deepEqual([cfg.meetingAnnounce, cfg.meetingAnnounceSource], [mode, 'installation']);
+  }
+  for (const bad of ['', ' ', 'NONE', 'everyone']) {
+    assert.throws(() => loadConfig({ MEETING_ANNOUNCE: bad }), /MEETING_ANNOUNCE must be one of chat, host, none/);
+  }
+  const r = await run({ MEETING_ANNOUNCE: 'everyone' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /MEETING_ANNOUNCE must be one of chat, host, none/);
+});
+
+test('MEETING_OPTOUT defaults to on, accepts on and off, and rejects invalid values at startup', async () => {
+  const defaults = loadConfig({});
+  assert.deepEqual([defaults.meetingOptOut, defaults.meetingOptOutSource], ['on', 'default']);
+  for (const mode of ['on', 'off']) {
+    const cfg = loadConfig({ MEETING_OPTOUT: mode });
+    assert.deepEqual([cfg.meetingOptOut, cfg.meetingOptOutSource], [mode, 'installation']);
+  }
+  for (const bad of ['', ' ', 'OFF', '0', 'false']) {
+    assert.throws(() => loadConfig({ MEETING_OPTOUT: bad }), /MEETING_OPTOUT must be on or off/);
+  }
+  const r = await run({ MEETING_OPTOUT: 'false' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /MEETING_OPTOUT must be on or off/);
+});
+
+test('startup logs one sandbox recommendation unless shared mode was acknowledged', async () => {
+  for (const acknowledgement of ['0', '1']) {
+    const r = await run({
+      WS_PORT: '0', BROWSER_TOKENS: `alice:${GOOD},bob:${GOOD}2`, BOSUN_ALLOW_UNSAFE_SHARED: acknowledgement,
+    }, /MCP over WebSocket/);
+    assert.equal(r.code, 0);
+    assert.equal((r.err.match(/multiple tenants share one process; enable isolation with BOSUN_TENANT_SANDBOX=on/g) || []).length,
+      acknowledgement === '0' ? 1 : 0);
+  }
+});

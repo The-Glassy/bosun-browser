@@ -1,10 +1,11 @@
 # Deploying Bosun on Linux with systemd
 
-A single-host deployment: Bosun as its own unprivileged user, headful Chromium under Xvfb, both listeners on
-loopback, the live view published to a private network only, and every secret outside this repository.
+This example runs Bosun as an unprivileged user with both listeners on loopback. Publish live view to a private
+network and keep authentication in an environment file. The unit defaults to shared mode. See the sandbox
+setup below to opt in to [tenant isolation](TENANT-SANDBOX.md).
 
 Example files: [`deploy/bosun.service`](../deploy/bosun.service) and
-[`deploy/bosun.env.example`](../deploy/bosun.env.example). Placeholders (`example.org`, `bosun.example.ts.net`) are
+[`deploy/bosun.env.example`](../deploy/bosun.env.example). Placeholders (`example.org`, `bosun.example.org`) are
 meant to be replaced; nothing in this repository knows your hostnames or tokens, and nothing here should learn
 them.
 
@@ -54,10 +55,10 @@ sudo editor /etc/bosun/bosun.env
   `Authorization: Bearer` header).
 - One token per consumer, so revoking one does not disturb the others. Rotation = edit the file,
   `systemctl restart bosun`.
-- The browser, `ffmpeg` and `pulseaudio` children inherit this environment, so anything able to read
-  `/proc/<pid>/environ` as the `bosun` user can read the tokens — every tenant's token, since `BROWSER_TOKENS` is
-  one variable. That is why `bosun` runs nothing else, why the browser keeps its sandbox (§3a), and why hard
-  tenant isolation means one service per tenant.
+- In sandbox mode the gateway holds the MCP and metrics bearers and passes each worker only its tenant
+  configuration over the private bootstrap channel. Browser and media processes receive a minimal environment.
+  In shared mode, child processes can inherit service environment variables. Run the service as a dedicated
+  unprivileged user.
 
 ## 3. The unit
 
@@ -68,7 +69,8 @@ sudo systemctl enable --now bosun
 journalctl -u bosun -f
 ```
 
-Expect two lines and no token:
+Startup reports the listener addresses. With multiple distinct tenants in shared mode, it also recommends
+enabling the tenant sandbox.
 
 ```
 bosun: MCP over WebSocket on 127.0.0.1:7360
@@ -94,6 +96,42 @@ Bosun locates leftover browser processes with `ps` and kills them by their profi
 
 These directives bound what the service **user** may do. They are not a renderer sandbox: that is §3a, and without
 it a page that breaks the renderer is already inside everything the unit allows.
+
+### Start sandboxed workers under systemd
+
+On Debian or Ubuntu, install bubblewrap with `sudo apt-get install bubblewrap`. Stop the unit and migrate
+`/var/lib/bosun/data` as the service user before enabling the sandbox on an existing deployment.
+
+```sh
+sudo systemctl stop bosun
+sudo -u bosun /usr/bin/node /opt/bosun/bin/bosun.mjs migrate-data --dry-run --data /var/lib/bosun/data
+sudo -u bosun /usr/bin/node /opt/bosun/bin/bosun.mjs migrate-data --data /var/lib/bosun/data
+```
+
+Set `BOSUN_TENANT_SANDBOX=on` in the service's environment file. The example `ExecStart` wraps the service in
+host Xvfb for shared mode. Each sandboxed headful worker launches its own Xvfb. Put the following in
+`/etc/systemd/system/bosun.service.d/tenant-sandbox.conf` to replace the command for sandbox mode.
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/node /opt/bosun/src/server.mjs
+ProtectHostname=no
+```
+
+Bubblewrap sets the private hostname and mounts a fresh procfs. If procfs mounting fails inside systemd or a
+container, check for masked or additional mounts under `/proc` introduced by the service manager or container
+profile. After adding the drop-in, reload systemd and start Bosun. The default browser's launch is checked
+at startup, and the public `GET /health` verifies the other enabled engines.
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl start bosun
+curl -f http://127.0.0.1:7360/health
+```
+
+On [rollback](TENANT-SANDBOX.md#roll-back-to-shared-mode-or-027), remove that drop-in and run
+`sudo systemctl daemon-reload` before starting the original unit.
 
 ## 3a. Chromium's sandbox (the service will not start without it)
 

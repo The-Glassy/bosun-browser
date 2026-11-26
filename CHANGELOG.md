@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.28.0 (Unreleased)
+
+### New (opt-in)
+
+- Set `BOSUN_TENANT_SANDBOX=on` for one Linux bubblewrap worker per distinct tenant, or `auto` to enable
+  workers when two or more tokens are configured. The host relay enforces tenant host and exit rules.
+- Set `MEETING_BOT_NAME`, `MEETING_ANNOUNCE`, `MEETING_ANNOUNCE_TEXT`, `MEETING_OWNER`, `MEETING_OPTOUT`,
+  `MEETING_ALONE_LEAVE_SEC` or `MEETING_FIRST_JOINER_WAIT_SEC` for installation defaults. The existing
+  `speech_settings_get/set` tools persist tenant overrides, and `meeting_join` can override each for one call.
+  Set a tenant field to `null` to fall back to the installation or built-in default.
+  `meeting_status.meeting_settings` reports each effective value and source.
+- Notice mode accepts `chat` (default), `host` or `none`. In `none` mode the operator informs participants
+  about recording. Automatic chat opt-out detection defaults to on. With detection off,
+  `bosun:meeting-chat` events continue and the operator or agent must honor objections by stopping
+  and deleting the recording and leaving when appropriate.
+- Set `BROWSER_TIMEZONE` or `BROWSER_LOCALE` to customize browser context defaults.
+- Use `BROWSER_TENANT_EGRESS` to restrict a tenant to a subset of exits. Existing named exit URL strings
+  still count toward readiness. Use the new object form with `"required": false` to make an exit optional.
+  Set `BOSUN_HEALTH_CHECK_ENGINES=1` to include browser launch checks in shared-mode readiness.
+
+### Meeting fixes
+
+- Join Google Meet calls that admit the signed-in profile on page load. Close the share-link dialog and verify
+  the mic and camera are off before announcing or recording.
+- Meet dry runs report direct admission and display the lobby button label when Meet offers Join now or Ask to join.
+
+### Breaking/default changes
+
+- The default guest display name is now `Notetaker`. The built-in English and German recording notices use
+  generic wording, describe the enabled capture, and include an owner name only if `MEETING_OWNER` is set.
+  To keep the previous name and wording, set `MEETING_BOT_NAME="Glassy (notetaker)"` and set
+  `MEETING_ANNOUNCE_TEXT` to the previous notice you want to send, including wording for any video or live
+  transcription you use.
+- A shared process with multiple distinct tenants logs one startup line recommending the sandbox.
+  Set `BOSUN_ALLOW_UNSAFE_SHARED=1` to acknowledge shared mode and silence it.
+- The existing `GET /health` endpoint is now public and drops addresses and diagnostic text so monitoring
+  can run without access to deployment details. The new public
+  `GET /health/exits` reports named exit status and probe times. The new `GET /metrics` is also public by
+  default and exports only `bosun_exit_up` by exit name. See the monitoring upgrade steps below.
+
+### Breaking changes and upgrade notes
+
+**Monitoring.** Remove the MCP bearer from `GET /health` probes. Both health endpoints ignore authentication.
+For readiness, keep checking the HTTP status or the JSON `.ok` field. Replace reads of `.egress.server`,
+`.proxies[].server`, `mode` or `error` with status checks using `.egress.ok` and `.proxies[] | {name, ok, checked_at}`,
+or use `/health/exits` with `.exits[] | {name, ok, checked_at}`. These fields keep proxy addresses and
+diagnostic text out of the public responses. Use only public-facing exit names. To require authentication on
+`/metrics`, set `BOSUN_METRICS_TOKEN` to a dedicated secret of at least 16 characters and configure the
+scraper to send `Authorization: Bearer <that secret>`. MCP tokens belong on the MCP connection.
+
+**Enable tenant sandboxing on an existing deployment.**
+
+1. Install bubblewrap on the Linux host (on Debian or Ubuntu, run `sudo apt-get install bubblewrap`). Verify
+   the service user can launch bubblewrap and the configured browser engines. See the host requirements in
+   [Tenant sandbox](docs/TENANT-SANDBOX.md).
+2. Stop Bosun. As the service user, run `bosun migrate-data --dry-run --data /var/lib/bosun/data` and then
+   `bosun migrate-data --data /var/lib/bosun/data`, using the deployment's actual `BROWSER_DATA` path.
+   From a checkout, replace `bosun` with `node bin/bosun.mjs`. Keep the printed backup path. The CLI
+   refuses conflicts unless run with `--force`.
+3. Set `BOSUN_TENANT_SANDBOX=on` (or `auto` for two or more tokens) and start Bosun. If legacy data
+   still exists, startup refuses with the migration command. Set `BOSUN_AUTO_MIGRATE=1` to explicitly
+   choose the same backup-first migration at startup instead of running it manually.
+   If you use the example systemd unit, apply the [sandbox drop-in](docs/DEPLOY-SYSTEMD.md#start-sandboxed-workers-under-systemd)
+   before starting it.
+4. Check `/health`, open an existing profile and verify the tenant's schedules, macros and recordings.
+   Sandboxed artifact and live-view links use `/tenant/<tenant>/` prefixes. Update proxy routes to
+   accept those paths. An active legacy `/v/<token>` redirects if exactly one worker owns it. Handoffs
+   and transfer links expire when Bosun restarts, so request new links. Shared mode retains the 0.27 paths.
+
+**Roll back.** Stop Bosun. With the 0.28 CLI, run `bosun migrate-data --reverse --dry-run --data /var/lib/bosun/data`
+and then `bosun migrate-data --reverse --data /var/lib/bosun/data`, substituting the actual data directory.
+Keep the reverse backup. Set `BOSUN_TENANT_SANDBOX=off` and unset `BOSUN_AUTO_MIGRATE` before starting shared
+mode. If you applied the example systemd drop-in, remove it to restore the original `xvfb-run` command and run
+`sudo systemctl daemon-reload`. If installing 0.27, first convert any named exit objects back to URL strings. Restore the MCP bearer on
+`/health` probes and remove scrapes of `/health/exits` and `/metrics`. See the
+[backup recovery and conflict instructions](docs/TENANT-SANDBOX.md#roll-back-to-shared-mode-or-027).
+
 ## 0.27.1 (2026-11-22)
 
 - Fix desktop clicks and phone taps on scrolled Camoufox live views by streaming the visible viewport in CSS pixels.

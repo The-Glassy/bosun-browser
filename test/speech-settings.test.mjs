@@ -20,6 +20,8 @@ test('defaults without env or settings; env fallbacks; the tenant\'s settings ov
     from: { backend: 'default', elevenlabs_model: 'default', elevenlabs_voice: 'default', supertonic_voice: 'default', vad_silence_s: 'default', ...Object.fromEntries(Object.keys(DEFAULTS).map((k) => [k, 'default'])) },
   });
   assert.deepEqual(DEFAULTS, {
+    bot_name: 'Notetaker', announce: 'chat', announce_text: null, owner_name: null, optout_detection: true,
+    alone_leave_sec: 30, first_joiner_wait_sec: 120,
     meeting_channel: true, transcript_events: 'auto', agent_partials: false, agent_partials_interval_s: 1.5, channel_prepare_chunks: false,
     ack_on_final: false, ack_phrases: ['Mhm.', 'One sec.', 'Okay.', 'Right.'], ack_lang: null, ack_delay_ms: 100, ack_min_words: 3, ack_cooldown_s: 8,
     turn_hold_ms: 900, turn_hold_complete_ms: 300, barge_in: true, barge_in_min_words: 2, barge_in_min_s: 0.6,
@@ -113,4 +115,18 @@ test('settings removed in 0.19.0 (draft_enabled, draft_max_new_words): a stored 
   const r = s.set('a', { draft_enabled: null, draft_max_new_words: null, ack_on_final: true });
   assert.deepEqual(r.settings, { backend: 'elevenlabs', speculative_speech: true, ack_on_final: true });
   assert.deepEqual(JSON.parse(fs.readFileSync(f, 'utf8')), { backend: 'elevenlabs', speculative_speech: true, ack_on_final: true });
+});
+
+test('leave timers validate, persist independently, and reset to defaults per tenant', () => {
+  const s = settings({});
+  const pick = ({ alone_leave_sec, first_joiner_wait_sec }) => [alone_leave_sec, first_joiner_wait_sec];
+  assert.deepEqual(pick(s.get('alice').effective), [30, 120]);
+  for (const key of ['alone_leave_sec', 'first_joiner_wait_sec']) {
+    for (const value of [0, 3601, 5.5, '120']) assert.throws(() => s.set('alice', { [key]: value }), new RegExp(key));
+  }
+  s.set('alice', { alone_leave_sec: 10 });
+  s.set('alice', { first_joiner_wait_sec: 45 });
+  assert.deepEqual(pick(new SpeechSettings(s.cfg).get('alice').effective), [10, 45]);
+  assert.deepEqual(pick(s.get('bob').effective), [30, 120]);
+  assert.deepEqual(pick(s.set('alice', { alone_leave_sec: null, first_joiner_wait_sec: null }).effective), [30, 120]);
 });

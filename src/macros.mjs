@@ -135,7 +135,7 @@ export function checkMacro(input) {
   if (!MACRO_NAME_RE.test(name)) fail(`name must match ${MACRO_NAME_RE} (lowercase letters, digits, . _ -; up to 64)`);
   const description = String(input.description ?? '');
   if (description.length > 2000) fail('description is longer than 2000 characters');
-  const sites = Array.isArray(input.site) ? input.site : fail('site must be a list of hosts the macro may run on, e.g. ["web.plaud.ai", "*.plaud.ai"]');
+  const sites = Array.isArray(input.site) ? input.site : fail('site must be a list of hosts the macro may run on, e.g. ["app.example.org", "*.example.org"]');
   if (!sites.length || sites.length > MAX_SITES) fail(`site needs 1 to ${MAX_SITES} hosts`);
   const site = sites.map((h) => {
     let p;

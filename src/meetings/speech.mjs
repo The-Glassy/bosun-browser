@@ -8,6 +8,7 @@
 //               response_format: wav}; voices supertonic-F1..F5, supertonic-M1..M5.
 //   elevenlabs  POST https://api.elevenlabs.io/v1/text-to-speech/<voice_id>?output_format=wav_24000&enable_logging=false
 //               {text, model_id (default eleven_v4_turbo), language_code}; voice = an ElevenLabs voice id.
+import { providerFetch } from '../tenant-network.mjs';
 import fs from 'fs';
 import { execFile } from 'child_process';
 import { nodeDebugOn, NODE_DEBUG_REFUSED } from './transcript.mjs';
@@ -75,11 +76,11 @@ async function readUpTo(r, max) {
   }
 }
 
-async function fetchAudio(url, init, what) {
+async function fetchAudio(url, init, what, socketPath) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), TTS_TIMEOUT_MS);
   try {
-    const r = await fetch(url, { ...init, signal: ac.signal, redirect: 'error' });
+    const r = await providerFetch(url, { ...init, signal: ac.signal }, socketPath);
     if (!r.ok) {
       const { buf } = await readUpTo(r, 2000).catch(() => ({ buf: Buffer.alloc(0) }));
       const body = buf.toString('utf8').replace(/\s+/g, ' ').slice(0, 300);
@@ -107,7 +108,7 @@ export async function synthesizeWav(cfg, { text, backend = 'supertonic', voice, 
     buf = await fetchAudio(`${cfg.ttsUrl}/v1/audio/speech`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ input: text, ...(voice ? { voice } : {}), ...(lang ? { lang } : {}), response_format: 'wav' }),
-    }, 'supertonic');
+    }, 'supertonic', cfg.providerSockets?.tts);
   } else if (backend === 'elevenlabs') {
     if (!cfg.elevenlabs?.apiKey) throw new Error('no ElevenLabs key configured (ELEVENLABS_API_KEY)');
     if (nodeDebugOn()) throw new Error(NODE_DEBUG_REFUSED);
@@ -120,7 +121,7 @@ export async function synthesizeWav(cfg, { text, backend = 'supertonic', voice, 
     buf = await fetchAudio(u.href, {
       method: 'POST', headers: { 'content-type': 'application/json', 'xi-api-key': cfg.elevenlabs.apiKey },
       body: JSON.stringify({ text, model_id: model || EL_DEFAULT_TTS_MODEL, ...(lang ? { language_code: lang } : {}) }),
-    }, 'ElevenLabs text-to-speech');
+    }, 'ElevenLabs text-to-speech', cfg.providerSockets?.elevenlabs);
   } else throw new Error(`backend must be one of ${BACKENDS.join(', ')}`);
   const w = parseWav(buf);
   if (!w || w.bits !== 16 || w.format !== 1) throw new Error(`${backend} did not send 16-bit PCM WAV audio`);

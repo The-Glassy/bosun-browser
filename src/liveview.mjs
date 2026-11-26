@@ -9,7 +9,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
-const PAGE = (token, reason, nonce) => `<!doctype html><html><head><meta charset="utf-8">
+const PAGE = (token, reason, nonce, tenantRouting) => `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>Agent needs you</title>
 <style>
@@ -63,7 +63,8 @@ const retry=(ms)=>{clearTimeout(rt);rt=setTimeout(connect,ms)};
 function finish(msg){ended=true;clearTimeout(rt);status(msg);document.body.classList.add('ended');try{if(ws)ws.close()}catch{}}
 function connect(){
  if(ended||ws)return;
- const s=ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/'+tok);
+ const prefix=${tenantRouting ? "location.pathname.slice(0,location.pathname.lastIndexOf('/v/'))" : "''"};
+ const s=ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+prefix+'/ws/'+tok);
  s.onopen=hint;
  s.onclose=(e)=>{if(ws!==s)return;ws=null;if(ended)return;
   // One viewer at a time: wait while another device has it; otherwise ask whether the link is still valid.
@@ -308,13 +309,19 @@ function reject(sock, code, text) {
   sock.destroy();
 }
 
-export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, ttlMs = 15 * 60 * 1000, staleMs = STALE_MS, refreshMs = REFRESH_MS, stepMs = STEP_MS } = {}) {
+export const handoffDigest = (token) => crypto.createHash('sha256').update(token).digest('hex');
+
+export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, socketPath, ttlMs = 15 * 60 * 1000, staleMs = STALE_MS, refreshMs = REFRESH_MS, stepMs = STEP_MS } = {}) {
   const handoffs = new Map(); // token -> handoff
+  const activeDigests = new Set();
   let base = baseUrl ? baseUrl.replace(/\/$/, '') : null;
   let origin = base ? new URL(base).origin : null;
 
   const srv = http.createServer((req, res) => {
     const [p] = String(req.url).split('?');
+    // The gateway can look up legacy links without disclosing their capability token to other workers.
+    const lookup = socketPath && req.method === 'HEAD' && /^\/handoff\/([a-f0-9]{64})$/.exec(p);
+    if (lookup) return res.writeHead(activeDigests.has(lookup[1]) ? 200 : 404).end();
     const m = /^\/v\/([a-f0-9]{32})$/.exec(p);
     const h = m && handoffs.get(m[1]);
     if (!h || h.done || (req.method !== 'GET' && req.method !== 'HEAD')) {
@@ -331,7 +338,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       'x-frame-options': 'DENY',
       'content-security-policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src data:; connect-src 'self' ${wsOrigin}; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
     });
-    res.end(req.method === 'HEAD' ? undefined : PAGE(h.token, h.reason, nonce));
+    res.end(req.method === 'HEAD' ? undefined : PAGE(h.token, h.reason, nonce, Boolean(socketPath)));
   });
   srv.on('clientError', (_e, sock) => sock.destroy());
   srv.on('error', (e) => console.error(`bosun live view: ${e.message}`));
@@ -534,6 +541,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
     h.lastFrame = null;
     clearTimeout(h.timer);
     handoffs.delete(h.token);
+    if (h.digest) activeDigests.delete(h.digest);
     const v = h.viewer;
     if (v) {
       try { v.ws.send(JSON.stringify({ end: status === 'human-done' ? 'Done — the agent continues.' : status })); } catch {}
@@ -552,7 +560,7 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
 
   return {
     async listen() {
-      await new Promise((resolve, rej) => { srv.once('error', rej); srv.listen(port, host, () => { srv.off('error', rej); resolve(); }); });
+      await new Promise((resolve, rej) => { srv.once('error', rej); srv.listen(socketPath ? { path: socketPath } : { port, host }, () => { srv.off('error', rej); resolve(); }); });
       const a = srv.address();
       if (!base) {
         const hh = a.family === 'IPv6' ? `[${a.address}]` : a.address;
@@ -570,6 +578,10 @@ export function createLiveView({ port = 0, host = '127.0.0.1', baseUrl = null, t
       const driver = opts.driver || 'cdp';
       if (!DRIVERS[driver]) throw new Error(`unknown live-view driver ${driver}`);
       const h = { token, page, reason, driver, resolve, viewer: null, done: false, expiresAt: Date.now() + ttl, teardowns: new Set(), drainFailed: false, lastFrame: null, mouse: null };
+      if (socketPath) {
+        h.digest = handoffDigest(token);
+        activeDigests.add(h.digest);
+      }
       h.timer = setTimeout(() => finish(h, 'handoff-timeout'), ttl);
       h.timer.unref?.();
       handoffs.set(token, h);

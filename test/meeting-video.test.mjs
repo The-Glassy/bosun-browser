@@ -102,8 +102,11 @@ test('no recorder or frames before both announcements finish; page and fps passe
   gate.resolve(); await until(() => !!m.rec);
   assert.deepEqual(f.log.map((x) => x[0]), ['announce-start', 'announce-end', 'announce-start', 'announce-end', 'record', 'record']);
   assert.deepEqual(f.recorders[1].video, { page: f.page, fps: 4 });
-  assert.match(f.log[0][1], /audio and video of this meeting page/);
-  assert.match(announcement('Notes', null, { video: true, live: true })[1], /Ton und Video/);
+  assert.match(f.log[0][1], /^An AI notetaker is recording audio and video of this meeting page for notes\./);
+  assert.match(f.log[2][1], /^Ein KI-Notizassistent zeichnet Ton und Video dieser Meeting-Seite für Notizen auf\./);
+  const [en, de] = announcement(null, { video: true, live: true });
+  assert.match(en, /^An AI notetaker is recording audio and video .* and transcribing the audio live\./);
+  assert.match(de, /^Ein KI-Notizassistent zeichnet Ton und Video .* und transkribiert den Ton live\./);
   assert.ok(m.file.endsWith('.ogg')); assert.ok(m.videoFile.endsWith('.webm')); assert.notEqual(m.rec, m.videoRec); assert.equal(fs.statSync(m.file).mode & 0o777, 0o600);
   assert.deepEqual(f.meetings.view(m).video, { on: true, fps: 4, bytes: 10 });
 });

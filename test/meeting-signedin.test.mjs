@@ -22,10 +22,94 @@ async function withService(fn) {
     const c = await connect(svc);
     const s = await c.open({ profile: 'google', engine: PROFILE_ENGINE }); // where a person signed in to Google earlier
     await c.call('session_close', { session: s });
-    return await fn(svc, c);
+    return await fn(svc, c, audio);
   } finally { await svc.stop(); }
 }
 const status = async (c, id) => (await c.call('meeting_status', { meeting_id: id })).json();
+
+test('a host who lands in the Meet call mutes both devices before announcing and recording', async () => {
+  await withService(async (svc, c, audio) => {
+    const { code, url } = fake.newRoom();
+    fake.set(code, { signedIn: true, direct: true, lang: 'de' });
+    const r = await c.call('meeting_join', { url, profile: 'google' });
+    assert.equal(r.isError, false, r.text);
+    const { meeting_id: id, state, joined_as } = r.json();
+    assert.equal(state, 'admitted');
+    assert.equal(joined_as, 'account');
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    const { guest, log, media } = fake.room(code);
+    assert.equal(guest, null);
+    const notice = log.find(([action]) => action === 'chat');
+    assert.ok(notice);
+    assert.deepEqual(media.map(({ mic, cam }) => [mic, cam]), [[false, undefined], [undefined, false]]);
+    assert.ok(media.every(({ at }) => at <= notice[1]));
+    assert.ok(notice[1] <= audio.recorders[0].startedAt);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('direct Meet entry with a share-link modal and a camera problem works in dry run and starts a normal join', async () => {
+  await withService(async (svc, c, audio) => {
+    const { code, url } = fake.newRoom();
+    fake.set(code, { signedIn: true, direct: true, shareDialog: true, cameraProblem: true });
+    const d = await c.call('meeting_join', { url, profile: 'google', dry_run: true });
+    assert.equal(d.isError, false, d.text);
+    const { state, lobby, join_button, microphone, camera, note } = d.json();
+    assert.deepEqual({ state, lobby, join_button, microphone, camera },
+      { state: 'admitted', lobby: null, join_button: null, microphone: 'off', camera: 'no device' });
+    assert.match(note, /Meet admitted/);
+    assert.equal(svc.manager.sessions.size, 0);
+    assert.equal(audio.recorders.length, 0);
+    const room = fake.room(code);
+    assert.deepEqual(room.media.map(({ at, ...action }) => action), [{ shareClosed: true }, { mic: false }]);
+
+    const r = await c.call('meeting_join', { url, profile: 'google' });
+    assert.equal(r.isError, false, r.text);
+    const id = r.json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    assert.deepEqual(room.media.slice(2).map(({ at, ...action }) => action), [{ shareClosed: true }, { mic: false }]);
+    assert.equal(room.guest, null);
+    assert.equal((await status(c, id)).announce.sent_to, 'everyone');
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  });
+});
+
+test('a host whose in-call microphone stays on is disconnected before chat or recording', async () => {
+  await withService(async (svc, c, audio) => {
+    const { code, url } = fake.newRoom();
+    fake.set(code, { signedIn: true, direct: true, micStuckOn: true });
+    const r = await c.call('meeting_join', { url, profile: 'google' });
+    assert.equal(r.isError, true, r.text);
+    assert.match(r.text, /could not confirm the microphone is off after Meet admitted the profile/);
+    await until(() => svc.manager.sessions.size === 0 && audio.stats.closed === 1);
+    assert.equal(fake.room(code).chat.length, 0);
+    assert.equal(audio.recorders.length, 0);
+    await c.close();
+  });
+});
+
+test('Meet dry run reports the visible Join now and Ask to join buttons; Ask to join still waits', async () => {
+  await withService(async (svc, c) => {
+    const host = fake.newRoom();
+    fake.set(host.code, { signedIn: true, open: true });
+    const guest = fake.newRoom();
+    for (const [{ code, url }, label, kind] of [[host, 'Join now', 'account'], [guest, 'Ask to join', 'guest']]) {
+      const r = await c.call('meeting_join', { url, profile: 'google', dry_run: true });
+      assert.equal(r.isError, false, r.text);
+      const { state, lobby, join_button } = r.json();
+      assert.deepEqual({ state, lobby, join_button }, { state: 'lobby', lobby: kind, join_button: label });
+      assert.equal(fake.room(code).guest, null);
+    }
+    const r = await c.call('meeting_join', { url: guest.url, profile: 'google' });
+    assert.equal(r.isError, false, r.text);
+    assert.equal(r.json().state, 'waiting');
+    assert.equal(fake.room(guest.code).via, 'ask');
+    await c.call('meeting_leave', { meeting_id: r.json().meeting_id });
+    await c.close();
+  });
+});
 
 test('the lobby kind: a name field is a guest; no name field with the account shown (or no "Sign in") is the account', async () => {
   await withService(async (svc, c) => {

@@ -2,11 +2,9 @@
 // with it is the agent's call). Names come from the join `name` (and the account name the call shows) and the speech
 // setting name_aliases.
 //
-// Speech-to-text writes a name the way it heard it: "Glassy", "Glassi", "Гласі", "Глассі", "Гласси". So words are
-// compared by a loose key, not by spelling: lower case, diacritics dropped, Cyrillic transliterated (Ukrainian and
-// Russian letters alike), y -> i, h -> g (Ukrainian "г" is an h), w -> v, x -> ks, ph -> f, ck -> k, and doubled letters
-// made single. "Glassy", "Гласі", "Глассі" and "Гласси" all become "glasi". A possessive ('s) is dropped. An alias of
-// several words matches those words in a row. Keys shorter than 3 letters never match ("AI", "Bo"): too many false hits.
+// Speech-to-text can spell a name differently. Compare words using lower case, drop diacritics, transliterate
+// Cyrillic, and normalize common spelling variants and doubled letters. A possessive ('s) is dropped. An alias of
+// several words matches those words in a row. Keys shorter than three letters never match ("AI", "Bo").
 
 const CYR = {
   а: 'a', б: 'b', в: 'v', г: 'g', ґ: 'g', д: 'd', е: 'e', є: 'e', ё: 'e', ж: 'zh', з: 'z', и: 'i', і: 'i', ї: 'i', й: 'i',
@@ -28,7 +26,7 @@ export function nameKey(word) {
 const wordsOf = (text) => String(text || '').match(/[\p{L}\p{N}'’ʼ]+/gu) || [];
 
 // The names to listen for, as lists of word keys: each name whole, and the first word of a name of several words
-// ("Glassy Notetaker" -> also "Glassy"); a bracketed note is no part of a name ("Glassy (notetaker)" -> "Glassy").
+// ("Alex Notetaker" -> also "Alex"); a bracketed note is no part of a name ("Alex (notetaker)" -> "Alex").
 // Aliases are taken as given (whole, and not split).
 export function aliasKeys({ names = [], aliases = [] } = {}) {
   const out = new Map();

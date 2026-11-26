@@ -87,7 +87,7 @@ const CHAT_RECIPIENT = '[class*="receiver-list__receiver"], [class*="chat-receiv
 const EVERYONE = /^(?:to:?\s*)?(?:everyone|everyone in (?:the )?meeting|meeting group chat|alle|alle im meeting|jeder|meeting-gruppenchat|всі|усі|всім|усім|всі учасники|все|всем|все участники)$/i;
 // Zoom's label for the host (and co-hosts) as one recipient, exactly: where the host allows chat with the host only.
 const HOSTS = /^(?:to:?\s*)?(?:(?:the )?hosts? (?:and|&) co-?hosts?|host|hosts? und co-?hosts?|організатор(?:и)? (?:і|й|та) співорганізатор(?:и|ам)?|организатор(?:ы)? и соорганизатор(?:ы|ам)?)$/i;
-// The recipient in a message's sender line ("Glassy Smartie to Host and co-hosts 10:07 AM"): everyone or the host group.
+// The recipient in a message's sender line ("Alex Example to Host and co-hosts 10:07 AM"): everyone or the host group.
 const TO_GROUP = '\\s+(?:to|an|для)\\s+(?:everyone|meeting group chat|alle|meeting-gruppenchat|всіх|всех|(?:the )?hosts? (?:and|&) co-?hosts?|host|hosts? und co-?hosts?|організатор\\S* (?:і|й|та) співорганізатор\\S*|организатор\\S* и соорганизатор\\S*)(?![\\p{L}\\p{N}]).*$';
 // How Zoom marks a message that went to one person only.
 const PRIVATELY = any('\\(privately\\)', 'direct message', '\\(privat\\)', 'direktnachricht', 'приватно', 'особисто', 'лично');
@@ -663,7 +663,7 @@ export const zoom = {
       for (const el of all.filter((e) => !all.some((o) => o !== e && e.contains(o)))) {
         const item = el.closest(ITEM);
         const named = item?.querySelector(SENDER);
-        // The sender line may carry the recipient and a time ("Glassy Notetaker to Everyone 10:07 AM"); the bubble
+        // The sender line may carry the recipient and a time ("Alex Notetaker to Everyone 10:07 AM"); the bubble
         // may carry a time and controls around the text: ours if it contains exactly what was sent.
         const sender = n(named ? named.innerText || named.textContent : '').replace(/\s+\d{1,2}:\d{2}(?:\s?[ap]\.?\s?m\.?)?$/i, '').replace(/\s+(?:to|an|для)\s+.*$/i, '') || last;
         last = sender;

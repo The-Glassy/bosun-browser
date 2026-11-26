@@ -82,7 +82,7 @@ export async function startBosun(env = {}, opts = {}) {
     // TEST_HEADFUL=1 (under Xvfb on Linux) runs the full browser instead of Chromium's headless shell, as a headful
     // deployment does: some browser behaviour (WebRTC policy) differs between the two.
     HEADLESS: process.env.TEST_HEADFUL === '1' ? '0' : '1', BROWSER_DATA: dataDir, WS_PORT: '0', LIVE_PORT: '0', BROWSER_TOKENS: `alice:${TOKEN},bob:${TOKEN_B}`,
-    MAX_SESSIONS: '4',
+    MAX_SESSIONS: '4', BOSUN_TENANT_SANDBOX: 'off', BOSUN_ALLOW_UNSAFE_SHARED: '1',
     // Chromium's sandbox needs host configuration (user namespaces or the setuid helper, see
     // docs/DEPLOY-SYSTEMD.md) that a CI container usually does not have; features.test.mjs asserts that the
     // default (sandbox on) either works or refuses to start.

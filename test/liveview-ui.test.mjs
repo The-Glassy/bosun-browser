@@ -38,6 +38,22 @@ async function openViewer(link, opts = PHONE) {
   return { ctx, vp };
 }
 
+test('shared live view opens the original root WebSocket behind a path-based proxy', async (t) => {
+  const c = await connect(svc);
+  t.after(() => c.close());
+  const { link } = await handoff(c, '/second');
+  const mounted = new URL(link);
+  mounted.pathname = `/live${mounted.pathname}`;
+  const ctx = await browser.newContext();
+  t.after(() => ctx.close());
+  await ctx.route(mounted.href, async (route) => {
+    await route.fulfill({ response: await route.fetch({ url: link }) });
+  });
+  const vp = await ctx.newPage();
+  const [socket] = await Promise.all([vp.waitForEvent('websocket'), vp.goto(mounted.href)]);
+  assert.equal(new URL(socket.url()).pathname, new URL(link).pathname.replace('/v/', '/ws/'));
+});
+
 // Touch gestures through CDP (Playwright's touchscreen only taps).
 async function touch(vp) {
   const cdp = await vp.context().newCDPSession(vp);

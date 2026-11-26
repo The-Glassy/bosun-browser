@@ -420,10 +420,10 @@ export class Keepalive {
         const started = Date.now();
         try {
           const response = await ss.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-          if (ss.egressProxy && response?.status() === 502 && ss.proxyRoute?.failuresSince(started)) throw egressError(ss.egressProxy);
+          if (ss.egressProxy && response?.status() === 502 && ss.proxyRoute?.failuresSince?.(started)) throw egressError(ss.egressProxy);
         } catch (err) {
           const code = /\b(net::ERR_[A-Z_]+|NS_ERROR_[A-Z_]+)\b/.exec(err?.message || '')?.[1];
-          reason = ss.egressProxy && (/PROXY|TUNNEL|SOCKS|AUTH_CREDENTIALS|egress proxy/i.test(String(err?.message)) || ss.proxyRoute?.failuresSince(started)) ? egressError(ss.egressProxy).message : /Timeout/.test(err?.name || '') || /timeout/i.test(err?.message || '') ? 'navigation timeout' : `navigation failed${code ? ` (${code})` : ''}`;
+          reason = ss.egressProxy && (/PROXY|TUNNEL|SOCKS|AUTH_CREDENTIALS|egress proxy/i.test(String(err?.message)) || ss.proxyRoute?.failuresSince?.(started)) ? egressError(ss.egressProxy).message : /Timeout/.test(err?.name || '') || /timeout/i.test(err?.message || '') ? 'navigation timeout' : `navigation failed${code ? ` (${code})` : ''}`;
           throw err;
         }
         await ss.page.waitForLoadState('load', { timeout: 15_000 }).catch(() => {});

@@ -57,9 +57,10 @@ function reject(sock, code, text) {
   sock.destroy();
 }
 
-export async function startWsServer({ cfg, manager }) {
-  const { host, port, maxConnections, allowedOrigins, allowNoToken } = cfg.ws;
+export async function startWsServer({ cfg, manager, socketPath, connect, routeHttp }) {
+  const { host, port, maxConnections, allowedOrigins, allowNoToken } = cfg.ws ?? { maxConnections: 1, allowedOrigins: [], allowNoToken: false };
   const auth = createAuthenticator(cfg.tokens);
+  const metricsAuth = createAuthenticator(cfg.metricsToken ? [{ tenant: 'metrics', token: cfg.metricsToken }] : []);
   const conns = new Set();
   let seq = 0;
 
@@ -70,12 +71,28 @@ export async function startWsServer({ cfg, manager }) {
   };
   const srv = http.createServer(async (req, res) => {
     try {
-      if (req.method === 'GET' && req.url === '/health') {
-        if (!authTenant(req)) { res.writeHead(401); return res.end(); }
-        const health = await manager.health();
-        res.writeHead(health.ok ? 200 : 503, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-        return res.end(JSON.stringify(health));
+      const [pathname] = req.url.split('?');
+      if (req.method === 'GET' && (pathname === '/health' || pathname === '/health/exits')) {
+        const report = pathname === '/health' ? await manager.health() : { exits: await manager.exitHealth() };
+        res.writeHead(report.ok === false ? 503 : 200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        return res.end(JSON.stringify(report));
       }
+      if (req.method === 'GET' && pathname === '/metrics') {
+        const bearer = tokenFromRequest(req, new URLSearchParams());
+        if (cfg.metricsToken && !metricsAuth(bearer)) {
+          res.writeHead(401, { 'www-authenticate': 'Bearer', 'cache-control': 'no-store' });
+          return res.end();
+        }
+        const exits = await manager.exitHealth();
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' });
+        return res.end([
+          '# HELP bosun_exit_up Whether the named egress exit passed its last probe.',
+          '# TYPE bosun_exit_up gauge',
+          ...exits.map(({ name, ok }) => `bosun_exit_up{name="${name}"} ${Number(ok)}`),
+          '',
+        ].join('\n'));
+      }
+      if (routeHttp && await routeHttp(req, res, authTenant(req))) return;
       // Checked without a tick in between: an upload's body must reach its handler before Node buffers more of it.
       if (secrets && Secrets.owns(req) && await secrets.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
       if (uploads && await uploads.handle(req, res, { authTenant, policyOf: (t) => policyOf(cfg, t) })) return;
@@ -115,6 +132,7 @@ export async function startWsServer({ cfg, manager }) {
   // Where this client reaches the port (upload and download URLs): UPLOAD_BASE_URL, else the Host it connected with (a tenant behind a proxy
   // device knows the port by its own address). Only ever shown to that same client.
   const uploadBase = (req) => {
+    if (socketPath) return req.headers['x-bosun-client-base'] || null;
     if (cfg.uploadBaseUrl) return cfg.uploadBaseUrl;
     const h = String(req.headers.host || '');
     return /^(?:[A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(?::\d{1,5})?$/.test(h) ? `http://${h}` : null;
@@ -128,17 +146,23 @@ export async function startWsServer({ cfg, manager }) {
     ws.on('pong', () => { alive = true; });
     const hb = setInterval(() => { if (!alive) return ws.terminate(); alive = false; try { ws.ping(); } catch {} }, HEARTBEAT_MS);
     hb.unref();
-    const server = buildServer({ manager, owner, tenant, cfg, policy: policyOf(cfg, tenant), conn: { inflight: 0 }, uploadBase: base });
+    const transport = new WsTransport(ws);
+    ws.once('close', () => { clearInterval(hb); conns.delete(ws); });
+    if (connect) {
+      connect(transport, tenant, base).catch(() => ws.terminate());
+      return;
+    }
+    const server = buildServer({ manager, owner, tenant, cfg, policy: policyOf(cfg, tenant), conn: { inflight: 0 },
+      uploadBase: base, artifactPrefix: cfg.artifactPrefix });
+
     ws.on('close', () => {
-      clearInterval(hb);
-      conns.delete(ws);
       manager.disposeOwner(owner).catch(() => {}); // lease ends with the connection
       server.close().catch(() => {});
     });
-    server.connect(new WsTransport(ws)).catch(() => ws.terminate());
+    server.connect(transport).catch(() => ws.terminate());
   }
 
-  await new Promise((resolve, rej) => { srv.once('error', rej); srv.listen(port, host, () => { srv.off('error', rej); resolve(); }); });
+  await new Promise((resolve, rej) => { srv.once('error', rej); srv.listen(socketPath ? { path: socketPath } : { port, host }, () => { srv.off('error', rej); resolve(); }); });
 
   return {
     port: srv.address().port,

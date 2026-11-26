@@ -483,11 +483,15 @@ test('robustness: a long name with an emoji, a failed delete keeps its quota, tw
     svc.downloads.sweep();
     await until(() => svc.downloads.used('alice') === 0);
     // A GET whose client reads nothing is cut off once the file is past its expiry; then the file goes.
-    const d3 = (await clickGo(c, await openAt(c, `${a}/page?to=/dl?kb=4096`))).downloads[0];
-    const g = (await c.call('download_get', { download_id: d3.download_id })).json();
-    const req = http.get(g.get_url, (res) => res.pause()); // never reads
-    req.on('error', () => {});
+    const session = await openAt(c, `${a}/page?to=/dl?kb=32768`);
+    const d3 = (await clickGo(c, session)).downloads[0];
     const f3 = svc.downloads.files.get(d3.download_id);
+    await until(() => f3.state === 'ready', 15_000);
+    const link = await c.call('download_get', { download_id: d3.download_id });
+    assert.equal(link.isError, false, link.text);
+    // The response must exceed the loopback socket's buffers to actually stall.
+    const req = http.get(link.json().get_url, (res) => res.pause());
+    req.on('error', () => {});
     await until(() => f3.sending, 5000);
     svc.downloads.sweep(Date.now() + 3600_000 + 120_000);
     await until(() => !f3.sending, 5000);

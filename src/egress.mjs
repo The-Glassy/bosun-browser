@@ -55,6 +55,22 @@ async function readBytes(sock, n) {
   return Buffer.concat(chunks);
 }
 
+function socksDestination({ host, port, pinned }) {
+  const portBytes = Buffer.from([port >> 8, port & 255]);
+  if (pinned && net.isIPv4(host)) return Buffer.concat([Buffer.from([1, ...host.split('.').map(Number)]), portBytes]);
+  if (pinned && net.isIPv6(host)) {
+    const [left, right] = new URL(`http://[${host}]`).hostname.slice(1, -1).split('::');
+    const head = left ? left.split(':') : [], tail = right ? right.split(':') : [];
+    const groups = [...head, ...Array(8 - head.length - tail.length).fill('0'), ...tail];
+    const address = Buffer.alloc(17, 4);
+    for (const [i, group] of groups.entries()) address.writeUInt16BE(parseInt(group, 16), 1 + i * 2);
+    return Buffer.concat([address, portBytes]);
+  }
+  const name = Buffer.from(host);
+  if (!name.length || name.length > 255) throw new Error('invalid SOCKS5 host');
+  return Buffer.concat([Buffer.from([3, name.length]), name, portBytes]);
+}
+
 async function socksConnect(p, target, track, timeoutMs) {
   const u = new URL(p.server);
   const sock = track(net.connect({ host: hostOf(p), port: Number(u.port) }));
@@ -67,10 +83,7 @@ async function socksConnect(p, target, track, timeoutMs) {
     const hello = await readBytes(sock, 2);
     if (hello[0] !== 5 || hello[1] !== 0) throw new Error('SOCKS5 authentication refused');
     if (target) {
-      // Domain form also accepts literal IPs; importantly, names are resolved by the exit, never here.
-      const name = Buffer.from(target.host);
-      if (!name.length || name.length > 255) throw new Error('invalid SOCKS5 host');
-      sock.write(Buffer.concat([Buffer.from([5, 1, 0, 3, name.length]), name, Buffer.from([target.port >> 8, target.port & 255])]));
+      sock.write(Buffer.concat([Buffer.from([5, 1, 0]), socksDestination(target)]));
       const reply = await readBytes(sock, 4);
       if (reply[0] !== 5 || reply[1] !== 0 || reply[2] !== 0) throw new Error('SOCKS5 refused');
       const len = reply[3] === 1 ? 4 : reply[3] === 4 ? 16 : reply[3] === 3 ? (await readBytes(sock, 1))[0] : 0;
@@ -127,23 +140,84 @@ export async function probeEgress(p, timeoutMs = 2000) {
 export function parseEgressProxies(raw) {
   if (raw === undefined || raw === '') return new Map();
   let values;
-  try { values = JSON.parse(raw); } catch { throw new Error('BROWSER_EGRESS_PROXIES must be a JSON object of name -> proxy URL'); }
+  try { values = JSON.parse(raw); } catch { throw new Error('BROWSER_EGRESS_PROXIES must be a JSON object of named exits'); }
   if (!values || Array.isArray(values) || typeof values !== 'object' || Object.keys(values).length > 32) throw new Error('BROWSER_EGRESS_PROXIES must be an object with at most 32 named proxies');
   const proxies = new Map();
   for (const [name, value] of Object.entries(values)) {
     if (!/^[a-z0-9_-]{1,40}$/.test(name) || ['default', 'direct'].includes(name)) throw new Error('BROWSER_EGRESS_PROXIES names must match [a-z0-9_-]{1,40}, excluding default and direct');
-    const proxy = parseEgress(value, 'BROWSER_EGRESS_PROXIES entry');
+    const object = value && typeof value === 'object' && !Array.isArray(value);
+    if (object && ('required' in value && typeof value.required !== 'boolean')) {
+      throw new Error('BROWSER_EGRESS_PROXIES entry required must be a boolean');
+    }
+    const proxy = parseEgress(object ? value.url : value, 'BROWSER_EGRESS_PROXIES entry');
     if (!proxy) throw new Error('BROWSER_EGRESS_PROXIES entries must have a proxy URL');
+    if (object && value.required === false) proxy.required = false;
     proxies.set(name, proxy);
   }
   return proxies;
 }
 
-export function selectEgress(cfg, name = 'default') {
+export function parseTenantExits(env, tenants, proxies) {
+  const routes = new Map();
+  for (const entry of String(env.BROWSER_TENANT_EGRESS || '').split(/[;\n]/).map((s) => s.trim()).filter(Boolean)) {
+    const [tenant, names, extra] = entry.split('=').map((s) => s.trim());
+    if ((!tenants.has(tenant) && tenant !== 'default') || routes.has(tenant) || !names || extra !== undefined) {
+      throw new Error('BROWSER_TENANT_EGRESS expects one entry per tenant, in the form <tenant>=<exit>,<exit>;…');
+    }
+    const allowed = new Set(names.split(',').map((s) => s.trim()));
+    for (const name of allowed) if (!['default', 'direct'].includes(name) && !proxies.has(name)) {
+      throw new Error('BROWSER_TENANT_EGRESS names an unknown exit');
+    }
+    routes.set(tenant, allowed);
+  }
+  return routes;
+}
+
+export function exitsFor(cfg, tenant) {
+  return cfg.tenantExits?.get(tenant) ?? new Set(['default', 'direct', ...(cfg.egressProxies?.keys() || [])]);
+}
+
+async function exitStatus(proxy) {
+  const { ok } = await probeEgress(proxy);
+  return { ok, checked_at: new Date().toISOString() };
+}
+
+// Share work in flight. Readiness still takes a fresh sample when no probe is pending.
+export function createExitHealth(cfg) {
+  let pending, sample;
+  return ({ fresh = false } = {}) => {
+    if (pending) return pending;
+    const now = Date.now();
+    if (!fresh && sample && now < sample.expires) return sample.report;
+    const report = Promise.all([...(cfg.egressProxies || [])].map(async ([name, proxy]) => ({
+      name, ...await exitStatus(proxy),
+    })));
+    sample = { report, expires: now + 10_000 };
+    pending = report.finally(() => { pending = null; });
+    return pending;
+  };
+}
+
+export async function serviceHealth(cfg, exitHealth, engineHealth, closing) {
+  const [egress, proxies, engines] = await Promise.all([exitStatus(cfg.egressProxy), exitHealth({ fresh: true }), engineHealth()]);
+  const ok = !closing() && egress.ok && engines.every((e) => e.ok !== false)
+    && proxies.every((e) => e.ok || cfg.egressProxies.get(e.name)?.required === false);
+  return { ok, egress, proxies, engines };
+}
+
+export function selectEgress(cfg, name = 'default', tenant) {
+  if (cfg.sandboxRoutes) {
+    if (!cfg.sandboxRoutes.has(name)) throw new Error('egress exit is not available to this tenant');
+    return cfg.sandboxRoutes.get(name).egress;
+  }
+  if (cfg.tenantExits?.has(tenant) && !cfg.tenantExits.get(tenant).has(name)) throw new Error('egress exit is not available to this tenant');
   protectEgressCredentials([cfg.egressProxy, ...(cfg.egressProxies?.values() || [])]);
   if (name === 'default') return cfg.egressProxy || null;
   if (name === 'direct') return null;
-  if (cfg.egressProxies?.has(name)) return cfg.egressProxies.get(name);
+  if (cfg.egressProxies?.has(name)) {
+    const { required, ...proxy } = cfg.egressProxies.get(name);
+    return proxy;
+  }
   // Saved profiles must fail closed if their named exit is removed. Never use the default or go direct instead.
   throw new Error('unknown egress proxy name; use default, direct, or a name in BROWSER_EGRESS_PROXIES');
 }

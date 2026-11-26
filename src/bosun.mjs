@@ -14,16 +14,22 @@ import { Downloads } from './downloads.mjs';
 import { Secrets } from './secrets.mjs';
 import { SecretSettings } from './secret-settings.mjs';
 import { Macros } from './macros.mjs';
+import { startTenantService } from './tenant-sandbox.mjs';
 
-export async function startService(cfg, { engines, keepalive: kaOpts = {}, meetings: mOpts = {} } = {}) {
+export async function startService(cfg, { engines, keepalive: kaOpts = {}, meetings: mOpts = {}, wsSocket, liveSocket } = {}) {
+  if (cfg.tenantSandbox && !wsSocket) return startTenantService(cfg);
+  if (cfg.warnUnsafeShared) console.error('bosun: WARNING — multiple tenants share one process; enable isolation with BOSUN_TENANT_SANDBOX=on');
   let live = null;
   if (cfg.live) {
-    live = createLiveView({ port: cfg.live.port, host: cfg.live.host, baseUrl: cfg.live.baseUrl, ttlMs: cfg.handoffTtlMs });
+    live = createLiveView({ port: cfg.live.port, host: cfg.live.host, baseUrl: cfg.live.baseUrl, socketPath: liveSocket, ttlMs: cfg.handoffTtlMs });
     await live.listen();
   }
   const manager = new SessionManager(cfg, { live, engines });
   // The default engine (package and browser binary) must be installed; others are checked when a session asks.
-  try { await manager.engines.check(cfg.engine, cfg); } catch (e) { await live?.close(); throw e; }
+  try {
+    if (wsSocket) await manager.engines.checkLaunch(cfg.engine, cfg);
+    else await manager.engines.check(cfg.engine, cfg);
+  } catch (e) { await live?.close(); throw e; }
   const events = manager.events = new EventBus();
   let keepalive;
   try {
@@ -41,7 +47,16 @@ export async function startService(cfg, { engines, keepalive: kaOpts = {}, meeti
     manager.macros = new Macros(cfg);
   } catch (e) { await live?.close(); throw e; }
   if (cfg.keepalive) keepalive.start();
-  const ws = cfg.ws ? await startWsServer({ cfg, manager }) : null;
+  let ws;
+  try {
+    ws = cfg.ws || wsSocket ? await startWsServer({ cfg, manager, socketPath: wsSocket }) : null;
+  } catch (e) {
+    await Promise.allSettled([keepalive.stop(), manager.meetings?.stop(), live?.close()]);
+    await manager.closeAll();
+    manager.secrets?.close();
+    await Promise.allSettled([manager.uploads?.close(), manager.downloads?.close()]);
+    throw e;
+  }
 
   let closing = null;
   const shutdown = () => (closing ??= (async () => {
@@ -87,6 +102,7 @@ export async function main(env = process.env) {
     delete process.env.ELEVENLABS_API_KEY;
     delete process.env.BROWSER_EGRESS_PROXY;
     delete process.env.BROWSER_EGRESS_PROXIES;
+    delete process.env.BOSUN_METRICS_TOKEN;
   }
   guardDriverRejections();
   // Never silent: an unsandboxed browser is said out loud at every start.
@@ -109,7 +125,9 @@ export async function main(env = process.env) {
     console.error(`bosun: MCP over WebSocket on ${cfg.ws.host}:${svc.ws.port}${cfg.ws.allowNoToken ? ' (NO AUTH — local development)' : ''}`);
   } else {
     process.stdin.on('close', () => exit(0));
-    await buildServer({ manager: svc.manager, owner: 'stdio', tenant: 'default', cfg, policy: policyOf(cfg, 'default') }).connect(new StdioServerTransport());
+    const stdio = new StdioServerTransport();
+    if (svc.connectStdio) await svc.connectStdio(stdio, () => exit(1));
+    else await buildServer({ manager: svc.manager, owner: 'stdio', tenant: 'default', cfg, policy: policyOf(cfg, 'default') }).connect(stdio);
   }
   if (svc.live) console.error(`bosun: live view on ${cfg.live.host}:${svc.live.port}`);
   return svc;

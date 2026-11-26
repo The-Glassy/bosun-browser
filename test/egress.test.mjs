@@ -5,13 +5,13 @@ import net from 'net';
 import fs from 'fs';
 import path from 'path';
 import { loadConfig } from '../src/config.mjs';
-import { parseEgress, connectEgress, probeEgress } from '../src/egress.mjs';
+import { parseEgress, connectEgress, probeEgress, selectEgress } from '../src/egress.mjs';
 import { redactUrlCredentials } from '../src/redact.mjs';
 import { parseHostPattern } from '../src/allow.mjs';
 import { startTenantProxy, resolveTarget } from '../src/proxy.mjs';
 import { createEngines, PROXY_ARGS, PROXY_FIREFOX_PREFS } from '../src/engines.mjs';
 import { SessionManager } from '../src/sessions.mjs';
-import { startBosun, connect, tmpDir, TOKEN } from './helpers.mjs';
+import { startBosun, connect, tmpDir, ENGINE, TOKEN } from './helpers.mjs';
 import { fixture, listen, closeServer } from './egress-fixture.mjs';
 
 const auth = (p) => `Basic ${Buffer.from(`${p.username}:${p.password}`).toString('base64')}`;
@@ -101,9 +101,9 @@ test('egress unreachable chain names exit, never connects directly, and health f
   const health = await probeEgress(egress); assert.equal(health.ok, false); assert.ok(!JSON.stringify(health).includes('supersecret'));
 });
 
-test('egress no-allowlist real browser visits only through the configured authenticated exit; health is authenticated', async (t) => {
+test('egress no-allowlist real browser visits only through the configured authenticated exit; health is public and contains only status', async (t) => {
   const f = await fixture(t);
-  const svc = await startBosun({ BROWSER_EGRESS_PROXY: f.url }); t.after(() => svc.stop());
+  const svc = await startBosun({ BROWSER_EGRESS_PROXY: f.url, FEATURES_ENGINES: ENGINE }); t.after(() => svc.stop());
   const c = await connect(svc); t.after(() => c.close());
   const id = await c.open();
   const nav = await c.call('navigate', { session: id, url: 'http://exit-only.invalid/page' });
@@ -112,9 +112,12 @@ test('egress no-allowlist real browser visits only through the configured authen
   assert.ok(f.requests.some((r) => r.url === 'http://exit-only.invalid/page'));
   assert.equal(f.directConnections(), 0);
   const base = svc.wsUrl.replace('ws:', 'http:');
-  assert.equal((await fetch(`${base}/health`)).status, 401);
-  const health = await fetch(`${base}/health`, { headers: { authorization: `Bearer ${TOKEN}` } });
-  assert.equal(health.status, 200); assert.equal((await health.json()).egress.server, `http://127.0.0.1:${f.port}`);
+  const health = await fetch(`${base}/health`);
+  assert.equal(health.status, 200);
+  const report = await health.json();
+  assert.deepEqual(Object.keys(report.egress).sort(), ['checked_at', 'ok']);
+  assert.equal(report.egress.ok, true);
+  assert.deepEqual(report.engines, [{ name: ENGINE }]);
   await f.stopExit();
   const before = f.connections();
   const failed = await c.call('navigate', { session: id, url: `http://127.0.0.1:${f.originPort}/never-direct` });
@@ -147,12 +150,133 @@ test('egress manager: non-allowlist ephemeral direct bypasses the exit while def
 });
 
 test('egress named proxy configuration rejects malformed maps and reserved names without echoing credentials', () => {
-  for (const value of ['[]', 'null', '{', '{"direct":"http://password@host:80"}', '{"home":null}', '{"home":""}']) {
+  for (const value of ['[]', 'null', '{', '{"direct":"http://password@host:80"}', '{"home":null}', '{"home":""}',
+    '{"home":{}}', '{"home":{"url":"http://password@host:80","required":"true"}}']) {
     assert.throws(() => loadConfig({ BROWSER_EGRESS_PROXIES: value }), (e) => !e.message.includes('password'));
   }
   const cfg = loadConfig({ BROWSER_EGRESS_PROXIES: '{"home":"http://user:pass@host:8080"}' });
   assert.equal(cfg.egressProxies.get('home').server, 'http://host:8080');
+  const required = loadConfig({ BROWSER_EGRESS_PROXIES: '{"home":{"url":"http://user:pass@host:8080","required":true}}' });
+  assert.deepEqual(selectEgress(required, 'home'), selectEgress(cfg, 'home'));
 });
+
+test('engine health launches and closes the installed Camoufox binary without invoking downloads', async () => {
+  let launched, closed = false;
+  const firefox = {
+    async launch(options) { launched = options; return { close: async () => { closed = true; } }; },
+  };
+  const modules = {
+    'camoufox-js': { launchOptions: () => assert.fail('health must not build Camoufox launch options') },
+    'camoufox-js/dist/pkgman.js': { launchPath: () => '/installed/camoufox-bin' },
+    playwright: { firefox },
+  };
+  const engines = createEngines({ importer: async (pkg) => modules[pkg] });
+  const cfg = loadConfig({ HEADLESS: '1', BROWSER_EGRESS_PROXY: 'http://exit:8080' });
+  await engines.checkLaunch('camoufox', cfg);
+  assert.equal(launched.executablePath, '/installed/camoufox-bin');
+  assert.equal(launched.headless, true);
+  assert.deepEqual(launched.proxy, cfg.egressProxy);
+  assert.deepEqual(launched.firefoxUserPrefs, PROXY_FIREFOX_PREFS);
+  assert.equal(closed, true);
+});
+
+test('health reports optional exit failures without failing readiness, and exports credential-free metrics', async (t) => {
+  let probes = 0;
+  const exit = http.createServer((req, res) => {
+    probes++;
+    res.writeHead(req.headers['proxy-authorization'] ? 407 : 200).end();
+  });
+  const port = await listen(exit);
+  t.after(() => closeServer(exit));
+  const url = `http://127.0.0.1:${port}`;
+  const down = `http://user:exit-secret@127.0.0.1:${port}`;
+  const svc = await startBosun({
+    ENGINE: 'chromium', FEATURES_ENGINES: 'chromium', BOSUN_METRICS_TOKEN: 'unique-metrics-bearer',
+    BROWSER_EGRESS_PROXIES: JSON.stringify({ ua: { url: down, required: false }, home: { url, required: true }, office: { url: down, required: false } }),
+  }, { engines: { check: async () => {}, checkLaunch: async () => {} } });
+  t.after(() => svc.stop());
+  const base = `http://127.0.0.1:${svc.ws.port}`;
+  const metricsHeaders = { authorization: 'Bearer unique-metrics-bearer' };
+  for (const [route, headers] of [
+    ['/metrics', undefined],
+    ['/metrics', { authorization: 'Bearer incorrect-token-for-metrics' }],
+    ['/metrics', { authorization: `Bearer ${TOKEN}` }],
+    ['/metrics?token=unique-metrics-bearer', undefined],
+  ]) {
+    const response = await fetch(base + route, { headers });
+    assert.equal(response.status, 401);
+    assert.doesNotMatch(await response.text(), /bosun_exit_up|office|home/);
+  }
+  assert.equal(probes, 0);
+  const [health, exitHealth, metrics] = await Promise.all([
+    fetch(`${base}/health`, { headers: { authorization: 'Bearer ignored' } }),
+    fetch(`${base}/health/exits`),
+    fetch(`${base}/metrics`, { headers: metricsHeaders }),
+  ]);
+  assert.equal(health.status, 200);
+  const report = await health.json();
+  assert.deepEqual(Object.keys(report).sort(), ['egress', 'engines', 'ok', 'proxies']);
+  assert.equal(report.ok, true);
+  assert.equal(report.egress.ok, true);
+  assert.deepEqual(report.engines, [{ name: 'chromium' }]);
+  assert.equal(exitHealth.status, 200);
+  const { exits } = await exitHealth.json();
+  assert.deepEqual(exits.map(({ name, ok }) => [name, ok]), [['ua', false], ['home', true], ['office', false]]);
+  assert.deepEqual(report.proxies, exits);
+  for (const entry of exits) {
+    assert.deepEqual(Object.keys(entry).sort(), ['checked_at', 'name', 'ok']);
+    assert.equal(new Date(entry.checked_at).toISOString(), entry.checked_at);
+  }
+  assert.doesNotMatch(JSON.stringify({ report, exits }), /exit-secret|127\.0\.0\.1|unique-metrics-bearer|alice|bob/);
+  assert.equal(metrics.status, 200);
+  assert.match(metrics.headers.get('content-type'), /^text\/plain; version=0\.0\.4/);
+  const exposition = await metrics.text();
+  assert.deepEqual(exposition.trim().split('\n').slice(1), [
+    '# TYPE bosun_exit_up gauge', 'bosun_exit_up{name="ua"} 0', 'bosun_exit_up{name="home"} 1', 'bosun_exit_up{name="office"} 0',
+  ]);
+  const open = await startBosun({ BROWSER_EGRESS_PROXIES: JSON.stringify({ office: { url: down, required: false } }) },
+    { engines: { check: async () => {}, checkLaunch: () => assert.fail('engine checks must be opt-in') } });
+  t.after(() => open.stop());
+  const publicMetrics = await fetch(`http://127.0.0.1:${open.ws.port}/metrics`);
+  assert.equal(publicMetrics.status, 200);
+  assert.match(await publicMetrics.text(), /bosun_exit_up\{name="office"\} 0/);
+});
+
+for (const failure of ['required exit', 'default egress', 'engine launch', 'shutdown']) {
+  test(`service health returns 503 for ${failure}; exit health still returns 200`, async (t) => {
+    const exit = http.createServer((_req, res) => res.writeHead(503).end());
+    const port = await listen(exit);
+    t.after(() => closeServer(exit));
+    const url = `http://127.0.0.1:${port}`;
+    const engines = {
+      check: async () => {},
+      async checkLaunch(name) {
+        if (name === 'patchright' && failure === 'engine launch') throw new Error('internal launch details');
+      },
+    };
+    const svc = await startBosun({
+      ENGINE: 'chromium', FEATURES_ENGINES: 'chromium,patchright',
+      BOSUN_HEALTH_CHECK_ENGINES: '1',
+      BROWSER_EGRESS_PROXY: failure === 'default egress' ? url : '',
+      BROWSER_EGRESS_PROXIES: failure === 'required exit' ? JSON.stringify({ ua: url }) : '',
+    }, { engines });
+    t.after(() => svc.stop());
+    if (failure === 'shutdown') svc.manager.closing = true;
+    const base = `http://127.0.0.1:${svc.ws.port}`;
+    const headers = { authorization: `Bearer ${TOKEN}` };
+    const health = await fetch(`${base}/health`, { headers });
+    assert.equal(health.status, 503);
+    const report = await health.json();
+    assert.equal(report.ok, false);
+    assert.equal(report.egress.ok, failure !== 'default egress');
+    assert.equal(report.engines.find(({ name }) => name === 'patchright').ok, failure !== 'engine launch');
+    assert.ok(!JSON.stringify(report).includes('internal launch details'));
+    const exitHealth = await fetch(`${base}/health/exits`, { headers });
+    assert.equal(exitHealth.status, 200);
+    assert.deepEqual((await exitHealth.json()).exits.map(({ name, ok }) => [name, ok]),
+      failure === 'required exit' ? [['ua', false]] : []);
+  });
+}
 
 // These lifecycle tests use a minimal browser adapter, exercising the real manager and profile persistence without
 // installing three browsers or opening sockets. The wire-level tests above separately exercise local fake exits.

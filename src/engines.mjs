@@ -135,6 +135,7 @@ function definitions(importer) {
       // Always direct, even when cfg.egressProxy is set. Selected exits use private processes in open() below,
       // so an ephemeral session choosing "direct" cannot inherit the default exit from a shared launch.
       launchShared: (bt, cfg) => bt.launch({ headless: cfg.headless, args: CHROMIUM_ARGS, chromiumSandbox: cfg.chromiumSandbox }),
+      launchProbe: (bt, opts) => bt.launch({ ...opts, args: chromiumArgs(opts.proxy) }),
       async open(bt, { cfg, dir, locale, timezone, shared, media, proxy, downloads }) {
         const o = { viewport: { width: 1366, height: 900 }, locale, timezoneId: timezone, acceptDownloads: false, ...(proxy ? { proxy } : {}) };
         if (dir) applyWebrtcPolicy(dir, !!proxy);
@@ -147,6 +148,7 @@ function definitions(importer) {
       name: 'patchright', family: 'chromium', cdp: true, shared: false, tracker: 'navigate',
       async load() { return (await importer('patchright')).chromium; },
       async check(bt, cfg) { exists(bt.executablePath()); await sandboxPreflight(bt, cfg); },
+      launchProbe: (bt, opts) => bt.launch({ ...opts, channel: 'chromium', args: opts.proxy ? PROXY_ARGS : [] }),
       // Recommended patchright setup: persistent context, no custom UA/headers, no automation-flag args, the
       // browser's own window size (viewport: null).
       async open(bt, { cfg, dir, locale, timezone, media, proxy, downloads }) {
@@ -167,6 +169,12 @@ function definitions(importer) {
         return { launchOptions, firefox };
       },
       async check({ launchOptions }) { exists((await launchOptions({ headless: true })).executablePath); },
+      async launchProbe({ firefox }, { chromiumSandbox, ...opts }) {
+        // Resolve the installed binary without triggering launchOptions' browser or add-on downloads.
+        const { launchPath } = await importer('camoufox-js/dist/pkgman.js');
+        const prefs = opts.proxy ? { firefoxUserPrefs: PROXY_FIREFOX_PREFS } : {};
+        return firefox.launch({ ...opts, executablePath: launchPath(), ...prefs });
+      },
       // Fingerprint (window, screen, fonts, UA) comes from Camoufox (viewport: null keeps Playwright out of it); the
       // OS matches the host unless CAMOUFOX_OS says otherwise, so fonts and rendering stay consistent with the claimed
       // platform. humanize stays off: with Playwright 1.64 its cursor patch makes actionability checks hang.
@@ -203,6 +211,14 @@ export function createEngines({ importer = defaultImporter, overrides = {} } = {
     async check(name, cfg) {
       const bt = await load(name);
       try { await get(name).check?.(bt, cfg); } catch (e) { throw explain(name, e); }
+    },
+    // Exercise the actual browser binary (including Chromium's headless shell) without opening a user session.
+    async checkLaunch(name, cfg) {
+      const bt = await load(name);
+      const opts = { headless: cfg.headless, chromiumSandbox: cfg.chromiumSandbox, timeout: 8000,
+        ...(cfg.egressProxy ? { proxy: cfg.egressProxy } : {}) };
+      const browser = await get(name).launchProbe(bt, opts);
+      await browser.close();
     },
     // Opens a context. Ephemeral sessions of non-shared engines, of meetings, of proxied tenants and of sessions that
     // may download get a private temp profile (tmpDir, removed on close): a proxied tenant's browser needs its own

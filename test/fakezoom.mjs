@@ -267,7 +267,7 @@ async function poll() {
       shown.add(m.id);
       const item = document.createElement('div');
       item.className = 'chat-item-container';
-      // liveChat: our own messages under our name with the recipient and a time ("Glassy (notetaker) to Everyone
+      // liveChat: our own messages under our name with the recipient and a time ("Notetaker to Everyone
       // 10:07 AM", "… to Host and co-hosts …"), and each bubble with a time and its menu control inside.
       const sender = m.self ? (R.liveChat ? m.sender + ' to ' + (m.to || 'Everyone') + ' 10:07 AM' : 'Me') : (R.liveChat ? m.sender + ' 10:07 AM' : m.sender);
       if (sender !== prev) { const h = document.createElement('div'); h.className = 'chat-item__sender'; h.textContent = sender; item.append(h); }

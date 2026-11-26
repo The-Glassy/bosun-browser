@@ -70,8 +70,8 @@ Not measured: no such host was available for this run. Expected differences, rou
    a macOS/Windows fingerprint on Linux fonts is a mismatch. Install a normal desktop font set (e.g. `fonts-noto`,
    `fonts-liberation`, `fonts-dejavu`).
 4. **Screen geometry.** `xvfb-run -s "-screen 0 1366x900x24"` is an uncommon size; prefer `1920x1080x24`.
-5. **Locale/timezone vs IP geolocation.** Bosun defaults to `de-AT`/`Europe/Vienna`; on a host abroad that conflicts
-   with the IP's location. Set `locale`/`timezone` on `session_open` to match the egress IP.
+5. **Locale/timezone vs IP geolocation.** Bosun defaults to `de-AT` and `Europe/Vienna`. Set
+   `BROWSER_LOCALE` and `BROWSER_TIMEZONE`, or pass `locale` and `timezone` to `session_open`, to match your exit.
 6. **Headless.** Never run production headless: headless patchright still reports `HeadlessChrome` in its UA.
 7. **Memory.** Expect lower absolute numbers than macOS (no Metal/GPU process; smaller font caches), and PSS gives the
    honest per-session cost. The ratio between engines should hold.
