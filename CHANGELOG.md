@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Tenant sandbox fixes
+
+- A sandboxed Chromium no longer hangs until the navigation timeout on sites that send an `ACCEPT_CH` frame
+  (`www.google.com`, `meet.google.com`). The worker's loopback bridge now presents the relay credentials, so
+  the browser holds none.
+- Workers mount `/etc/alternatives`, so `ffmpeg` finds `libblas.so.3` and `liblapack.so.3` on Debian and
+  `meeting_join` no longer fails with "ffmpeg is not installed". They also mount `/usr/share/fontconfig`
+  (pages fell back to the wrong default and emoji fonts), `/usr/local/share/ca-certificates` and the
+  RHEL-family CA bundle directories, and get a generated `/etc/hosts` that resolves `localhost`.
+- The meeting audio check reports a program that is installed but cannot run with the program's own error.
+  "not installed" now means the program was not found.
+
 ## 0.28.0 (Unreleased)
 
 ### New (opt-in)
