@@ -1,6 +1,7 @@
 // MCP tool surface. One McpServer per connection; every session lookup is scoped to that connection (owner).
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import crypto from 'crypto';
+import fs from 'fs';
 import path from 'path';
 import { z } from 'zod';
 import { redactUrlCredentials, countNodes, markSensitive, markValue, maskText, maskedScreenshot, readText, scrubValue, sensitiveValues } from './redact.mjs';
@@ -22,6 +23,9 @@ import { showPattern } from './allow.mjs';
 import { currentCall, stepCall, withDeadline } from './deadline.mjs';
 import { MAX_SITES, MAX_STEPS, RUN_DEFAULT_SEC, RUN_MAX_SEC, runMacro, flattenSteps } from './macros.mjs';
 
+// What the server reports as its version: the package's, so a release cannot forget it.
+export const VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+const HASH_PREFIX_MIN_BYTES = 16; // secret_save: shorter values get no sha256_prefix
 const MAX_SHOT_PX = 8000; // tallest full-page screenshot, CSS px
 const POLL_SEC = 50; // default handoff wait: below the MCP SDK's 60 s request timeout
 
@@ -444,7 +448,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const dlHosts = downloads ? downloads.allowFor(tenant).map(showPattern).join(', ') : null;
   // What click and navigate report: a download kept or refused (also "downloads are off for this token").
   const capture = !ephemeral ? manager.downloads ?? null : null;
-  const server = new McpServer({ name: 'bosun', version: '0.28.0' }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
+  const server = new McpServer({ name: 'bosun', version: VERSION }, { capabilities: ephemeral ? {} : { experimental: { mcpl: MANIFEST } } });
   // MCPL push events (needs-human) for this tenant, once the host has granted them.
   if (manager.events && !ephemeral) {
     const mcpl = mcplConnection(server.server, { bus: manager.events, tenant });
@@ -471,6 +475,10 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   // handler is never wired up) and is left out of tools/list below. The handlers this token may call, with their
   // argument schemas, are also kept in handlers: a macro step runs the same code as the tool.
   const handlers = new Map();
+  // Values that came from or went to a secret store (stores/index.mjs SecretGuard): taken out of every text a tool
+  // returns or throws, whatever the page did with them. Nothing is held unless a store was used.
+  const guard = manager.guard ?? null;
+  const scrubbed = (r) => (guard && Array.isArray(r?.content) ? { ...r, content: r.content.map((c) => (c?.type === 'text' ? { ...c, text: guard.scrub(tenant, c.text) } : c)) } : r);
   const tool = (name, desc, shape, fn) => {
     if (ephemeral && !EPHEMERAL_TOOLS.has(name)) return server.tool(name, NOT_ALLOWED, {}, async () => { throw new Error(`${name}: ${NOT_ALLOWED}`); });
     handlers.set(name, { fn, schema: z.object(shape) });
@@ -479,8 +487,8 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       if (conn.inflight >= cfg.maxInflight) throw new Error(`too many concurrent requests on this connection (max ${cfg.maxInflight})`);
       conn.inflight++;
       try {
-        return limitMs ? await withDeadline(name, limitMs, () => fn(a, extra)) : await fn(a, extra);
-      } catch (e) { throw new Error(cleanError(e)); } finally { conn.inflight--; }
+        return scrubbed(limitMs ? await withDeadline(name, limitMs, () => fn(a, extra)) : await fn(a, extra));
+      } catch (e) { throw new Error(guard ? guard.scrub(tenant, cleanError(e)) : cleanError(e)); } finally { conn.inflight--; }
     });
   };
 
@@ -607,13 +615,18 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       const l = found.asElement ? found : await found.elementHandle({ timeout: left(until) });
       try {
         stillOn(call);
-        return await typeSecretInto(s, l, a, call, until);
+        return await typeSecretInto(s, l, a, call, until, {
+          take: () => { const buf = secrets.take(tenant, a.secret_id); const v = buf.toString('utf8'); buf.fill(0); return v; },
+          done: 'typed and deleted', spent: '(the secret is deleted; call secret_create for a new one)',
+          log: (bytes) => console.error(`bosun: secret ${a.secret_id} of tenant ${tenant}: typed in session ${s.id}, ${bytes} bytes`),
+        });
       } finally {
         if (l !== found) await l.dispose().catch(() => {});
       }
     });
   }
-  async function typeSecretInto(s, l, a, call, until) {
+  // from: where the value comes from, at the last moment (take), and what to say about it afterwards.
+  async function typeSecretInto(s, l, a, call, until, from) {
     // The page the secret goes into, also for scrubbing and leaving it: s.page may change under a call that ran out
     // of time (the tab is replaced).
     const page = s.page;
@@ -626,9 +639,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     // A macro step: the field and the page are still where the macro may act (the field was found after a wait
     // that a navigation may have crossed), and the step has not run out of time.
     await recheck(call, l);
-    const buf = secrets.take(tenant, a.secret_id);
-    let value = buf.toString('utf8');
-    buf.fill(0);
+    let value = await from.take();
     // As typed, and as a form that submits with GET puts it into the URL.
     const forms = [...new Set([value, encodeURIComponent(value), new URLSearchParams({ v: value }).toString().slice(2)])];
     const hide = (t) => forms.reduce((out, f) => (value && out.includes(f) ? out.split(f).join('[masked]') : out), String(t));
@@ -648,12 +659,110 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       await markValue(page, value);
       if (a.submit) { await recheck(call); await l.press('Enter', { timeout: a.timeoutMs === undefined ? 15000 : left(until) }); await page.waitForTimeout(1500); }
       const info = await pageInfo(page);
-      console.error(`bosun: secret ${a.secret_id} of tenant ${tenant}: typed in session ${s.id}, ${Buffer.byteLength(value)} bytes`);
-      return { ...info, url: hide(info.url), title: hide(info.title), secret: 'typed and deleted' };
+      // A form that submits with GET puts what was typed into the URL, where every later result (read, click,
+      // sessions) would repeat it: then the value is kept, in memory and for this session only, to mask it there.
+      if (guard && forms.some((f) => info.url.includes(f) || info.title.includes(f))) guard.add(tenant, s.id, value);
+      from.log?.(Buffer.byteLength(value));
+      return { ...info, url: hide(info.url), title: hide(info.title), secret: from.done };
     } catch (e) {
-      throw new Error(`${hide(cleanError(e))} (the secret is deleted; call secret_create for a new one)`);
+      throw Object.assign(new Error(`${hide(cleanError(e))} ${from.spent}`), { code: e?.code });
     } finally {
       value = null;
+    }
+  }
+
+
+  // Secret stores (BOSUN_SECRET_STORES): the operator's recipes for this tenant. The agent names a recipe; where
+  // the value comes from, which page and field it may go into and where that form may send it are the recipe's.
+  const store = !ephemeral ? manager.secretStores?.forTenant(tenant) ?? null : null;
+  const recipes = store?.enabled ? store.list() : null;
+  const coded = (code, message) => Object.assign(new Error(message), { code });
+  // The page is the recipe's: its top-level origin (scheme, host and port, exactly) and path.
+  const recipePlace = (page, r) => {
+    let u = null;
+    try { u = new URL(page.url()); } catch {}
+    if (!u || u.origin !== r.origin) throw coded('ORIGIN_MISMATCH', `recipe ${r.name} is for ${r.origin}; this page is ${u && u.origin !== 'null' ? u.origin : 'not a web page'}. Nothing was filled.`);
+    if (r.path_prefix && !u.pathname.startsWith(r.path_prefix)) throw coded('ORIGIN_MISMATCH', `recipe ${r.name} is for pages under ${r.origin}${r.path_prefix}. Nothing was filled.`);
+    return u.origin;
+  };
+  // Runs in the page: what the field is and where its form would send it (the attributes, not the form's
+  // properties: an input named "action" replaces those).
+  function fieldFacts(el) {
+    const kind = el.localName === 'input' ? String(el.type || 'text').toLowerCase() : el.localName === 'textarea' ? 'textarea' : `<${el.localName}>`;
+    const abs = (u) => { try { return new URL(u, document.baseURI).href; } catch { return 'invalid:'; } };
+    const form = el.form || el.closest('form');
+    const id = form?.getAttribute('id');
+    const overrides = form ? [...form.querySelectorAll('[formaction]'), ...(id ? [...document.querySelectorAll('[formaction][form]')].filter((b) => b.getAttribute('form') === id) : [])] : [];
+    return { kind, top: window === window.top, editable: !el.disabled && !el.readOnly,
+      form: form ? { action: abs(form.getAttribute('action') || document.URL), overrides: overrides.map((b) => abs(b.getAttribute('formaction'))) } : null };
+  }
+  async function fillRecipe(s, a) {
+    const page = s.page;
+    let r = null, origin = null, status = 'refused', code = null;
+    try {
+      r = store.binding(a.recipe);
+      if (driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
+      const client = r.source === 'client';
+      if (client && a.secret_id === undefined) throw coded('INVALID', `recipe ${r.name} takes its value from your side: call secret_create, PUT the value, then pass secret_id`);
+      if (!client && a.secret_id !== undefined) throw coded('INVALID', `recipe ${r.name} reads its value from the store: call it without secret_id`);
+      if (client) { if (!secrets) throw coded('INVALID', 'secret_create is not available here'); secrets.find(tenant, a.secret_id); }
+      origin = recipePlace(page, r);
+      const until = Date.now() + (a.timeoutMs ?? FIND_MS);
+      const all = page.locator(r.selector);
+      let n = 0;
+      for (;;) { n = await all.count(); if (n || Date.now() >= until) break; await sleep(200); }
+      if (n !== 1) throw coded(n ? 'TARGET_NOT_UNIQUE' : 'TARGET_NOT_FOUND', `recipe ${r.name}: its field selector matches ${n} elements on this page (exactly one is required). Nothing was filled.`);
+      const l = await all.elementHandle({ timeout: left(until) });
+      try {
+        const f = await l.evaluate(fieldFacts);
+        if (!f.top) throw coded('ORIGIN_MISMATCH', `recipe ${r.name}: the field is not in the top-level page. Nothing was filled.`);
+        if (f.kind.startsWith('<') || NO_SECRET_TYPES.has(f.kind)) throw coded('TARGET_NOT_EDITABLE', `recipe ${r.name}: the field is ${f.kind.startsWith('<') ? f.kind : `<input type=${f.kind}>`}, not a text field. Nothing was filled.`);
+        if (r.field_type !== 'any' && f.kind !== r.field_type) throw coded('FIELD_TYPE', `recipe ${r.name} fills ${r.field_type === 'textarea' ? 'a <textarea>' : `<input type=${r.field_type}>`}; the field on this page is ${f.kind === 'textarea' ? 'a <textarea>' : `<input type=${f.kind}>`}. Nothing was filled.`);
+        if (!f.editable) throw coded('TARGET_NOT_EDITABLE', `recipe ${r.name}: the field is disabled or read-only. Nothing was filled.`);
+        // Where the form would send the value: every destination it names must be one the recipe allows.
+        const allowed = r.submit_to.map((d) => new URL(d));
+        for (const dest of f.form ? [f.form.action, ...f.form.overrides] : []) {
+          let u = null;
+          try { u = new URL(dest); } catch {}
+          if (!u || !allowed.some((d) => d.origin === u.origin && u.pathname.startsWith(d.pathname))) throw coded('SUBMIT_TARGET', `recipe ${r.name}: the form on this page submits to ${u && /^https?:$/.test(u.protocol) ? u.origin + u.pathname : 'a destination that is not a web address'}, which the recipe does not allow. Nothing was filled.`);
+        }
+        const out = await typeSecretInto(s, l, { allow_non_password: true, submit: r.submit, timeoutMs: a.timeoutMs }, null, until, {
+          take: async () => {
+            let v;
+            if (client) { const buf = secrets.take(tenant, a.secret_id); v = buf.toString('utf8'); buf.fill(0); } else {
+              const buf = await store.resolve(r.name, { session: s.id, origin }).catch((e) => { throw coded(e?.code, `recipe ${r.name}: ${e?.message || 'the secret store failed'}. Nothing was filled.`); });
+              v = buf.toString('utf8');
+              buf.fill(0);
+            }
+            // Masked in everything this session returns from here on, wherever the page puts it.
+            guard?.add(tenant, s.id, v);
+            // The store took its time: the page and the field are still the ones that were checked.
+            recipePlace(page, r);
+            if (!(await l.evaluate((el) => el.isConnected).catch(() => false))) throw coded('TARGET_CHANGED', 'the field left the page before anything was typed');
+            return v;
+          },
+          done: r.submit ? 'filled and submitted' : 'filled',
+          spent: client ? '(the secret is deleted; call secret_create for a new one)' : '(nothing more was done; the value was not shown to you)',
+        });
+        status = 'ok';
+        return { recipe: r.name, status: r.submit ? 'submitted' : 'filled', url: out.url, title: out.title, ...(r.submit ? {} : { next: 'submit the form as usual (click); the field is masked in read and screenshot' }) };
+      } finally { await l.dispose().catch(() => {}); }
+    } catch (e) {
+      // refused: a check said no and nothing was typed. error: the store or the page failed.
+      code = e?.code && /^[A-Z_]{3,30}$/.test(String(e.code)) ? e.code : 'FILL_FAILED';
+      status = /^(?:ORIGIN_MISMATCH|TARGET_NOT_UNIQUE|TARGET_NOT_FOUND|TARGET_NOT_EDITABLE|FIELD_TYPE|SUBMIT_TARGET|INVALID|NOT_FOUND)$/.test(code) ? 'refused' : 'error';
+      throw e;
+    } finally {
+      store.note({ action: 'fill', recipe: r?.name ?? String(a.recipe).slice(0, 64), session: s.id, origin: origin ?? undefined, status, ...(code ? { code } : {}) });
+    }
+  }
+  if (recipes) {
+    tool('secret_recipes', 'List the secret recipes and save targets the operator set up for this token. A recipe names a credential in the operator\'s secret store and the one place it may go: origin (the page), selector (the field), field_type and submit_to (where that form may send it). Use one with secret_fill; the value never passes through you. A save target takes a value a page generated (secret_save with store_target). Only the operator can add or change them.', {},
+      async () => ok(recipes));
+    if (recipes.recipes.length) {
+      tool('secret_fill', `Fill a credential from the operator's secret store into the page, by recipe name (secret_recipes lists them: ${recipes.recipes.slice(0, 20).map((r) => r.name).join(', ')}${recipes.recipes.length > 20 ? ', …' : ''}). Navigate to the recipe's page first. Bosun checks that the page is the recipe's origin, that its selector matches exactly one field of the right type and that the form submits where the recipe allows, then types the value itself; a recipe with submit also presses Enter. You get a status, never the value: it is masked in read, screenshot and every later result of this session, cannot be read back with secret_reveal or secret_save, and is taken out of the page before a human handoff. A recipe with source "client" takes its value from your side instead: secret_create, PUT, then pass secret_id.`,
+        { session: str(40), recipe: str(64), ...(secrets ? { secret_id: str(40).optional().describe('only for a recipe with source "client": the secret_id from secret_create') } : {}), ...actionTimeout },
+        async (a) => run(a.session, async (s) => ok(await fillRecipe(s, a))));
     }
   }
 
@@ -719,14 +828,14 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         if (!a.fullPage) return s.page.screenshot({ ...opt, mask });
         const [w, h] = await s.page.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.scrollHeight]);
         return s.page.screenshot({ ...opt, mask, fullPage: true, clip: { x: 0, y: 0, width: Math.min(w, 4000), height: Math.min(h, MAX_SHOT_PX) } });
-      });
+      }, guard?.values(s.id) ?? []);
       const file = await manager.saveShot(s, buf);
       return { content: [{ type: 'image', data: buf.toString('base64'), mimeType: 'image/jpeg' }, { type: 'text', text: file || 'not saved to disk (SAVE_SHOTS=1 enables it)' }] };
     }));
 
   // Secrets: sent by the agent's shell over a one-time PUT, typed with type secret_id, never in a tool call.
   if (secrets) {
-    tool('secret_create', `Get a password or other secret to the browser without it passing through you. Returns secret_id and a one-time PUT URL (valid ${SECRET_URL_TTL_MS / 60000} min, this token only) with a curl line that reads the secret from stdin: pipe it in from where it is stored (e.g. sops -d --extract '["password"]' secrets.yaml | curl …), never echo it or put it in a command line. Up to ${SECRET_MAX_BYTES} bytes of UTF-8; one trailing newline is dropped. Then call type with secret_id: the secret goes into an <input type=password> (other fields only with allow_non_password=true) and is deleted. Kept in memory only, ${SECRET_TTL_MS / 60000} min after it arrived at most, never on disk or in a log.`,
+    tool('secret_create', `Get a password or other secret to the browser without it passing through you. Returns secret_id and a one-time PUT URL (valid ${SECRET_URL_TTL_MS / 60000} min; the URL itself is the credential, and another token's bearer is refused) with a curl line that reads the secret from stdin: pipe it in from where it is stored (e.g. sops -d --extract '["password"]' secrets.yaml | curl …), never echo it or put it in a command line. Up to ${SECRET_MAX_BYTES} bytes of UTF-8; one trailing newline is dropped. Then call type with secret_id: the secret goes into an <input type=password> (other fields only with allow_non_password=true) and is deleted. Kept in memory only, ${SECRET_TTL_MS / 60000} min after it arrived at most, never on disk or in a log.`,
       { label: str(100).optional().describe('what it is, for you (e.g. "github password"); not secret') },
       async (a) => {
         if (!cfg.ws) throw new Error('secret_create needs the WebSocket service (WS_PORT): the secret comes in over an HTTP PUT on that port');
@@ -751,6 +860,11 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       { secrets_reveal: z.boolean().nullable() }, async (a) => ok(secretSettings.set(tenant, a.secrets_reveal)));
 
     const secretTarget = { session: str(40), ...target };
+    // The first 8 hex digits of the value's SHA-256, to compare with the saved copy. Not for a short value: 32 bits
+    // of hash single out a 6-digit code or a PIN among everything it could be, which would hand the value itself to
+    // whoever reads the result.
+    const hashPrefix = (value, length) => (length >= HASH_PREFIX_MIN_BYTES ? { sha256_prefix: crypto.createHash('sha256').update(value).digest('hex').slice(0, 8) }
+      : { sha256_prefix: null, sha256_note: `left out for a value under ${HASH_PREFIX_MIN_BYTES} bytes (it would let the value be guessed); check the saved copy with sha256sum instead` });
     const secretAction = (name, a, use) => manager.run(owner, a.session, async (s) => {
       const call = currentCall();
       const host = new URL(s.page.url()).host || '(no host)';
@@ -758,7 +872,9 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       let element = kind, length = 0, status = 'refused';
       try {
         if (name === 'secret_reveal' && !revealEnabled()) throw new Error('secrets_reveal is off for this tenant; use secret_save to save the value to a file');
-        if (name === 'secret_save' && !cfg.ws) throw new Error('secret_save needs the WebSocket service (WS_PORT) for the one-time download URL');
+        if (name === 'secret_save' && !cfg.ws && a.store_target === undefined) throw new Error('secret_save needs the WebSocket service (WS_PORT) for the one-time download URL');
+        if (name === 'secret_save' && (a.store_target === undefined) !== (a.store_key === undefined)) throw new Error('give store_target and store_key together (or neither, for a one-time download)');
+        if (name === 'secret_save' && a.overwrite !== undefined && a.store_target === undefined) throw new Error('overwrite goes with store_target');
         if (driverLogsValues()) throw new Error(DRIVER_LOGS_REFUSED);
         if (!hasTarget(a)) throw new Error('give ref, role(+name), selector or text for the secret element');
         if (a.ref && (a.nth !== undefined || a.after || a.before)) throw new Error('nth, after and before go with role, selector or text, not with ref');
@@ -781,7 +897,9 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
         if (typeof value !== 'string' || !value.trim()) throw new Error('the secret element has an empty value');
         length = Buffer.byteLength(value, 'utf8');
         if (name === 'secret_reveal' && !revealEnabled()) throw new Error('secrets_reveal was turned off for this tenant; use secret_save to save the value to a file');
-        const result = await use(value, length, call);
+        // What a secret store filled in (or already took) stays out of the model's reach and out of downloads.
+        if (guard?.holds(tenant, value) && a.store_target === undefined) throw new Error('this value came from the secret store (secret_fill) or was saved to it; it is not revealed or saved to a download');
+        const result = await use(value, length, call, s);
         status = 'ok';
         return result;
       } finally {
@@ -789,9 +907,24 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
       }
     });
 
-    tool('secret_save', 'Save an element’s current value or text to a private, one-time download. Use the same target as click. Returns its ID, UTF-8 byte length, SHA-256 prefix and a curl template. Call download_get with inline=false for the URL. Expires after 15 minutes.',
-      { ...secretTarget, attribute: z.enum(['value', 'text']).optional().describe('Default: current value for an input, textContent for other elements.'), filename: str(255).optional() },
-      async (a) => secretAction('secret_save', a, async (value, length, call) => {
+    const saveTargets = recipes?.save_targets.length ? recipes.save_targets : null;
+    tool('secret_save', `Save an element’s current value or text to a private, one-time download. Use the same target as click. Returns its ID, UTF-8 byte length, SHA-256 prefix and a curl template. Call download_get with inline=false for the URL. Expires after 15 minutes.${saveTargets ? ' With store_target and store_key the value goes straight into the operator’s secret store instead (e.g. a token you just generated on a page): nothing to download, and it never passes through you.' : ''}`,
+      { ...secretTarget, attribute: z.enum(['value', 'text']).optional().describe('Default: current value for an input, textContent for other elements.'), filename: str(255).optional(),
+        ...(saveTargets ? {
+          store_target: str(64).optional().describe(`save into the operator's secret store instead of a download: one of ${saveTargets.map((t) => t.name).join(', ')} (secret_recipes shows which pages each takes values from)`),
+          store_key: str(64).optional().describe('with store_target: the name to store it under (letters, digits, . _ -), e.g. "github-pat"'),
+          overwrite: z.boolean().optional().describe('with store_target: replace an existing entry (only where the target allows it; default false: an existing entry is an error)'),
+        } : {}) },
+      async (a) => secretAction('secret_save', a, async (value, length, call, s) => {
+        if (a.store_target !== undefined) {
+          let origin = null;
+          try { origin = new URL(s.page.url()).origin; } catch {}
+          const saved = await store.save(a.store_target, a.store_key, Buffer.from(value, 'utf8'), { overwrite: a.overwrite ?? false, session: s.id, origin: origin ?? undefined });
+          // From here on it is a stored secret: masked in what this session returns, not revealed, not downloaded.
+          guard?.add(tenant, s.id, value);
+          return ok({ stored: true, ...saved, length, ...hashPrefix(value, length),
+            next: 'the value is in the secret store; it was not shown to you and is masked in this session from now on' });
+        }
         if (a.filename?.includes(value)) throw new Error('use a filename without the secret value');
         const f = await capture.saveSecret(tenant, a.filename ?? 'secret.txt', Buffer.from(value, 'utf8'));
         if (call?.expired || call?.done) {
@@ -799,7 +932,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
           stillOn(call);
         }
         return ok({
-          download_id: f.id, length, sha256_prefix: crypto.createHash('sha256').update(value).digest('hex').slice(0, 8),
+          download_id: f.id, length, ...hashPrefix(value, length),
           curl: `(umask 077; curl -fsS -o ${shq(f.name)} '<get_url from download_get>')`,
           next: `download_get { download_id: "${f.id}", inline: false }`,
         });
@@ -812,7 +945,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
   const uploads = manager.uploads;
   if (uploads) {
     const maxMb = Math.round(cfg.uploadMaxBytes / 1024 / 1024);
-    tool('upload_create', `Get a file onto the browser machine for upload. Returns file_id and a one-time PUT URL (valid ${Math.round(cfg.uploadUrlTtlMs / 60000)} min, this token only): send the file with the curl line given (curl -T <file> '<put_url>'), then call upload with the file_id. Up to ${maxMb} MB. For a small file (up to 1 MB) pass content_base64 instead and use the file_id at once. Files are deleted when the session that used them closes, ${Math.round(cfg.uploadTtlMs / 60000)} min after they arrived, or on a service restart.`,
+    tool('upload_create', `Get a file onto the browser machine for upload. Returns file_id and a one-time PUT URL (valid ${Math.round(cfg.uploadUrlTtlMs / 60000)} min; the URL itself is the credential, and another token's bearer is refused): send the file with the curl line given (curl -T <file> '<put_url>'), then call upload with the file_id. Up to ${maxMb} MB. For a small file (up to 1 MB) pass content_base64 instead and use the file_id at once. Files are deleted when the session that used them closes, ${Math.round(cfg.uploadTtlMs / 60000)} min after they arrived, or on a service restart.`,
       { filename: str(255).describe('name the page will see, e.g. "report.pdf"'), size_bytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional().describe('the exact size; the PUT must match it'),
         content_base64: z.string().max(Math.ceil(BASE64_MAX_BYTES / 3) * 4 + 8).optional().describe('the whole file, base64 (1 MB at most): no PUT needed') },
       async (a) => {
@@ -974,7 +1107,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
           settings: { speculative_speech: a.speculative_speech },
         }));
       });
-    tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), platform (meet, zoom), joined_as (account, guest), participants if visible, recorded seconds, video {on, fps, bytes} (bytes is the combined file size), announce {mode, source (call|tenant|installation|default), sent_to (everyone|host|none|failed), reason and failures when delivery fell short}, optout {mode (on|off), source (call|tenant|installation|default)}, meeting_settings {bot_name, announce, announce_text, owner_name, optout_detection, alone_leave_sec, first_joiner_wait_sec}, each with value and source. announce_text.value lists the notice messages. live_transcript {state, zero_retention, minutes, lag} if asked for, speaking, channel {id, registered, published}, acks, speaker_labels, speaker_timeline {intervals}, mic_open + mute_error when Bosun could not mute its microphone again; without meeting_id all your meetings.',
+    tool('meeting_status', 'State of a meeting (joining, waiting, admitted, recording, ended), platform (meet, zoom), joined_as (account, guest), participants if visible, recorded seconds, video {on, fps, bytes} (bytes is the combined file size), announce {mode, source (call|tenant|installation|default), sent_to (everyone|host|none|failed), reason and failures when delivery fell short}, optout {mode (on|off), source (call|tenant|installation|default)}, meeting_settings {bot_name, announce, announce_text, owner_name, optout_detection, alone_leave_sec, first_joiner_wait_sec}, each with value and source. announce_text.value lists the notice messages. live_transcript {state, zero_retention, segments, streamed_min, today_min, daily_cap_min, final_lag_s} if asked for, speaking, channel {id, registered, published}, acks, speaker_labels, speaker_timeline {intervals}, mic_open + mute_error when Bosun could not mute its microphone again; without meeting_id all your meetings.',
       { meeting_id: z.string().max(20).optional() }, async (a) => ok(meetings.status(tenant, a.meeting_id)));
     tool('meeting_chat_read', 'Chat messages of a meeting seen so far (others\' messages; since = last seq you have).', { ...mid, since: z.number().int().min(0).optional() },
       async (a) => ok(meetings.chatRead(tenant, a.meeting_id, a.since ?? 0)));
@@ -1018,7 +1151,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     tool('meeting_stop_recording', 'Stop recording (delete=true, default: also delete all three artifacts (Ogg audio, optional WebM video and speaker timeline)); a live transcript stops too (delete: its text is forgotten). The meeting goes on unrecorded.', { ...mid, delete: z.boolean().optional() },
       async (a) => ok(await meetings.stopRecordingTool(tenant, a.meeting_id, a.delete ?? true)));
     tool('meeting_leave', 'Leave the meeting; the recording is finished and kept (bosun:meeting-ended).', mid, async (a) => ok(await meetings.leave(tenant, a.meeting_id)));
-    tool('recording_get', `Fetch the recording of one of your meetings (Ogg/Opus audio, plus a separate WebM video and speaker timeline with record_video: three artifacts): returns a one-time GET URL (valid ${Math.round(cfg.downloadUrlTtlMs / 60000)} min, this token only) and a ready curl -o line, plus speakers (inline timeline JSON up to 32 KiB, otherwise a separate one-time JSON URL; null for older recordings). Use its audio-relative intervals to label an offline transcript. Only once the recording is finished (the meeting ended, or meeting_stop_recording with delete=false) and not deleted. The file is kept (deleted after ${cfg.recordingRetentionDays ?? 30} days or with meeting_recording_delete); call recording_get again for a new URL.`,
+    tool('recording_get', `Fetch the recording of one of your meetings (Ogg/Opus audio, plus a separate WebM video and speaker timeline with record_video: three artifacts): returns a one-time GET URL (valid ${Math.round(cfg.downloadUrlTtlMs / 60000)} min; the URL itself is the credential, so keep it out of logs and chats) and a ready curl -o line, plus speakers (inline timeline JSON up to 32 KiB, otherwise a separate one-time JSON URL; null for older recordings). Use its audio-relative intervals to label an offline transcript. Only once the recording is finished (the meeting ended, or meeting_stop_recording with delete=false) and not deleted. The file is kept (deleted after ${cfg.recordingRetentionDays ?? 30} days or with meeting_recording_delete); call recording_get again for a new URL.`,
       mid, async (a) => {
         const r = meetings.recordingGet(tenant, a.meeting_id);
         const meta = { meeting_id: a.meeting_id, filename: path.basename(r.file), size: r.bytes, mime: 'audio/ogg', ...(r.seconds ? { seconds: r.seconds } : {}) };
@@ -1049,7 +1182,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
           valid_min: Math.round(cfg.downloadUrlTtlMs / 60000), next: 'GET it once (curl), then transcribe it; call recording_get again for another URL',
         });
       });
-    tool('meeting_recording_delete', `Delete a meeting's Ogg recording, optional WebM video, speaker timeline and live transcript (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days).`, mid,
+    tool('meeting_recording_delete', `Delete a meeting's Ogg recording, optional WebM video, speaker timeline and live transcript (recordings are deleted automatically after ${cfg.recordingRetentionDays ?? 30} days). On a meeting that has not started recording yet, it keeps it from recording at all (recording_disabled: true).`, mid,
       async (a) => ok(await meetings.deleteRecording(tenant, a.meeting_id)));
   }
 
@@ -1154,7 +1287,7 @@ export function buildServer({ manager, owner, tenant, cfg, policy = 'full', conn
     };
 
     const stepsHelp = `Steps (each {"tool": …, "optional"?: true, "note"?: …}): navigate {url, wait?}; click {target, timeoutMs?} where target is role+name | selector | text (no ref), optionally with nth (which visible match, -1 = last) and after / before (count from a text on the page: {"role": "button", "after": "Share"} is the first button after Share; for icon buttons without a name); hover {target, timeoutMs?}; type {target, timeoutMs?, value | secret_id: "{{param}}", submit?, allow_non_password?}; select {target, value, timeoutMs?}; press {key}; wait_for {text | selector, timeoutMs?}; upload {target, file_id: "{{param}}" | files, method?}; download_wait {timeoutMs?}; read {mode?, selector?, maxChars?, as?}; screenshot {target?, fullPage?}; assert {text?, selector?, url_contains?, timeoutMs? (default 5000)}. if_exists {target: {role+name | selector | text, nth?, after?, before?}, then: [steps], else?: [steps]} checks presence instantly; repeat {while: {target fields}, max: 1–100 (required), steps: [steps]} checks instantly each iteration and reports count/max_hit. Nesting depth <=3; at most 100 saved steps including nested steps; each run at most 1000 executed steps, 4 MiB retained text/metadata, 20 images and 8 MiB image data; action timeoutMs 100–60000, default unchanged. read returns reads [{step, as?, text}]; assert returns matched text in its step result (omitted on pages containing frames, where a cross-frame scan cannot be atomic). Any string may use {{param}}; a step that uses a param not given is skipped.`;
-    tool('macro_save', `Save a multi-step flow on a site as a macro to rerun with macro_run (saving an existing name makes a new version; the last 20 are kept). site: the hosts it may run on (e.g. ["app.example.org", "*.example.org"]); a page outside them stops the run. params: {name: {type: string|number|file_id|secret_id, required?, default?, description?}}; a secret or file goes in only as a {{param}} of type secret_id / file_id, never stored. ${stepsHelp} A step whose text says pay, buy, purchase, submit/place order, checkout or delete account is refused unless confirm_risky: true.`,
+    tool('macro_save', `Save a multi-step flow on a site as a macro to rerun with macro_run (saving an existing name makes a new version; the last 20 are kept). site: the hosts it may run on (e.g. ["app.example.org", "*.example.org"]); a page outside them stops the run. params: {name: {type: string|number|file_id|secret_id, required?, default?, description?}}; a secret or file goes in only as a {{param}} of type secret_id / file_id, never stored. ${stepsHelp} A click step whose text says pay, buy, purchase, submit/place order, checkout or delete account is refused unless confirm_risky: true (only clicks are looked at: press Enter on such a button, or type with submit, is not).`,
       { name: str(64).describe('lowercase letters, digits, . _ -'), description: str(2000).optional(), site: z.array(str(300)).min(1).max(MAX_SITES),
         params: z.record(z.string().max(40), z.record(z.string(), z.unknown())).optional(), steps: z.array(z.record(z.string(), z.unknown())).min(1).max(MAX_STEPS),
         confirm_risky: z.boolean().optional().describe('allow steps that may pay, buy, order, check out or delete an account'), created_by: str(100).optional().describe('who saved it (default: the tenant)') },

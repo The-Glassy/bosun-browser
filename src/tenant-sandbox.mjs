@@ -18,6 +18,8 @@ import { startWsServer } from './wsserver.mjs';
 import { driverLogsValues, nodeDebugOn } from './secrets.mjs';
 import { prepareSandboxData } from './migrate-data.mjs';
 import { handoffDigest } from './liveview.mjs';
+import { SecretAudit, SecretStores } from './stores/index.mjs';
+import { startSecretBroker } from './stores/broker.mjs';
 
 const APP = fileURLToPath(new URL('../', import.meta.url));
 const RUN = '/run/bosun';
@@ -108,7 +110,7 @@ export function sandboxCommand({ state, ipc, relay, runtime, headless, tz, scrip
   ];
 }
 
-async function hostRelays(cfg, tenant, dir, cleanup) {
+async function hostRelays(cfg, tenant, dir, cleanup, stores) {
   const routes = new Map();
   const providerSockets = {};
   for (const name of exitsFor(cfg, tenant)) {
@@ -127,13 +129,22 @@ async function hostRelays(cfg, tenant, dir, cleanup) {
     cleanup.push(forwarder.close);
     providerSockets[service] = `${SOCKETS.relay}/${service}`;
   }
-  return { routes, providerSockets };
+  // Secret stores stay on this side: the worker gets a socket that answers for its tenant only (stores/broker.mjs),
+  // and only when that tenant has a recipe or a save target.
+  let secretBroker = null;
+  const store = stores?.forTenant(tenant);
+  if (store?.enabled) {
+    const broker = await startSecretBroker({ store, socketPath: path.join(dir, 'secrets') });
+    cleanup.push(broker.close);
+    secretBroker = `${SOCKETS.relay}/secrets`;
+  }
+  return { routes, providerSockets, secretBroker };
 }
 
 const tenantOnly = (map, tenant) => new Map(map?.has(tenant) ? [[tenant, map.get(tenant)]] : []);
 const routePrefix = (tenant) => `/tenant/${tenant}`;
 
-function workerConfig(cfg, tenant, state, token, live, routes, providerSockets) {
+export function workerConfig(cfg, tenant, state, token, live, routes, providerSockets, secretBroker = null) {
   return {
     ...cfg, dataDir: state, tenantSandbox: false, warnUnsafeShared: false, metricsToken: null,
     tokens: [{ tenant, token }], policies: new Map([[tenant, policyOf(cfg, tenant)]]),
@@ -141,6 +152,10 @@ function workerConfig(cfg, tenant, state, token, live, routes, providerSockets) 
     live: live ? { baseUrl: `${live.baseUrl}${routePrefix(tenant)}` } : null, uploadBaseUrl: null,
     artifactPrefix: routePrefix(tenant), tenantAllow: tenantOnly(cfg.tenantAllow, tenant), downloadAllow: tenantOnly(cfg.downloadAllow, tenant),
     macroSource: new Map(), egressProxy: null, egressProxies: new Map(), tenantExits: new Map(), sandboxRoutes: routes, providerSockets,
+    // No store configuration, token file path or adapter crosses into the sandbox.
+    secretStores: null, secretBroker,
+    // The speech provider's key is the installation's: a worker gets it only when it has meetings to use it for.
+    elevenlabs: cfg.features.meetings ? cfg.elevenlabs : null,
   };
 }
 
@@ -151,7 +166,7 @@ async function waitFor(promise, ms, message) {
   } finally { clearTimeout(timer); }
 }
 
-async function startWorker(cfg, tenant, state, runtime, live, generation) {
+async function startWorker(cfg, tenant, state, runtime, live, generation, stores) {
   const root = fs.mkdtempSync(path.join(runtime, 'w-'));
   const ipc = path.join(root, 'ipc'), relay = path.join(root, 'relay');
   fs.mkdirSync(ipc, { mode: 0o700 });
@@ -163,7 +178,7 @@ async function startWorker(cfg, tenant, state, runtime, live, generation) {
     fs.rmSync(root, { recursive: true, force: true });
   })();
   try {
-    const { routes, providerSockets } = await hostRelays(cfg, tenant, relay, cleanups);
+    const { routes, providerSockets, secretBroker } = await hostRelays(cfg, tenant, relay, cleanups, stores);
     const token = crypto.randomBytes(32).toString('base64url');
     const options = { state, ipc, relay, runtime, headless: cfg.headless, tz: cfg.tz };
     const filter = fs.openSync(path.join(runtime, 'seccomp'), 'r');
@@ -178,7 +193,7 @@ async function startWorker(cfg, tenant, state, runtime, live, generation) {
       });
     });
     const spawnError = new Promise((_, reject) => child.once('error', reject));
-    const config = workerConfig(cfg, tenant, state, token, live, routes, providerSockets);
+    const config = workerConfig(cfg, tenant, state, token, live, routes, providerSockets, secretBroker);
     const diagnostics = { driver: driverLogsValues(), node: nodeDebugOn() };
     child.stdin.write(`${serialize({ cfg: config, sockets: SOCKETS, diagnostics }).toString('base64')}\n`);
     const ready = once(child.stdout, 'data').then(([data]) => String(data).trim() === 'ready');
@@ -303,6 +318,8 @@ export async function startTenantService(cfg) {
   if (!cfg.ws && tenants.size > 1) throw new Error('sandboxed stdio requires one tenant; set WS_PORT for multiple tenants');
   const sandbox = createSandboxRuntime(cfg.dataDir, cfg.autoMigrate);
   const generations = new Map();
+  // The audit log sits in the data root, outside every tenant's directory: no worker can read or rewrite it.
+  const stores = cfg.secretStores ? new SecretStores(cfg.secretStores, { audit: new SecretAudit(fs.realpathSync(cfg.dataDir)) }) : null;
   let live, ws, closing = false;
   const getExisting = (tenant) => generations.get(tenant)?.worker;
   const getWorker = async (tenant) => {
@@ -311,7 +328,7 @@ export async function startTenantService(cfg) {
     if (current) return current.start;
     const generation = {};
     generations.set(tenant, generation);
-    generation.start = Promise.resolve().then(() => startWorker(cfg, tenant, sandbox.state(tenant), sandbox.runtime, live, generation));
+    generation.start = Promise.resolve().then(() => startWorker(cfg, tenant, sandbox.state(tenant), sandbox.runtime, live, generation, stores));
     const forget = () => { if (generations.get(tenant) === generation) generations.delete(tenant); };
     generation.start.then(() => generation.done.then(forget), forget);
     return generation.start;
@@ -351,6 +368,7 @@ export async function startTenantService(cfg) {
     closing = true;
     await Promise.allSettled([ws?.close(), live?.close()]);
     await Promise.allSettled([...generations.values()].map(async ({ start }) => (await start).stop()));
+    stores?.close();
     sandbox.close();
   })();
   const connect = (transport, tenant, base) => connectWorker(transport, () => getWorker(tenant), base);

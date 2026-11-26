@@ -279,3 +279,49 @@ test('the gateway diagnostic guard applies to secret tools in its worker', { ski
   assert.equal(result.isError, true);
   assert.match(result.text, /secrets are refused.*NODE_DEBUG/);
 });
+
+test('secret stores stay in the gateway: a sandboxed worker fills through its own socket and cannot see the store', { skip, timeout: 90_000 }, async (t) => {
+  const posts = [];
+  const origin = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      if (req.method === 'POST') posts.push(new URLSearchParams(Buffer.concat(chunks).toString()).get('password'));
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<title>Login</title><form method="post" action="/session"><input id="password" type="password" name="password"><button>Go</button></form>');
+    });
+  });
+  const port = await listen(origin);
+  t.after(() => closeServer(origin));
+  const host = `127.0.0.1:${port}`, web = `http://${host}`;
+  const storeDir = tmpDir();
+  t.after(() => fs.rmSync(storeDir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(storeDir, 'tenants', 'alice'), { recursive: true });
+  const entry = path.join(storeDir, 'tenants', 'alice', 'site');
+  fs.writeFileSync(entry, 'store held value', { mode: 0o600 });
+  const svc = await startBosun({
+    BOSUN_TENANT_SANDBOX: 'on', BOSUN_ALLOW_UNSAFE_SHARED: '0', ENGINE: 'chromium', FEATURES_ENGINES: 'chromium', CHROMIUM_SANDBOX: '1', HEADLESS: '1', KEEPALIVE: '0',
+    BROWSER_TENANT_ALLOW: `alice=${host};bob=${host}`,
+    BOSUN_SECRET_STORES: JSON.stringify({ stores: { files: { type: 'file', dir: storeDir } },
+      tenants: { alice: { recipes: { login: { store: 'files', path: 'tenants/alice/site', origin: web, selector: '#password', submit: true } } } } }),
+  });
+  t.after(() => svc.stop());
+  const [a, b] = await Promise.all([connect(svc, TOKEN), connect(svc, TOKEN_B)]);
+  t.after(() => Promise.all([a.close(), b.close()]));
+  const tools = async (c) => (await c.listTools()).tools.map(({ name }) => name);
+  assert.ok((await tools(a)).includes('secret_fill'));
+  assert.ok(!(await tools(b)).includes('secret_fill'), 'a tenant without recipes has no broker and no tool');
+  const session = await a.open();
+  await assertOk(a, 'navigate', { session, url: web });
+  const filled = await a.call('secret_fill', { session, recipe: 'login' });
+  assert.equal(filled.isError, false, filled.text);
+  assert.ok(!filled.text.includes('store held value'));
+  assert.deepEqual(posts, ['store held value']);
+  const audit = path.join(svc.dataDir, 'audit', 'secrets.jsonl');
+  await until(() => fs.existsSync(audit) && fs.readFileSync(audit, 'utf8').includes('"action":"fill"'));
+  const sandbox = createSandboxRuntime(svc.dataDir);
+  t.after(() => sandbox.close());
+  for (const tenant of ['alice', 'bob']) {
+    assert.deepEqual(inspectSandbox(sandbox, tenant, [entry, audit], port).seen, ['ENOENT', 'ENOENT'], `${tenant}'s sandbox sees neither the store nor the audit log`);
+  }
+});
