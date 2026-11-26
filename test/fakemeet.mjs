@@ -54,7 +54,8 @@ const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 // selfName: the name on our own tile (default "self"; a signed-in account shows its name there). selfMark 'controls':
 // our tile is told by its "Backgrounds and effects" button, not data-self-name (live Meet, 2026-11-02).
 // chatReadyMs: clicks on the chat button in the first that many ms of the call do nothing (Meet still settling).
-function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false, chatOff = false, chatUi = null, chatReadyMs = 0, selfName = 'self', selfMark = null }) {
+// direct: a host lands in the call on load. shareDialog covers the call controls; cameraProblem replaces the toggle.
+function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareName = false, searchBox = false, bigChallenge = false, account = false, dialog = false, readyMs = 0, elsewhere = false, live = false, joinName = null, liveChat = false, chatOff = false, chatUi = null, chatReadyMs = 0, selfName = 'self', selfMark = null, direct = false, shareDialog = false, cameraProblem = false }) {
   const L = UI[lang];
   const de = lang === 'de';
   const joinButtons = elsewhere
@@ -66,7 +67,7 @@ function app({ title = '', lang = 'en', toggles = 'ok', signedIn = false, bareNa
   const nameField = signedIn ? '' : bareName ? '<input type="text">' : `<input type="text" placeholder="${esc(L.name)}"${lang === 'en' ? ` aria-label="${esc(L.name)}"` : ''}>`;
   return `<!doctype html><meta charset="utf-8"><title>Meet</title>
 <style>[hidden]{display:none!important} .tile{display:inline-block;width:80px;height:60px;background:#333;margin:4px}</style>
-<div id="lobby"><h1>${esc(bareName ? "What's your name?" : L.ready)}</h1>
+<div id="lobby"${direct ? ' hidden' : ''}><h1>${esc(bareName ? "What's your name?" : L.ready)}</h1>
   <button id="mic" aria-label="${esc(L.micOff)}"${toggles === 'disabledOn' ? ' disabled' : ''}>mic</button><button id="cam" aria-label="${esc(L.camOff)}">cam</button>
   ${toggles === 'nodevices' ? `<p>${esc(L.noCam)}</p><p>${esc(L.noMic)}</p>` : toggles === 'staleBanner' ? `<p>${esc(L.noMic)}</p>` : ''}
   ${searchBox ? '<input type="text" id="search" aria-label="Search">' : ''}
@@ -88,12 +89,14 @@ ${live ? `<div role="alert"><h2><span aria-hidden="true">error</span>${esc(L.noC
 <div id="denied" hidden><h1>${esc(L.cantJoin)}</h1><p>${esc(L.denied)}</p></div>
 <div id="refused" hidden><h1>${esc(L.cantJoin)}</h1><button>${esc(L.home)}</button><p>${esc(L.safe)}</p>${frame}</div>
 <div id="pending" hidden></div>
-<div id="call" hidden><div id="topic">${esc(title || '')}</div><div id="tiles"></div><div id="captions" class="caption-text"></div>
+<div id="call"${direct ? '' : ' hidden'}${shareDialog ? ' inert aria-hidden="true"' : ''}><div id="topic">${esc(title || '')}</div><div id="tiles"></div><div id="captions" class="caption-text"></div>
   <div role="toolbar" id="toolbar"${chatUi === 'hiddenToolbar' ? ' style="visibility:hidden"' : ''}><button id="callMic">mic</button><button id="hand" aria-label="Raise hand (ctrl + alt + h)">hand</button>${chatUi === 'noButton' ? '' : `<button id="chatBtn" aria-label="${esc(L.chat)}" aria-pressed="false">chat</button>`}<button aria-label="${esc(L.leave)}">leave</button></div>
+  ${direct ? `<button id="callCam" aria-label="${cameraProblem ? 'Camera problem. Show more info' : esc(L.camOff)}">videocam</button>` : ''}
   <aside id="panel" hidden><h2>In-call messages</h2>${chatUi === 'blocked'
     ? '<div role="switch" aria-label="Let participants send messages" aria-checked="false" aria-disabled="true"></div><p>Only hosts can send messages</p>'
     : chatUi === 'frame' ? '<iframe id="chatFrame" title="Chat" style="width:320px;height:240px"></iframe>'
     : `<div role="list" id="msgs"></div><textarea aria-label="${esc(L.send)}"${chatOff ? ' disabled' : ''}></textarea><button id="sendBtn" aria-label="${esc(L.send)}">send</button>`}</aside></div>
+${shareDialog ? `<dialog id="share" aria-labelledby="shareTitle"><h2 id="shareTitle">Your meeting’s ready</h2><button>Copy joining info</button><button id="shareClose" aria-label="Close dialog">close</button></dialog>` : ''}
 <div id="over" hidden><h1 id="overText"></h1></div>
 <script>
 const L = ${JSON.stringify(L)}, TOGGLES = ${JSON.stringify(toggles)};
@@ -104,6 +107,15 @@ const JOIN_NAME = ${JSON.stringify(joinName)}, LIVE_CHAT = ${liveChat ? 'true' :
 const nameJoin = () => { if (JOIN_NAME === 'devices' && $('ask')) { if (!mic && !cam) $('ask').setAttribute('aria-label', L.ask + ' without microphone & camera'); else $('ask').removeAttribute('aria-label'); } };
 const post = (p, b) => fetch('/api/' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, ...b }) });
 let mic = true, cam = true, shown = new Set(), toned = false;
+if ($('share')) {
+  $('share').showModal();
+  $('shareClose').onclick = () => {
+    $('share').remove();
+    $('call').inert = false;
+    $('call').removeAttribute('aria-hidden');
+    post('media', { shareClosed: true });
+  };
+}
 $('mic').onclick = () => { mic = !mic; $('mic').setAttribute('aria-label', mic ? L.micOff : L.micOn); nameJoin(); };
 $('cam').onclick = () => { cam = !cam; $('cam').setAttribute('aria-label', cam ? L.camOff : L.camOn); nameJoin(); };
 if (TOGGLES === 'none' || TOGGLES === 'nodevices') { $('mic').hidden = $('cam').hidden = true; }
@@ -129,6 +141,11 @@ const micLabel = () => $('callMic').setAttribute('aria-label', (callMic ? L.micO
 // micStuckOn (room option, read from the state): the call's microphone won't turn off again.
 let micStuckOn = false;
 $('callMic').onclick = () => { if (callMic && micStuckOn) return; callMic = !callMic; micLabel(); post('media', { mic: callMic }); };
+if ($('callCam') && !${cameraProblem}) $('callCam').onclick = () => {
+  cam = !cam;
+  $('callCam').setAttribute('aria-label', cam ? L.camOff : L.camOn);
+  post('media', { cam });
+};
 const toggleHand = () => { hand = !hand; $('hand').setAttribute('aria-label', (hand ? 'Lower hand' : 'Raise hand') + ' (ctrl + alt + h)'); post('media', { hand }); };
 $('hand').onclick = toggleHand;
 document.addEventListener('keydown', (e) => { if (e.ctrlKey && e.altKey && e.code === 'KeyH') toggleHand(); });
@@ -164,7 +181,7 @@ async function poll() {
     inCallAt ||= Date.now();
     $('captions').textContent = s.caption || '';
     const want = s.participants.join();
-    if ($('tiles').dataset.p !== want) {
+    if (!$('share') && $('tiles').dataset.p !== want) {
       $('tiles').dataset.p = want;
       $('tiles').replaceChildren(...s.participants.map((p) => {
         const t = document.createElement('div'); t.className = 'tile'; t.dataset.participantId = p;
@@ -256,7 +273,7 @@ poll();
     if (u.pathname === '/api/state') {
       const r = room(u.searchParams.get('code'));
       if (r.phase === 'pending' && Date.now() >= r.refuseAt) r.phase = 'refused';
-      const view = r.over ? 'over' : ['waiting', 'denied', 'refused', 'pending'].includes(r.phase) ? r.phase : r.phase === 'admitted' ? 'call' : 'lobby';
+      const view = r.over ? 'over' : ['waiting', 'denied', 'refused', 'pending'].includes(r.phase) ? r.phase : r.direct || r.phase === 'admitted' ? 'call' : 'lobby';
       const chat = r.chat.map((m) => (m.fillAt && Date.now() < m.fillAt ? { ...m, text: '' } : m));
       return json({ view, over: r.over, participants: ['self', ...r.others], chat, tone: r.tone, caption: r.caption || null, play: r.play || null, micStuckOn: !!r.micStuckOn, speaking: r.speaking || null, selfSpeaking: !!r.selfSpeaking });
     }

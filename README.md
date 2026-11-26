@@ -877,7 +877,7 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
    - **Zoom links** (`zoom.us/j/<id>?pwd=…`, any `*.zoom.us` subdomain, webinar `/w/` and web client `/wc/`
      links) are rewritten to the web client, `https://app.zoom.us/wc/<id>/join?pwd=…`, so Zoom's "open the app"
      page doesn't come up. If it does anyway, Bosun clicks "Launch Meeting" and then "Join from your browser".
-2. **Lobby:**
+2. **Joining:**
    - Microphone and camera must be **verifiably off** before joining. Bosun switches a device off and checks it,
      unless Meet shows the device doesn't exist ("Camera not found" / "Kamera nicht gefunden") and no control shows
      it on; then it already counts as off. If neither can be confirmed, Bosun does not join.
@@ -898,6 +898,9 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
      A join button that
      is still disabled ("Getting ready...") is waited for, up to 25 s. Bosun then waits up to
      `max_wait_admit_min` for admission. `meeting_status` shows `joined_as`: `account` or `guest`.
+   - **Meet, admitted on page load:** Bosun closes the share-link dialog if present and verifies the mic and camera
+     are off before opening chat or recording. If it cannot verify both, it closes the meeting page. A `dry_run`
+     on this path reports `state: "admitted"`, `lobby: null` and `join_button: null` and closes the session.
    - **Meet, account already in the call on another device:** Meet offers "Switch here", which would drop the
      other device. Bosun picks **"Join here too"** (directly, or under "Other ways to join") and uses "Switch here"
      only when Meet offers nothing else.
