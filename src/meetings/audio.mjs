@@ -21,19 +21,31 @@ const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   execFile(cmd, args, { timeout: 10_000, ...opts }, (e, stdout, stderr) => (e ? reject(Object.assign(e, { stderr: String(stderr) })) : resolve(String(stdout))));
 });
 
+// A check that could not run its program at all (ENOENT) means the package is missing. Anything else is a program
+// that is installed and broken, for example a shared library the dynamic loader cannot find inside a sandbox:
+// then the reason carries what the program printed, not an install hint that would send the operator the wrong way.
+function probeFailure(program, install, e) {
+  if (e?.code === 'ENOENT') return `${program} is not installed (apt-get install ${install})`;
+  const output = `${e?.stderr || ''}`.trim().split('\n').filter(Boolean).pop();
+  const how = e?.killed ? 'timed out' : e?.signal ? `was killed by ${e.signal}` : `exited with code ${e?.code ?? 'unknown'}`;
+  return `${program} is installed but could not run: ${(output || how).slice(0, 300)}`;
+}
+
 let support = null;
 // Whether recording can work on this host; resolves to null (yes) or the reason it can't.
-export function audioUnsupported() {
-  support ??= (async () => {
+export function audioUnsupported({ exec = run, cached = true } = {}) {
+  const probe = async () => {
     if (process.platform !== 'linux') return 'meeting recording needs Linux with PulseAudio (or pipewire-pulse) and ffmpeg';
-    try { await run('pulseaudio', ['--version']); } catch { return 'pulseaudio is not installed (apt-get install pulseaudio pulseaudio-utils)'; }
-    try { await run('pactl', ['--version']); } catch { return 'pactl is not installed (apt-get install pulseaudio-utils)'; }
+    try { await exec('pulseaudio', ['--version']); } catch (e) { return probeFailure('pulseaudio', 'pulseaudio pulseaudio-utils', e); }
+    try { await exec('pactl', ['--version']); } catch (e) { return probeFailure('pactl', 'pulseaudio-utils', e); }
     try {
-      const out = await run('ffmpeg', ['-hide_banner', '-devices']);
+      const out = await exec('ffmpeg', ['-hide_banner', '-devices']);
       if (!/\bpulse\b/.test(out)) return 'ffmpeg has no PulseAudio input (use a build with libpulse, e.g. apt-get install ffmpeg)';
-    } catch { return 'ffmpeg is not installed (apt-get install ffmpeg)'; }
+    } catch (e) { return probeFailure('ffmpeg', 'ffmpeg', e); }
     return null;
-  })();
+  };
+  if (!cached) return probe();
+  support ??= probe();
   return support;
 }
 

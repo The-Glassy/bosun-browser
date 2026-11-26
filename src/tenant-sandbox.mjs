@@ -28,6 +28,12 @@ const SYSTEM_MOUNTS = [
   '/usr/share/fonts', '/usr/local/share/fonts', '/usr/share/mime', '/usr/share/X11', '/usr/share/pulseaudio',
   '/usr/share/glib-2.0', '/usr/share/ca-certificates', '/usr/share/zoneinfo', '/var/cache/fontconfig',
   '/etc/fonts', '/etc/pulse', '/etc/ssl/certs', '/etc/ca-certificates', '/etc/ld.so.cache', '/etc/nsswitch.conf',
+  // Targets of symlinks inside the mounts above. Without them the links dangle in the sandbox:
+  // Debian alternatives (libblas.so.3 and liblapack.so.3, which ffmpeg links), the fontconfig rules behind
+  // /etc/fonts/conf.d, locally added CA certificates, and the RHEL-family CA bundle behind /etc/ssl/certs.
+  // Host-specific /etc files (resolv.conf, hosts, localtime, gai.conf, ld.so.conf.d) stay out: the worker has no
+  // network of its own, TZ is set explicitly, and the loader reads only ld.so.cache.
+  '/etc/alternatives', '/usr/share/fontconfig', '/usr/local/share/ca-certificates', '/etc/pki/tls/certs', '/etc/pki/ca-trust/extracted',
 ];
 const START_MS = 30_000;
 const STOP_MS = 8000;
@@ -88,7 +94,7 @@ export function sandboxCommand({ state, ipc, relay, runtime, headless, tz, scrip
     ...SYSTEM_MOUNTS.map((p) => [p, p]), ...assets,
     [path.join(APP, 'src'), '/app/src'], [path.join(APP, 'node_modules'), '/app/node_modules'],
     [path.join(APP, 'package.json'), '/app/package.json'], [fs.realpathSync(process.execPath), `${RUN}/node`],
-    [path.join(runtime, 'passwd'), '/etc/passwd'], [path.join(runtime, 'group'), '/etc/group'],
+    [path.join(runtime, 'passwd'), '/etc/passwd'], [path.join(runtime, 'group'), '/etc/group'], [path.join(runtime, 'hosts'), '/etc/hosts'],
   ];
   return [
     '--unshare-user', '--unshare-pid', '--unshare-net', '--unshare-ipc', '--unshare-uts', '--unshare-cgroup-try',
@@ -227,6 +233,8 @@ export function createSandboxRuntime(dataDir, autoMigrate = false) {
     fs.writeFileSync(path.join(runtime, 'seccomp'), filter, { mode: 0o600 });
     fs.writeFileSync(path.join(runtime, 'passwd'), `root:x:0:0:root:/root:/bin/false\nbosun:x:1000:1000:Bosun:${WORKER_HOME}:/bin/false\n`, { mode: 0o644 });
     fs.writeFileSync(path.join(runtime, 'group'), 'root:x:0:\nbosun:x:1000:\n', { mode: 0o644 });
+    // The worker's own names only. The host's /etc/hosts is not shared.
+    fs.writeFileSync(path.join(runtime, 'hosts'), '127.0.0.1 localhost bosun\n::1 localhost ip6-localhost ip6-loopback\n', { mode: 0o644 });
     return {
       runtime,
       state(tenant) {
