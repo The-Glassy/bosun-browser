@@ -5,8 +5,26 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { Readable } from 'node:stream';
 
-export async function forwardTcp(listen, destination) {
+// The first request line a relay bridge holds back while it waits for its end. Node's HTTP parser refuses a
+// request head beyond 16 KiB, so a longer line never was a request the relay would have served.
+const MAX_REQUEST_LINE = 32 * 1024;
+
+// firstHeader: one HTTP header line the forwarder adds to the first request of every connection (see startRelayProxy).
+export async function forwardTcp(listen, destination, firstHeader = null) {
   const upstreams = new Set();
+  const forward = (client, upstream) => {
+    if (!firstHeader) return client.pipe(upstream);
+    let held = Buffer.alloc(0);
+    const onData = (chunk) => {
+      held = Buffer.concat([held, chunk]);
+      const end = held.indexOf('\r\n');
+      if (end < 0) { if (held.length > MAX_REQUEST_LINE) client.destroy(); return; }
+      client.off('data', onData);
+      upstream.write(Buffer.concat([held.subarray(0, end + 2), Buffer.from(`${firstHeader}\r\n`), held.subarray(end + 2)]));
+      client.pipe(upstream);
+    };
+    client.on('data', onData);
+  };
   const server = net.createServer((client) => {
     const upstream = net.connect(destination);
     upstreams.add(upstream);
@@ -17,7 +35,8 @@ export async function forwardTcp(listen, destination) {
     client.once('close', () => upstream.destroy());
     upstream.on('error', () => client.destroy());
     client.on('error', () => upstream.destroy());
-    client.pipe(upstream).pipe(client);
+    forward(client, upstream);
+    upstream.pipe(client);
   });
   server.maxConnections = 256;
   await new Promise((resolve, reject) => {
@@ -34,12 +53,17 @@ export async function forwardTcp(listen, destination) {
   };
 }
 
+// The browser's proxy inside a worker: a loopback listener bridged to the tenant's relay socket. The bridge, not the
+// browser, presents the relay credentials, on the first request of each connection (the relay accepts the rest of
+// that connection, see startTenantProxy). A browser given proxy credentials answers the relay's 407 through
+// Playwright's CDP Fetch interception, and with that enabled Chromium never resumes a request it restarts for an
+// ACCEPT_CH frame (the client-hints frame Google's servers send in the TLS handshake): every such navigation hangs
+// until it times out. The listener is on the worker's private loopback, which only this tenant's own processes
+// reach, and the relay applies the same destination checks to everything that arrives.
 export async function startRelayProxy({ socketPath, username, password }) {
-  const bridge = await forwardTcp({ host: '127.0.0.1', port: 0 }, { path: socketPath });
-  return {
-    server: `http://127.0.0.1:${bridge.port}`, username, password, bypass: '<-loopback>',
-    close: bridge.close,
-  };
+  const credentials = Buffer.from(`${username}:${password}`).toString('base64');
+  const bridge = await forwardTcp({ host: '127.0.0.1', port: 0 }, { path: socketPath }, `Proxy-Authorization: Basic ${credentials}`);
+  return { server: `http://127.0.0.1:${bridge.port}`, bypass: '<-loopback>', close: bridge.close };
 }
 
 // Provider sockets are separate from browser exits. Each is pinned to the configured origin on the host.

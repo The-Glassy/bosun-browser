@@ -47,6 +47,13 @@ relay. The relay checks the destination against the tenant's host/port allowlist
 The namespace prevents bypass via direct DNS, UDP or WebRTC. An unavailable relay or exit fails the request.
 Proxy credentials stay on the gateway side.
 
+The browser is configured with the loopback proxy and no credentials. The worker's bridge presents the relay
+credentials on the first request of each connection, and the relay accepts the rest of that connection. The
+loopback listener exists only in the worker's private network namespace, and the relay applies its destination
+checks to every request. A Chromium that holds proxy credentials itself never finishes a navigation to a site
+that sends an `ACCEPT_CH` frame, such as `www.google.com` and `meet.google.com`: the request pauses for
+authentication handling and is not resumed after Chromium restarts it with the requested client hints.
+
 - Set `BROWSER_TENANT_EGRESS='alice=default,direct;bob=default,office'` to restrict each tenant to an explicit
   subset of `default`, `direct` and names from `BROWSER_EGRESS_PROXIES`. With no entry the tenant may select all
   configured exits. `direct` always goes through the host relay, which dials the destination itself.
@@ -121,6 +128,25 @@ A join's `name`, `announce_text`, `announce`, and `optout_detection` override th
 Set `TZ` for keepalive quiet hours and transcript quotas. Use `BROWSER_LOCALE` and `BROWSER_TIMEZONE` for browser
 contexts. The default time zone for each is `Europe/Vienna`.
 
+## What a worker sees of the host
+
+A worker mounts the system program and library directories read-only, along with the directories their symlinks
+point into: `/etc/alternatives` (Debian's `libblas.so.3` and `liblapack.so.3`, which `ffmpeg` links),
+`/usr/share/fontconfig` (the rules behind `/etc/fonts/conf.d`), `/usr/local/share/ca-certificates`, and on
+RHEL-family hosts `/etc/pki/tls/certs` and `/etc/pki/ca-trust/extracted`. Its `/etc/passwd`, `/etc/group` and
+`/etc/hosts` are generated. The host's `resolv.conf`, `hosts`, `localtime`, `gai.conf` and `ld.so.conf.d` are not
+mounted: the relay resolves names on the host, `TZ` sets the time zone, and the loader reads `ld.so.cache`.
+
+A program that needs a file outside these mounts fails inside the worker only. `meeting_join` then reports the
+program's own error, for example `ffmpeg is installed but could not run: ... libblas.so.3: cannot open shared
+object file`. To find such a link on a host, run `ldd` on the program and resolve each library path with
+`readlink -f`.
+
+Each headful worker's Xvfb prints `_XSERVTransmkdir: ERROR: euid != 0, directory /tmp/.X11-unix will not be
+created` at startup. The message is harmless. Xvfb warns that a non-root server owns the socket directory, then
+creates it anyway. The directory is in the worker's private `/tmp`, which no other tenant or host process shares,
+and the worker waits for the display socket before it starts.
+
 ## Run the containment test
 
 On a host that allows bubblewrap and the browser's own sandbox, use
@@ -128,3 +154,9 @@ On a host that allows bubblewrap and the browser's own sandbox, use
 and downloads in both, and uses the same sandbox launcher to verify that either tenant's files and temporary
 paths are unavailable to the other. It also exercises authorized egress, session ownership, gated artifact URLs
 and live-view forwarding. With the flag set, an unavailable sandbox fails the test.
+
+`BOSUN_TEST_SANDBOX=1 node --test test/tenant-sandbox-media.test.mjs` covers what a worker needs from its host. It
+checks shared libraries and the meeting audio check inside the sandbox, records a tone with PulseAudio and FFmpeg
+there, and loads `https://www.google.com` and `https://meet.google.com` through the relay. The audio tests are
+skipped on a host without PulseAudio and FFmpeg. The network test is skipped when the host cannot reach
+`www.google.com`, or with `BOSUN_TEST_OFFLINE=1`.

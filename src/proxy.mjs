@@ -135,9 +135,16 @@ export async function startTenantProxy({ tenant, allow, host = '127.0.0.1', sock
     return sock;
   };
 
+  // A Unix-socket relay serves one sandbox worker, whose bridge authenticates each connection with its first
+  // request (startRelayProxy): later requests on that connection are accepted as they come. A loopback TCP
+  // listener is reachable by every local process, so there each request has to carry the credentials.
+  const admitted = new WeakSet();
   const authenticated = (req) => {
+    if (socketPath && admitted.has(req.socket)) return true;
     const presented = digest(req.headers['proxy-authorization'] || '');
-    return crypto.timingSafeEqual(presented, expected);
+    const ok = crypto.timingSafeEqual(presented, expected);
+    if (ok && socketPath) admitted.add(req.socket);
+    return ok;
   };
   const deny = (what, port, reason) => {
     stats.denied++;
