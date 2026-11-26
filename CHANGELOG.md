@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.28.1 (2026-11-26)
 
 ### Tenant sandbox fixes
 
@@ -14,7 +14,7 @@
 - The meeting audio check reports a program that is installed but cannot run with the program's own error.
   "not installed" now means the program was not found.
 
-## 0.28.0 (Unreleased)
+## 0.28.0 (2026-11-26)
 
 ### New (opt-in)
 
