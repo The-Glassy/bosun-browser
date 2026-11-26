@@ -54,7 +54,7 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
     const events = [], optouts = [];
     const queue = [{ id: '1', sender: null, text: BUBBLE(echoed) }, { id: '2', sender: '10:07 AM', text: BUBBLE('Hi all') },
       { id: '3', sender: 'Alex Example', text: BUBBLE("please don't record") }];
-    const m = { name: 'Notetaker', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sentTexts.map((t) => [t, { count: 1, until: 0, norm: normalize(t) }])), optedOut: null, state: 'recording',
+    const m = { name: 'Notetaker', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sentTexts.map((t) => [t, { count: 1, until: 0, norm: normalize(t) }])), optOutMode: 'on', optedOut: null, state: 'recording',
       platform: { drainChat: async () => queue.splice(0) } };
     const fake = Object.assign(Object.create(Meetings.prototype), {
       now: Date.now, page: async (_m, fn) => fn(null), emit: (_m, kind, data) => events.push([kind, data]), optOut: async (_m, entry) => { optouts.push(entry); },
@@ -68,7 +68,7 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
   const ann = announcement(null)[0];
   const run = async (sent, queue) => {
     const events = [], optouts = [];
-    const m = { name: 'Notetaker', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sent.map((t) => [t, { count: 1, until: Date.now() + 60_000, norm: normalize(t) }])), optedOut: null, state: 'recording',
+    const m = { name: 'Notetaker', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], echoes: new Map(sent.map((t) => [t, { count: 1, until: Date.now() + 60_000, norm: normalize(t) }])), optOutMode: 'on', optedOut: null, state: 'recording',
       platform: { drainChat: async () => queue.splice(0) } };
     const fake = Object.assign(Object.create(Meetings.prototype), { now: Date.now, page: async (_m, fn) => fn(null), emit: (_m, k, d) => events.push(d), optOut: async (_m, e) => { optouts.push(e); } });
     await fake.pollChat(m);
@@ -88,7 +88,7 @@ test('pollChat: our own announcement echoed back (no sender, UI text around it) 
   // takes words out of someone's message, and once the minute is over the same words are someone's.
   const fresh = async (sent, queue, now = Date.now()) => {
     const events = [], optouts = [];
-    const m = { name: 'Notetaker', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], optedOut: null, state: 'recording',
+    const m = { name: 'Notetaker', info: {}, chat: [], chatSeq: 0, chatTexts: new Map(), pendingOwn: [], optOutMode: 'on', optedOut: null, state: 'recording',
       echoes: new Map(sent.map((t) => [t, { count: 1, until: now + 60_000, norm: normalize(t) }])), platform: { drainChat: async () => queue.splice(0) } };
     const fake = Object.assign(Object.create(Meetings.prototype), { now: () => now, page: async (_m, fn) => fn(null), emit: (_m, k, d) => events.push(d), optOut: async (_m, e) => { optouts.push(e); } });
     await fake.pollChat(m);

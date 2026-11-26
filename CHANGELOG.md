@@ -11,7 +11,12 @@
   A join can override them, and status reports the values in effect.
 - Set `MEETING_ANNOUNCE` to `chat` (default), `host`, or `none` for instance-wide control of recording notices.
   A per-call `announce` takes precedence. `meeting_status.announce` reports the mode and its source. In `none` mode
-  the operator must inform participants about recording. Chat opt-outs still stop and delete recordings in every mode.
+  the operator must inform participants about recording.
+- Set `MEETING_OPTOUT` to `on` (default) or `off` for instance-wide control of automatic chat opt-outs.
+  The setting is validated at startup. A per-call `optout_detection` boolean takes precedence, and
+  `meeting_status.optout` reports the mode and its source. With detection off, `bosun:meeting-chat` events
+  continue and the operator or agent must honor objections by stopping and deleting the recording and leaving
+  when appropriate.
 - Use `BROWSER_TENANT_EGRESS` to restrict a tenant to a subset of exits. Existing named exit URL strings
   still count toward readiness. Use the new object form with `"required": false` to make an exit optional.
   Set `BOSUN_HEALTH_CHECK_ENGINES=1` to include browser launch checks in shared-mode readiness.

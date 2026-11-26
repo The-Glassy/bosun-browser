@@ -92,8 +92,11 @@ audio, and leaves when the meeting ends or everyone leaves.
   `name` defaults to `Notetaker` and applies to guest joins.
 - `announce` overrides the instance's `MEETING_ANNOUNCE` setting. Use `chat` (default, everyone with host
   fallback), `host` (host only) or `none` (no notice). Use `none` per call only with the meeting owner's
-  approval. The operator must inform participants when the notice is disabled. An opt-out in the chat
-  ("please don't record") always stops and deletes the recording.
+  approval. The operator must inform participants when the notice is disabled.
+- `optout_detection` overrides the instance's `MEETING_OPTOUT` setting. With detection on (default), a chat
+  objection stops and deletes the recording. Bosun leaves unless `leave_on_optout: false`. With detection off,
+  watch `bosun:meeting-chat` and honor objections with `meeting_stop_recording {meeting_id, delete: true}` and,
+  when appropriate, `meeting_leave`. Check `meeting_status.optout` for the mode and source.
 - `record_video:true` adds a separate WebM of the meeting page; audio stays a separate Ogg.
 - `live_transcript:true` gives transcript finals live (`meeting_transcript`, or as an MCPL channel).
 - `dry_run:true` only checks the lobby.

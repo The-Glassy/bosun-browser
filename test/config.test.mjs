@@ -177,6 +177,21 @@ test('MEETING_ANNOUNCE accepts chat, host and none and rejects invalid values at
   assert.match(r.err, /MEETING_ANNOUNCE must be one of chat, host, none/);
 });
 
+test('MEETING_OPTOUT defaults to on, accepts on and off, and rejects invalid values at startup', async () => {
+  const defaults = loadConfig({});
+  assert.deepEqual([defaults.meetingOptOut, defaults.meetingOptOutSource], ['on', 'default']);
+  for (const mode of ['on', 'off']) {
+    const cfg = loadConfig({ MEETING_OPTOUT: mode });
+    assert.deepEqual([cfg.meetingOptOut, cfg.meetingOptOutSource], [mode, 'config']);
+  }
+  for (const bad of ['', ' ', 'OFF', '0', 'false']) {
+    assert.throws(() => loadConfig({ MEETING_OPTOUT: bad }), /MEETING_OPTOUT must be on or off/);
+  }
+  const r = await run({ MEETING_OPTOUT: 'false' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /MEETING_OPTOUT must be on or off/);
+});
+
 test('startup logs one sandbox recommendation unless shared mode was acknowledged', async () => {
   for (const acknowledgement of ['0', '1']) {
     const r = await run({

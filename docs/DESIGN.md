@@ -217,9 +217,10 @@ characters as `previous_text`; fatal errors (auth, quota, terms, invalid request
 8 failures in a row at most (a session that closes within 10 s counts as one).
 
 **Consent.** Live transcription starts with the recording after the configured announcement step. The built-in
-notice describes live transcription when enabled. An opt-out stops both concurrently (`Promise.all`), and
-deleting the recording also clears the transcript text. Zero retention is requested on every connection;
-ElevenLabs grants it only to enterprise and trial plans and otherwise says so in a `warning`, which is reported
+notice describes live transcription when enabled. With opt-out detection on, a chat objection stops both
+concurrently (`Promise.all`). Chat events are delivered in both modes. Deleting the recording also clears
+the transcript text. Bosun requests zero retention on every connection. ElevenLabs grants it only to enterprise
+and trial plans and otherwise reports a `warning`, which appears in status
 (`zero_retention: false`).
 
 **Cost cap.** Minutes are counted per tenant and local day in `BROWSER_DATA/live-transcript-usage.json`

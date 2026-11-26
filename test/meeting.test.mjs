@@ -48,6 +48,7 @@ test('join as a guest: mic and camera off, name, ask to join; waiting until admi
     assert.ok(audio.recorders[0].startedAt >= announcedAt, 'recording started only after the announcement');
     const s = await status(c, j.meeting_id);
     assert.deepEqual(s.announce, { mode: 'chat', source: 'default', sent_to: 'everyone' });
+    assert.deepEqual(s.optout, { mode: 'on', source: 'default' });
     assert.equal(s.participants, 3);
     assert.equal(s.recording.path, path.join(svc.dataDir, 'recordings', 'alice', `${j.meeting_id}.ogg`));
     assert.equal(fs.statSync(s.recording.path).mode & 0o777, 0o600);
@@ -157,6 +158,79 @@ test('MEETING_ANNOUNCE=none suppresses the configured notice, preserves opt-out 
     await c.call('meeting_leave', { meeting_id: id });
     await c.close();
   }, { env: { MEETING_ANNOUNCE: 'none', MEETING_ANNOUNCE_TEXT: 'This call is recorded.' } });
+});
+
+for (const [config, args, source] of [['off', {}, 'config'], ['on', { optout_detection: false }, 'call']]) {
+  test(`opt-out detection off from ${source} delivers chat and leaves recording under manual control`, async () => {
+    await withService(async (svc, ev, audio) => {
+      const c = await connect(svc);
+      const pushes = [];
+      const detach = svc.events.attach('alice', async (event) => { pushes.push(event); return true; });
+      const { code, url } = fake.newRoom();
+      fake.open(code);
+      const joined = await c.call('meeting_join', { url, ...args });
+      assert.equal(joined.isError, false, joined.text);
+      const id = joined.json().meeting_id;
+      await until(async () => (await status(c, id)).state === 'recording', 15_000);
+      const initial = await status(c, id);
+      assert.deepEqual(initial.optout, { mode: 'off', source });
+      const room = fake.room(code);
+      assert.match(room.chat[0].text, /tell the meeting organizer\.$/);
+      assert.match(room.chat[1].text, /sagt der Meeting-Leitung Bescheid\.$/);
+
+      const objection = "please don't record";
+      fake.say(code, 'Alex Example', objection);
+      fake.say(code, 'Sam Sample', 'Hello');
+      await until(() => pushes.length >= 2, 5000);
+      assert.deepEqual(pushes.map((e) => [e.tags[0], e.origin.meeting_id, e.origin.sender, e.origin.text]), [
+        ['bosun:meeting-chat', id, 'Alex Example', objection],
+        ['bosun:meeting-chat', id, 'Sam Sample', 'Hello'],
+      ]);
+      const chat = (await c.call('meeting_chat_read', { meeting_id: id })).json();
+      assert.deepEqual(chat.messages.map((m) => m.text), [objection, 'Hello']);
+      const s = await status(c, id);
+      assert.equal(s.state, 'recording');
+      assert.equal(s.opted_out, undefined);
+      assert.equal(s.recording.path, initial.recording.path);
+      assert.ok(fs.existsSync(initial.recording.path));
+      assert.equal(audio.recorders[0].killed, false);
+      assert.equal(room.over, null);
+      assert.equal(room.chat.some((m) => m.text === CONFIRM_DELETED), false);
+      assert.deepEqual([ev.optout, ev.ended], [[], []]);
+
+      const stopped = (await c.call('meeting_stop_recording', { meeting_id: id, delete: true })).json();
+      assert.deepEqual([stopped.stopped, stopped.deleted, stopped.state], [true, true, 'admitted']);
+      assert.equal(fs.existsSync(initial.recording.path), false);
+      assert.equal((await c.call('meeting_leave', { meeting_id: id })).json().reason, 'left');
+      detach();
+      await c.close();
+    }, { env: { MEETING_OPTOUT: config } });
+  });
+}
+
+test('optout_detection: true overrides MEETING_OPTOUT=off and respects leave_on_optout', async () => {
+  await withService(async (svc, ev) => {
+    const c = await connect(svc);
+    const { code, url } = fake.newRoom();
+    fake.open(code);
+    const invalid = await c.call('meeting_join', { url, optout_detection: 'true' });
+    assert.equal(invalid.isError, true);
+    assert.match(invalid.text, /optout_detection/);
+    const joined = await c.call('meeting_join', { url, announce: 'none', optout_detection: true, leave_on_optout: false });
+    assert.equal(joined.isError, false, joined.text);
+    const id = joined.json().meeting_id;
+    await until(async () => (await status(c, id)).state === 'recording', 15_000);
+    const file = (await status(c, id)).recording.path;
+    fake.say(code, 'Alex Example', "please don't record");
+    await until(() => ev.optout.length === 1, 5000);
+    assert.equal(ev.optout[0].left, false);
+    assert.equal(fs.existsSync(file), false);
+    const s = await status(c, id);
+    assert.deepEqual(s.optout, { mode: 'on', source: 'call' });
+    assert.deepEqual([s.state, s.recording, s.opted_out.sender], ['admitted', 'deleted', 'Alex Example']);
+    await c.call('meeting_leave', { meeting_id: id });
+    await c.close();
+  }, { env: { MEETING_OPTOUT: 'off' } });
 });
 
 test('opt-out in natural language: the recording stops and is deleted at once, confirmed in the chat, an event, and Bosun leaves', async () => {

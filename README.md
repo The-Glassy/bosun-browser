@@ -157,6 +157,7 @@ for host requirements, egress, and the `bosun migrate-data` command.
 | `MEETING_BOT_NAME` | `Notetaker` | default guest display name. A signed-in account supplies its own name |
 | `MEETING_ANNOUNCE` | `chat` | default recording notice mode. Use `chat`, `host`, or `none`. The operator must inform participants when the notice is disabled |
 | `MEETING_ANNOUNCE_TEXT` | – | custom chat notice for meeting recording. Unset uses the built-in English and German notice |
+| `MEETING_OPTOUT` | `on` | automatic handling of recording objections in chat. Use `on` or `off`. When off, the operator or agent must honor objections |
 | `MEETING_OWNER` | – | name included in the built-in notice as the notetaker's owner |
 | `ELEVENLABS_API_KEY` | – | ElevenLabs key: the live meeting transcript (`meeting_join` `live_transcript`) and the `elevenlabs` voice of `meeting_speak`; unset: both refused. Kept in the service only (removed from its environment at start) |
 | `ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io` | another ElevenLabs API host (`https://*.elevenlabs.io`, e.g. `https://api.eu.residency.elevenlabs.io`); nothing else gets the key (http on loopback is accepted, for tests) |
@@ -874,14 +875,15 @@ Platforms:
 
 ```jsonc
 meeting_join({ "url": "https://meet.google.com/abc-defg-hij" })   // name, announce_text, announce ("chat" | "host" | "none"),
-                                                                   // max_wait_admit_min (10), profile, engine, leave_on_optout (true)
+                                                                   // max_wait_admit_min (10), profile, engine, optout_detection,
+                                                                   // leave_on_optout (true)
 meeting_join({ "url": "https://us02web.zoom.us/j/81234567890?pwd=…", "profile": "zoom" })
 //  -> { "meeting_id": "m1a2b3c4d5e6", "platform": "zoom", "state": "waiting", "joined_as": "account", ... }
 meeting_join({ "url": "https://meet.google.com/abc-defg-hij", "profile": "google", "dry_run": true })
 //  -> { "dry_run": true, "state": "lobby", "lobby": "account", "join_button": "Ask to join without microphone & camera",
 //       "microphone": "on (no device found)", "camera": "no device", "challenge": false, "page": "…/meet/abc-defg-hij", ... }
 meeting_status({ "meeting_id": "m1a2b3c4d5e6" })   // joining | waiting | admitted | recording | ended, participants, recording_seconds,
-                                                   // announce: { mode, source, sent_to, reason?, failures? }
+                                                   // announce: { mode, source, sent_to, reason?, failures? }, optout: { mode, source }
 meeting_chat_read({ "meeting_id": "…", "since": 0 })      meeting_chat_send({ "meeting_id": "…", "text": "…" })
 meeting_stop_recording({ "meeting_id": "…", "delete": true })   meeting_leave({ "meeting_id": "…" })
 meeting_recording_delete({ "meeting_id": "…" })
@@ -958,17 +960,18 @@ meeting_stop_speaking({ "meeting_id": "…" })   meeting_mute({ "meeting_id": "�
    - **`"none"`: no recording notice.** The operator is responsible for informing participants about recording.
      Use a per-call `announce: "none"` only with the meeting owner's approval.
 
-   In every mode the chat is watched and an objection stops and deletes the recording. `meeting_status.announce`
-   shows the effective `mode`, its `source` (`call`, `config`, or `default`), and `sent_to`
+   The chat is watched in every announcement mode. `meeting_status.announce` shows the effective `mode`, its
+   `source` (`call`, `config`, or `default`), and `sent_to`
    (`everyone`, `host`, `none`, or `failed` after the announcement step). `announce.reason` says why
    the announcement didn't reach everyone: `chat-restricted` (the chat can't be addressed to everyone),
    `chat-unavailable` (no chat), `sent-privately`, `not-sent` (still in the box), `not-confirmed` (it never showed
    up as Bosun's), and for the host `host-unreachable`. Later messages (`meeting_chat_send`, the opt-out
    confirmation) follow the announcement's destination and default to everyone in `none` mode. The built-in
-   English and German notice calls the bot an AI notetaker, describes the enabled capture, and invites objections
-   in chat. It names the owner only when `MEETING_OWNER` is set. Set `MEETING_ANNOUNCE_TEXT` for a deployment-wide
-   custom notice or pass `announce_text` for one meeting. Include any enabled video recording and live transcription
-   in the custom wording.
+   English and German notice calls the bot an AI notetaker and describes the enabled capture. It invites objections
+   in chat with opt-out detection on and directs objections to the meeting organizer with detection off. It names
+   the owner only when `MEETING_OWNER` is set. Set `MEETING_ANNOUNCE_TEXT` for a deployment-wide custom notice or pass
+   `announce_text` for one meeting. Include any enabled video recording and live transcription in the custom wording
+   and explain how participants can object.
 5. While in the call:
    - Every chat message from someone else is pushed to the agent as `bosun:meeting-chat`, with `meeting_id`,
      `sender` and `text`. `meeting_chat_read` returns them too.
@@ -1004,12 +1007,19 @@ Events use the MCPL feature set **`bosun.meeting`** (tags `bosun:meeting-chat`, 
 `bosun:meeting-transcript-stopped`, `bosun:meeting-speech`); host recipes that list `enabledFeatureSets` need to add it (or `bosun.*`).
 
 **Consent.** Recording starts after the announcement step. The effective `none` mode skips the notice and makes the
-operator responsible for informing participants. A plain-language request in English, German, Ukrainian, Russian
-or Slovak is enough to opt out (`please don't record`, `stop
-recording`, `bitte nicht aufnehmen`, `не записуй`, `не записывай`, `nenahrávaj`, …).
-- **What happens:** Bosun **stops the recording and deletes the file at once**, posts "Recording stopped and
+operator responsible for informing participants. `MEETING_OPTOUT` controls automatic chat opt-outs independently
+of the announcement mode. It accepts `on` (default) or `off` and is validated at startup.
+Pass `optout_detection: true` or `false` to `meeting_join` to override it for one meeting.
+`meeting_status.optout` shows the effective `mode` (`on` or `off`) and `source` (`call`, `config`, or `default`).
+
+- **With detection on**, a plain-language request in English, German, Ukrainian, Russian or Slovak is enough
+  (`please don't record`, `stop recording`, `bitte nicht aufnehmen`, `не записуй`, `не записывай`, `nenahrávaj`, …).
+  Bosun **stops the recording and deletes the file at once**, posts "Recording stopped and
   deleted. / Aufnahme gestoppt und gelöscht." in the chat, sends `bosun:meeting-optout` and leaves. With
   `leave_on_optout: false` it stays but never records again in that meeting.
+- **With detection off**, objections still arrive as `bosun:meeting-chat` events. Recording continues until
+  stopped or the meeting ends. The **operator or agent must honor objections**, using
+  `meeting_stop_recording` with `delete: true` to stop and delete the capture and `meeting_leave` when appropriate.
 - **The matcher is conservative.** "don't stop recording", "keep recording" or "record the next steps" do not
   trigger it, and neither do instructions about opting out ("if you'd rather not…", "to opt out, write 'stop
   recording'"): quoted words in a longer message are a mention. Bosun's own messages never count. A message that
@@ -1167,8 +1177,9 @@ A process crash before finalization can leave audio without a sidecar.
     - The page's highlight lags the voice by a few hundred ms.
   - `meeting_status.speaker_labels` says whether a speaker has been seen at all (`seen` / `none-seen`).
 - **Consent.** Live transcription starts and stops **with the recording**. When enabled, the built-in notice
-  says in English and German that the audio is also transcribed live. An opt-out in the chat stops both **at once**, deletes
-  the recording and forgets the transcript's text, and posts *"Recording and live transcript stopped and deleted."*
+  says in English and German that the audio is also transcribed live. With opt-out detection on, a chat objection
+  stops both **at once**, deletes the recording and forgets the transcript's text, and posts
+  *"Recording and live transcript stopped and deleted."*
   `meeting_stop_recording` stops it too (`delete: true` forgets its text), and so does `meeting_recording_delete`.
 - **Retention at ElevenLabs:** Bosun always asks for zero retention (`enable_logging=false`). ElevenLabs applies it
   only on enterprise and trial plans; otherwise it answers with a warning and logs the session. `meeting_status`

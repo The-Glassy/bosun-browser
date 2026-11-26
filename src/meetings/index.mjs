@@ -4,8 +4,8 @@
 // can speak into the call (speech.mjs: text to speech, or an uploaded file, played into the browser's microphone),
 // unmute and mute, and raise a hand; when to do any of that is the agent's call, never Bosun's. Consent: the chat is told before recording starts (announce: everyone, else the host where the host allows
 // chat with the host only; or the host only or nobody, as configured for the instance or the call), every chat message reaches the agent
-// as an event, and a clear request not to be recorded (any of five languages, see optout.mjs) stops the recording and
-// deletes the file at once, whatever the announcement mode.
+// as an event. With opt-out detection on, a clear request not to be recorded (any of five languages, see optout.mjs)
+// stops the recording and deletes it at once, whatever the announcement mode.
 //
 // A meeting runs in a session of its own (owner meeting:<id>, so it outlives the agent's connection), in a browser
 // process of its own whose audio goes to a private PulseAudio server (audio.mjs). Platforms (platforms/*.mjs) hold
@@ -16,7 +16,7 @@ import crypto from 'crypto';
 import { httpUrl } from '../sessions.mjs';
 import { readProfileMeta } from '../engines.mjs';
 import { TENANT_RE } from '../auth.mjs';
-import { ANNOUNCE_MODES, DEFAULT_MEETING_ANNOUNCE, DEFAULT_MEETING_BOT_NAME } from '../config.mjs';
+import { ANNOUNCE_MODES, DEFAULT_MEETING_ANNOUNCE, DEFAULT_MEETING_BOT_NAME, DEFAULT_MEETING_OPTOUT } from '../config.mjs';
 import { matchOptOut, normalize } from './optout.mjs';
 import { cleanChatText, cleanSender } from './platforms/common.mjs';
 import { meet } from './platforms/meet.mjs';
@@ -111,18 +111,20 @@ export function transition(m, to) {
 
 const botName = (name) => String(name).replace(/\s*\(.*\)\s*$/, '').trim() || 'Bosun';
 // The built-in notice is in English and German. Only MEETING_OWNER supplies a name.
-export function announcement(owner, { live = false, video = false } = {}) {
+export function announcement(owner, { live = false, video = false, optOutDetection = true } = {}) {
   const notetakerEn = owner ? `${owner}'s AI notetaker` : 'An AI notetaker';
   const notetakerDe = owner ? `Der KI-Notizassistent von ${owner}` : 'Ein KI-Notizassistent';
   const captureEn = video ? 'audio and video of this meeting page' : 'the audio of this call';
   const captureDe = video ? 'Ton und Video dieser Meeting-Seite' : 'den Ton dieses Anrufs';
   const liveEn = live ? ' and transcribing the audio live' : '';
   const liveDe = live ? ' und transkribiert den Ton live' : '';
-  const optOutEn = live ? 'the recording and live transcription stop, and the recording and transcript are deleted' : 'the recording stops and is deleted';
-  const optOutDe = live ? 'Dann werden Aufnahme und Live-Transkription gestoppt und Aufnahme und Transkript gelöscht.' : 'Dann wird die Aufnahme gestoppt und gelöscht.';
+  const stoppedEn = live ? 'the recording and live transcription stop, and the recording and transcript are deleted' : 'the recording stops and is deleted';
+  const stoppedDe = live ? 'Dann werden Aufnahme und Live-Transkription gestoppt und Aufnahme und Transkript gelöscht.' : 'Dann wird die Aufnahme gestoppt und gelöscht.';
+  const objectionEn = optOutDetection ? `say so here in chat (e.g. 'please don't record') and ${stoppedEn}.` : 'tell the meeting organizer.';
+  const objectionDe = optOutDetection ? `schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“). ${stoppedDe}` : 'sagt der Meeting-Leitung Bescheid.';
   return [
-    `${notetakerEn} is recording ${captureEn} for notes${liveEn}. If you'd rather not be recorded, say so here in chat (e.g. 'please don't record') and ${optOutEn}.`,
-    `${notetakerDe} zeichnet ${captureDe} für Notizen auf${liveDe}. Wenn ihr nicht aufgenommen werden wollt, schreibt es einfach hier in den Chat (z. B. „bitte nicht aufnehmen“). ${optOutDe}`,
+    `${notetakerEn} is recording ${captureEn} for notes${liveEn}. If you'd rather not be recorded, ${objectionEn}`,
+    `${notetakerDe} zeichnet ${captureDe} für Notizen auf${liveDe}. Wenn ihr nicht aufgenommen werden wollt, ${objectionDe}`,
   ];
 }
 export const CONFIRM_DELETED = 'Recording stopped and deleted. / Aufnahme gestoppt und gelöscht.';
@@ -349,12 +351,14 @@ export class Meetings {
 
   // Starts joining; resolves once the join request is out (state waiting or admitted), or rejects with the reason the
   // meeting could not be joined (denied, not a meeting page, no audio, ...).
-  async join(tenant, { url, name = this.cfg.meetingBotName ?? DEFAULT_MEETING_BOT_NAME, announceText, announce, maxWaitAdmitMin = 10, profile, engine, leaveOnOptOut = true, aloneLeaveSec, firstJoinerWaitSec,
+  async join(tenant, { url, name = this.cfg.meetingBotName ?? DEFAULT_MEETING_BOT_NAME, announceText, announce, maxWaitAdmitMin = 10, profile, engine, optOutDetection, leaveOnOptOut = true, aloneLeaveSec, firstJoinerWaitSec,
     liveTranscript = false, transcriptPartials = true, vadSilenceS, recordVideo = false, videoFps = 2, settings: perCall = {} }) {
     validateVideo(recordVideo, videoFps);
     const announceMode = announce === undefined ? this.cfg.meetingAnnounce ?? DEFAULT_MEETING_ANNOUNCE : announce;
     const announceSource = announce === undefined ? this.cfg.meetingAnnounceSource ?? 'default' : 'call';
     if (!ANNOUNCE_MODES.includes(announceMode)) throw new Error(`announce must be one of ${ANNOUNCE_MODES.join(', ')}`);
+    const optOutMode = optOutDetection === undefined ? this.cfg.meetingOptOut ?? DEFAULT_MEETING_OPTOUT : optOutDetection ? 'on' : 'off';
+    const optOutSource = optOutDetection === undefined ? this.cfg.meetingOptOutSource ?? 'default' : 'call';
     // Speech settings for this meeting only (PER_CALL), over the tenant's.
     const overrides = {};
     for (const [k, v] of Object.entries(perCall || {})) {
@@ -389,10 +393,10 @@ export class Meetings {
     this.capacity(tenant);
     const id = `m${crypto.randomBytes(6).toString('hex')}`;
     const m = {
-      id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, leaveOnOptOut,
+      id, tenant, url, name, platform, profile: profile || null, engine: eng, owner: `meeting:${id}`, optOutMode, optOutSource, leaveOnOptOut,
       recordVideo, videoFps, videoReserved: recordVideo,
       aloneLeaveSec, firstJoinerWaitSec, othersSeen: false,
-      announce: announceText ? [announceText] : announcement(this.cfg.meetingOwner, { live: liveTranscript, video: recordVideo }),
+      announce: announceText ? [announceText] : announcement(this.cfg.meetingOwner, { live: liveTranscript, video: recordVideo, optOutDetection: optOutMode === 'on' }),
       live: liveTranscript, partials: transcriptPartials, vadSilenceS, transcript: null, speech: null, speechSeq: 0,
       announceMode, announceSource, announced: { sent_to: null, failures: [] }, chatTo: announceMode === 'host' ? 'host' : 'everyone', chatError: null,
       maxWaitMs: maxWaitAdmitMin * 60_000, state: 'joining', reason: null, error: null,
@@ -1491,7 +1495,7 @@ export class Meetings {
       m.chat.push(entry);
       if (m.chat.length > MAX_CHAT) m.chat.shift();
       this.emit(m, 'chat', { sender: entry.sender, text: entry.text, ...(edited ? { edited: true } : {}) });
-      if (!m.optedOut && matchOptOut(rest)) await this.optOut(m, entry);
+      if (m.optOutMode === 'on' && !m.optedOut && matchOptOut(rest)) await this.optOut(m, entry);
       if (m.state === 'ended') return;
     }
   }
@@ -1619,6 +1623,7 @@ export class Meetings {
       recording: m.file ? { path: m.file, bytes, ...(m.state === 'ended' && bytes ? { next: `call recording_get { meeting_id: "${m.id}" }` } : {}) } : m.deleted ? 'deleted' : null,
       ...(m.recError ? { recording_error: m.recError } : {}),
       ...(m.optedOut ? { opted_out: { sender: m.optedOut.sender, at: m.optedOut.at } } : {}),
+      optout: { mode: m.optOutMode, source: m.optOutSource },
       announce: { mode: m.announceMode, source: m.announceSource, sent_to: m.announced.sent_to, ...(m.announced.failures.length ? { reason: m.announced.failures[0].reason, failures: m.announced.failures } : {}) },
       ...(m.chatError ? { chat_error: m.chatError } : {}),
       ...(m.live ? { live_transcript: m.transcript ? m.transcript.status() : { state: m.transcriptError ? 'unavailable' : m.state === 'ended' || m.noRecord ? 'off' : 'not-started', ...(m.transcriptError ? { error: m.transcriptError } : {}) } } : {}),

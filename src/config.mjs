@@ -9,6 +9,7 @@ import { parseMacroSource } from './macros.mjs';
 export const DEFAULT_MEETING_BOT_NAME = 'Notetaker';
 export const ANNOUNCE_MODES = ['chat', 'host', 'none'];
 export const DEFAULT_MEETING_ANNOUNCE = 'chat';
+export const DEFAULT_MEETING_OPTOUT = 'on';
 
 function int(env, name, def, min, max) {
   const raw = env[name];
@@ -40,6 +41,7 @@ function timeZone(value, key) {
 
 export function loadConfig(env = process.env) {
   const meetingAnnounce = env.MEETING_ANNOUNCE?.trim();
+  const meetingOptOut = env.MEETING_OPTOUT?.trim();
   const cfg = {
     egressProxy: parseEgress(env.BROWSER_EGRESS_PROXY),
     egressProxies: parseEgressProxies(env.BROWSER_EGRESS_PROXIES),
@@ -67,6 +69,8 @@ export function loadConfig(env = process.env) {
     meetingAnnounce: meetingAnnounce ?? DEFAULT_MEETING_ANNOUNCE,
     meetingAnnounceSource: meetingAnnounce === undefined ? 'default' : 'config',
     meetingAnnounceText: env.MEETING_ANNOUNCE_TEXT?.trim() || null,
+    meetingOptOut: meetingOptOut ?? DEFAULT_MEETING_OPTOUT,
+    meetingOptOutSource: meetingOptOut === undefined ? 'default' : 'config',
     meetingOwner: (env.MEETING_OWNER || '').trim().slice(0, 60) || null,
     recordingRetentionDays: int(env, 'RECORDING_RETENTION_DAYS', 30, 1, 3650), // meeting recordings are deleted after this
     meetingVideoLimit: int(env, 'MEETING_VIDEO_LIMIT', 1, 0, 1000),
@@ -110,6 +114,7 @@ export function loadConfig(env = process.env) {
   if (cfg.meetingBotName.length > 60) throw new Error('MEETING_BOT_NAME must be at most 60 characters');
   if (!ANNOUNCE_MODES.includes(cfg.meetingAnnounce)) throw new Error(`MEETING_ANNOUNCE must be one of ${ANNOUNCE_MODES.join(', ')}`);
   if (cfg.meetingAnnounceText?.length > 1000) throw new Error('MEETING_ANNOUNCE_TEXT must be at most 1000 characters');
+  if (!['on', 'off'].includes(cfg.meetingOptOut)) throw new Error('MEETING_OPTOUT must be on or off');
 
   const sandbox = env.BOSUN_TENANT_SANDBOX ?? 'off';
   if (!['auto', 'on', 'off'].includes(sandbox)) throw new Error('BOSUN_TENANT_SANDBOX must be auto, on or off');

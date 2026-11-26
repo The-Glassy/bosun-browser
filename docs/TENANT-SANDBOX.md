@@ -115,10 +115,11 @@ and point `BROWSER_DATA` at the recovered directory.
 The guest name defaults to `Notetaker` and can be set with `MEETING_BOT_NAME`. The built-in English and German
 notice uses generic wording, with optional attribution from `MEETING_OWNER`. Set `MEETING_ANNOUNCE_TEXT` for
 custom wording. Set `MEETING_ANNOUNCE` to `chat` (default), `host`, or `none`. When the notice is disabled,
-the operator must inform participants about recording. Chat opt-outs apply in every mode. A join's `name`,
-`announce_text`, and `announce` override the instance defaults. Set `TZ` for keepalive quiet hours and
-transcript quotas. Use `BROWSER_LOCALE` and `BROWSER_TIMEZONE` for browser contexts. The default time zone for each
-is `Europe/Vienna`.
+the operator must inform participants about recording. Set `MEETING_OPTOUT` to `on` (default) or `off` for
+automatic chat opt-outs. With detection off, chat events continue and the operator or agent must honor objections.
+A join's `name`, `announce_text`, `announce`, and `optout_detection` override the instance defaults.
+Set `TZ` for keepalive quiet hours and transcript quotas. Use `BROWSER_LOCALE` and `BROWSER_TIMEZONE` for browser
+contexts. The default time zone for each is `Europe/Vienna`.
 
 ## Run the containment test
 
