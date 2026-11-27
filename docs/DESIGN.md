@@ -243,6 +243,15 @@ Precedence: call > tenant > env > built-in (`supertonic`, `eleven_v4_turbo`, Sar
 `elevenlabs` without a key falls back to `supertonic` and says so (start-up warning for the env value, `warning` in
 `speech_settings_get`) rather than refusing every utterance. Read-only tokens may read the settings, not change them.
 
+**ElevenLabs access (0.28.2).** The operator sets `ELEVENLABS_TENANTS` to a comma-separated list of token
+tenant IDs. An omitted variable allows all tenants and an empty value denies access by default.
+An explicit `ELEVENLABS_TENANT_OVERRIDES` entry (`tenant=0` or `tenant=1`) supersedes the fallback for that tenant.
+Bosun reads both at startup. Speech settings are tenant-writable and do not affect this policy.
+Denied tenants record without live transcription and use Supertonic for speech that would otherwise use ElevenLabs,
+including channel chunks and acknowledgement clips. The ElevenLabs client checks the authenticated tenant when
+attaching credentials to each HTTP request and WebSocket handshake, including reconnects. The gateway supplies
+isolated workers with the ElevenLabs key and relay only where the tenant has access.
+
 **VAD pause (0.16.0).** The Scribe segment ends after `vad_silence_s` of silence (was a fixed 1 s; ElevenLabs' own
 default is 1.5 s). Measured on real Scribe with TTS speech (River, `eleven_v4_turbo`) in English and Ukrainian, pauses
 inside sentences 0.15–0.6 s plus the clips' own edges: a final comes 0.83–0.97 s after the speaker stops at 0.5 s,

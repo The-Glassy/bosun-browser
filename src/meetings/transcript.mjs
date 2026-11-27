@@ -14,8 +14,7 @@
 //
 // Times (start_s, end_s) are seconds of meeting audio since the transcript started. A segment's partials carry the
 // seq its final will have; a final replaces them.
-import { nodeDebugOn } from '../secrets.mjs';
-export { nodeDebugOn } from '../secrets.mjs';
+import { elevenLabsHeaders } from './elevenlabs.mjs';
 import { providerConnection } from '../tenant-network.mjs';
 import fs from 'fs';
 import path from 'path';
@@ -23,8 +22,6 @@ import WebSocket from 'ws';
 import { PCM_RATE } from './audio.mjs';
 
 export const EL_MODEL = 'scribe_v2_realtime';
-// Node's own diagnostics (NODE_DEBUG=net, http, fetch, ...) print request headers: the key is not sent while it is set.
-export const NODE_DEBUG_REFUSED = 'NODE_DEBUG is set (Node would log the request headers with the ElevenLabs key); the operator has to switch it off';
 export const EL_PATH = '/v1/speech-to-text/realtime';
 const BYTES_PER_SEC = PCM_RATE * 2;
 const CHUNK_BYTES = BYTES_PER_SEC / 4; // 250 ms per message (ElevenLabs: 0.1 - 1 s)
@@ -102,10 +99,9 @@ export class TranscriptUsage {
 // that a new connection would not fix (reason error), or when the audio ends (reason audio-ended).
 export class LiveTranscript {
   // limits (tests): {startMs, unsentBytes, stallMs, shortSessionMs}.
-  constructor({ apiKey, baseUrl, socketPath, source, tenant, usage, on, partials = true, now = Date.now, retryMs = 1000, limits = {}, vadSilenceS = VAD_SILENCE_SEC }) {
-    Object.assign(this, { apiKey, baseUrl, socketPath, source, tenant, usage, on, partials, now, retryMs, vadSilenceS });
+  constructor({ cfg, source, tenant, usage, on, partials = true, now = Date.now, retryMs = 1000, limits = {}, vadSilenceS = VAD_SILENCE_SEC }) {
+    Object.assign(this, { cfg, source, tenant, usage, on, partials, now, retryMs, vadSilenceS });
     this.limits = { startMs: START_MS, unsentBytes: MAX_UNSENT_BYTES, stallMs: STALL_MS, shortSessionMs: SHORT_SESSION_MS, ...limits };
-    this.url = realtimeUrl(baseUrl, { vadSilenceS });
     this.state = 'connecting'; // connecting | live | reconnecting | stopped
     this.reason = null; this.error = null;
     this.startedAt = now();
@@ -184,11 +180,14 @@ export class LiveTranscript {
 
   connect() {
     if (this.state === 'stopped') return;
-    if (nodeDebugOn()) { this.stop('error', NODE_DEBUG_REFUSED); return; }
+    let headers;
+    try { headers = elevenLabsHeaders(this.cfg, this.tenant); } catch (e) { this.stop('error', e.message); return; }
+    const url = realtimeUrl(this.cfg.elevenlabs.baseUrl, { vadSilenceS: this.vadSilenceS });
+    const socketPath = this.cfg.providerSockets?.elevenlabs;
     this.sessionSent = false;
     this.stallSince = null;
-    const ws = this.ws = new WebSocket(this.url, { headers: { 'xi-api-key': this.apiKey }, handshakeTimeout: 15_000,
-      ...(this.socketPath ? { createConnection: providerConnection(this.url, this.socketPath) } : {}), });
+    const ws = this.ws = new WebSocket(url, { headers, handshakeTimeout: 15_000,
+      ...(socketPath ? { createConnection: providerConnection(url, socketPath) } : {}), });
     let started = false;
     clearTimeout(this.startTimer);
     this.startTimer = setTimeout(() => this.dropped(ws, 'error', `no session_started within ${this.limits.startMs / 1000} s`), this.limits.startMs);

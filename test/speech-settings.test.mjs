@@ -78,6 +78,30 @@ test('backend elevenlabs without an ElevenLabs key: supertonic, with a warning (
   assert.equal(settings(KEY).set('a', { backend: 'elevenlabs' }).warning, undefined);
 });
 
+test('operator overrides win, and stored speech settings cannot grant ElevenLabs access', () => {
+  assert.throws(() => loadConfig({ ELEVENLABS_TENANTS: '*' }), /ELEVENLABS_TENANTS/);
+  for (const overrides of ['alice', 'alice=true', 'alice=0=1', 'alice=0, alice=1']) {
+    assert.throws(() => loadConfig({ ELEVENLABS_TENANT_OVERRIDES: overrides }), /ELEVENLABS_TENANT_OVERRIDES/);
+  }
+  const s = settings({ ...KEY, ELEVENLABS_TENANTS: 'alice, charlie ', ELEVENLABS_TENANT_OVERRIDES: 'alice=0, bob=1' });
+  assert.equal(s.set('bob', { backend: 'elevenlabs' }).effective.backend, 'elevenlabs');
+  assert.equal(s.set('charlie', { backend: 'elevenlabs' }).effective.backend, 'elevenlabs');
+  assert.equal(s.get('alice').elevenlabs, 'not available for this tenant');
+  assert.equal(s.get('dana').elevenlabs, 'not available for this tenant');
+  assert.equal(settings({ ...KEY, ELEVENLABS_TENANTS: '', ELEVENLABS_TENANT_OVERRIDES: 'alice=1' }).get('alice').elevenlabs, undefined);
+
+  const legacy = new SpeechSettings({ ...s.cfg, elevenlabsTenants: null, elevenlabsTenantOverrides: new Map() });
+  const stored = legacy.set('alice', { backend: 'elevenlabs', elevenlabs_voice: 'SAz9YHcvj6GT2YYXdXww' }).settings;
+  assert.equal(s.get('alice').effective.backend, 'supertonic');
+  assert.match(s.get('alice').warning, /using supertonic/);
+  for (const patch of [{ backend: 'elevenlabs' }, { elevenlabs_voice: null }, { elevenlabs_model: 'eleven_v4_turbo' }]) {
+    assert.throws(() => s.set('alice', { bot_name: 'Changed', ...patch }), /not available for this tenant/);
+    assert.deepEqual(s.get('alice').settings, stored);
+  }
+  assert.throws(() => s.set('alice', { elevenlabs_allowed: true }), /not available for this tenant/);
+  assert.equal(s.set('alice', { supertonic_voice: 'supertonic-F2' }).effective.supertonic_voice, 'supertonic-F2');
+});
+
 test('channel and acknowledgement settings: validated, set and removed per tenant', () => {
   const s = settings(KEY);
   const r = s.set('a', { meeting_channel: false, transcript_events: 'never', agent_partials: true, agent_partials_interval_s: 2, channel_prepare_chunks: true,

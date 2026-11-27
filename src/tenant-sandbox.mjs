@@ -18,6 +18,7 @@ import { startWsServer } from './wsserver.mjs';
 import { driverLogsValues, nodeDebugOn } from './secrets.mjs';
 import { prepareSandboxData } from './migrate-data.mjs';
 import { handoffDigest } from './liveview.mjs';
+import { elevenLabsAllowed } from './meetings/elevenlabs.mjs';
 
 const APP = fileURLToPath(new URL('../', import.meta.url));
 const RUN = '/run/bosun';
@@ -125,7 +126,8 @@ async function hostRelays(cfg, tenant, dir, cleanup) {
     routes.set(name, { socketPath: `${SOCKETS.relay}/${leaf}`, username: proxy.username, password: proxy.password,
       egress: egress ? { server: egress.server } : null });
   }
-  for (const [service, url] of [['tts', cfg.ttsUrl], ['elevenlabs', cfg.elevenlabs?.baseUrl]]) {
+  const elevenLabsUrl = elevenLabsAllowed(cfg, tenant) ? cfg.elevenlabs?.baseUrl : null;
+  for (const [service, url] of [['tts', cfg.ttsUrl], ['elevenlabs', elevenLabsUrl]]) {
     if (!cfg.features.meetings || !url) continue;
     const target = new URL(url);
     const destination = { host: target.hostname.replace(/^\[|\]$/g, ''), port: Number(target.port || (target.protocol === 'https:' ? 443 : 80)) };
@@ -142,6 +144,7 @@ const routePrefix = (tenant) => `/tenant/${tenant}`;
 function workerConfig(cfg, tenant, state, token, live, routes, providerSockets) {
   return {
     ...cfg, dataDir: state, tenantSandbox: false, warnUnsafeShared: false, metricsToken: null,
+    elevenlabs: providerSockets.elevenlabs ? cfg.elevenlabs : null,
     tokens: [{ tenant, token }], policies: new Map([[tenant, policyOf(cfg, tenant)]]),
     ws: cfg.ws ? { maxConnections: cfg.ws.maxConnections, allowNoToken: false, allowedOrigins: [] } : null,
     live: live ? { baseUrl: `${live.baseUrl}${routePrefix(tenant)}` } : null, uploadBaseUrl: null,

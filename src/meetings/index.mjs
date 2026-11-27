@@ -21,7 +21,9 @@ import { cleanChatText, cleanSender } from './platforms/common.mjs';
 import { meet } from './platforms/meet.mjs';
 import { zoom } from './platforms/zoom.mjs';
 import { pulseAudio } from './audio.mjs';
-import { LiveTranscript, TranscriptUsage, nodeDebugOn, NODE_DEBUG_REFUSED } from './transcript.mjs';
+import { LiveTranscript, TranscriptUsage } from './transcript.mjs';
+import { nodeDebugOn } from '../secrets.mjs';
+import { ELEVENLABS_DENIED, ELEVENLABS_FALLBACK, NODE_DEBUG_REFUSED, elevenLabsAllowed } from './elevenlabs.mjs';
 import { synthesizeWav, splitSpeech, takeSentences, probeSeconds, audioFormat } from './speech.mjs';
 import { SpeechSettings, SETTINGS, PER_CALL, REMOVED, removedSetting, DEFAULTS, MEETING_DEFAULTS } from './settings.mjs';
 import { CHANNEL_PREFIX } from '../events.mjs';
@@ -30,6 +32,7 @@ import { RecordingLinks } from './recording-links.mjs';
 import { SpeakerTimeline, speakerFile } from './speaker-timeline.mjs';
 import { validateVideo, videoCapacity, validVideo } from './video.mjs';
 
+const LIVE_TRANSCRIPT_DENIED = `live_transcript is refused: ${ELEVENLABS_DENIED}; join without it`;
 const recordingBase = (file) => file.replace(/\.(?:ogg|webm)$/, '');
 export const recordingMime = (file) => file.endsWith('.webm') ? 'video/webm' : 'audio/ogg';
 
@@ -306,7 +309,8 @@ export class Meetings {
   // dry_run: loads the meeting page exactly as a join would (same profile, engine, devices and language) and reports
   // what Bosun sees there (platform.inspect): the lobby kind, the button it would click, microphone and camera,
   // and whether a challenge is shown. Meet can admit the profile on load. The session is closed right after.
-  async inspect(tenant, { url, profile, engine }) {
+  async inspect(tenant, { url, profile, engine, liveTranscript }) {
+    if (liveTranscript && !elevenLabsAllowed(this.cfg, tenant)) throw new Error(LIVE_TRANSCRIPT_DENIED);
     const checked = await this.check(tenant, { url, profile, engine });
     const { platform, eng } = checked;
     url = checked.url;
@@ -391,6 +395,7 @@ export class Meetings {
     );
     vadSilenceS ??= defaults.values.vad_silence_s;
     if (liveTranscript) {
+      if (defaults.elevenlabs) throw new Error(LIVE_TRANSCRIPT_DENIED);
       if (!this.cfg.elevenlabs) throw new Error('live_transcript needs ElevenLabs (ELEVENLABS_API_KEY is not set on this Bosun); join without it');
       if (nodeDebugOn()) throw new Error(`live_transcript is refused: ${NODE_DEBUG_REFUSED}`);
       if (this.usage.left(tenant) <= 0) throw new Error(`the daily live transcript limit (${this.usage.capSec / 60} min) is used up for today; join without live_transcript`);
@@ -599,7 +604,7 @@ export class Meetings {
     if (!m.live || m.transcript || m.noRecord || m.optedOut || m.state === 'ended') return;
     if (!m.rig.capture) { m.transcriptError = 'this audio backend cannot capture the meeting audio'; return; }
     m.transcript = new LiveTranscript({
-      apiKey: this.cfg.elevenlabs.apiKey, baseUrl: this.cfg.elevenlabs.baseUrl, socketPath: this.cfg.providerSockets?.elevenlabs, source: m.rig.capture(), tenant: m.tenant, usage: this.usage,
+      cfg: this.cfg, source: m.rig.capture(), tenant: m.tenant, usage: this.usage,
       partials: true, vadSilenceS: m.vadSilenceS, now: this.now,
       on: {
         // Never thrown into the transcript's socket or timers (that would end the process): the text is emitted as it was.
@@ -654,7 +659,11 @@ export class Meetings {
         const named = [p?.turn_seq, p?.metadata?.turn_seq].find((x) => Number.isInteger(x) && x >= 0 && x <= m.lastTurnSeq);
         const turn = named ?? m.lastTurnSeq;
         const superseded = m.extendedSeqs.has(turn) || (m.heardSeq > m.lastTurnSeq && (!!m.hold || this.now() - m.lastHumanAt < STALE_HEARD_MS));
-        const receipt = (r = {}) => ({ messageId: `${m.id}:out${++m.channelMsgs}`, superseded_by_new_speech: superseded, turn_seq: turn, last_turn_seq: m.lastTurnSeq, ...r });
+        const receipt = (r = {}) => {
+          const { warning } = this.tts(m.tenant);
+          return { messageId: `${m.id}:out${++m.channelMsgs}`, superseded_by_new_speech: superseded,
+            turn_seq: turn, last_turn_seq: m.lastTurnSeq, ...(warning ? { warning } : {}), ...r };
+        };
         const spec = this.specPublish(m, text, p, turn);
         if (spec?.dropped) {
           this.inCall(m, 'speaking');
@@ -909,7 +918,7 @@ export class Meetings {
     if (m.prepared.has(key)) return;
     for (const [k, x] of m.prepared) if (x.done && this.now() - x.at > PREPARED_MS) m.prepared.delete(k);
     if (m.prepared.size >= PREPARED_MAX) return;
-    const e = { at: this.now(), done: false, wav: synthesizeWav(this.cfg, { text: t, ...tts }) };
+    const e = { at: this.now(), done: false, wav: synthesizeWav(this.cfg, { tenant: m.tenant, text: t, ...tts }) };
     e.wav.then(() => { e.done = true; }, () => { m.prepared.delete(key); });
     m.prepared.set(key, e);
   }
@@ -922,7 +931,7 @@ export class Meetings {
     const key = this.preparedKey(tts, text);
     const e = m.prepared.get(key);
     if (e && this.now() - e.at <= PREPARED_MS) { m.prepared.delete(key); return e.wav; }
-    return synthesizeWav(this.cfg, { text, ...tts });
+    return synthesizeWav(this.cfg, { tenant: m.tenant, text, ...tts });
   }
 
   // A partial of the live transcript: a bosun:meeting-transcript event (transcript_partials, transcript_events) and,
@@ -1240,7 +1249,7 @@ export class Meetings {
       if (e?.error && this.now() - e.failedAt > ACK_RETRY_MS) e = null;
       if (!e) {
         e = { text, clip: null, error: null, failedAt: 0 };
-        e.ready = synthesizeWav(this.cfg, { text, ...tts }).then((c) => { e.clip = c; }, (err) => { e.error = oneLine(err); e.failedAt = this.now(); });
+        e.ready = synthesizeWav(this.cfg, { tenant: m.tenant, text, ...tts }).then((c) => { e.clip = c; }, (err) => { e.error = oneLine(err); e.failedAt = this.now(); });
         this.ackCache.set(key, e);
         while (this.ackCache.size > ACK_CACHE) this.ackCache.delete(this.ackCache.keys().next().value);
       }
@@ -1697,7 +1706,10 @@ export class Meetings {
   // What a call leaves out of backend, voice and model: the tenant's speech settings, then the environment, then
   // Bosun's defaults.
   tts(tenant, { backend, voice, model, lang } = {}) {
-    const d = this.settings.effective(tenant).values;
+    const { values: d, elevenlabs, warning } = this.settings.effective(tenant);
+    if (elevenlabs && (backend === 'elevenlabs' || (backend == null && warning))) {
+      return { backend: 'supertonic', voice: d.supertonic_voice ?? undefined, lang, warning: ELEVENLABS_FALLBACK };
+    }
     backend ??= d.backend;
     if (model !== undefined && backend !== 'elevenlabs') throw new Error('model is an ElevenLabs model id: only with backend "elevenlabs"');
     model ??= d.elevenlabs_model;
@@ -1728,7 +1740,7 @@ export class Meetings {
   // open, so more text is added while it plays, until it has played out with nothing new), 'ack' (a cached clip).
   // m.speech is this utterance from the start (synchronously), so what comes next sees it.
   // whole: the text is one piece (a sentence synthesized ahead as it is).
-  async utter(m, { text, audioFileId, clip, clipText, backend, voice, lang, model, autoMute = true, interrupt = false, wait = false, kind = 'speak', open = false, whole = false }) {
+  async utter(m, { text, audioFileId, clip, clipText, backend, voice, lang, model, warning, autoMute = true, interrupt = false, wait = false, kind = 'speak', open = false, whole = false }) {
     if (kind !== 'ack') { clearTimeout(m.ackTimer); m.ackTimer = null; } // the agent speaks: no acknowledgement now
     const prev = m.speech;
     const t0 = this.now();
@@ -1787,7 +1799,7 @@ export class Meetings {
     if (fail) {
       const r = await this.endUtterance(m, u, u.cancelled ? 'interrupted' : 'failed', fail, { t0 });
       if (u.cancelled) return r;
-      throw new Error(`nothing was said: ${oneLine(fail)}`);
+      throw new Error(`nothing was said: ${oneLine(fail)}${text && warning ? ` (${warning})` : ""}`);
     }
     const head = a.value;
     const pcm = !!(text || clip);
@@ -1843,6 +1855,7 @@ export class Meetings {
     const started = {
       meeting_id: m.id, utterance_id: u.id, speaking: u.state === 'speaking', duration_s: Math.round(u.seconds * 100) / 100, source: clip ? 'ack' : text ? backend : 'file',
       ...(head.voice ? { voice: head.voice } : {}), ...(text && backend === 'elevenlabs' ? { model } : {}), ...(text ? { pieces: count } : {}),
+      ...(text && warning ? { warning } : {}),
       prepare_ms: prepMs, start_ms: u.startedAt - t0, ...(text ? { synth_ms: this.now() - t0 } : {}), ...(count > 1 ? { gap_ms: gapMs } : {}),
       unmuted: !!m.speechUnmuted,
       ...(error ? { error: `cut short, the rest could not be synthesized: ${oneLine(error)}` } : {}),

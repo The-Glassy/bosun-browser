@@ -1,5 +1,5 @@
 // Environment -> validated configuration. Anything malformed or unsafe throws, so the service refuses to start.
-import { isLoopbackHost, MIN_TOKEN_LENGTH, parsePolicies, parseTokens } from './auth.mjs';
+import { isLoopbackHost, MIN_TOKEN_LENGTH, TENANT_RE, parsePolicies, parseTokens } from './auth.mjs';
 import { parseTenantAllow } from './allow.mjs';
 import { parseEgress, parseEgressProxies, parseTenantExits, protectEgressCredentials } from './egress.mjs';
 import { ENGINE_NAMES } from './engines.mjs';
@@ -23,6 +23,22 @@ function int(env, name, def, min, max) {
 }
 
 const list = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
+
+function elevenLabsAccess(env) {
+  const elevenlabsTenants = env.ELEVENLABS_TENANTS === undefined ? null : new Set(list(env.ELEVENLABS_TENANTS));
+  for (const tenant of elevenlabsTenants ?? []) {
+    if (!TENANT_RE.test(tenant)) throw new Error(`ELEVENLABS_TENANTS must contain tenant IDs matching ${TENANT_RE}`);
+  }
+  const elevenlabsTenantOverrides = new Map();
+  for (const entry of list(env.ELEVENLABS_TENANT_OVERRIDES)) {
+    const [tenant, value, extra] = entry.split('=').map((s) => s.trim());
+    if (!TENANT_RE.test(tenant) || !['0', '1'].includes(value) || extra !== undefined || elevenlabsTenantOverrides.has(tenant)) {
+      throw new Error('ELEVENLABS_TENANT_OVERRIDES must be a comma list of distinct <tenant>=0 or <tenant>=1 entries');
+    }
+    elevenlabsTenantOverrides.set(tenant, value === '1');
+  }
+  return { elevenlabsTenants, elevenlabsTenantOverrides };
+}
 
 // A 0/1 switch. Anything else stops the service rather than silently turning a feature on or off.
 function flag(env, name, def) {
@@ -87,6 +103,7 @@ export function loadConfig(env = process.env) {
     // test server; nothing else gets the key.
     liveTranscriptDailyMin: int(env, 'LIVE_TRANSCRIPT_DAILY_MIN', 180, 1, 24 * 60),
     elevenlabs: null,
+    ...elevenLabsAccess(env),
     // Speaking in meetings (meeting_speak with text): the local OpenAI-style TTS service (Supertonic) and its default
     // voice. The env fallbacks of the speech settings (src/meetings/settings.mjs; null: not set): the backend
     // meeting_speak uses when none is passed (TTS_DEFAULT_BACKEND; elevenlabs without a key falls back to supertonic,

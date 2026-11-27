@@ -2,6 +2,15 @@
 
 Decisions made without asking (Misha: "use your judgment and decide yourself"), with the reason. Newest first.
 
+## 0.28.2 (2026-11-27) — access to the installation ElevenLabs key
+
+- Use an explicit operator-owned environment map for tenant overrides. Each entry takes precedence over the
+  installation fallback, following the precedence of `secrets_reveal`. The map is outside tenant-writable state
+  and is read at startup so the gateway and workers have the same policy.
+- Keep stored backend and voice preferences across access changes. When ElevenLabs is denied, speech selects
+  that tenant's Supertonic voice or the installation Supertonic voice. The ElevenLabs voice and model cannot
+  be used by the fallback.
+
 ## 0.22.0 (2026-11-09): recording speaker timeline
 
 - Keep a recording-only timeline separate from the ten-minute live-transcript speaker log. Page snapshots now

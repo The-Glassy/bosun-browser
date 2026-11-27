@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
-import { startBosun, connect, until, sleep } from './helpers.mjs';
+import { startBosun, connect, until, sleep, TOKEN_B } from './helpers.mjs';
 import { startFakeMeet, fakeAudio } from './fakemeet.mjs';
 import { startFakeZoom } from './fakezoom.mjs';
 import { startFakeElevenLabs, tonePcm } from './fakeelevenlabs.mjs';
@@ -36,8 +36,8 @@ async function withService(fn, { env = {} } = {}) {
 
 // An MCPL host that grants channels (caps) and records what Bosun sends: registrations, channels/changed, incoming
 // messages (accepted unless refuse), push events.
-async function host(svc, { caps = ['tools', 'pushEvents', 'channels.*'], refuse = false } = {}) {
-  const c = await connect(svc, undefined, { capabilities: MCPL });
+async function host(svc, { caps = ['tools', 'pushEvents', 'channels.*'], refuse = false, token } = {}) {
+  const c = await connect(svc, token, { capabilities: MCPL });
   Object.assign(c, { pushes: [], registered: [], changed: [], incoming: [] });
   c.setRequestHandler(z.object({ method: z.literal('push/event'), params: z.any() }), async (r) => { c.pushes.push(r.params); return { accepted: true }; });
   c.setRequestHandler(z.object({ method: z.literal('channels/register'), params: z.any() }), async (r) => {
@@ -64,6 +64,90 @@ async function admitted(c, more = {}) {
   await until(async () => (await status(c, id)).state === 'recording', 15_000);
   return { id, code };
 }
+
+test('tenant ElevenLabs policy covers transcript, settings, acknowledgements, speaking and meeting-channel speech', async (t) => {
+  for (const [name, policy, allowed] of [
+    ['unset allows legacy access', {}, true],
+    ['listed tenant allowed', { ELEVENLABS_TENANTS: 'bob' }, true],
+    ['unlisted tenant denied', { ELEVENLABS_TENANTS: 'alice' }, false],
+    ['empty list denies everyone', { ELEVENLABS_TENANTS: '' }, false],
+  ]) {
+    await t.test(name, async () => {
+      await withService(async (svc, ev) => {
+        const c = await host(svc, { token: TOKEN_B });
+        try {
+          const before = { ...el.st.requests };
+          const get = (await c.call('speech_settings_get')).json();
+          const { url } = fake.newRoom();
+          if (allowed) {
+            assert.equal(get.elevenlabs, undefined);
+            assert.equal(get.effective.backend, 'elevenlabs');
+            const result = await c.call('speech_settings_set', {
+              backend: 'elevenlabs', elevenlabs_voice: 'SAz9YHcvj6GT2YYXdXww', elevenlabs_model: 'eleven_flash_v2_5',
+            });
+            assert.equal(result.isError, false, result.text);
+          } else {
+            assert.equal(get.elevenlabs, 'not available for this tenant');
+            assert.equal(get.effective.backend, 'supertonic');
+            for (const patch of [{ backend: 'elevenlabs' }, { elevenlabs_voice: 'SAz9YHcvj6GT2YYXdXww' }, { elevenlabs_model: 'eleven_flash_v2_5' }]) {
+              const result = await c.call('speech_settings_set', patch);
+              assert.equal(result.isError, true, result.text);
+              assert.match(result.text, /ElevenLabs is not available for this tenant/);
+            }
+            for (const dry_run of [false, true]) {
+              const result = await c.call('meeting_join', { url, live_transcript: true, dry_run });
+              assert.equal(result.isError, true, result.text);
+              assert.match(result.text, /live_transcript is refused: ElevenLabs is not available for this tenant/);
+              assert.equal(svc.meetings.active.size, 0);
+              assert.equal(svc.meetings.dryRuns.size, 0);
+            }
+            assert.deepEqual(el.st.requests, before);
+          }
+
+          const settings = await c.call('speech_settings_set', {
+            ack_on_final: true, ack_phrases: ['Acknowledge.'], channel_prepare_chunks: true, supertonic_voice: 'supertonic-F2',
+          });
+          assert.equal(settings.isError, false, settings.text);
+          const speechAt = el.st.speech.length, elevenAt = el.st.tts.length;
+          const requests = allowed ? el.st.tts : el.st.speech;
+          const start = allowed ? elevenAt : speechAt;
+          const spoken = () => requests.slice(start).map(allowed ? (r) => r.body.text : (r) => r.input);
+          const { id } = await admitted(c, { live_transcript: allowed });
+          const channelId = `bosun:meeting:${id}`;
+          await until(() => c.registered.length === 1 && spoken().includes('Acknowledge.'), 10_000);
+          if (allowed) await until(() => el.st.requests.transcript === before.transcript + 1, 5000);
+
+          const direct = await c.call('meeting_speak', {
+            meeting_id: id, text: 'Direct speech.', backend: 'elevenlabs', voice: 'SAz9YHcvj6GT2YYXdXww', model: 'eleven_v4_turbo', wait: true,
+          });
+          assert.equal(direct.isError, false, direct.text);
+          assert.equal(direct.json().source, allowed ? 'elevenlabs' : 'supertonic');
+          assert.equal(direct.json().voice, allowed ? 'SAz9YHcvj6GT2YYXdXww' : 'supertonic-F2');
+          assert.equal(direct.json().model, allowed ? 'eleven_v4_turbo' : undefined);
+
+          const warn = (r) => allowed ? assert.equal(r.warning, undefined) : assert.match(r.warning, /using supertonic/);
+          warn(direct.json());
+          const ordinary = await c.publish(channelId, 'Channel speech.');
+          assert.equal(ordinary.delivered, true);
+          warn(ordinary);
+          await until(() => ev.speech.some((r) => r.kind === 'stream' && r.state === 'done'), 10_000);
+          await c.notify('channels/outgoing/chunk', { inferenceId: 'prepared', conversationId: 'x', channelId, index: 0, delta: 'Prepared speech. ' });
+          await until(() => spoken().includes('Prepared speech.'), 5000);
+          const prepared = await c.publish(channelId, 'Prepared speech.');
+          assert.equal(prepared.delivered, true);
+          warn(prepared);
+          await until(() => ev.speech.filter((r) => r.kind === 'stream' && r.state === 'done').length === 2, 10_000);
+          assert.deepEqual(spoken(), ['Acknowledge.', 'Direct speech.', 'Channel speech.', 'Prepared speech.']);
+          assert.deepEqual(el.st.requests, allowed
+            ? { ...before, elevenlabsSpeech: before.elevenlabsSpeech + 4, transcript: before.transcript + 1 }
+            : before);
+          assert.equal((await fetch(svc.wsUrl.replace(/^ws:/, 'http:') + '/health')).status, 200);
+          await c.call('meeting_leave', { meeting_id: id });
+        } finally { await c.close(); }
+      }, { env: { TTS_DEFAULT_BACKEND: 'elevenlabs', ...policy } });
+    });
+  }
+});
 const mics = (code) => fake.room(code).media.filter((m) => 'mic' in m).map((m) => m.mic);
 const transcriptPushes = (c) => c.pushes.filter((p) => p.tags.includes('bosun:meeting-transcript'));
 
