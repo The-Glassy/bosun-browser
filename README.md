@@ -162,6 +162,8 @@ for host requirements, egress, and the `bosun migrate-data` command.
 | `MEETING_ALONE_LEAVE_SEC` | `30` | seconds alone after everyone else has left (5–3600) |
 | `MEETING_FIRST_JOINER_WAIT_SEC` | `120` | seconds alone waiting for the first participant (5–3600) |
 | `ELEVENLABS_API_KEY` | – | ElevenLabs key: the live meeting transcript (`meeting_join` `live_transcript`) and the `elevenlabs` voice of `meeting_speak`; unset: both refused. Kept in the service only (removed from its environment at start) |
+| `ELEVENLABS_TENANTS` | unset (all tenants) | Comma-separated tenant IDs allowed to use the installation key. An explicitly empty value allows none by default. See [ElevenLabs access per tenant](#elevenlabs-access-per-tenant). |
+| `ELEVENLABS_TENANT_OVERRIDES` | unset | Operator-only tenant settings, e.g. `glassy=1,junga=0`. Each explicit `0` or `1` takes precedence over `ELEVENLABS_TENANTS` for that tenant. |
 | `ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io` | another ElevenLabs API host (`https://*.elevenlabs.io`, e.g. `https://api.eu.residency.elevenlabs.io`); nothing else gets the key (http on loopback is accepted, for tests) |
 | `ELEVENLABS_VOICE` | `EXAVITQu4vr4xnSDxMaL` ("Sarah") | fallback ElevenLabs voice id for `meeting_speak` with `backend: "elevenlabs"` (a tenant's speech setting wins) |
 | `ELEVENLABS_TTS_MODEL` | `eleven_v4_turbo` | fallback ElevenLabs text-to-speech model for `meeting_speak` (`[a-z0-9_]`, 3–60 characters), e.g. `eleven_flash_v2_5` |
@@ -1167,9 +1169,26 @@ speaker are merged, runs under 300 ms are dropped, and Bosun's own names are exc
 A process crash before finalization can leave audio without a sidecar.
 
 
+### ElevenLabs access per tenant
+
+The operator can set `ELEVENLABS_TENANTS=glassy,glassy-swarm` to restrict the installation key to those
+tenant IDs. Use the IDs from `BROWSER_TOKENS`, or `default` for `BROWSER_TOKEN`. Omitting the variable preserves
+access for every tenant. Setting `ELEVENLABS_TENANTS=` denies access by default.
+An operator can explicitly deny or allow a tenant with `ELEVENLABS_TENANT_OVERRIDES`, for example
+`glassy=1,junga=0`. This takes precedence for the named tenants, including when the installation list is empty.
+Restart Bosun after changing the environment. Existing token policies and the API key requirement still apply.
+
+For a denied tenant, `meeting_join { live_transcript: true }` fails before opening the meeting. Join with
+`live_transcript` omitted or false for a recording. When `meeting_speak` or a meeting-channel publish would use
+ElevenLabs, Bosun uses the configured Supertonic service (`TTS_URL`) and returns a `warning`. Meeting speech
+uses the Supertonic voice settings in this case and ignores ElevenLabs voice and model parameters. Channel
+preparation and acknowledgement clips also use Supertonic. `speech_settings_get` reports
+`elevenlabs: "not available for this tenant"`, and `speech_settings_set` refuses `backend: "elevenlabs"`
+and `elevenlabs_*` settings. The operator controls access independently of speech settings.
+
 ### Live transcript and speaking
 
-**Live transcript** (`meeting_join { live_transcript: true }`, off by default; needs `ELEVENLABS_API_KEY`):
+**Live transcript** (`meeting_join { live_transcript: true }`, off by default and requires `ELEVENLABS_API_KEY` and tenant access):
 - **What it is:** the meeting audio Bosun records is also read by a second ffmpeg as raw PCM (16 kHz mono) and
   streamed to **ElevenLabs Scribe v2 Realtime**: `wss://api.elevenlabs.io/v1/speech-to-text/realtime`, model
   `scribe_v2_realtime`, `audio_format=pcm_16000`, `commit_strategy=vad` (a pause of `vad_silence_s` ends a segment:
@@ -1230,7 +1249,8 @@ A process crash before finalization can leave audio without a sidecar.
   `supertonic_voice` and `vad_silence_s`, alongside the [meeting defaults](#meeting-defaults). Pass `null` to reset a setting. What a call leaves out comes
   from the tenant's setting, then the env fallback, then Bosun's default; `speech_settings_get` shows the effective
   values and where each comes from (`tenant`, `env`, `default`). `backend` `elevenlabs` without `ELEVENLABS_API_KEY`
-  falls back to `supertonic` (with a `warning`). A read-only (ephemeral) token may read them, not set them.
+  falls back to `supertonic` (with a `warning`). Tenant access also controls when ElevenLabs defaults apply.
+  A read-only (ephemeral) token may read these settings.
 - **How:** ffmpeg plays it into the meeting's `bosun_mic` sink, whose monitor is the browser's microphone. The join
   still starts muted; `meeting_speak` unmutes for the utterance and mutes again 0.4 s after it ends (`auto_mute`,
   default true; a microphone that was already on stays on). It returns once the audio plays, with `duration_s`,

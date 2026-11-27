@@ -65,6 +65,7 @@ authentication handling and is not resumed after Chromium restarts it with the r
   server name to the destination. An upstream proxy must support tunneling to the checked IP.
 - The worker has dedicated Unix channels for explicitly configured speech providers. These are pinned to the
   configured provider origin; the browser's host relay continues to apply its destination checks.
+  The gateway provides the ElevenLabs relay and installation key only to workers whose tenant has ElevenLabs access.
 - The gateway serves public `/health`, `/health/exits` and `/metrics`. Set `BOSUN_METRICS_TOKEN` to require
   that dedicated bearer for metrics scraping.
 

@@ -29,12 +29,14 @@ const SILENCE_SEC = 1.0;
 
 export async function startFakeElevenLabs({ key = 'el-test-key-0123456789', phrases = ['Hello Misha, this is a test.'], ttsDelayMs = 0, zeroRetention = false } = {}) {
   const st = { conns: [], tts: [], speech: [], rejectNext: null, phrases, phraseAt: 0, ttsDelayMs, silent: false, stampDelayMs: 0, stampFirst: false, stall: false, hugeTts: false };
+  st.requests = { elevenlabsSpeech: 0, transcript: 0, supertonicWithKey: 0 };
   const wss = new WebSocketServer({ noServer: true });
   const body = (req) => new Promise((r) => { let b = ''; req.on('data', (d) => { b += d; }); req.on('end', () => { try { r(JSON.parse(b || '{}')); } catch { r({}); } }); });
   const srv = http.createServer(async (req, res) => {
     const u = new URL(req.url, 'http://x');
     const wav = (seconds) => { res.writeHead(200, { 'content-type': 'audio/wav' }); res.end(toneWav(seconds)); };
     if (req.method === 'POST' && u.pathname === '/v1/audio/speech') { // Supertonic
+      if (req.headers['xi-api-key']) st.requests.supertonicWithKey++;
       const b = await body(req);
       st.speech.push({ ...b, at: Date.now() });
       if (st.ttsDelayMs) await new Promise((r) => setTimeout(r, st.ttsDelayMs));
@@ -44,6 +46,7 @@ export async function startFakeElevenLabs({ key = 'el-test-key-0123456789', phra
     }
     const m = /^\/v1\/text-to-speech\/([A-Za-z0-9]+)$/.exec(u.pathname);
     if (req.method === 'POST' && m) {
+      st.requests.elevenlabsSpeech++;
       if (req.headers['xi-api-key'] !== key) { res.writeHead(401, { 'content-type': 'application/json' }); return res.end('{"detail":{"status":"invalid_api_key"}}'); }
       const b = await body(req);
       st.tts.push({ voice: m[1], query: Object.fromEntries(u.searchParams), body: b, at: Date.now() });
@@ -56,6 +59,7 @@ export async function startFakeElevenLabs({ key = 'el-test-key-0123456789', phra
     const u = new URL(req.url, 'http://x');
     const refuse = (code) => { sock.end(`HTTP/1.1 ${code} No\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`); };
     if (u.pathname !== '/v1/speech-to-text/realtime') return refuse(404);
+    st.requests.transcript++;
     if (req.headers['xi-api-key'] !== key) return refuse(401);
     if (st.rejectNext) { const c = st.rejectNext; st.rejectNext = null; return refuse(c); }
     wss.handleUpgrade(req, sock, head, (ws) => session(ws, u.searchParams));

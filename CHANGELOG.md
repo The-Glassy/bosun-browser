@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.28.2 (2026-11-27)
+
+### Per-tenant ElevenLabs access
+
+- Set `ELEVENLABS_TENANTS` to allow specific token tenant IDs to use the installation key. Omit it to
+  preserve existing access, or set it to an empty string to deny access by default. An operator can
+  override individual tenants with `ELEVENLABS_TENANT_OVERRIDES` entries such as `glassy=1,junga=0`.
+- **Behavior changes for denied tenants.** `meeting_join` refuses `live_transcript: true` before joining.
+  ElevenLabs speech falls back to Supertonic with a warning in `meeting_speak` and meeting-channel publish
+  receipts. Acknowledgements and prepared channel speech also use Supertonic. `speech_settings_set` rejects
+  ElevenLabs backend, model and voice settings, and `speech_settings_get` reports access as unavailable.
+  Existing speech settings stay stored so they can take effect again if the operator restores access.
+- Both ElevenLabs transports check the tenant before attaching the key. Denied sandbox workers receive neither
+  the key nor the ElevenLabs relay.
+
 ## 0.28.1 (2026-11-26)
 
 ### Tenant sandbox fixes

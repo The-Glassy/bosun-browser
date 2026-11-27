@@ -11,6 +11,7 @@ import { PassThrough } from 'stream';
 import { fileURLToPath } from 'url';
 import { LiveTranscript, TranscriptUsage, realtimeUrl, EL_MODEL } from '../src/meetings/transcript.mjs';
 import { synthesizeWav, splitSpeech, wavSeconds, parseWav, audioFormat, probeSeconds } from '../src/meetings/speech.mjs';
+import { loadConfig } from '../src/config.mjs';
 import { startFakeElevenLabs, tonePcm, toneWav } from './fakeelevenlabs.mjs';
 import { tmpDir, until, sleep } from './helpers.mjs';
 
@@ -37,7 +38,7 @@ const usage = (capMin = 60, file = path.join(tmpDir(), 'u.json')) => new Transcr
 function live(src, opts = {}) {
   const ev = { partial: [], final: [], stopped: [] };
   const t = new LiveTranscript({
-    apiKey: el.key, baseUrl: el.base, source: src, tenant: 'alice', usage: opts.usage || usage(), retryMs: 50, partials: opts.partials ?? true, limits: opts.limits,
+    cfg: { elevenlabs: { apiKey: el.key, baseUrl: el.base } }, source: src, tenant: 'alice', usage: opts.usage || usage(), retryMs: 50, partials: opts.partials ?? true, limits: opts.limits,
     on: { partial: (s) => ev.partial.push({ ...s, t: Date.now() }), final: (s) => ev.final.push({ ...s, t: Date.now() }), stopped: (s) => ev.stopped.push(s) },
   });
   return { t: t.start(), ev };
@@ -131,7 +132,7 @@ test('an error a new connection would not fix stops it (auth_error); one it woul
   // A wrong key: HTTP 401 at the handshake, stopped at once.
   const ev = { stopped: [] };
   const src = source(silence(5));
-  const b = new LiveTranscript({ apiKey: 'wrong-key-0123456789', baseUrl: el.base, source: src, tenant: 'alice', usage: usage(), retryMs: 50, on: { stopped: (s) => ev.stopped.push(s) } }).start();
+  const b = new LiveTranscript({ cfg: { elevenlabs: { apiKey: 'wrong-key-0123456789', baseUrl: el.base } }, source: src, tenant: 'alice', usage: usage(), retryMs: 50, on: { stopped: (s) => ev.stopped.push(s) } }).start();
   await until(() => ev.stopped.length === 1, 5000);
   assert.equal(ev.stopped[0].reason, 'error');
   assert.match(ev.stopped[0].error, /auth_error: HTTP 401/);
@@ -207,16 +208,16 @@ test('parseWav reads the header (also a LIST chunk first, a streamed size); synt
   await assert.rejects(synthesizeWav(cfg, { text: 'x', voice: 'alloy' }), /voice must be one of supertonic-F1/);
   await assert.rejects(synthesizeWav({}, { text: 'x' }), /no TTS service configured/);
 
-  const b = await synthesizeWav(cfg, { text: 'Привіт', backend: 'elevenlabs', lang: 'uk' });
+  const b = await synthesizeWav(cfg, { tenant: 'alice', text: 'Привіт', backend: 'elevenlabs', lang: 'uk' });
   assert.equal(b.voice, 'EXAVITQu4vr4xnSDxMaL');
   const req = el.st.tts.at(-1);
   assert.equal(req.voice, 'EXAVITQu4vr4xnSDxMaL');
   assert.deepEqual(req.query, { output_format: 'wav_24000', enable_logging: 'false' });
   assert.deepEqual(req.body, { text: 'Привіт', model_id: 'eleven_v4_turbo', language_code: 'uk' });
-  await synthesizeWav(cfg, { text: 'Hi', backend: 'elevenlabs', model: 'eleven_flash_v2_5' });
+  await synthesizeWav(cfg, { tenant: 'alice', text: 'Hi', backend: 'elevenlabs', model: 'eleven_flash_v2_5' });
   assert.equal(el.st.tts.at(-1).body.model_id, 'eleven_flash_v2_5');
-  await assert.rejects(synthesizeWav(cfg, { text: 'Hi', backend: 'elevenlabs', model: 'Eleven-V4' }), /model must be an ElevenLabs model id/);
-  await assert.rejects(synthesizeWav({ ...cfg, elevenlabs: { ...cfg.elevenlabs, apiKey: 'wrong-key-0123456789' } }, { text: 'x', backend: 'elevenlabs' }), /ElevenLabs text-to-speech answered HTTP 401/);
+  await assert.rejects(synthesizeWav(cfg, { tenant: 'alice', text: 'Hi', backend: 'elevenlabs', model: 'Eleven-V4' }), /model must be an ElevenLabs model id/);
+  await assert.rejects(synthesizeWav({ ...cfg, elevenlabs: { ...cfg.elevenlabs, apiKey: 'wrong-key-0123456789' } }, { tenant: 'alice', text: 'x', backend: 'elevenlabs' }), /ElevenLabs text-to-speech answered HTTP 401/);
   await assert.rejects(synthesizeWav({ ttsUrl: 'http://127.0.0.1:9' }, { text: 'x' }), /supertonic could not be reached/);
 });
 
@@ -274,7 +275,7 @@ test('errors after sessions that lasted never add up to giving up', async () => 
 
 test('a partial still waiting for its turn when its segment is committed is dropped, not sent as the next segment', async () => {
   const ev = { partial: [], final: [] };
-  const t = new LiveTranscript({ apiKey: el.key, baseUrl: el.base, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { partial: (s) => ev.partial.push(s), final: (s) => ev.final.push(s) } });
+  const t = new LiveTranscript({ cfg: { elevenlabs: { apiKey: el.key, baseUrl: el.base } }, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { partial: (s) => ev.partial.push(s), final: (s) => ev.final.push(s) } });
   t.onMessage({ message_type: 'partial_transcript', text: 'Hello' });
   t.onMessage({ message_type: 'partial_transcript', text: 'Hello Misha' }); // throttled: waits
   t.onMessage({ message_type: 'committed_transcript', text: 'Hello Misha, hi.' });
@@ -290,7 +291,7 @@ test('a partial still waiting for its turn when its segment is committed is drop
 test('a committed text still waiting for its copy when the transcript stops is kept (not when discarded)', async () => {
   for (const discard of [false, true]) {
     const ev = { final: [] };
-    const t = new LiveTranscript({ apiKey: el.key, baseUrl: el.base, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { final: (s) => ev.final.push(s) } });
+    const t = new LiveTranscript({ cfg: { elevenlabs: { apiKey: el.key, baseUrl: el.base } }, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { final: (s) => ev.final.push(s) } });
     t.onMessage({ message_type: 'committed_transcript', text: 'Last words before the end.' });
     await t.stop('ended', null, { discard });
     assert.deepEqual(t.since(0).map((f) => [f.seq, f.text]), discard ? [] : [[1, 'Last words before the end.']], `discard ${discard}`);
@@ -300,7 +301,7 @@ test('a committed text still waiting for its copy when the transcript stops is k
 
 test('a final waiting for its copy leaves the next segment\'s waiting partial alone', async () => {
   const ev = { partial: [], final: [] };
-  const t = new LiveTranscript({ apiKey: el.key, baseUrl: el.base, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { partial: (s) => ev.partial.push(s), final: (s) => ev.final.push(s) } });
+  const t = new LiveTranscript({ cfg: { elevenlabs: { apiKey: el.key, baseUrl: el.base } }, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { partial: (s) => ev.partial.push(s), final: (s) => ev.final.push(s) } });
   t.onMessage({ message_type: 'committed_transcript', text: 'First.' });
   t.onMessage({ message_type: 'partial_transcript', text: 'Second' }); // sent at once, #2
   t.onMessage({ message_type: 'partial_transcript', text: 'Second one' }); // waits for its turn, #2
@@ -313,7 +314,7 @@ test('a final waiting for its copy leaves the next segment\'s waiting partial al
 
 test('many copies late: plain texts made into finals and dropped from the queue still swallow their copies', async () => {
   const ev = { final: [] };
-  const t = new LiveTranscript({ apiKey: el.key, baseUrl: el.base, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { final: (s) => ev.final.push(s) } });
+  const t = new LiveTranscript({ cfg: { elevenlabs: { apiKey: el.key, baseUrl: el.base } }, source: source(silence(1)), tenant: 'alice', usage: usage(), on: { final: (s) => ev.final.push(s) } });
   for (let i = 1; i <= 60; i++) t.onMessage({ message_type: 'committed_transcript', text: `Segment ${i}.` });
   await sleep(1700); // all made into finals without their copies
   for (let i = 1; i <= 60; i++) t.onMessage({ message_type: 'committed_transcript_with_timestamps', text: `Segment ${i}.`, words: [] });
@@ -333,8 +334,28 @@ test('NODE_DEBUG set: no connection with the key (Node would log its headers)', 
     assert.equal(ev.stopped[0].reason, 'error');
     assert.match(ev.stopped[0].error, /NODE_DEBUG is set/);
     assert.equal(el.conns.length, n);
-    await assert.rejects(synthesizeWav({ elevenlabs: { apiKey: el.key, baseUrl: el.base } }, { text: 'x', backend: 'elevenlabs' }), /NODE_DEBUG is set/);
+    await assert.rejects(synthesizeWav({ elevenlabs: { apiKey: el.key, baseUrl: el.base } }, { tenant: 'alice', text: 'x', backend: 'elevenlabs' }), /NODE_DEBUG is set/);
   } finally { delete process.env.NODE_DEBUG; }
+});
+
+test('the credential guard refuses both transports for a denied or missing tenant before any request', async () => {
+  const env = { ELEVENLABS_API_KEY: el.key, ELEVENLABS_BASE_URL: el.base };
+  const before = { ...el.st.requests };
+  for (const [policy, tenant] of [
+    [{ ELEVENLABS_TENANTS: 'bob' }, 'alice'],
+    [{ ELEVENLABS_TENANTS: '' }, 'alice'],
+    [{ ELEVENLABS_TENANT_OVERRIDES: 'alice=0' }, 'alice'],
+    [{}, undefined],
+  ]) {
+    const cfg = loadConfig({ ...env, ...policy });
+    await assert.rejects(synthesizeWav(cfg, { tenant, text: 'Blocked', backend: 'elevenlabs' }), /not available for this tenant/);
+    const src = source(silence(1));
+    const t = new LiveTranscript({ cfg, tenant, source: src, usage: usage(), on: {} }).start();
+    assert.equal(t.status().state, 'stopped');
+    assert.match(t.status().error, /not available for this tenant/);
+    assert.equal(src.stopped, true);
+  }
+  assert.deepEqual(el.st.requests, before);
 });
 
 test('a usage file that could not be written stays due and is written later', () => {
@@ -407,7 +428,7 @@ test('ElevenLabs for real: the speech fixture comes back as text', { skip: !proc
   const pcm = fs.readFileSync(path.join(FIXTURES, 'speech-en.wav')).subarray(44);
   const ev = { partial: [], final: [], stopped: [] };
   const t = new LiveTranscript({
-    apiKey: process.env.ELEVENLABS_API_KEY, baseUrl: 'https://api.elevenlabs.io', source: source(Buffer.concat([pcm, silence(3)]), { speed: 1 }), tenant: 'test', usage: usage(),
+    cfg: { elevenlabs: { apiKey: process.env.ELEVENLABS_API_KEY, baseUrl: 'https://api.elevenlabs.io' } }, source: source(Buffer.concat([pcm, silence(3)]), { speed: 1 }), tenant: 'test', usage: usage(),
     on: { partial: (s) => ev.partial.push(s), final: (s) => ev.final.push(s), stopped: (s) => ev.stopped.push(s) },
   }).start();
   try {

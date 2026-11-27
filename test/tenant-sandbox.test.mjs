@@ -279,3 +279,23 @@ test('the gateway diagnostic guard applies to secret tools in its worker', { ski
   assert.equal(result.isError, true);
   assert.match(result.text, /secrets are refused.*NODE_DEBUG/);
 });
+
+test('isolated workers apply the tenant ElevenLabs policy and health stays anonymous', { skip, timeout: 45_000 }, async (t) => {
+  const svc = await startBosun({
+    BOSUN_TENANT_SANDBOX: 'on', FEATURES_ENGINES: 'chromium', KEEPALIVE: '0', HEADLESS: '1',
+    ELEVENLABS_API_KEY: 'synthetic-elevenlabs-key', ELEVENLABS_VOICE: 'SAz9YHcvj6GT2YYXdXww',
+    ELEVENLABS_TENANTS: 'bob', ELEVENLABS_TENANT_OVERRIDES: 'alice=1,bob=0', TTS_DEFAULT_BACKEND: 'elevenlabs',
+  });
+  t.after(() => svc.stop());
+  const [allowed, denied] = await Promise.all([connect(svc, TOKEN), connect(svc, TOKEN_B)]);
+  t.after(() => Promise.all([allowed.close(), denied.close()]));
+  assert.equal((await assertOk(allowed, 'speech_settings_get')).effective.backend, 'elevenlabs');
+  const settings = await assertOk(denied, 'speech_settings_get');
+  assert.equal(settings.elevenlabs, 'not available for this tenant');
+  assert.equal(settings.effective.backend, 'supertonic');
+  assert.notEqual(settings.effective.elevenlabs_voice, 'SAz9YHcvj6GT2YYXdXww');
+  const join = await denied.call('meeting_join', { url: 'https://meet.google.com/abc-defg-hij', live_transcript: true });
+  assert.equal(join.isError, true);
+  assert.match(join.text, /live_transcript is refused: ElevenLabs is not available for this tenant/);
+  assert.equal((await fetch(svc.wsUrl.replace(/^ws:/, 'http:') + '/health')).status, 200);
+});

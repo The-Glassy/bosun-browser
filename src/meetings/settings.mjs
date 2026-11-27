@@ -16,6 +16,7 @@ import { ANNOUNCE_MODES, DEFAULT_MEETING_ANNOUNCE, DEFAULT_MEETING_BOT_NAME, DEF
 
 export { LEAVE_TIMER_MIN_SEC, LEAVE_TIMER_MAX_SEC };
 import { BACKENDS, SUPERTONIC_VOICES, EL_DEFAULT_TTS_MODEL, EL_DEFAULT_VOICE } from './speech.mjs';
+import { ELEVENLABS_DENIED, ELEVENLABS_FALLBACK, ELEVENLABS_UNAVAILABLE, elevenLabsAllowed } from './elevenlabs.mjs';
 
 export const EL_MODEL_RE = /^[a-z0-9_]{3,60}$/;
 export const EL_VOICE_RE = /^[A-Za-z0-9]{10,40}$/;
@@ -140,8 +141,12 @@ export class SpeechSettings {
   // Changes the given settings; null removes one (back to the environment's or Bosun's default). All or nothing.
   set(tenant, patch) {
     const next = this.stored(tenant);
+    const allowed = elevenLabsAllowed(this.cfg, tenant);
     for (const [k, v] of Object.entries(patch)) {
       if (v === undefined) continue;
+      if (!allowed && ((k === 'backend' && v === 'elevenlabs') || k.startsWith('elevenlabs_'))) {
+        throw new Error(ELEVENLABS_DENIED);
+      }
       if (Object.hasOwn(REMOVED, k)) { if (v === null) continue; throw new Error(removedSetting(k)); } // null: gone already
       if (!Object.hasOwn(SETTINGS, k)) throw new Error(`no speech setting ${k}`);
       if (v === null) { delete next[k]; continue; }
@@ -165,7 +170,7 @@ export class SpeechSettings {
   // What a call without its own values gets: {backend, elevenlabs_model, elevenlabs_voice, supertonic_voice,
   // vad_silence_s, and the meeting, channel and ack settings}. Meeting settings label the environment
   // 'installation'; existing speech settings still use 'env'. backend
-  // elevenlabs without a key: supertonic, with a warning.
+  // elevenlabs denied by policy or without a key: supertonic, with a warning.
   effective(tenant) {
     const s = this.stored(tenant);
     const cfg = this.cfg;
@@ -188,16 +193,19 @@ export class SpeechSettings {
       vad_silence_s: pick('vad_silence_s', cfg.vadSilenceEnv ?? null, VAD_DEFAULT_S),
       ...Object.fromEntries(Object.entries(this.defaults).map(([k, def]) => [k, pick(k, meeting[k], def, 'installation')])),
     })) { out[k] = v; from[k] = f; }
+    const elevenlabs = elevenLabsAllowed(cfg, tenant) ? null : ELEVENLABS_UNAVAILABLE;
     let warning = null;
-    if (out.backend === 'elevenlabs' && !cfg.elevenlabs) {
-      warning = `backend elevenlabs (from ${from.backend === 'tenant' ? 'this tenant\'s setting' : 'TTS_DEFAULT_BACKEND'}) but ELEVENLABS_API_KEY is not set: meeting_speak uses supertonic`;
+    if (out.backend === 'elevenlabs' && (elevenlabs || !cfg.elevenlabs)) {
+      warning = elevenlabs ? ELEVENLABS_FALLBACK :
+        `backend elevenlabs (from ${from.backend === 'tenant' ? 'this tenant\'s setting' : 'TTS_DEFAULT_BACKEND'}) but ELEVENLABS_API_KEY is not set: meeting_speak uses supertonic`;
       out.backend = 'supertonic';
     }
-    return { values: out, from, warning };
+    return { values: out, from, warning, elevenlabs };
   }
 
   get(tenant) {
     const e = this.effective(tenant);
-    return { settings: this.stored(tenant), effective: e.values, from: e.from, ...(e.warning ? { warning: e.warning } : {}) };
+    return { settings: this.stored(tenant), effective: e.values, from: e.from,
+      ...(e.elevenlabs ? { elevenlabs: e.elevenlabs } : {}), ...(e.warning ? { warning: e.warning } : {}) };
   }
 }

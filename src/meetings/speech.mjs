@@ -11,7 +11,7 @@
 import { providerFetch } from '../tenant-network.mjs';
 import fs from 'fs';
 import { execFile } from 'child_process';
-import { nodeDebugOn, NODE_DEBUG_REFUSED } from './transcript.mjs';
+import { elevenLabsAllowed, elevenLabsHeaders } from './elevenlabs.mjs';
 
 export const BACKENDS = ['supertonic', 'elevenlabs'];
 export const SUPERTONIC_VOICES = [...'FM'].flatMap((g) => [1, 2, 3, 4, 5].map((i) => `supertonic-${g}${i}`));
@@ -99,10 +99,13 @@ async function fetchAudio(url, init, what, socketPath) {
 }
 
 // One piece of text -> WAV audio. Returns {pcm: {rate, channels}, data (s16le samples), seconds, voice}.
-export async function synthesizeWav(cfg, { text, backend = 'supertonic', voice, lang, model }) {
+export async function synthesizeWav(cfg, { tenant, text, backend = 'supertonic', voice, lang, model }) {
   let buf;
   if (backend === 'supertonic') {
-    if (!cfg.ttsUrl) throw new Error('no TTS service configured (TTS_URL): pass audio_file_id, or backend "elevenlabs"');
+    if (!cfg.ttsUrl) {
+      const alternative = elevenLabsAllowed(cfg, tenant) ? ', or backend "elevenlabs"' : '';
+      throw new Error(`no TTS service configured (TTS_URL): pass audio_file_id${alternative}`);
+    }
     voice ??= cfg.ttsVoice || undefined;
     if (voice && !SUPERTONIC_VOICES.includes(voice)) throw new Error(`voice must be one of ${SUPERTONIC_VOICES.join(', ')} for supertonic`);
     buf = await fetchAudio(`${cfg.ttsUrl}/v1/audio/speech`, {
@@ -110,8 +113,7 @@ export async function synthesizeWav(cfg, { text, backend = 'supertonic', voice, 
       body: JSON.stringify({ input: text, ...(voice ? { voice } : {}), ...(lang ? { lang } : {}), response_format: 'wav' }),
     }, 'supertonic', cfg.providerSockets?.tts);
   } else if (backend === 'elevenlabs') {
-    if (!cfg.elevenlabs?.apiKey) throw new Error('no ElevenLabs key configured (ELEVENLABS_API_KEY)');
-    if (nodeDebugOn()) throw new Error(NODE_DEBUG_REFUSED);
+    const headers = elevenLabsHeaders(cfg, tenant);
     voice ??= cfg.elevenlabs.voice || EL_DEFAULT_VOICE;
     if (!/^[A-Za-z0-9]{10,40}$/.test(voice)) throw new Error('voice must be an ElevenLabs voice id for backend elevenlabs');
     if (model && !/^[a-z0-9_]{3,60}$/.test(model)) throw new Error('model must be an ElevenLabs model id such as eleven_v4_turbo');
@@ -119,7 +121,7 @@ export async function synthesizeWav(cfg, { text, backend = 'supertonic', voice, 
     u.searchParams.set('output_format', 'wav_24000');
     u.searchParams.set('enable_logging', 'false');
     buf = await fetchAudio(u.href, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'xi-api-key': cfg.elevenlabs.apiKey },
+      method: 'POST', headers: { 'content-type': 'application/json', ...headers },
       body: JSON.stringify({ text, model_id: model || EL_DEFAULT_TTS_MODEL, ...(lang ? { language_code: lang } : {}) }),
     }, 'ElevenLabs text-to-speech', cfg.providerSockets?.elevenlabs);
   } else throw new Error(`backend must be one of ${BACKENDS.join(', ')}`);
